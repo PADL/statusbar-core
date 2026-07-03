@@ -14,6 +14,7 @@
 #include "statusbar/itc/itc_message_pipe.hpp"
 #include "statusbar/itc/itc_published.hpp"
 #include "statusbar/itc/itc_rt_callback_slot.hpp"
+#include "statusbar/itc/itc_seqlock_value.hpp"
 #include "statusbar/itc/itc_spin_lock.hpp"
 #include "statusbar/itc/itc_stop_token.hpp"
 #include "statusbar/itc/itc_telemetry_counter.hpp"

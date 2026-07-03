@@ -13,6 +13,7 @@ statusbar_add_module(
   itc_message_pipe_test.cpp
   itc_published_test.cpp
   itc_rt_callback_slot_test.cpp
+  itc_seqlock_value_test.cpp
   itc_spin_lock_test.cpp
   itc_stop_token_test.cpp
   itc_telemetry_counter_test.cpp)
