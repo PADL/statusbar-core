@@ -194,6 +194,18 @@ TEST(ipv4_header, version_ihl)
     EXPECT_EQ(hdr.version_ihl.get(), 0x45);
 }
 
+TEST(ipv4_header, payload_length_underflow_guard)
+{
+    IPv4Header hdr;
+    hdr.set_version(4);
+    hdr.set_ihl(5);  // header_length() == 20
+    // Malformed: total_length < header_length must NOT wrap to a huge uint16.
+    hdr.total_length = statusbar::ieee::IeeeOrderedUInt<uint16_t>(10);
+    EXPECT_EQ(hdr.payload_length(), 0U);
+    hdr.total_length = statusbar::ieee::IeeeOrderedUInt<uint16_t>(120);
+    EXPECT_EQ(hdr.payload_length(), 100U);
+}
+
 TEST(ipv4_header, dscp_ecn)
 {
     IPv4Header hdr;

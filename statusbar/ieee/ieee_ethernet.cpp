@@ -135,8 +135,10 @@ auto load_unchecked(std::span<uint8_t const> const buf, VlanTag* const item) noe
     doublet_t tpid;
     span_load(tpid, buf);
 
-    if (tpid != VlanTag::ETHERTYPE) {
-        // Not a VLAN tag
+    if (tpid != VlanTag::ETHERTYPE || buf.size() < VlanTag::LENGTH) {
+        // Not a VLAN tag, or a truncated one. The 2-byte guard above is enough to
+        // peek the TPID, but a full tag is 4 bytes: without this a 2-3 byte 0x8100
+        // prefix would read past the span in the parse below (OOB read).
         item->tpid = 0;
         item->tci = 0;
         return size_t{0};

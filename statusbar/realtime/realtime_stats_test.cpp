@@ -834,6 +834,17 @@ TEST(timing_window, empty_window)
     EXPECT_EQ(window.size(), 0U);
 }
 
+TEST(timing_window, zero_max_size_is_safe)
+{
+    // max_size 0 would divide by zero in push()/operator[] (`% max_size_`); the
+    // constructor clamps to 1 so the ring degrades to holding the newest sample.
+    TimingSampleWindow<int64_t> window(0);
+    window.push(42);
+    window.push(43);
+    EXPECT_EQ(window.size(), 1U);
+    EXPECT_EQ(window[0], 43);
+}
+
 TEST(timing_window, single_sample)
 {
     TimingSampleWindow<int64_t> window(8);

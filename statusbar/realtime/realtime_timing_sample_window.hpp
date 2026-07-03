@@ -25,7 +25,10 @@ class TimingSampleWindow
 {
   public:
     explicit TimingSampleWindow(size_t max_size) noexcept
-        : max_size_{max_size > max_timing_sample_window_size ? max_timing_sample_window_size : max_size}
+        // Clamp to [1, max]: 0 would make every ring operation divide by max_size_
+        // (`% max_size_`) — undefined behavior / SIGFPE.
+        : max_size_{
+              max_size == 0 ? size_t{1} : (max_size > max_timing_sample_window_size ? max_timing_sample_window_size : max_size)}
     {}
 
     void push(T sample) noexcept

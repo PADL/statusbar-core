@@ -502,7 +502,11 @@ template <typename T>
     requires std::is_trivially_copyable_v<T> && HasWireSize<T>
 auto span_store_wire(std::span<uint8_t> const dest, T const& src) noexcept -> void
 {
-    std::memcpy(dest.data(), &src, src.wire_size());
+    size_t const wsize = src.wire_size();
+    size_t const dsize = dest.size();
+    STATUSBAR_ASSERT(wsize <= dsize && "span_store_wire: wire_size exceeds destination");
+    STATUSBAR_ASSERT(wsize <= sizeof(T) && "span_store_wire: wire_size exceeds source object");
+    std::memcpy(dest.data(), &src, wsize);
 }
 
 /// Return a read-only byte view over a descriptor's on-wire bytes —
@@ -541,6 +545,11 @@ template <typename Header>
 [[nodiscard]] inline auto span_pack_header_payload(
     std::span<uint8_t> frame, Header const& header, std::span<uint8_t const> payload) noexcept -> std::span<uint8_t const>
 {
+    // frame must hold the header + payload: otherwise subspan(sizeof(Header)) or
+    // first(...) below is UB on an undersized frame in libc++.
+    size_t const frame_size = frame.size();
+    size_t const need = sizeof(Header) + payload.size();
+    STATUSBAR_ASSERT(frame_size >= need && "span_pack_header_payload: frame too small");
     span_store(frame, header);
     span_copy(frame.subspan(sizeof(Header)), payload);
     return frame.first(sizeof(Header) + payload.size());

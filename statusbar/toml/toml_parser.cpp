@@ -818,6 +818,11 @@ auto Parser::parse_inline_table() -> StatusValue<Table>
 
 auto Parser::advance() -> char
 {
+    // input_ is a string_view: operator[] at pos_ >= size() is UB (unlike std::string,
+    // it does not return '\0'). Fail safe past end, matching peek().
+    if (pos_ >= input_.size()) {
+        return '\0';
+    }
     char const c = input_[pos_++];
     if (c == '\n') {
         ++line_;

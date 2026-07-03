@@ -106,7 +106,11 @@ struct IPv4Header
     /// Get payload length (total_length - header_length)
     [[nodiscard]] constexpr auto payload_length() const noexcept -> uint16_t
     {
-        return static_cast<uint16_t>(total_length.get() - header_length());
+        // Guard the underflow: a malformed header with total_length < header_length
+        // would otherwise wrap to a huge uint16_t (mirrors UdpHeader::payload_length).
+        auto const total = total_length.get();
+        auto const hlen = header_length();
+        return (total >= hlen) ? static_cast<uint16_t>(total - hlen) : uint16_t{0};
     }
 
     /// Initialize for a typical packet
