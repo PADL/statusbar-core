@@ -211,15 +211,17 @@ struct SpscMsg
 TEST(sync_message_pipe, latest_concurrent_publish_consume_no_torn_reads)
 {
     // LatestPipe contract: each consumed value must be one the producer
-    // actually published — no torn reads, no half-state. This test does
-    // NOT assert monotonic ordering of consumed values: the triple-buffer
-    // design can hand the consumer an older committed slot if a publish
-    // races with the consumer's gen-check / exchange sequence. That is a
-    // documented quirk of LatestPipe — callers that need monotonic
-    // ordering should use QueuedPipe.
+    // actually published — no torn reads, no half-state. Consumed values must
+    // also be monotonic non-decreasing: latest-wins may SKIP values (the
+    // consumer can miss intermediate publishes), but it must never hand back an
+    // already-superseded slot. A publish racing with the consumer's exchange
+    // previously recorded a stale generation and re-delivered an older slot on
+    // the next consume (a backwards snap); the generation is now sampled after
+    // the exchange, so that cannot happen.
     LatestPipe<SpscMsg> pipe;
     std::atomic<uint64_t> max_observed{0};
     std::atomic<bool> torn_read_seen{false};
+    std::atomic<bool> backwards_seen{false};
     std::atomic<bool> producer_done{false};
 
     std::thread producer{[&] {
@@ -230,15 +232,17 @@ TEST(sync_message_pipe, latest_concurrent_publish_consume_no_torn_reads)
     }};
 
     std::thread consumer{[&] {
+        uint64_t last = 0;
         while (!producer_done.load(std::memory_order_acquire) || pipe.can_consume()) {
             if (auto m = pipe.try_consume()) {
                 if (m->lo != m->hi) {
                     torn_read_seen.store(true, std::memory_order_relaxed);
                 }
-                uint64_t const cur_max = max_observed.load(std::memory_order_relaxed);
-                if (m->lo > cur_max) {
-                    max_observed.store(m->lo, std::memory_order_relaxed);
+                if (m->lo < last) {
+                    backwards_seen.store(true, std::memory_order_relaxed);
                 }
+                last = m->lo;
+                max_observed.store(last, std::memory_order_relaxed);
             }
         }
     }};
@@ -247,6 +251,7 @@ TEST(sync_message_pipe, latest_concurrent_publish_consume_no_torn_reads)
     consumer.join();
 
     EXPECT_FALSE(torn_read_seen.load(std::memory_order_relaxed));
+    EXPECT_FALSE(backwards_seen.load(std::memory_order_relaxed));
     // The consumer must have observed something (producer publishes far
     // faster than we can plausibly all-miss).
     EXPECT_TRUE(max_observed.load(std::memory_order_relaxed) > 0U);

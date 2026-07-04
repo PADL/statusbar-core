@@ -125,6 +125,14 @@ struct MessagePipe<Msg, 2, Policy::LatestWins>
     {
         size_t const ps = producer_slot_.load(std::memory_order_relaxed);
         slots_[ps] = m;
+        // Tag the slot with a monotonically increasing publish sequence. The
+        // consumer uses it to reject a stale slot it may grab when a publish
+        // races its exchange, so it never delivers an already-superseded value.
+        // Written before the release-exchange below, so it's visible whenever
+        // the slot's data is.
+        uint64_t const seq = next_seq_.load(std::memory_order_relaxed) + 1;
+        next_seq_.store(seq, std::memory_order_relaxed);
+        slot_seq_[ps].store(seq, std::memory_order_relaxed);
         // Atomically swap producer's owned slot with the ready slot. The
         // returned value (the previous ready slot) becomes our next staging
         // slot to write into.
@@ -158,13 +166,19 @@ struct MessagePipe<Msg, 2, Policy::LatestWins>
     // can_consume() returns false until another publish happens.
     [[nodiscard]] auto consume() noexcept -> Msg
     {
-        // Re-read the generation so a publish that arrived between the
-        // can_consume() and consume() calls is captured.
-        last_seen_gen_.store(gen_.load(std::memory_order_acquire), std::memory_order_relaxed);
         size_t const cs = consumer_slot_.load(std::memory_order_relaxed);
         size_t const new_cs = ready_idx_.exchange(cs, std::memory_order_acq_rel);
+        last_seen_gen_.store(gen_.load(std::memory_order_acquire), std::memory_order_relaxed);
         consumer_slot_.store(new_cs, std::memory_order_relaxed);
-        return slots_[new_cs];
+        // If a racing publish left us holding a slot no newer than the last one
+        // delivered, freeze on the previous value rather than snapping backwards
+        // to a superseded one.
+        uint64_t const seq = slot_seq_[new_cs].load(std::memory_order_relaxed);
+        if (seq > last_delivered_seq_) {
+            last_delivered_seq_ = seq;
+            last_msg_ = slots_[new_cs];
+        }
+        return last_msg_;
     }
 
     // Inner workings duplicated from consume() so the empty path doesn't
@@ -172,15 +186,24 @@ struct MessagePipe<Msg, 2, Policy::LatestWins>
     // optional storage via mandatory copy elision.
     [[nodiscard]] auto try_consume() noexcept -> std::optional<Msg>
     {
-        size_t const cur = gen_.load(std::memory_order_acquire);
-        if (cur == last_seen_gen_.load(std::memory_order_relaxed)) {
+        if (gen_.load(std::memory_order_acquire) == last_seen_gen_.load(std::memory_order_relaxed)) {
             return std::nullopt;
         }
-        last_seen_gen_.store(cur, std::memory_order_relaxed);
         size_t const cs = consumer_slot_.load(std::memory_order_relaxed);
         size_t const new_cs = ready_idx_.exchange(cs, std::memory_order_acq_rel);
+        last_seen_gen_.store(gen_.load(std::memory_order_acquire), std::memory_order_relaxed);
         consumer_slot_.store(new_cs, std::memory_order_relaxed);
-        return slots_[new_cs];
+        // A publish racing this exchange can hand us a slot no newer than the
+        // last delivered; report "nothing new" (freeze) rather than snapping
+        // backwards to a superseded value. The seq tag, not the generation
+        // counter, is the authoritative monotonicity gate.
+        uint64_t const seq = slot_seq_[new_cs].load(std::memory_order_relaxed);
+        if (seq <= last_delivered_seq_) {
+            return std::nullopt;
+        }
+        last_delivered_seq_ = seq;
+        last_msg_ = slots_[new_cs];
+        return last_msg_;
     }
 
   private:
@@ -194,11 +217,18 @@ struct MessagePipe<Msg, 2, Policy::LatestWins>
     // measurable cost — relaxed load/store on an aligned size_t is the
     // same machine code as a regular load/store on x86_64 / AArch64.
     std::array<Msg, 3> slots_{};
+    // Per-slot publish sequence, cross-thread: producer writes before its
+    // release-exchange, consumer reads after acquiring the slot. Relaxed —
+    // ordering rides on ready_idx_.
+    std::array<std::atomic<uint64_t>, 3> slot_seq_{};
     std::atomic<size_t> ready_idx_{2};
     std::atomic<size_t> gen_{0};
     std::atomic<size_t> producer_slot_{0};
     std::atomic<size_t> consumer_slot_{1};
     std::atomic<size_t> last_seen_gen_{0};
+    std::atomic<uint64_t> next_seq_{0};  // producer-only
+    uint64_t last_delivered_seq_{0};     // consumer-only
+    Msg last_msg_{};                     // consumer-only; last value delivered (freeze target)
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

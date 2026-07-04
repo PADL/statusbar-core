@@ -121,8 +121,19 @@ else()
   list(APPEND _STATUSBAR_LINKER_FLAGS --rtlib=compiler-rt)
 endif()
 
-# Architecture-specific SIMD flags are set in the root CMakeLists.txt (after
-# project()) where CMAKE_SYSTEM_PROCESSOR is available.
+# Architecture-specific SIMD baseline. The dsp SIMDVec AVX backends are gated on
+# __AVX__/__FMA__, so without these flags they preprocess to nothing on x86_64
+# and every SIMD op silently falls back to scalar. Applied globally (every TU,
+# not just the dsp target): two TUs that both include the SIMD headers but
+# disagree on -mavx2 pick different inline definitions - an ODR hazard. NEON is
+# baseline on ARMv8, so aarch64 needs no flag. The cross toolchain sets
+# CMAKE_SYSTEM_PROCESSOR=aarch64 before including this file; a native x86_64
+# build leaves it empty here, which the else branch covers.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm")
+  # ARMv8 NEON is mandatory - nothing to add.
+else()
+  list(APPEND _STATUSBAR_CXX_FLAGS -mavx2 -mfma)
+endif()
 
 # Warnings
 option(ENABLE_WARNINGS_AS_ERRORS "Warning is an error" ON)
