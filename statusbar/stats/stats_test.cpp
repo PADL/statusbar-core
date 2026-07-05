@@ -8,7 +8,9 @@
 #include <unistd.h>
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -357,6 +359,139 @@ TEST(stats_atomic_histogram, underflow_routed)
     auto snap = h.snapshot();
     EXPECT_EQ(snap.underflow, int64_t{1});
     EXPECT_EQ(snap.overflow, int64_t{0});
+}
+
+// ---------------------------------------------------------------------------
+// stats_atomic_time - AtomicTimeStats tests
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The framework has no EXPECT_NEAR; compare with an absolute tolerance.
+[[nodiscard]] auto near(double a, double b, double eps = 1e-6) -> bool
+{
+    return std::fabs(a - b) < eps;
+}
+
+}  // namespace
+
+TEST(stats_atomic_time, initial_state_and_reset)
+{
+    AtomicTimeStats stats;
+    EXPECT_EQ(stats.count(), 0);
+    EXPECT_EQ(stats.sum_ns(), 0);
+    EXPECT_FALSE(stats.snapshot().has_samples());
+    EXPECT_EQ(stats.snapshot().average_ns(), 0.0);
+    EXPECT_EQ(stats.snapshot().stddev_ns(), 0.0);
+
+    stats.update(100);
+    EXPECT_EQ(stats.count(), 1);
+    stats.reset();
+    EXPECT_EQ(stats.count(), 0);
+    EXPECT_EQ(stats.sum_ns(), 0);
+    EXPECT_FALSE(stats.snapshot().has_samples());
+}
+
+TEST(stats_atomic_time, tracks_count_sum_min_max)
+{
+    AtomicTimeStats stats;
+    stats.update(300);
+    stats.update(-100);
+    stats.update(200);
+
+    EXPECT_EQ(stats.count(), 3);
+    EXPECT_EQ(stats.sum_ns(), 400);
+    EXPECT_EQ(stats.min_ns(), -100);
+    EXPECT_EQ(stats.max_ns(), 300);
+}
+
+TEST(stats_atomic_time, average_and_stddev)
+{
+    AtomicTimeStats stats;
+    stats.update(1);
+    stats.update(2);
+    stats.update(3);
+    stats.update(4);
+
+    auto const snap = stats.snapshot();
+    EXPECT_EQ(snap.count, 4);
+    EXPECT_EQ(snap.sum_ns, 10);
+    EXPECT_EQ(snap.sum_sq, 30);  // 1 + 4 + 9 + 16
+    EXPECT_TRUE(near(snap.average_ns(), 2.5));
+    // Population variance = 30/4 - 2.5^2 = 1.25
+    EXPECT_TRUE(near(snap.stddev_ns(), std::sqrt(1.25)));
+}
+
+TEST(stats_atomic_time, huge_sample_does_not_overflow_square)
+{
+    // Regression: value_ns * value_ns was a plain signed multiply — any
+    // sample beyond ~3.037 s (sqrt(INT64_MAX) ns) was signed-overflow UB.
+    // Magnitudes are now clamped before squaring and the accumulator
+    // saturates instead of wrapping.
+    AtomicTimeStats stats;
+    stats.update(5'000'000'000);  // 5 s
+    stats.update(std::numeric_limits<int64_t>::max());
+    stats.update(std::numeric_limits<int64_t>::min());
+
+    auto const snap = stats.snapshot();
+    EXPECT_EQ(snap.count, 3);
+    EXPECT_EQ(snap.sum_sq, std::numeric_limits<int64_t>::max());  // saturated
+    EXPECT_TRUE(snap.stddev_ns() >= 0.0);
+    EXPECT_TRUE(std::isfinite(snap.stddev_ns()));
+
+    stats.reset();
+    EXPECT_EQ(stats.snapshot().sum_sq, 0);  // reset clears saturation
+}
+
+TEST(stats_atomic_time, sum_sq_saturates_instead_of_wrapping)
+{
+    // Two squares each near INT64_MAX must pin the accumulator at
+    // INT64_MAX (previously they wrapped to a garbage negative value).
+    AtomicTimeStats stats;
+    stats.update(3'000'000'000);
+    stats.update(3'000'000'000);
+
+    auto const snap = stats.snapshot();
+    EXPECT_EQ(snap.sum_sq, std::numeric_limits<int64_t>::max());
+    EXPECT_TRUE(snap.stddev_ns() >= 0.0);
+}
+
+TEST(stats_atomic_time, exact_below_clamp_threshold)
+{
+    // Samples up to floor(sqrt(INT64_MAX)) = 3'037'000'499 square exactly.
+    AtomicTimeStats stats;
+    stats.update(3'037'000'499);
+    auto const snap = stats.snapshot();
+    EXPECT_EQ(snap.sum_sq, int64_t{3'037'000'499} * int64_t{3'037'000'499});
+}
+
+// ---------------------------------------------------------------------------
+// stats_atomic_wake - AtomicWakeStats tests
+// ---------------------------------------------------------------------------
+
+TEST(stats_atomic_wake, tracks_error_duration_and_skips)
+{
+    AtomicWakeStats stats;
+    stats.update(-500, 1);
+    stats.update_with_duration(500, 2'000, 2);
+
+    EXPECT_EQ(stats.count(), 2);
+    EXPECT_EQ(stats.sum_ns(), 0);
+    EXPECT_EQ(stats.min_ns(), -500);
+    EXPECT_EQ(stats.max_ns(), 500);
+    EXPECT_EQ(stats.skipped_counts(), 3);
+
+    auto const snap = stats.snapshot();
+    EXPECT_EQ(snap.error.count, 2);
+    EXPECT_EQ(snap.duration.count, 1);
+    EXPECT_EQ(snap.duration.max_ns, 2'000);
+    EXPECT_EQ(snap.skipped_counts, 3);
+    EXPECT_TRUE(near(snap.average_ns(), 0.0));
+    EXPECT_TRUE(near(snap.stddev_ns(), 500.0));
+
+    stats.reset();
+    EXPECT_EQ(stats.count(), 0);
+    EXPECT_EQ(stats.skipped_counts(), 0);
 }
 
 //

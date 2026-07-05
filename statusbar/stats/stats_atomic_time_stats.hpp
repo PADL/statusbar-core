@@ -5,6 +5,12 @@
 
 /// Thread-safe atomic time measurement statistics.
 /// Lock-free accumulator for count, sum, min, max, and variance.
+///
+/// The sum-of-squares accumulator saturates at INT64_MAX rather than
+/// wrapping, and per-sample magnitudes above ~3.037 s (floor(sqrt(INT64_MAX))
+/// ns) are clamped before squaring. Once saturated, stddev_ns() degrades
+/// deterministically instead of returning wrapped garbage; reset() clears
+/// the saturation.
 
 #include <atomic>
 #include <cmath>
