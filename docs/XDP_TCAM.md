@@ -2,14 +2,18 @@
 
 # XDP TCAM
 
-**Status**: partial migration. The shared `net_tcam_bpf_abi.h` ABI header
-and the userspace `TcamClassifier` are in place
-(`statusbar/net/net_tcam_classifier.{hpp,_test.cpp}`). The kernel-side
-XDP path still runs `xdp_filter.bpf.c` (the hand-rolled
-hash-map matcher); rewriting it as a TCAM interpreter that reads the same
-`CompiledRule<N>` representation is future work.
+**Status**: complete. The shared `net_tcam_bpf_abi.h` ABI header, the
+userspace `TcamClassifier`
+(`statusbar/net/net_tcam_classifier.{hpp,_test.cpp}`), and the
+kernel-side TCAM interpreter are all in place: `xdp_filter.bpf.c` reads
+`tcam_rule` entries out of `rules_map`, and the userspace loader
+installs them via `detail::BpfState::install_tcam_rules(std::span<CompiledRule<32> const>)`
+(`net_linux_xdp.cpp`). The pre-migration `filter_key` /
+`populate_filter_map` / `XdpFilterRule` machinery described below no
+longer exists. The rest of this document is the design and migration
+plan as written before the work shipped, kept as the rationale record.
 
-## Migration plan
+## Migration plan (completed)
 
 Migrate the kernel-side XDP packet classifier (`statusbar/net/xdp_filter.bpf.c`
 plus its C++ userspace wrapper) from a hand-rolled semantic-lookup design to
@@ -18,7 +22,7 @@ a TCAM interpreter driven by the same `CompiledRule<N>` the userspace
 
 ## Context
 
-### Today (two parallel matchers)
+### Before the migration (two parallel matchers)
 
 - **Userspace:** `statusbar::net::TcamClassifier<N, Capacity>` evaluates
   a `std::span<CompiledRule<N> const>` against the first *N* bytes of a
@@ -71,7 +75,7 @@ struct tcam_rule {
     uint16_t min_frame_size;
     uint8_t  priority;
     uint8_t  _pad;
-};  // 72 bytes, same as CompiledRule<32>
+};  // 80 bytes (72 + 4 tail fields padded to 8-byte alignment), same as CompiledRule<32>
 
 // Reserved low bits of result_flags interpreted by the BPF program
 // itself. Must stay in sync with statusbar::net::flag::* at bits 0..15.
@@ -299,7 +303,7 @@ bits.
 
 - **`max_entries` sizing**: `TCAM_MAX_RULES = 16` matches
   `TCAM_DEFAULT_CAPACITY`. Bump if users need more; each entry adds
-  72 bytes of map memory.
+  80 bytes of map memory.
 
 - **Future: larger windows**: if we later want an XDP path that also
   matches IPv6 UDP destination port, we'd need a second program

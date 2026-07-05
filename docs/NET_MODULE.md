@@ -16,9 +16,10 @@ construction — nothing on the hot path allocates.
 The socket layer adds RAII (`FileDescriptor`), an IPv4/IPv6 address
 abstraction (`SocketAddress`) including link-local scope, factory
 helpers (`create_udp_socket` / `create_tcp_socket` /
-`create_tcp_listener`) that pre-configure DSCP/QoS, reuse and
-nonblocking mode, and a `NotificationPipe` for cross-thread
-reactor wakeup. For Layer-2 work `RawnetContext` wraps `AF_PACKET`
+`create_tcp_listener`) that pre-configure DSCP/QoS and address reuse
+(call `set_nonblocking()` yourself — the factories return blocking
+sockets, as the Quick example shows), and a `NotificationPipe` for
+cross-thread reactor wakeup. For Layer-2 work `RawnetContext` wraps `AF_PACKET`
 (Linux) and `BPF` (macOS); the `EthernetPort` concept unifies
 zero-copy backends `TestPortContext`, paired `LoopbackPortContext`,
 `BpfPortContext` (`AF_PACKET` on Linux / `/dev/bpfN` on macOS),

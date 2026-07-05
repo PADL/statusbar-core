@@ -63,15 +63,28 @@ int main()
         0x00,0x11,0x22,0x33,0x44,0x55, 0xAA,0xBB,0xCC,0xDD,0xEE,0xFF,
         0x08,0x00, 'H','i','!',0,0,0};
     {
-        FileWriter writer("/tmp/example.pcap");
-        writer.write_packet(1'000'000ULL, frame);  // span overload, 1s
-        writer.flush();
+        auto writer = FileWriter::open("/tmp/example.pcap");
+        if (!writer) {
+            return 1;
+        }
+        (void)writer->write_packet(1'000'000ULL, frame);  // span overload, 1s
+        writer->flush();
     }
     // Timestamps come back relative to the first packet.
-    FileReader reader("/tmp/example.pcap");
+    auto reader = FileReader::open("/tmp/example.pcap");
+    if (!reader) {
+        return 1;
+    }
     uint64_t ts_us = 0;
     Packet pkt;
-    while (reader.read_packet(&ts_us, pkt)) {
+    // read_packet returns StatusValue<bool>: success(true) = packet read,
+    // success(false) = clean EOF, failure = read error. Check the value,
+    // not just the status, or the loop never terminates.
+    while (true) {
+        auto more = reader->read_packet(&ts_us, pkt);
+        if (!more || !*more) {
+            break;
+        }
         std::println("ts={}us size={}", ts_us, pkt.size());
     }
 }
@@ -94,7 +107,7 @@ int main()
 ## Notes & caveats
 
 - No header or link dependency on system libpcap — `grep '#include' statusbar/pcap/*.{hpp,cpp}` shows no `pcap.h` / `pcap/pcap.h`; the formats are reimplemented from spec.
-- Error reporting is via thrown `std::runtime_error`, not `statusbar::Status`. Constructors throw on open/header failure; read/write methods throw on I/O errors.
+- Error reporting is via `statusbar::Status` / `StatusValue` with `PcapError` codes — nothing throws. Constructors are private; open files through the static `open()` factories (`FileReader::open`, `FileWriter::open`, `PcapngReader::open`), which return `StatusValue<T>`. `read_packet` returns `StatusValue<bool>`: `success(true)` = packet read, `success(false)` = clean EOF, `failure(...)` = read error — test the contained `bool`, not just the status.
 - `FileWriter` opens existing files in **append mode** — *adds* frames to existing captures. `PcapngFileWriter` **truncates** on construction.
 - `FileWriter::write_packet` silently drops frames smaller than 14 bytes. See the `write_too_small_ignored` test.
 - Reader timestamps are relative to the first packet — `read_packet` returns `0` for the first call, then deltas. Don't expect Unix-epoch microseconds out.

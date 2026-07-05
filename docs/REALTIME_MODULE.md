@@ -44,7 +44,7 @@ error reporting stays allocation-free (raw `errno` + static
 - `Tripwire` / `TripwireMonitor` / `TripwireEvent` — fire latch, monitor thread, coherent event payload.
 - `TraceConfig` / `TraceController` — ftrace wiring that captures kernel traces on fire.
 - `ScopedTripwireObserver<ClockT>` — RAII observer; throws `TripwireFiredException` on wake-latency trip.
-- `TimingSampleWindow<T>` — fixed-size ring buffer (≤ `MAX_TIMING_SAMPLE_WINDOW_SIZE`); single-threaded.
+- `TimingSampleWindow<T>` — fixed-size ring buffer (≤ `max_timing_sample_window_size`); single-threaded.
 
 ## Quick example
 
@@ -60,7 +60,8 @@ int main()
 
     realtime::TimerConfig cfg{.name = "rt-1ms", .period_ns = 1'000'000, .cpu = 3};
     auto timer = realtime::AnyTimer::create(cfg,
-        [](realtime::TimerEvent<realtime::MonotonicClock> const& ev) {
+        [](realtime::TimerEvent<realtime::MonotonicClock> const& ev,
+           stats::AtomicWakeStats::Snapshot const& /*wake_stats*/) {
             (void)ev.wake_count;  // RT thread — keep allocation-free.
         });
 
@@ -92,7 +93,7 @@ int main()
 
 - **RT-priority requirements.** `lock_memory()` needs `CAP_IPC_LOCK`; `set_realtime_priority()` / `set_realtime_affinity()` need `CAP_SYS_NICE`. Unprivileged hosts get `error_code = EPERM` — handle it. `check_realtime_capabilities()` is safe as non-root.
 - **Blocking vs non-blocking.** `Timer::start()` returns immediately; the callback runs on the RT thread. Inside it, never block on locks, allocate, or call APIs that can page-fault.
-- **Allocation behaviour.** `RealtimeResult` uses static `strerror` pointers; `Tripwire` publishes through a pre-allocated `AtomicTripleBuffer`; `TimingSampleWindow<T>` is a `std::array` capped at 512. `AnyTimer::create()` calls `std::make_unique` — construct timers off the RT path.
+- **Allocation behaviour.** `RealtimeResult` stores the raw `char const*` from `strerror` — allocation-free, but `strerror`'s static buffer is not thread-safe (nor async-signal-safe), so treat `error_message` as best-effort diagnostic text and consume it promptly on the thread that produced it; `Tripwire` publishes through a pre-allocated `AtomicTripleBuffer`; `TimingSampleWindow<T>` is a `std::array` capped at 512. `AnyTimer::create()` calls `std::make_unique` — construct timers off the RT path.
 - **MCL_FUTURE.** `lock_memory(false)` (default) locks only currently-mapped pages; pass `true` only on memory-constrained hosts. Touch required pages first.
 - **Busy-wait.** `TimerConfig::busy_wait` switches `Timer` to a hybrid sleep-then-spin loop governed by `busy_wait_threshold_ns` — trades a CPU for lower jitter (see deep-dive below).
 - **Scheduling assumptions.** Absolute deadlines. `compensation_ns` offsets each target. `resync_interval_cycles` re-bases the monotonic deadline against the adapter domain (0 disables). `start_offset_cycles` must be ≥ 2 to avoid a startup race.

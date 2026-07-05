@@ -91,7 +91,7 @@ int main()
 - `statusbar/bpf/bpf.hpp` — module header; picks the platform backend
   and exports `BpfDevice`. Consumers `#include` this.
 - `statusbar/bpf/bpf_base.hpp` — constants (`ETHERNET_HEADER_MIN_SIZE`,
-  `BPF_BUFFER_SIZE`, `BPF_MAX_DEVICE_NUM`, `BPF_FILTER_MAX_PACKET`),
+  `bpf_buffer_size`, `bpf_max_device_num`, `bpf_filter_max_packet`),
   `BpfError`, `BpfErrorCategory`, `AcquisitionTimeAssociation`,
   `BpfStatistics`, `BpfPacketCallback`, `FilterParams`, `FileDescriptor`.
 - `statusbar/bpf/bpf_device_base.hpp` — `BpfDeviceBase` abstract class.
@@ -124,7 +124,7 @@ int main()
   only as precise as one user-space `clock_gettime` per `recv()`.
 - The Linux backend filters by EtherType at socket-creation time;
   changing the EtherType requires a new device.
-- `BPF_FILTER_MAX_PACKET` (512 KiB) exceeds the 16 KiB `BPF_BUFFER_SIZE`
+- `bpf_filter_max_packet` (512 KiB) exceeds the 16 KiB `bpf_buffer_size`
   default, so jumbo frames stay visible if you raise `buffer_size`.
 - Callback exceptions are caught, counted in
   `callback_errors`, and surfaced as `BpfError::callback_exception`.

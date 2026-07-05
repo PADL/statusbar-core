@@ -15,7 +15,10 @@ The `stats` module covers two complementary use cases:
 2. **Live, lock-free accumulation** from realtime threads —
    `AtomicTimeStats` and `AtomicHistogram` use `std::atomic<int64_t>`
    counters so any thread can call `update()` without locking, and a
-   consumer thread pulls a consistent `snapshot()` for display.
+   consumer thread pulls a `snapshot()` for display. The snapshot's
+   fields are loaded individually (not as one atomic unit), so under
+   concurrent updates the fields may be mutually slightly out of step —
+   fine for display, not a linearizable point-in-time view.
 
 The post-hoc side operates on `std::vector<double>` and `std::span`
 inputs (typically nanoseconds). `analyze()` sorts in place and returns

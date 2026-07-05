@@ -2,12 +2,17 @@
 
 # Build system
 
-The `cmake/` directory holds five reusable scripts plus one
-package-specific template. The five `.cmake` files —
-`toolchain-clang.cmake`, `module.cmake`, `sanitizers.cmake`,
-`coverage.cmake`, `fuzzing.cmake` — are reusable build scripts. The
-sixth file, `statusbar-coreConfig.cmake.in`, is this package's
-`find_package` template.
+The `cmake/` directory holds seven reusable `.cmake` scripts plus one
+package-specific template. The scripts — `toolchain-clang.cmake`,
+`toolchain-clang-aarch64.cmake` (cross-compile variant: same Clang +
+libc++ setup targeting aarch64-linux-gnu with multiarch
+`find_root_path` / `PKG_CONFIG_LIBDIR` handling), `module.cmake`,
+`sanitizers.cmake`, `coverage.cmake`, `fuzzing.cmake`, and
+`clang_tidy.cmake` — are reusable build scripts.
+`statusbar-coreConfig.cmake.in` is this package's `find_package`
+template. Several helper shell scripts (`coverage-*.sh`,
+`run-clang-tidy*.sh`, `fuzz-*.sh`) back the custom targets those
+scripts register.
 
 `toolchain-clang.cmake` is mandatory: it pins Clang + libc++ and C++23.
 A build with the default compiler or stdlib will not work. The
@@ -67,8 +72,9 @@ works in C++23 mode (used to embed BPF object files). Per-config:
 | `RelWithDebInfo` | `-O2 -g -DNDEBUG`      |
 | `MinSizeRel`     | `-Os -DNDEBUG`         |
 
-`STATUSBAR_STDLIB` is cached as `"libc++"`. The exported aggregate
-`statusbarConfig.cmake` reads this for a downstream ABI check.
+`STATUSBAR_STDLIB` is cached as `"libc++"` for reference; no exported
+config file currently consumes it, so downstream builds get no
+automatic libc++/libstdc++ ABI-mismatch guard.
 
 **Platform branches.**
 
@@ -92,9 +98,9 @@ package's root `CMakeLists.txt` after `project()`, where
 | `ENABLE_WARNINGS_AS_ERRORS`  | `ON`    | Adds `-Werror` to `CMAKE_CXX_FLAGS`.         |
 
 **Transitive includes.** At the bottom, `toolchain-clang.cmake`
-includes `sanitizers.cmake`, `coverage.cmake`, and `fuzzing.cmake`.
-Their options become available without any extra `include()` from the
-project.
+includes `sanitizers.cmake`, `coverage.cmake`, `fuzzing.cmake`, and
+`clang_tidy.cmake`. Their options become available without any extra
+`include()` from the project.
 
 ## `module.cmake` — `statusbar_add_module()`
 
@@ -109,11 +115,11 @@ statusbar_add_module(
   PRIVATE_DEPS <target>...          # private deps (PRIVATE link, not propagated)
   INTERFACE                         # header-only flag — INTERFACE library
   TESTS   <file>...                 # test .cpp files; pushed onto a global property
-  INSTALL                           # parsed but currently has no effect; install
-                                    # registration happens unconditionally
 )
 ```
 
+Any other keyword is a configure-time `FATAL_ERROR` (install
+registration happens unconditionally, so there is no `INSTALL` flag).
 The target name is `statusbar-<NAME>`. An alias `statusbar::<NAME>` is
 also created so consumers can write either form.
 
@@ -194,9 +200,21 @@ LLVM source-based coverage. Pulled in by the toolchain file.
 |-------------------|---------|---------------------------------------------------------------------|
 | `ENABLE_COVERAGE` | `OFF`   | Adds `-fprofile-instr-generate -fcoverage-mapping` to compile/link. |
 
-Running an instrumented binary writes `.profraw` files. There is no
-in-tree script that processes them — invoke `llvm-profdata` and
-`llvm-cov` directly to produce reports.
+Running an instrumented binary writes `.profraw` files. When
+`ENABLE_COVERAGE` is on (and `llvm-profdata` / `llvm-cov` are found),
+the script registers three chained custom targets backed by
+`cmake/coverage-collect.sh`, `coverage-report.sh`, and
+`coverage-html.sh`:
+
+| Target             | What it does                                                            |
+|--------------------|-------------------------------------------------------------------------|
+| `coverage-collect` | Builds and runs `statusbar_test`, merges `.profraw` into `combined.profdata` |
+| `coverage-report`  | Prints a text line-coverage report                                      |
+| `coverage-html`    | Generates an HTML report under `<build>/coverage/html/`                 |
+
+Each depends on the previous, so `cmake --build build-cov --target
+coverage-html` runs the whole pipeline (see the README's Coverage
+section for the full walkthrough).
 
 ## `fuzzing.cmake`
 

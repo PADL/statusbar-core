@@ -33,7 +33,7 @@ if you need cross-thread access, copy out at the boundary.
 
 - `SlotTable<Entry, MaxN>` — bounded bag. `add()` returns `bool` (false
   when full). `remove(index)` is O(1) swap-with-last. `find_if(pred)`
-  returns `capacity()` as the not-found sentinel. `MAX_CAPACITY` is the
+  returns `capacity()` as the not-found sentinel. `max_capacity` is the
   compile-time ceiling; the constructor optionally accepts a runtime
   soft cap in `[0, MaxN]` (primarily for tests that want to exercise
   full-slot behaviour at a smaller bound).
@@ -43,7 +43,7 @@ if you need cross-thread access, copy out at the boundary.
   if the slot's stored timestamp doesn't already match the requested
   time. `load()` returns `std::optional<Payload>`, populated only when
   the stored timestamp matches the requested time's quantized boundary.
-  `kEmpty` (= `INT64_MIN`) is the never-written sentinel; `kCapacity`
+  `empty_slot` (= `INT64_MIN`) is the never-written sentinel; `capacity`
   is the compile-time slot count.
 
 ## Quick example

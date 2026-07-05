@@ -59,8 +59,8 @@ struct WriterConfig
 /// row count into the header so a concurrent reader (or a reader after
 /// the writer crashes) sees a coherent count.
 ///
-/// Non-movable, non-copyable: holds an open fd and an mmap'd address
-/// that must stay stable for the lifetime of the writer.
+/// Movable, non-copyable: holds an open fd and an mmap'd address, with
+/// ownership transferred (and the source disarmed) on move.
 ///
 /// Append-mode: opening an existing file with the same schema
 /// continues writing from `committed_rows`. Mismatch returns

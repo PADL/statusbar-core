@@ -64,7 +64,9 @@ class AtomicTimeStats : public AtomicTimeStatsBase
     [[nodiscard]] auto min_ns() const noexcept -> int64_t { return load_min_ns(); }
     [[nodiscard]] auto max_ns() const noexcept -> int64_t { return load_max_ns(); }
 
-    /// Non-atomic snapshot for consistent multi-field reads.
+    /// Plain-value copy of all fields. Loaded individually (relaxed), so
+    /// under concurrent update() the fields can be mutually slightly out
+    /// of step — suitable for display, not a linearizable snapshot.
     struct Snapshot
     {
         int64_t count = 0;

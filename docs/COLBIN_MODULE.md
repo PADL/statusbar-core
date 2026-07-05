@@ -75,7 +75,7 @@ int main()
 
 ## Headers
 
-- `statusbar/colbin/colbin.hpp` — format constants (`kMagic`, `kEndianMarker`, `kFormatVersion`, `kHeaderPreambleBytes`), `TypeCode`, schema types, and the `resolve_schema` / `serialize_schema` / `parse_schema` helpers.
+- `statusbar/colbin/colbin.hpp` — format constants (`MAGIC`, `ENDIAN_MARKER`, `FORMAT_VERSION`, `HEADER_PREAMBLE_BYTES`), `TypeCode`, schema types, and the `resolve_schema` / `serialize_schema` / `parse_schema` helpers.
 - `statusbar/colbin/colbin_writer.hpp` — `Writer` and `WriterConfig`.
 - `statusbar/colbin/colbin_reader.hpp` — `Reader`.
 - `statusbar/colbin/colbin_error.hpp` — `ColbinError`, `ColbinErrorCategory`, `make_error_code`.
@@ -87,12 +87,12 @@ int main()
 
 ## Notes & caveats
 
-- `Writer` growth is Linux-optimized via `mremap(MREMAP_MAYMOVE)`; on Darwin/BSD, growth falls back to `munmap` + a fresh `mmap`, which moves the base address and invalidates any in-flight `std::span` views into the mapped buffer. Don't hold spans into the writer's buffer across `write_row`/`commit` calls on those platforms.
+- `Writer` growth is Linux-optimized via `mremap(MREMAP_MAYMOVE)`; on Darwin/BSD, growth falls back to `munmap` + a fresh `mmap`. Either way growth can move the base address (`MREMAP_MAYMOVE` is exactly the permission to do so), invalidating any in-flight `std::span` views into the mapped buffer — don't hold spans into the writer's buffer across `write_row`/`commit` calls on any platform.
 - `Writer` is movable but not copyable. `Reader` is also movable but not copyable.
 - Rows are *not* visible to a `Reader` until `commit()` runs. The intended cadence is roughly once per second from the writer thread; pick a cadence that matches your durability and freshness needs.
 - `write_row` requires the input span to be exactly `row_size()` bytes. The hot path is a bounds check plus a `memcpy`; there is no per-field conversion. Lay out your row struct to match `resolve_schema()`'s output (use `#pragma pack` plus explicit padding if needed — see `colbin_test.cpp`'s `SampleRow`).
 - Re-opening an existing file with `Writer::create` appends from `committed_rows`. The schema you pass must round-trip to the same on-disk text and same row size; otherwise you get `invalid_schema` or `schema_row_size_mismatch`.
-- `endian_mismatch` is a hard failure — `colbin` files are not portable across byte orders. The `kEndianMarker` check happens before any other parsing.
+- `endian_mismatch` is a hard failure — `colbin` files are not portable across byte orders. The `ENDIAN_MARKER` check happens before any other parsing.
 - The initial mmap size is `max(WriterConfig::initial_capacity_bytes, header + one row)` rounded up to a system page boundary, so even a tiny `initial_capacity_bytes` always leaves room for at least one row. Growing past `max_capacity_bytes` yields `capacity_exceeded`; an `mremap`/`mmap` failure during growth surfaces as `grow_failed`.
 - `sync()` issues `msync(MS_ASYNC)` and is optional — the kernel will write back dirty pages on its own schedule.
 - The `Reader::row(i)` span aliases the mmap region; do not retain it past the `Reader`'s lifetime.
