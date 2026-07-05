@@ -126,12 +126,16 @@ endif()
 # and every SIMD op silently falls back to scalar. Applied globally (every TU,
 # not just the dsp target): two TUs that both include the SIMD headers but
 # disagree on -mavx2 pick different inline definitions - an ODR hazard. NEON is
-# baseline on ARMv8, so aarch64 needs no flag. The cross toolchain sets
-# CMAKE_SYSTEM_PROCESSOR=aarch64 before including this file; a native x86_64
-# build leaves it empty here, which the else branch covers.
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm")
-  # ARMv8 NEON is mandatory - nothing to add.
-else()
+# baseline on ARMv8, so aarch64 needs no flag.
+#
+# Gate strictly on an x86_64 TARGET. A NATIVE build leaves CMAKE_SYSTEM_PROCESSOR
+# empty here (it is not populated until project() runs compiler detection), so a
+# native aarch64 build would otherwise fall through and fail to compile with
+# "-mavx2 unsupported for aarch64". Consult CMAKE_HOST_SYSTEM_PROCESSOR (set from
+# uname at startup, before project()) for the native case; CMAKE_SYSTEM_PROCESSOR
+# for the explicit cross case.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64"
+   OR (NOT CMAKE_SYSTEM_PROCESSOR AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64"))
   list(APPEND _STATUSBAR_CXX_FLAGS -mavx2 -mfma)
 endif()
 
