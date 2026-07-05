@@ -1260,6 +1260,136 @@ TEST(net_reactor, finished_in_on_ready_skips_tick)
     EXPECT_EQ(reactor.active_count(), size_t{0});
 }
 
+TEST(net_reactor, hangup_delivered_as_on_ready)
+{
+    // poll() reports POLLHUP/POLLERR/POLLNVAL regardless of the requested
+    // event mask. Before these were dispatched, a port whose fd died without
+    // also being readable got no callback, never finished, and the reactor
+    // spun hot on the dead fd forever.
+    itc::StopToken stop{};
+    auto clock = []() -> int64_t { return 0; };
+
+    int external_on_ready_count = 0;
+
+    struct HangupPort : public Pollable
+    {
+        int pipe_r{-1};
+        bool is_finished{false};
+        int& on_ready_count_ref;
+
+        explicit HangupPort(int& c)
+            : on_ready_count_ref(c)
+        {
+            int fds[2];
+            ::pipe(fds);
+            pipe_r = fds[0];
+            (void)set_nonblocking(pipe_r);
+            ::close(fds[1]);  // writer gone, no data buffered: POLLHUP, not POLLIN
+        }
+        ~HangupPort() override { ::close(pipe_r); }
+        HangupPort(HangupPort const&) = delete;
+        auto operator=(HangupPort const&) -> HangupPort& = delete;
+        HangupPort(HangupPort&&) = delete;
+        auto operator=(HangupPort&&) -> HangupPort& = delete;
+
+        [[nodiscard]] auto fd() const noexcept -> int override { return pipe_r; }
+        void on_ready(int64_t /*now_ns*/) override
+        {
+            ++on_ready_count_ref;
+            uint8_t buf[16];
+            if (::read(pipe_r, buf, sizeof(buf)) <= 0) {
+                is_finished = true;  // EOF observed
+            }
+        }
+        void tick(int64_t /*now_ns*/) override {}
+        [[nodiscard]] auto finished() const noexcept -> bool override { return is_finished; }
+    };
+
+    auto port = std::make_unique<HangupPort>(external_on_ready_count);
+    MessageReactor reactor{stop, clock, 0};
+    reactor.add(std::move(port));
+
+    (void)reactor.poll_once(10);
+    // The hangup must reach on_ready so the port can observe EOF and finish.
+    EXPECT_EQ(external_on_ready_count, 1);
+    EXPECT_EQ(reactor.active_count(), size_t{0});
+}
+
+TEST(net_reactor, add_from_on_ready_does_not_invalidate_dispatch)
+{
+    // dispatch_ready used to hold a reference into ports_ across both
+    // callbacks; an add() from on_ready() that reallocated the vector left
+    // the reference dangling for the on_writable() call on the same port
+    // (use-after-free under ASan). Dispatch now snapshots the raw pointer,
+    // which stays stable across vector growth.
+    itc::StopToken stop{};
+    auto clock = []() -> int64_t { return 0; };
+
+    MessageReactor reactor{stop, clock, 0};
+
+    int on_writable_count = 0;
+
+    struct AddingPort : public Pollable
+    {
+        int sock_a{-1};
+        int sock_b{-1};
+        MessageReactor& reactor_ref;
+        int& on_writable_count_ref;
+
+        AddingPort(MessageReactor& r, int& wc)
+            : reactor_ref(r)
+            , on_writable_count_ref(wc)
+        {
+            int fds[2];
+            ::socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+            sock_a = fds[0];
+            sock_b = fds[1];
+            (void)set_nonblocking(sock_a);
+            uint8_t byte = 1;
+            (void)::write(sock_b, &byte, 1);  // sock_a: POLLIN and POLLOUT in one cycle
+        }
+        ~AddingPort() override
+        {
+            ::close(sock_a);
+            ::close(sock_b);
+        }
+        AddingPort(AddingPort const&) = delete;
+        auto operator=(AddingPort const&) -> AddingPort& = delete;
+        AddingPort(AddingPort&&) = delete;
+        auto operator=(AddingPort&&) -> AddingPort& = delete;
+
+        [[nodiscard]] auto fd() const noexcept -> int override { return sock_a; }
+        [[nodiscard]] auto poll_events() const noexcept -> short override
+        {
+            return static_cast<short>(POLLIN | POLLOUT);
+        }
+        void on_ready(int64_t /*now_ns*/) override
+        {
+            uint8_t buf[16];
+            while (::read(sock_a, buf, sizeof(buf)) > 0) {
+            }
+            // Grow ports_ far past any small-capacity threshold so the
+            // vector reallocates mid-dispatch.
+            for (int i = 0; i < 64; ++i) {
+                auto extra = std::make_unique<MockPollable>();
+                extra->set_finished(true);  // reaped by remove_finished()
+                reactor_ref.add(std::move(extra));
+            }
+        }
+        void on_writable(int64_t /*now_ns*/) override { ++on_writable_count_ref; }
+        void tick(int64_t /*now_ns*/) override {}
+        [[nodiscard]] auto finished() const noexcept -> bool override { return false; }
+    };
+
+    reactor.add(std::make_unique<AddingPort>(reactor, on_writable_count));
+    (void)reactor.poll_once(10);
+
+    // on_writable must still be delivered to the (stable) port after the add.
+    EXPECT_EQ(on_writable_count, 1);
+    // The finished extras were reaped; only the AddingPort remains.
+    EXPECT_EQ(reactor.active_count(), size_t{1});
+}
+
 TEST(net_reactor, run_stops_on_flag)
 {
     itc::StopToken stop{};

@@ -39,7 +39,11 @@ class Pollable
     /// Poll event mask. Override to include POLLOUT for write-readiness.
     [[nodiscard]] virtual auto poll_events() const noexcept -> short { return POLLIN; }
 
-    /// Called when the fd has data ready (POLLIN).
+    /// Called when the fd has data ready (POLLIN), and also when poll()
+    /// reports an error or hangup condition (POLLERR / POLLHUP / POLLNVAL,
+    /// which poll() delivers regardless of the requested event mask). The
+    /// read path observes the error/EOF and should mark the port finished()
+    /// so the reactor removes it instead of spinning on the dead fd.
     virtual void on_ready(int64_t now_ns) = 0;
 
     /// Called when the fd is writable (POLLOUT). Only fires if poll_events() includes POLLOUT.

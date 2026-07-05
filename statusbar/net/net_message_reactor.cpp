@@ -89,11 +89,28 @@ void MessageReactor::dispatch_ready(int64_t now_ns)
 {
     for (size_t pfd_idx = 0; pfd_idx < pollfds_.size(); ++pfd_idx) {
         auto const revents = pollfds_[pfd_idx].revents;
-        auto& port = ports_[pollfd_port_idx_[pfd_idx]];
-        if ((revents & POLLIN) != 0) {
+        if (revents == 0) {
+            continue;
+        }
+        // Take the raw pointer, not a reference into ports_: a callback may
+        // add() a port, and the vector reallocation would dangle a reference
+        // held across the two dispatches below. The pointee itself is stable.
+        Pollable* const port = ports_[pollfd_port_idx_[pfd_idx]].get();
+        // A port dispatched earlier this cycle may have finished this one
+        // (e.g. closed a peer); don't deliver events to a logically-dead port.
+        if (port->finished()) {
+            continue;
+        }
+        // POLLERR / POLLHUP / POLLNVAL are reported regardless of the
+        // requested event mask. Without a callback the port never learns the
+        // fd is dead, never finishes, and poll() returns immediately every
+        // cycle — a silent 100% CPU spin. Deliver them as on_ready() so the
+        // port's read path observes the error/EOF and can mark itself
+        // finished.
+        if ((revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0) {
             port->on_ready(now_ns);
         }
-        if ((revents & POLLOUT) != 0) {
+        if ((revents & POLLOUT) != 0 && !port->finished()) {
             port->on_writable(now_ns);
         }
     }
