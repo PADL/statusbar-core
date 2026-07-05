@@ -166,9 +166,18 @@ struct MessagePipe<Msg, 2, Policy::LatestWins>
     // can_consume() returns false until another publish happens.
     [[nodiscard]] auto consume() noexcept -> Msg
     {
+        // Snapshot the generation BEFORE taking the ready slot. A publish
+        // completing between the exchange and a post-exchange gen_ read would
+        // be absorbed into the watermark: can_consume() would go false while
+        // the fresh value sits in the ready slot, stranded until a later
+        // publish bumps gen_ again. With the pre-exchange snapshot such a
+        // racing publish keeps can_consume() true; at worst the next consume
+        // grabs a superseded slot and the seq gate below freezes on the
+        // previous value.
+        size_t const gen_snapshot = gen_.load(std::memory_order_acquire);
         size_t const cs = consumer_slot_.load(std::memory_order_relaxed);
         size_t const new_cs = ready_idx_.exchange(cs, std::memory_order_acq_rel);
-        last_seen_gen_.store(gen_.load(std::memory_order_acquire), std::memory_order_relaxed);
+        last_seen_gen_.store(gen_snapshot, std::memory_order_relaxed);
         consumer_slot_.store(new_cs, std::memory_order_relaxed);
         // If a racing publish left us holding a slot no newer than the last one
         // delivered, freeze on the previous value rather than snapping backwards
@@ -186,12 +195,16 @@ struct MessagePipe<Msg, 2, Policy::LatestWins>
     // optional storage via mandatory copy elision.
     [[nodiscard]] auto try_consume() noexcept -> std::optional<Msg>
     {
-        if (gen_.load(std::memory_order_acquire) == last_seen_gen_.load(std::memory_order_relaxed)) {
+        // The emptiness-check load doubles as the pre-exchange generation
+        // snapshot — see consume() for why the watermark must not be read
+        // after the exchange.
+        size_t const gen_snapshot = gen_.load(std::memory_order_acquire);
+        if (gen_snapshot == last_seen_gen_.load(std::memory_order_relaxed)) {
             return std::nullopt;
         }
         size_t const cs = consumer_slot_.load(std::memory_order_relaxed);
         size_t const new_cs = ready_idx_.exchange(cs, std::memory_order_acq_rel);
-        last_seen_gen_.store(gen_.load(std::memory_order_acquire), std::memory_order_relaxed);
+        last_seen_gen_.store(gen_snapshot, std::memory_order_relaxed);
         consumer_slot_.store(new_cs, std::memory_order_relaxed);
         // A publish racing this exchange can hand us a slot no newer than the
         // last delivered; report "nothing new" (freeze) rather than snapping

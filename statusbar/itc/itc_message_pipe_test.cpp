@@ -6,6 +6,7 @@
 #include "statusbar/test/test.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <thread>
@@ -215,9 +216,9 @@ TEST(sync_message_pipe, latest_concurrent_publish_consume_no_torn_reads)
     // also be monotonic non-decreasing: latest-wins may SKIP values (the
     // consumer can miss intermediate publishes), but it must never hand back an
     // already-superseded slot. A publish racing with the consumer's exchange
-    // previously recorded a stale generation and re-delivered an older slot on
-    // the next consume (a backwards snap); the generation is now sampled after
-    // the exchange, so that cannot happen.
+    // can hand the consumer a stale slot; the per-slot publish sequence gate
+    // (slot_seq_ / last_delivered_seq_) rejects it, so a backwards snap
+    // cannot happen.
     LatestPipe<SpscMsg> pipe;
     std::atomic<uint64_t> max_observed{0};
     std::atomic<bool> torn_read_seen{false};
@@ -255,6 +256,61 @@ TEST(sync_message_pipe, latest_concurrent_publish_consume_no_torn_reads)
     // The consumer must have observed something (producer publishes far
     // faster than we can plausibly all-miss).
     EXPECT_TRUE(max_observed.load(std::memory_order_relaxed) > 0U);
+}
+
+TEST(sync_message_pipe, latest_burst_final_value_never_stranded)
+{
+    // Regression: consume()/try_consume() recorded the generation watermark
+    // AFTER the ready-slot exchange. A publish landing between the two was
+    // absorbed into the watermark — can_consume() went false while the fresh
+    // value sat in the ready slot, stranded until a later publish bumped the
+    // generation. With bursty publishers ("publish, then go quiet") the
+    // consumer froze one value behind indefinitely. Publish in bursts and
+    // require the final value of every burst to become consumable while the
+    // producer is quiet.
+    LatestPipe<SpscMsg> pipe;
+    std::atomic<uint64_t> acked{0};
+    std::atomic<bool> stop{false};
+    std::atomic<bool> timed_out{false};
+
+    constexpr uint64_t bursts = 2'000;
+    constexpr uint64_t burst_len = 50;
+
+    std::thread consumer{[&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            if (auto m = pipe.try_consume()) {
+                acked.store(m->lo, std::memory_order_release);
+            }
+        }
+    }};
+
+    std::thread producer{[&] {
+        for (uint64_t b = 0; b < bursts; ++b) {
+            uint64_t const base = b * burst_len;
+            for (uint64_t i = 1; i <= burst_len; ++i) {
+                pipe.publish(SpscMsg{.lo = base + i, .hi = base + i});
+            }
+            // The producer is now quiet; the burst's final value must become
+            // consumable without any further publish. Generous bound so slow
+            // sanitizer runs don't flake — a stranded value never arrives at
+            // all, so a genuine regression always exhausts it.
+            auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+            while (acked.load(std::memory_order_acquire) != base + burst_len) {
+                if (std::chrono::steady_clock::now() > deadline) {
+                    timed_out.store(true, std::memory_order_relaxed);
+                    stop.store(true, std::memory_order_release);
+                    return;
+                }
+            }
+        }
+        stop.store(true, std::memory_order_release);
+    }};
+
+    producer.join();
+    consumer.join();
+
+    EXPECT_FALSE(timed_out.load(std::memory_order_relaxed));
+    EXPECT_EQ(acked.load(std::memory_order_relaxed), bursts * burst_len);
 }
 
 TEST(sync_message_pipe, fifo_concurrent_preserves_every_value_in_order)
