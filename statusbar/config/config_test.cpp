@@ -542,7 +542,30 @@ TEST(config_serialize_edge, deeply_nested_tables)
     config.set("a.b.c.d.e", "deep");
 
     auto toml = config.to_toml_string();
-    EXPECT_TRUE(toml.find("[a]") != std::string::npos || toml.find("[a.b]") != std::string::npos);
+    EXPECT_TRUE(toml.find("[a.b.c.d]") != std::string::npos);
+    EXPECT_TRUE(toml.find("e = \"deep\"") != std::string::npos);
+}
+
+TEST(config_serialize_edge, deeply_nested_roundtrip)
+{
+    Config config1;
+    config1.set("name", "test");
+    config1.set("server.host", "localhost");
+    config1.set("server.tls.enabled", true);
+    config1.set("server.tls.cert.path", "/etc/cert.pem");
+    config1.set("a.b.c.d.e", static_cast<int64_t>(5));
+
+    auto toml = config1.to_toml_string();
+
+    Config config2;
+    auto load_result = config2.load_string(toml);
+    EXPECT_TRUE(load_result.has_value());
+
+    EXPECT_EQ(config2.get_string("name", ""), "test");
+    EXPECT_EQ(config2.get_string("server.host", ""), "localhost");
+    EXPECT_TRUE(config2.get_boolean("server.tls.enabled", false));
+    EXPECT_EQ(config2.get_string("server.tls.cert.path", ""), "/etc/cert.pem");
+    EXPECT_EQ(config2.get_integer("a.b.c.d.e", 0), 5);
 }
 
 TEST(config_serialize_edge, float_values)

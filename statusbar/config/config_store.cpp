@@ -419,43 +419,30 @@ void emit_description_comment(std::ostream& out, std::string_view full_key, args
 
 void Config::write_table(std::ostream& out, toml::Table const& table, std::string_view prefix, args::ArgumentSpecs const* specs)
 {
-    // First write non-table values
+    // The root table (empty prefix) has no header; every nested table emits
+    // its own `[dotted.key]` header before its values, so arbitrarily deep
+    // tables serialize completely.
+    if (!prefix.empty()) {
+        out << '\n';
+        out << '[' << prefix << ']' << '\n';
+    }
+
+    // First write this table's non-table values
     for (auto const& [key, value] : table) {
         if (!value.is_table()) {
-            if (!prefix.empty()) {
-                // We'll write these under the table header
-                continue;
-            }
-            emit_description_comment(out, key, specs);
+            std::string const full_key = prefix.empty() ? key : std::string{prefix} + "." + key;
+            emit_description_comment(out, full_key, specs);
             out << key << " = ";
             write_value(out, value);
             out << '\n';
         }
     }
 
-    // Then write nested tables with headers
+    // Then recurse into nested tables
     for (auto const& [key, value] : table) {
         if (value.is_table()) {
             std::string const full_key = prefix.empty() ? key : std::string{prefix} + "." + key;
-            out << '\n';
-            out << '[' << full_key << ']' << '\n';
-
-            // Write this table's values
-            for (auto const& [sub_key, sub_value] : *value.as_table()) {
-                if (!sub_value.is_table()) {
-                    emit_description_comment(out, full_key + "." + sub_key, specs);
-                    out << sub_key << " = ";
-                    write_value(out, sub_value);
-                    out << '\n';
-                }
-            }
-
-            // Recursively write nested tables
-            for (auto const& [sub_key, sub_value] : *value.as_table()) {
-                if (sub_value.is_table()) {
-                    write_table(out, *sub_value.as_table(), full_key + "." + sub_key, specs);
-                }
-            }
+            write_table(out, *value.as_table(), full_key, specs);
         }
     }
 }
