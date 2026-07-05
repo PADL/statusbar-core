@@ -147,13 +147,16 @@ consteval std::size_t field_bound(Spec sp, ArgInfo a)
         if (t == 's') {
             fail("statusbar::fmt: {:s} used with an integer argument");
         }
+        // Signed arguments emit a leading '-' in every base, so the bound
+        // must include it or the most-negative values silently truncate.
+        std::size_t const sign = a.is_signed ? 1 : 0;
         std::size_t natural = 0;
         if (t == 'x' || t == 'X') {
-            natural = 2 * a.size;
+            natural = 2 * a.size + sign;
         } else if (t == 'b' || t == 'B') {
-            natural = 8 * a.size;
+            natural = 8 * a.size + sign;
         } else {  // 'd' or default
-            natural = max_decimal_digits(a.size) + (a.is_signed ? 1 : 0);
+            natural = max_decimal_digits(a.size) + sign;
         }
         return natural > sp.width ? natural : sp.width;
     }

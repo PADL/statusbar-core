@@ -55,11 +55,28 @@ TEST(statusbar_fmt, hex_lower_upper_and_zero_pad)
     EXPECT_EQ(fmt::format<"0x{:04x}">(static_cast<uint16_t>(0x88F7)), "0x88f7");
 }
 
+TEST(statusbar_fmt, hex_signed_negative)
+{
+    // The worst-case bound must leave room for the '-' or the most-negative
+    // values silently truncate (regression: INT32_MIN printed "-8000000").
+    EXPECT_EQ(fmt::format<"{:x}">(std::numeric_limits<int32_t>::min()), "-80000000");
+    EXPECT_EQ(fmt::format<"{:x}">(std::numeric_limits<int8_t>::min()), "-80");
+    EXPECT_EQ(fmt::format<"{:X}">(std::numeric_limits<int16_t>::min()), "-8000");
+    EXPECT_EQ(fmt::format<"{:x}">(std::numeric_limits<int64_t>::min()), "-8000000000000000");
+    EXPECT_EQ(fmt::format<"{:x}">(-5), "-5");
+}
+
 // ---- binary ----
 TEST(statusbar_fmt, binary_zero_pad)
 {
     EXPECT_EQ(fmt::format<"{:08b}">(static_cast<uint8_t>(0x05)), "00000101");
     EXPECT_EQ(fmt::format<"{:b}">(static_cast<uint8_t>(0x05)), "101");
+}
+
+TEST(statusbar_fmt, binary_signed_negative)
+{
+    EXPECT_EQ(fmt::format<"{:b}">(std::numeric_limits<int8_t>::min()), "-10000000");
+    EXPECT_EQ(fmt::format<"{:b}">(-5), "-101");
 }
 
 // ---- strings / char / literal braces ----
@@ -105,6 +122,8 @@ TEST(statusbar_fmt, derived_capacity_and_constexpr)
 static_assert(fmt::detail::worst_case<"{}", uint8_t>() == 3);
 static_assert(fmt::detail::worst_case<"{}", int32_t>() == 11);  // -2147483648
 static_assert(fmt::detail::worst_case<"{:02x}", uint8_t>() == 2);
+static_assert(fmt::detail::worst_case<"{:x}", int32_t>() == 9);   // -80000000
+static_assert(fmt::detail::worst_case<"{:b}", int8_t>() == 9);    // -10000000
 static_assert(fmt::detail::worst_case<"0x{:04x}", uint16_t>() == 6);
 static_assert(fmt::detail::worst_case<"{:08b}", uint8_t>() == 8);
 static_assert(
