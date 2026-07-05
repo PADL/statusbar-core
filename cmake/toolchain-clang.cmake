@@ -134,8 +134,13 @@ endif()
 # "-mavx2 unsupported for aarch64". Consult CMAKE_HOST_SYSTEM_PROCESSOR (set from
 # uname at startup, before project()) for the native case; CMAKE_SYSTEM_PROCESSOR
 # for the explicit cross case.
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64"
-   OR (NOT CMAKE_SYSTEM_PROCESSOR AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64"))
+# ENABLE_AVX (default ON) lets a build opt out of the AVX/FMA baseline - e.g. to
+# target an older x86 CPU without AVX2, or to produce a portable binary. It only
+# has an effect on x86 targets; on non-x86 the flags are never added regardless.
+option(ENABLE_AVX "Enable the AVX2/FMA SIMD baseline on x86 targets" ON)
+if(ENABLE_AVX
+   AND (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64"
+        OR (NOT CMAKE_SYSTEM_PROCESSOR AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")))
   list(APPEND _STATUSBAR_CXX_FLAGS -mavx2 -mfma)
 endif()
 
