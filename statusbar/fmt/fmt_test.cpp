@@ -122,8 +122,8 @@ TEST(statusbar_fmt, derived_capacity_and_constexpr)
 static_assert(fmt::detail::worst_case<"{}", uint8_t>() == 3);
 static_assert(fmt::detail::worst_case<"{}", int32_t>() == 11);  // -2147483648
 static_assert(fmt::detail::worst_case<"{:02x}", uint8_t>() == 2);
-static_assert(fmt::detail::worst_case<"{:x}", int32_t>() == 9);   // -80000000
-static_assert(fmt::detail::worst_case<"{:b}", int8_t>() == 9);    // -10000000
+static_assert(fmt::detail::worst_case<"{:x}", int32_t>() == 9);  // -80000000
+static_assert(fmt::detail::worst_case<"{:b}", int8_t>() == 9);   // -10000000
 static_assert(fmt::detail::worst_case<"0x{:04x}", uint16_t>() == 6);
 static_assert(fmt::detail::worst_case<"{:08b}", uint8_t>() == 8);
 static_assert(

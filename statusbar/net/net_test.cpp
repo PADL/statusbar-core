@@ -1359,10 +1359,7 @@ TEST(net_reactor, add_from_on_ready_does_not_invalidate_dispatch)
         auto operator=(AddingPort&&) -> AddingPort& = delete;
 
         [[nodiscard]] auto fd() const noexcept -> int override { return sock_a; }
-        [[nodiscard]] auto poll_events() const noexcept -> short override
-        {
-            return static_cast<short>(POLLIN | POLLOUT);
-        }
+        [[nodiscard]] auto poll_events() const noexcept -> short override { return static_cast<short>(POLLIN | POLLOUT); }
         void on_ready(int64_t /*now_ns*/) override
         {
             uint8_t buf[16];

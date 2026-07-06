@@ -35,8 +35,7 @@ auto AtomicTimeStatsBase::update_atomics(int64_t value_ns) noexcept -> void
     // overflow the multiply, so take the magnitude in uint64 (well-defined
     // even for INT64_MIN) and clamp it first. A clamped square is ~INT64_MAX
     // and saturates the accumulator below on its own.
-    uint64_t const mag =
-        value_ns < 0 ? 0U - static_cast<uint64_t>(value_ns) : static_cast<uint64_t>(value_ns);
+    uint64_t const mag = value_ns < 0 ? 0U - static_cast<uint64_t>(value_ns) : static_cast<uint64_t>(value_ns);
     uint64_t const capped = mag < max_exact_square_root ? mag : max_exact_square_root;
     uint64_t const sq = capped * capped;
 
@@ -49,8 +48,8 @@ auto AtomicTimeStatsBase::update_atomics(int64_t value_ns) noexcept -> void
     while (true) {
         uint64_t const total = static_cast<uint64_t>(cur) + sq;
         int64_t const next = total > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
-                                 ? std::numeric_limits<int64_t>::max()
-                                 : static_cast<int64_t>(total);
+            ? std::numeric_limits<int64_t>::max()
+            : static_cast<int64_t>(total);
         if (sum_sq_.compare_exchange_weak(cur, next, std::memory_order_relaxed)) {
             break;
         }
