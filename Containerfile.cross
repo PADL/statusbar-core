@@ -20,6 +20,7 @@ RUN dpkg --add-architecture "${TARGET_ARCH}" \
       clang clang-tools lld \
       cmake ninja-build ccache pkg-config \
       dpkg-dev file ca-certificates \
+      python3 \
       libc++-dev:${TARGET_ARCH} \
       libc++abi-dev:${TARGET_ARCH} \
       libclang-rt-dev:${TARGET_ARCH} \
@@ -28,6 +29,9 @@ RUN dpkg --add-architecture "${TARGET_ARCH}" \
       libxdp-dev:${TARGET_ARCH} \
       libelf-dev:${TARGET_ARCH} \
       zlib1g-dev:${TARGET_ARCH} \
- && rm -rf /var/lib/apt/lists/*
+      libasound2t64 libbpf1 libxdp1 \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /opt/cross-tools \
+ && cp /usr/lib/llvm-19/bin/clang-scan-deps /opt/cross-tools/clang-scan-deps
 
 WORKDIR /build

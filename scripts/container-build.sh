@@ -65,11 +65,19 @@ fi
 
 mkdir -p "$DEB_OUTPUT"
 
-if ! "$ENGINE" image exists "$IMAGE" >/dev/null 2>&1; then
+# Rebuild the builder image when it is missing or its Containerfile changed —
+# the image records the Containerfile checksum in a label at build time. The
+# tag is shared by all statusbar packages, whose Containerfiles are kept
+# byte-identical so any package can (re)build the image for the others.
+CF_SUM="$(cksum "$TREE_DIR/Containerfile" | cut -d' ' -f1)"
+if [ "$("$ENGINE" image inspect \
+         --format '{{index .Config.Labels "statusbar.containerfile"}}' \
+         "$IMAGE" 2>/dev/null)" != "$CF_SUM" ]; then
   echo "=== building builder image $IMAGE ==="
   "$ENGINE" build -t "$IMAGE" \
     --platform "$TARGET_PLATFORM" \
     --build-arg "DEBIAN_VERSION=$DEBIAN_VERSION" \
+    --label "statusbar.containerfile=$CF_SUM" \
     -f "$TREE_DIR/Containerfile" "$TREE_DIR"
 fi
 

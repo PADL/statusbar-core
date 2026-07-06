@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libc++-dev libc++abi-dev libclang-rt-dev \
     cmake ninja-build ccache pkg-config \
     dpkg-dev file ca-certificates \
+    python3 \
     libasound2-dev libbpf-dev libxdp-dev libelf-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
