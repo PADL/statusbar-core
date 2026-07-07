@@ -20,7 +20,7 @@ RUN dpkg --add-architecture "${TARGET_ARCH}" \
       clang clang-tools lld \
       cmake ninja-build ccache pkg-config \
       dpkg-dev file ca-certificates \
-      python3 \
+      python3 python3-jsonschema \
       libc++-dev:${TARGET_ARCH} \
       libc++abi-dev:${TARGET_ARCH} \
       libclang-rt-dev:${TARGET_ARCH} \
