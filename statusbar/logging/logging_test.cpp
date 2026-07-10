@@ -67,6 +67,13 @@ TEST(logging, formats_arithmetic_and_literal_args)
     EXPECT_EQ(drain_message(channel), "plain message");
     EXPECT_EQ(drain_message(channel), "i=-42 u=7 f=2.625 b=true c=x");
     EXPECT_EQ(drain_message(channel), "mode=fast rate=96000");
+
+    // static_str: the explicit escape hatch for name-table lookups (runtime-
+    // selected pointers to string literals).
+    static constexpr char const* names[] = {"Idle", "Ready"};
+    int const state = 1;
+    log.status("state={}", static_str(names[state]));  // NOLINT
+    EXPECT_EQ(drain_message(channel), "state=Ready");
     EXPECT_FALSE(channel.drain_one().has_value());
 }
 

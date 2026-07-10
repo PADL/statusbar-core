@@ -105,6 +105,36 @@ class StrLit
     return StrLit{s};
 }
 
+/// The runtime escape hatch for name-TABLE lookups: a pointer the CALLER
+/// guarantees refers to static storage (e.g. state_string(), status-name
+/// tables — string literals selected at runtime, which consteval lit() cannot
+/// see). The guarantee is unchecked; never wrap a transient pointer. The loud
+/// name keeps call sites greppable/reviewable.
+class StaticStr
+{
+  public:
+    explicit constexpr StaticStr(char const* s) noexcept
+        : ptr_{s}
+    {}
+    explicit constexpr StaticStr(std::string_view const s) noexcept
+        : ptr_{s.data()}
+    {}
+
+    [[nodiscard]] constexpr auto c_str() const noexcept -> char const* { return ptr_; }
+
+  private:
+    char const* ptr_;
+};
+
+[[nodiscard]] constexpr auto static_str(char const* s) noexcept -> StaticStr
+{
+    return StaticStr{s};
+}
+[[nodiscard]] constexpr auto static_str(std::string_view const s) noexcept -> StaticStr
+{
+    return StaticStr{s};
+}
+
 namespace detail {
 
 /// The wire type an argument is stored (and later formatted) as.
@@ -129,13 +159,19 @@ struct stored<StrLit>
     using type = char const*;
 };
 
+template <>
+struct stored<StaticStr>
+{
+    using type = char const*;
+};
+
 template <typename T>
 using stored_t = typename stored<std::remove_cvref_t<T>>::type;
 
 template <typename T>
 [[nodiscard]] constexpr auto to_stored(T const& v) noexcept -> stored_t<T>
 {
-    if constexpr (std::is_same_v<std::remove_cvref_t<T>, StrLit>) {
+    if constexpr (std::is_same_v<std::remove_cvref_t<T>, StrLit> || std::is_same_v<std::remove_cvref_t<T>, StaticStr>) {
         return v.c_str();
     } else {
         return v;
