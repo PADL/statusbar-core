@@ -63,6 +63,9 @@ enum class LogLevel : uint8_t
     Debug = 4,
 };
 
+/// Immediate argument payload per entry (see LogEntry::MAX_ARG_BYTES).
+inline constexpr size_t LogEntryArgBudget = 64;
+
 /// One-letter tag for a rendered line ('E', 'W', 'S', 'D').
 [[nodiscard]] constexpr auto level_char(LogLevel const level) noexcept -> char
 {
@@ -135,7 +138,46 @@ class StaticStr
     return StaticStr{s};
 }
 
+/// A bounded string COPIED into the entry's 64-byte payload — for runtime
+/// text that is neither a literal nor a name-table entry (resolved addresses,
+/// truncated paths). No pointer is stored, so nothing can dangle; content
+/// beyond N-1 characters is truncated. Budget the payload: an embedded string
+/// costs its full N bytes. Construct via logging::embed<N>(text).
+template <size_t N = 24>
+struct ShortStr
+{
+    static_assert(N >= 2 && N <= LogEntryArgBudget, "ShortStr size out of range");
+
+    constexpr ShortStr() noexcept = default;
+    explicit constexpr ShortStr(std::string_view const text) noexcept
+    {
+        size_t const n = text.size() < N - 1 ? text.size() : N - 1;
+        for (size_t i = 0; i < n; ++i) {
+            chars[i] = text[i];
+        }
+        chars[n] = '\0';
+    }
+
+    [[nodiscard]] constexpr auto view() const noexcept -> std::string_view { return {chars.data()}; }
+
+    std::array<char, N> chars{};
+};
+
+/// Copy up to N-1 characters of @p text into the log entry.
+template <size_t N = 24>
+[[nodiscard]] constexpr auto embed(std::string_view const text) noexcept -> ShortStr<N>
+{
+    return ShortStr<N>{text};
+}
+
 namespace detail {
+
+template <typename T>
+struct is_short_str : std::false_type
+{};
+template <size_t N>
+struct is_short_str<ShortStr<N>> : std::true_type
+{};
 
 /// The wire type an argument is stored (and later formatted) as.
 template <typename T>
@@ -144,12 +186,13 @@ struct stored
     static_assert(
         !std::is_pointer_v<T> && !std::is_same_v<T, std::string_view> && !std::is_same_v<T, std::string>,
         "log arguments must not be pointers or transient strings — pass "
-        "integers/floats/bool/char by value, and strings only as "
-        "logging::lit(\"...\") (static storage, enforced at compile time)");
+        "integers/floats/bool/char by value, strings as logging::lit(\"...\") "
+        "(static storage, compile-time enforced), or bounded copies via "
+        "logging::embed<N>(text)");
     static_assert(
-        std::is_arithmetic_v<T>,
-        "log arguments must be arithmetic (integers, floats, bool, char) or "
-        "logging::lit(\"...\") string literals");
+        std::is_arithmetic_v<T> || is_short_str<T>::value,
+        "log arguments must be arithmetic (integers, floats, bool, char), "
+        "logging::lit(\"...\") string literals, or logging::embed<N>(text)");
     using type = T;
 };
 
@@ -190,7 +233,7 @@ using FormatFn = auto (*)(std::byte const* args, std::string_view fmt) -> std::s
 /// storage, and the argument VALUES live in the inline 64-byte payload.
 struct LogEntry
 {
-    static constexpr size_t MAX_ARG_BYTES = 64;
+    static constexpr size_t MAX_ARG_BYTES = LogEntryArgBudget;
 
     uint64_t seq{0};           ///< per-channel monotonic sequence number
     uint64_t timestamp_ns{0};  ///< channel clock at the log call (default: steady)
@@ -416,3 +459,13 @@ class LogChannel final : public LogChannelBase
 };
 
 }  // namespace statusbar::logging
+
+/// Render an embedded ShortStr exactly like a string.
+template <size_t N>
+struct std::formatter<statusbar::logging::ShortStr<N>> : std::formatter<std::string_view>
+{
+    auto format(statusbar::logging::ShortStr<N> const& s, std::format_context& ctx) const
+    {
+        return std::formatter<std::string_view>::format(s.view(), ctx);
+    }
+};

@@ -74,6 +74,15 @@ TEST(logging, formats_arithmetic_and_literal_args)
     int const state = 1;
     log.status("state={}", static_str(names[state]));  // NOLINT
     EXPECT_EQ(drain_message(channel), "state=Ready");
+
+    // embed<N>: bounded COPY of runtime text into the payload (no pointer).
+    std::string transient = "203.0.113.9:5004";
+    log.status("peer={}", embed<24>(transient));
+    transient = "gone";
+    EXPECT_EQ(drain_message(channel), "peer=203.0.113.9:5004");
+    // Truncates at N-1 characters.
+    log.status("p={}", embed<8>(std::string_view{"abcdefghij"}));
+    EXPECT_EQ(drain_message(channel), "p=abcdefg");
     EXPECT_FALSE(channel.drain_one().has_value());
 }
 
