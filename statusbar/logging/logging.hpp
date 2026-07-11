@@ -113,6 +113,10 @@ class StrLit
 /// tables — string literals selected at runtime, which consteval lit() cannot
 /// see). The guarantee is unchecked; never wrap a transient pointer. The loud
 /// name keeps call sites greppable/reviewable.
+///
+/// The pointed-to string must be NUL-TERMINATED: only the data pointer is
+/// stored (the entry formats it as a C string), so the string_view overload
+/// must wrap a whole C string, never a substring view.
 class StaticStr
 {
   public:
@@ -235,7 +239,9 @@ struct LogEntry
 {
     static constexpr size_t MAX_ARG_BYTES = LogEntryArgBudget;
 
-    uint64_t seq{0};           ///< per-channel monotonic sequence number
+    uint64_t seq{0};           ///< per-channel sequence number; dropped entries
+                               ///< still consume one, so gaps mark where in the
+                               ///< stream overflow drops occurred
     uint64_t timestamp_ns{0};  ///< channel clock at the log call (default: steady)
     char const* fmt_data{nullptr};
     uint32_t fmt_size{0};

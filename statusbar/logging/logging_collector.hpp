@@ -20,8 +20,8 @@
 #include "statusbar/itc/itc_stop_token.hpp"
 #include "statusbar/logging/logging.hpp"
 #include "statusbar/logging/logging_sink.hpp"
+#include "statusbar/sg14/inplace_vector.h"
 
-#include <array>
 #include <chrono>
 #include <cstddef>
 #include <format>
@@ -35,17 +35,9 @@ class LogCollector
   public:
     /// Register a channel for draining. Returns false when full. The channel
     /// must outlive the collector's consumer loop.
-    [[nodiscard]] auto add(LogChannelBase& channel) noexcept -> bool
-    {
-        if (count_ >= MaxChannels) {
-            return false;
-        }
-        channels_[count_] = &channel;
-        ++count_;
-        return true;
-    }
+    [[nodiscard]] auto add(LogChannelBase& channel) noexcept -> bool { return channels_.try_push_back(&channel) != nullptr; }
 
-    [[nodiscard]] auto channel_count() const noexcept -> size_t { return count_; }
+    [[nodiscard]] auto channel_count() const noexcept -> size_t { return channels_.size(); }
 
     /// Drain up to @p batch_per_channel entries from every channel into
     /// @p sink, oldest first per channel, then report any drops. Returns the
@@ -54,8 +46,8 @@ class LogCollector
     auto poll(LogSink& sink, size_t const batch_per_channel = 64) -> size_t
     {
         size_t lines = 0;
-        for (size_t i = 0; i < count_; ++i) {
-            auto& channel = *channels_[i];
+        for (auto* const channel_ptr : channels_) {
+            auto& channel = *channel_ptr;
             for (size_t n = 0; n < batch_per_channel; ++n) {
                 auto const entry = channel.drain_one();
                 if (!entry) {
@@ -92,8 +84,7 @@ class LogCollector
     }
 
   private:
-    std::array<LogChannelBase*, MaxChannels> channels_{};
-    size_t count_{0};
+    sg14::inplace_vector<LogChannelBase*, MaxChannels> channels_;
 };
 
 }  // namespace statusbar::logging
