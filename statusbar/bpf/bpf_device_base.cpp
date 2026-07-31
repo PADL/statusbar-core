@@ -58,7 +58,7 @@ auto BpfDeviceBase::get_mtu() const -> StatusValue<size_t>
     return success(static_cast<size_t>(ifr.ifr_mtu));
 }
 
-auto BpfDeviceBase::get_mac_address() const -> StatusValue<std::array<uint8_t, 6>>
+auto BpfDeviceBase::get_mac_address() const -> StatusValue<ieee::Eui48>
 {
     if (!is_valid()) {
         return failure(BpfError::invalid_file_descriptor);
@@ -75,8 +75,8 @@ auto BpfDeviceBase::get_mac_address() const -> StatusValue<std::array<uint8_t, 6
         return failure(BpfError::get_mac_address_failed);
     }
 
-    std::array<uint8_t, 6> mac{};
-    span_copy(mac, ::statusbar::net::hwaddr_bytes(ifr));
+    ieee::Eui48 mac{};
+    span_copy(mac.span(), ::statusbar::net::hwaddr_bytes(ifr));
     return success(mac);
 #endif
 }

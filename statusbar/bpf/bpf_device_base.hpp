@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "statusbar/bpf/bpf_base.hpp"
+#include "statusbar/ieee/ieee.hpp"
 #include "statusbar/status/status.hpp"
 
 #include <array>
@@ -92,8 +93,8 @@ class BpfDeviceBase
     [[nodiscard]] virtual auto get_mtu() const -> StatusValue<size_t>;
 
     /// Get interface MAC address
-    /// @return 6-byte MAC address, or error
-    [[nodiscard]] virtual auto get_mac_address() const -> StatusValue<std::array<uint8_t, 6>>;
+    /// @return The interface's EUI-48 MAC address, or error
+    [[nodiscard]] virtual auto get_mac_address() const -> StatusValue<ieee::Eui48>;
 
     //
     // Configuration (Virtual)
