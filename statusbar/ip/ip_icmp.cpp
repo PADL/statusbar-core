@@ -3,9 +3,11 @@
 
 #include "statusbar/ip/ip_icmp.hpp"
 
+#include <string_view>
+
 namespace statusbar::ip {
 
-auto icmp_type_name(uint8_t type) noexcept -> char const*
+auto icmp_type_name(uint8_t type) noexcept -> std::string_view
 {
     switch (type) {
         case ICMP_TYPE_ECHO_REPLY:

@@ -3,9 +3,11 @@
 
 #include "statusbar/ip/ip_arp.hpp"
 
+#include <string_view>
+
 namespace statusbar::ip {
 
-auto arp_op_name(uint16_t op) noexcept -> char const*
+auto arp_op_name(uint16_t op) noexcept -> std::string_view
 {
     switch (op) {
         case ARP_OP_REQUEST:

@@ -3,9 +3,11 @@
 
 #include "statusbar/ip/ip_igmp.hpp"
 
+#include <string_view>
+
 namespace statusbar::ip {
 
-auto igmp_type_name(uint8_t type) noexcept -> char const*
+auto igmp_type_name(uint8_t type) noexcept -> std::string_view
 {
     switch (type) {
         case IGMP_TYPE_MEMBERSHIP_QUERY:

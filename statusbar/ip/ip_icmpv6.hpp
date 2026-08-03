@@ -15,6 +15,7 @@
 #include <cstring>
 #include <expected>
 #include <span>
+#include <string_view>
 
 namespace statusbar::ip {
 
@@ -83,7 +84,7 @@ constexpr uint8_t NDP_OPTION_MTU = 5;
 
 /// Get human-readable name for ICMPv6 type
 /// @param type ICMPv6 message type code
-[[nodiscard]] auto icmpv6_type_name(uint8_t type) noexcept -> char const*;
+[[nodiscard]] auto icmpv6_type_name(uint8_t type) noexcept -> std::string_view;
 
 //
 // ICMPv6 Header (4 bytes base, message-specific data follows)

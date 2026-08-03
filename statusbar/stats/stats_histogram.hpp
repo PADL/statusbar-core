@@ -11,6 +11,7 @@
 #include <format>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace statusbar::stats {
@@ -19,7 +20,7 @@ namespace statusbar::stats {
 template <typename T = double>
 struct Bucket
 {
-    char const* label;
+    std::string_view label;
     T low;   ///< inclusive
     T high;  ///< exclusive
 };
@@ -28,7 +29,7 @@ struct Bucket
 template <typename T = double>
 struct HistogramEntry
 {
-    char const* label;
+    std::string_view label;
     T low;
     T high;
     size_t count;

@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string_view>
 
 namespace statusbar::ip {
 
@@ -26,7 +27,7 @@ constexpr uint8_t IGMP_TYPE_MEMBERSHIP_REPORT_V3 = 0x22;
 
 /// Get human-readable name for IGMP type
 /// @param type IGMP message type code
-[[nodiscard]] auto igmp_type_name(uint8_t type) noexcept -> char const*;
+[[nodiscard]] auto igmp_type_name(uint8_t type) noexcept -> std::string_view;
 
 /// IGMP header (8 bytes for v1/v2)
 /// Network byte order is handled by doublet_t type

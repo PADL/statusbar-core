@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstring>
 #include <print>
+#include <string_view>
 #include <vector>
 
 using namespace statusbar;
@@ -151,7 +152,7 @@ namespace {
 
 struct Frame
 {
-    char const* name;
+    std::string_view name;
     std::array<std::uint8_t, 32> bytes;
 };
 

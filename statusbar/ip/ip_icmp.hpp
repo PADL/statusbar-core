@@ -14,6 +14,7 @@
 #include <cstring>
 #include <expected>
 #include <span>
+#include <string_view>
 
 namespace statusbar::ip {
 
@@ -51,7 +52,7 @@ constexpr uint8_t ICMP_CODE_FRAGMENT_REASSEMBLY_EXCEEDED = 1;
 
 /// Get human-readable name for ICMP type
 /// @param type ICMP message type code
-[[nodiscard]] auto icmp_type_name(uint8_t type) noexcept -> char const*;
+[[nodiscard]] auto icmp_type_name(uint8_t type) noexcept -> std::string_view;
 
 /// ICMP header (8 bytes minimum)
 /// Network byte order is handled by doublet_t type

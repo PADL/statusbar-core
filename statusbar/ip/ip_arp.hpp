@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string_view>
 
 namespace statusbar::ip {
 
@@ -32,7 +33,7 @@ constexpr uint16_t ARP_OP_RARP_REPLY = 4;
 
 /// Get human-readable name for ARP operation
 /// @param op ARP operation code
-[[nodiscard]] auto arp_op_name(uint16_t op) noexcept -> char const*;
+[[nodiscard]] auto arp_op_name(uint16_t op) noexcept -> std::string_view;
 
 /// ARP header for Ethernet/IPv4 (28 bytes)
 /// This is the most common ARP format

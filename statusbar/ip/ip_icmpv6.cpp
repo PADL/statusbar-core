@@ -3,9 +3,11 @@
 
 #include "statusbar/ip/ip_icmpv6.hpp"
 
+#include <string_view>
+
 namespace statusbar::ip {
 
-auto icmpv6_type_name(uint8_t type) noexcept -> char const*
+auto icmpv6_type_name(uint8_t type) noexcept -> std::string_view
 {
     switch (type) {
         case ICMPV6_TYPE_DEST_UNREACHABLE:

@@ -3,9 +3,11 @@
 
 #include "statusbar/tsn/tsn_error.hpp"
 
+#include <string_view>
+
 namespace statusbar::tsn {
 
-auto tsn_error_name(TsnError e) noexcept -> char const*
+auto tsn_error_name(TsnError e) noexcept -> std::string_view
 {
     switch (e) {
         case TsnError::attribute_table_full:

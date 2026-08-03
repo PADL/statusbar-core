@@ -15,6 +15,7 @@
 #include "statusbar/status/status.hpp"
 
 #include <string>
+#include <string_view>
 #include <system_error>
 
 namespace statusbar::tsn {
@@ -32,7 +33,7 @@ enum class TsnError
 };
 
 /// Get human-readable name for TsnError
-[[nodiscard]] auto tsn_error_name(TsnError e) noexcept -> char const*;
+[[nodiscard]] auto tsn_error_name(TsnError e) noexcept -> std::string_view;
 
 /// Error category for TSN errors
 class TsnErrorCategory : public std::error_category
@@ -40,7 +41,10 @@ class TsnErrorCategory : public std::error_category
   public:
     [[nodiscard]] auto name() const noexcept -> char const* override { return "statusbar.tsn"; }
 
-    [[nodiscard]] auto message(int ev) const -> std::string override { return tsn_error_name(static_cast<TsnError>(ev)); }
+    [[nodiscard]] auto message(int ev) const -> std::string override
+    {
+        return std::string{tsn_error_name(static_cast<TsnError>(ev))};
+    }
 };
 
 /// Get the TSN error category singleton
