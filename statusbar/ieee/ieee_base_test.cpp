@@ -321,4 +321,73 @@ TEST(ieee_ordered_uint, comparison_no_truncation)
 // Test driver main function
 //
 
+//
+// sextlet_t (48-bit ordered type)
+//
+
+TEST(ieee_base, sextlet_default_is_zero)
+{
+    sextlet_t v;
+    EXPECT_EQ(v.get(), 0U);
+    EXPECT_EQ(sizeof(v), 6U);
+}
+
+TEST(ieee_base, sextlet_network_byte_order_storage)
+{
+    sextlet_t v{0x0123456789ABULL};
+    auto const s = v.span();
+    EXPECT_EQ(s[0], 0x01);
+    EXPECT_EQ(s[1], 0x23);
+    EXPECT_EQ(s[2], 0x45);
+    EXPECT_EQ(s[3], 0x67);
+    EXPECT_EQ(s[4], 0x89);
+    EXPECT_EQ(s[5], 0xAB);
+    EXPECT_EQ(v.get(), 0x0123456789ABULL);
+}
+
+TEST(ieee_base, sextlet_truncates_to_48_bits)
+{
+    sextlet_t v{0xFFFF'0123456789ABULL};
+    EXPECT_EQ(v.get(), 0x0123456789ABULL);
+    EXPECT_EQ(sextlet_t::max_value(), 0x0000FFFFFFFFFFFFULL);
+    sextlet_t max{sextlet_t::max_value()};
+    EXPECT_EQ(max.get(), 0x0000FFFFFFFFFFFFULL);
+}
+
+TEST(ieee_base, sextlet_assignment_and_conversion)
+{
+    sextlet_t v;
+    v = 0x800000000001ULL;
+    uint64_t const host = v;
+    EXPECT_EQ(host, 0x800000000001ULL);
+}
+
+TEST(ieee_base, sextlet_comparisons)
+{
+    sextlet_t const a{100};
+    sextlet_t const b{200};
+    EXPECT_TRUE(a < b);
+    EXPECT_TRUE(a == 100U);
+    EXPECT_TRUE(b > 150);
+    EXPECT_TRUE(a != b);
+}
+
+TEST(ieee_base, sextlet_span_direct_write)
+{
+    sextlet_t v;
+    auto s = v.span();
+    s[0] = 0x00;
+    s[1] = 0x00;
+    s[2] = 0x00;
+    s[3] = 0x00;
+    s[4] = 0x01;
+    s[5] = 0x02;
+    EXPECT_EQ(v.get(), 0x0102U);
+}
+
+TEST(ieee_base, sextlet_satisfies_ordered_trait)
+{
+    EXPECT_TRUE(is_ieee_ordered_uint<sextlet_t>::value);
+}
+
 TEST_MAIN(statusbar_ieee, ieee_base_test)

@@ -265,6 +265,115 @@ using quadlet_t = IeeeOrderedUInt<std::uint32_t>;
 /// Network byte order 64-bit unsigned integer (8 bytes).
 using octlet_t = IeeeOrderedUInt<std::uint64_t>;
 
+///
+/// A network byte order (big-endian) 48-bit unsigned integer.
+///
+/// Six bytes of storage with a uint64_t host-order interface — the wire type
+/// for IEEE 802.1AS / 1722.1 48-bit fields (PTP seconds, GPTP_TIME control
+/// values). Mirrors the IeeeOrderedUInt API; there is no native 48-bit
+/// integer, so the byte marshalling lives here instead of std::byteswap.
+/// Values are truncated to the low 48 bits on store.
+///
+struct IeeeOrderedUInt48
+{
+  private:
+    std::array<uint8_t, 6> bytes_;
+
+    static constexpr std::uint64_t VALUE_MASK = 0x0000FFFFFFFFFFFFULL;
+
+    [[nodiscard]] constexpr auto load_bytes() const noexcept -> std::uint64_t
+    {
+        return (static_cast<std::uint64_t>(bytes_[0]) << 40) | (static_cast<std::uint64_t>(bytes_[1]) << 32) |
+            (static_cast<std::uint64_t>(bytes_[2]) << 24) | (static_cast<std::uint64_t>(bytes_[3]) << 16) |
+            (static_cast<std::uint64_t>(bytes_[4]) << 8) | static_cast<std::uint64_t>(bytes_[5]);
+    }
+
+    constexpr auto store_bytes(std::uint64_t host_value) noexcept
+    {
+        bytes_[0] = static_cast<uint8_t>((host_value >> 40) & 0xFFU);
+        bytes_[1] = static_cast<uint8_t>((host_value >> 32) & 0xFFU);
+        bytes_[2] = static_cast<uint8_t>((host_value >> 24) & 0xFFU);
+        bytes_[3] = static_cast<uint8_t>((host_value >> 16) & 0xFFU);
+        bytes_[4] = static_cast<uint8_t>((host_value >> 8) & 0xFFU);
+        bytes_[5] = static_cast<uint8_t>(host_value & 0xFFU);
+    }
+
+  public:
+    /// Default constructor - zero-initializes the value.
+    constexpr IeeeOrderedUInt48() noexcept
+        : bytes_{}
+    {}
+
+    /// Construct from a host byte order value (truncated to 48 bits).
+    constexpr IeeeOrderedUInt48(std::uint64_t host_value) noexcept
+        : bytes_{}
+    {
+        store_bytes(host_value);
+    }
+
+    /// Assignment from a host byte order value (truncated to 48 bits).
+    constexpr auto operator=(std::uint64_t host_value) noexcept -> IeeeOrderedUInt48&
+    {
+        store_bytes(host_value);
+        return *this;
+    }
+
+    /// Implicit conversion to host byte order.
+    [[nodiscard]] constexpr operator std::uint64_t() const noexcept { return load_bytes(); }
+
+    /// Get the value in host byte order (explicit alternative to implicit conversion).
+    [[nodiscard]] constexpr auto get() const noexcept -> std::uint64_t { return load_bytes(); }
+
+    /// Set the value from host byte order (truncated to 48 bits).
+    constexpr auto set(std::uint64_t host_value) noexcept { store_bytes(host_value); }
+
+    /// Get a mutable span of the underlying bytes (network byte order).
+    [[nodiscard]] constexpr auto span() noexcept -> std::span<uint8_t, 6> { return std::span<uint8_t, 6>(bytes_); }
+
+    /// Get a const span of the underlying bytes (network byte order).
+    [[nodiscard]] constexpr auto span() const noexcept -> std::span<uint8_t const, 6>
+    {
+        return std::span<uint8_t const, 6>(bytes_);
+    }
+
+    /// Equality comparison with another IeeeOrderedUInt48.
+    [[nodiscard]] constexpr auto operator==(IeeeOrderedUInt48 const& other) const noexcept -> bool
+    {
+        return bytes_ == other.bytes_;
+    }
+
+    /// Three-way comparison with another IeeeOrderedUInt48.
+    [[nodiscard]] constexpr auto operator<=>(IeeeOrderedUInt48 const& other) const noexcept
+    {
+        return load_bytes() <=> other.load_bytes();
+    }
+
+    /// Equality comparison with any integral type.
+    template <std::integral U>
+    [[nodiscard]] constexpr auto operator==(U other) const noexcept -> bool
+    {
+        using Common = std::common_type_t<std::uint64_t, U>;
+        return static_cast<Common>(load_bytes()) == static_cast<Common>(other);
+    }
+
+    /// Three-way comparison with any integral type.
+    template <std::integral U>
+    [[nodiscard]] constexpr auto operator<=>(U other) const noexcept
+    {
+        using Common = std::common_type_t<std::uint64_t, U>;
+        return static_cast<Common>(load_bytes()) <=> static_cast<Common>(other);
+    }
+
+    /// The largest value representable in 48 bits.
+    [[nodiscard]] static constexpr auto max_value() noexcept -> std::uint64_t { return VALUE_MASK; }
+};
+
+static_assert(sizeof(IeeeOrderedUInt48) == 6);
+static_assert(alignof(IeeeOrderedUInt48) == 1);
+
+/// Network byte order 48-bit unsigned integer (6 bytes).
+using sextlet_t = IeeeOrderedUInt48;
+
 /// Type trait to check if a type is an IeeeOrderedUInt.
 template <typename T>
 struct is_ieee_ordered_uint : std::false_type
@@ -273,6 +382,11 @@ struct is_ieee_ordered_uint : std::false_type
 /// Specialization for IeeeOrderedUInt types.
 template <UnsignedIntegerType U>
 struct is_ieee_ordered_uint<IeeeOrderedUInt<U>> : std::true_type
+{};
+
+/// Specialization for the 48-bit ordered type (same span()-based interface).
+template <>
+struct is_ieee_ordered_uint<IeeeOrderedUInt48> : std::true_type
 {};
 
 /// Type trait to check if a type is an std::array of IeeeOrderedUInt.
