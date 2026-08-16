@@ -30,11 +30,31 @@ constexpr auto generate_dot() -> FixedString<Capacity>
     out.append(Machine::state_name(static_cast<Machine::State>(0)));
     out.append(" [shape=\"point\"];\n");
 
-    // Remaining states as ellipses
+    // Remaining states as ellipses; states with entry/exit hooks get them
+    // rendered inside the node, per-state-box style.
     for (size_t i = 1; i < Machine::num_states; ++i) {
+        auto const state = static_cast<Machine::State>(i);
+        auto const& entry_hook = Machine::table.get_entry_hook(state);
+        auto const& exit_hook = Machine::table.get_exit_hook(state);
         out.append("    ");
-        out.append(Machine::state_name(static_cast<Machine::State>(i)));
-        out.append(" [shape=\"ellipse\"];\n");
+        out.append(Machine::state_name(state));
+        if (entry_hook.is_set() || exit_hook.is_set()) {
+            out.append(" [shape=\"ellipse\" label=<");
+            out.append(Machine::state_name(state));
+            if (entry_hook.is_set()) {
+                out.append("<br/><i>entry / ");
+                out.append(entry_hook.name);
+                out.append("()</i>");
+            }
+            if (exit_hook.is_set()) {
+                out.append("<br/><i>exit / ");
+                out.append(exit_hook.name);
+                out.append("()</i>");
+            }
+            out.append(">];\n");
+        } else {
+            out.append(" [shape=\"ellipse\"];\n");
+        }
     }
 
     // Generate edges for all valid transitions

@@ -10,6 +10,8 @@
 // - Zero-overhead abstraction using constexpr transition tables
 // - Compile-time reflection for enum/type/function names
 // - Optional UCT (Unconditional Transition) handling
+// - Optional per-state entry/exit hooks (UML ordering: exit -> action ->
+//   entry; self-transitions re-run both; compiled out when unused)
 // - Pluggable observers for instrumentation/logging
 // - Compile-time DOT graph and Markdown table generation
 //

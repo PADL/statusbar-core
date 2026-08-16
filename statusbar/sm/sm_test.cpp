@@ -220,6 +220,81 @@ using Machine = StateMachine<Def, table>;
 }  // namespace self_action
 
 //
+// Test State Machine with entry/exit hooks
+//
+
+namespace with_hooks {
+
+struct Context
+{
+    std::vector<std::string> trace{};
+};
+
+struct Def
+{
+    using Context = with_hooks::Context;
+    enum class State : uint8_t
+    {
+        Begin = 0,
+        Idle,
+        Running,
+        Count
+    };
+    enum class Event : uint8_t
+    {
+        UCT = 0,
+        Go,
+        Stop,
+        Kick,
+        Count
+    };
+};
+
+inline void enter_idle(Def::Context& ctx, TimePoint /*event_time*/)
+{
+    ctx.trace.emplace_back("enter_idle");
+}
+
+inline void enter_running(Def::Context& ctx, TimePoint /*event_time*/)
+{
+    ctx.trace.emplace_back("enter_running");
+}
+
+inline void exit_running(Def::Context& ctx, TimePoint /*event_time*/)
+{
+    ctx.trace.emplace_back("exit_running");
+}
+
+inline void go_action(Def::Context& ctx, TimePoint /*event_time*/)
+{
+    ctx.trace.emplace_back("go_action");
+}
+
+inline constexpr auto table = [] {
+    using State = Def::State;
+    using Event = Def::Event;
+    using T = Transitions<Def>;
+
+    TransitionTable<Def> t{};
+
+    t.at(State::Begin, Event::UCT) = T::transition(State::Idle);
+    t.at(State::Idle, Event::Go) = T::action<go_action>(State::Running);
+    t.at(State::Running, Event::Stop) = T::transition(State::Idle);
+    // Self-transition with no action: hooks alone make it observable
+    t.at(State::Running, Event::Kick) = T::transition(State::Running);
+
+    t.on_entry(State::Idle) = T::hook<enter_idle>();
+    t.on_entry(State::Running) = T::hook<enter_running>();
+    t.on_exit(State::Running) = T::hook<exit_running>();
+
+    return t;
+}();
+
+using Machine = StateMachine<Def, table>;
+
+}  // namespace with_hooks
+
+//
 // Recording Observer for Testing (shared utility)
 //
 
@@ -1195,6 +1270,138 @@ TEST(sm_tool, sm_tool_returns_nonzero_for_unknown_machine)
     char arg[] = "--machine=missing";
     char* argv[] = {prog, arg};
     EXPECT_NE(sm_tool(2, argv, registry), 0);
+}
+
+//
+// Entry / Exit hook tests
+//
+
+static_assert(!with_uct::Machine::has_hooks, "hook-free machine reports has_hooks == false");
+static_assert(!without_uct::Machine::has_hooks, "hook-free machine reports has_hooks == false");
+static_assert(with_hooks::Machine::has_hooks, "hooked machine reports has_hooks == true");
+
+TEST(sm_hooks, uct_and_transition_fire_hooks_in_uml_order)
+{
+    with_hooks::Context ctx;
+    with_hooks::Machine machine;
+
+    // UCT chain: Begin -> Idle fires entry(Idle); then Go: Idle -> Running
+    // fires go_action then entry(Running). Idle has no exit hook.
+    machine.handle_event(ctx, with_hooks::Def::Event::Go);
+
+    EXPECT_EQ(ctx.trace.size(), 3);
+    EXPECT_EQ(ctx.trace[0], "enter_idle");
+    EXPECT_EQ(ctx.trace[1], "go_action");
+    EXPECT_EQ(ctx.trace[2], "enter_running");
+    EXPECT_EQ(machine.current_state(), with_hooks::Def::State::Running);
+}
+
+TEST(sm_hooks, exit_runs_before_entry_on_transition)
+{
+    with_hooks::Context ctx;
+    with_hooks::Machine machine;
+
+    machine.handle_event(ctx, with_hooks::Def::Event::Go);
+    ctx.trace.clear();
+
+    // Running -> Idle: exit(Running) then entry(Idle)
+    machine.handle_event(ctx, with_hooks::Def::Event::Stop);
+
+    EXPECT_EQ(ctx.trace.size(), 2);
+    EXPECT_EQ(ctx.trace[0], "exit_running");
+    EXPECT_EQ(ctx.trace[1], "enter_idle");
+    EXPECT_EQ(machine.current_state(), with_hooks::Def::State::Idle);
+}
+
+TEST(sm_hooks, self_transition_reruns_exit_and_entry)
+{
+    with_hooks::Context ctx;
+    with_hooks::Machine machine;
+
+    machine.handle_event(ctx, with_hooks::Def::Event::Go);
+    ctx.trace.clear();
+
+    // Kick loops Running -> Running with no action: the state box re-executes
+    machine.handle_event(ctx, with_hooks::Def::Event::Kick);
+
+    EXPECT_EQ(ctx.trace.size(), 2);
+    EXPECT_EQ(ctx.trace[0], "exit_running");
+    EXPECT_EQ(ctx.trace[1], "enter_running");
+    EXPECT_EQ(machine.current_state(), with_hooks::Def::State::Running);
+}
+
+TEST(sm_hooks, hook_only_self_transition_notifies_observer)
+{
+    using Obs = RecordingObserver<with_hooks::Def>;
+    std::vector<Obs::Transition> transitions;
+    Obs obs{&transitions};
+
+    with_hooks::Context ctx;
+    StateMachine<with_hooks::Def, with_hooks::table, Obs> machine{obs};
+
+    machine.handle_event(ctx, with_hooks::Def::Event::Go);
+    size_t const count_after_go = transitions.size();
+
+    // Kick has no action and no state change, but hooks ran -> notify
+    machine.handle_event(ctx, with_hooks::Def::Event::Kick);
+
+    EXPECT_EQ(transitions.size(), count_after_go + 1);
+    EXPECT_EQ(transitions.back().old_state, with_hooks::Def::State::Running);
+    EXPECT_EQ(transitions.back().new_state, with_hooks::Def::State::Running);
+    EXPECT_TRUE(transitions.back().action_name.empty());
+}
+
+TEST(sm_hooks, start_runs_initial_entry_hook_and_uct_chain)
+{
+    with_hooks::Context ctx;
+    with_hooks::Machine machine;
+
+    // Begin has no entry hook; the UCT chain lands in Idle firing its hook
+    machine.start(ctx);
+
+    EXPECT_EQ(ctx.trace.size(), 1);
+    EXPECT_EQ(ctx.trace[0], "enter_idle");
+    EXPECT_EQ(machine.current_state(), with_hooks::Def::State::Idle);
+}
+
+TEST(sm_hooks, reset_is_hard_and_runs_no_hooks)
+{
+    with_hooks::Context ctx;
+    with_hooks::Machine machine;
+
+    machine.handle_event(ctx, with_hooks::Def::Event::Go);
+    ctx.trace.clear();
+
+    machine.reset();
+
+    EXPECT_TRUE(ctx.trace.empty());
+    EXPECT_EQ(machine.current_state(), with_hooks::Def::State::Begin);
+}
+
+TEST(sm_hooks, dot_renders_hooks_in_state_nodes)
+{
+    constexpr auto dot = generate_dot<with_hooks::Machine>();
+    auto const view = dot.view();
+
+    EXPECT_TRUE(view.find("<i>entry / enter_running()</i>") != std::string_view::npos);
+    EXPECT_TRUE(view.find("<i>exit / exit_running()</i>") != std::string_view::npos);
+    // Hook-free machines keep the plain node form
+    constexpr auto plain = generate_dot<with_uct::Machine>();
+    EXPECT_TRUE(plain.view().find("entry /") == std::string_view::npos);
+}
+
+TEST(sm_hooks, markdown_emits_state_hooks_table)
+{
+    constexpr auto md = generate_markdown_table<with_hooks::Machine>();
+    auto const view = md.view();
+
+    EXPECT_TRUE(view.find("| State | Entry | Exit |") != std::string_view::npos);
+    EXPECT_TRUE(view.find("| Running | enter_running() | exit_running() |") != std::string_view::npos);
+    EXPECT_TRUE(view.find("| Idle | enter_idle() | - |") != std::string_view::npos);
+
+    // Hook-free machines emit no hooks table
+    constexpr auto plain = generate_markdown_table<with_uct::Machine>();
+    EXPECT_TRUE(plain.view().find("| State | Entry | Exit |") == std::string_view::npos);
 }
 
 // Main test runner function required by create_test_sourcelist
