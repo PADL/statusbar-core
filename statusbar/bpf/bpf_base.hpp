@@ -4,12 +4,12 @@
 // SPDX-License-Identifier: MIT
 
 #include "statusbar/buffer/file_descriptor.hpp"
+#include "statusbar/sg14/inplace_function.h"
 
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -104,10 +104,11 @@ struct BpfStatistics
 //
 // Callback Type
 //
-/// Callback type for packet reception
+/// Callback type for packet reception. An inplace_function so the per-packet
+/// hot path never touches the heap; captures must fit in 64 bytes.
 /// @param frame The received Ethernet frame
 /// @param time The acquisition time association
-using BpfPacketCallback = std::function<void(std::span<uint8_t const>, AcquisitionTimeAssociation const)>;
+using BpfPacketCallback = statusbar::sg14::inplace_function<void(std::span<uint8_t const>, AcquisitionTimeAssociation const), 64>;
 
 //
 // Filter Configuration

@@ -21,9 +21,9 @@
 
 #include "statusbar/net/net_message_reactor.hpp"  // Pollable
 #include "statusbar/net/net_posix_util.hpp"       // read_interface_carrier
+#include "statusbar/sg14/inplace_function.h"
 
 #include <cstdint>
-#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -36,11 +36,12 @@ class LinkMonitor : public Pollable
   public:
     /// Fired on a transition (and on the first observed state). @p up is the new
     /// link state; @p now_ns is the reactor clock passed to tick().
-    using OnChange = std::function<void(bool up, int64_t now_ns)>;
+    /// Allocation-free inplace_function; captures must fit in 64 bytes.
+    using OnChange = statusbar::sg14::inplace_function<void(bool up, int64_t now_ns), 64>;
 
     /// Returns the current link state: true=up, false=down, nullopt=unknown
     /// (the monitor then leaves its last-known state unchanged and emits nothing).
-    using Reader = std::function<std::optional<bool>()>;
+    using Reader = statusbar::sg14::inplace_function<std::optional<bool>(), 64>;
 
     static constexpr int64_t DEFAULT_POLL_INTERVAL_NS = 500'000'000;  // 500 ms
 
