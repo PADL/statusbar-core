@@ -10,4 +10,5 @@ statusbar_add_module(
   statusbar-args
   statusbar-config
   TESTS
-  sm_test.cpp)
+  sm_test.cpp
+  sm_dsl_test.cpp)

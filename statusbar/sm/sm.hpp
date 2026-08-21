@@ -14,10 +14,13 @@
 //   entry; self-transitions re-run both; compiled out when unused)
 // - Pluggable observers for instrumentation/logging
 // - Compile-time DOT graph and Markdown table generation
+// - Compile-time string DSL (sm_dsl.hpp): arrow-grammar text parsed by a
+//   consteval front-end into the same TransitionTable
 //
 // Module structure:
 //   :base     - Enum traits, reflection helpers, FixedString
 //   :core     - Transition, TransitionTable, Observer, StateMachine
+//   :dsl      - consteval string-grammar parser producing TransitionTable
 //   :dot      - DOT graph generation
 //   :markdown - Markdown table generation
 //   :registry - Type-erased registry for documentation tools
@@ -26,6 +29,7 @@
 #include "statusbar/sm/sm_base.hpp"
 #include "statusbar/sm/sm_core.hpp"
 #include "statusbar/sm/sm_dot.hpp"
+#include "statusbar/sm/sm_dsl.hpp"
 #include "statusbar/sm/sm_markdown.hpp"
 #include "statusbar/sm/sm_registry.hpp"
 #include "statusbar/sm/sm_tool.hpp"
