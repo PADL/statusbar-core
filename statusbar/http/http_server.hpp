@@ -30,6 +30,7 @@
 #include "statusbar/http/http_limits.hpp"
 #include "statusbar/http/http_parser.hpp"
 #include "statusbar/http/http_static.hpp"
+#include "statusbar/http/http_ws.hpp"
 #include "statusbar/net/net_tcp_server.hpp"
 
 #include <cstdint>
@@ -105,6 +106,24 @@ class HttpServer
     /// with '/'. The handler is borrowed and must outlive the server.
     [[nodiscard]] auto add_route(HttpMethod method, std::string path, HttpHandler& handler) -> bool;
 
+    /// Register a WebSocket endpoint for @p path — before the reactor
+    /// runs (this sizes the per-slot reassembly buffers). A valid GET
+    /// upgrade answers 101 and flips the slot to WebSocket mode; a plain
+    /// GET on the path answers 426.
+    [[nodiscard]] auto add_ws_route(std::string path, WsEndpoint& endpoint) -> bool;
+
+    /// Send one WebSocket message frame. Refusal-based: false when the
+    /// slot is not an open WebSocket, is mid-close, is still draining the
+    /// previous frame, or (for the copying form) the payload does not fit
+    /// the tx buffer. ws_send_external references the span instead —
+    /// keep it stable until the frame finishes sending.
+    [[nodiscard]] auto ws_send(size_t slot, std::span<uint8_t const> payload, bool is_text) noexcept -> bool;
+    [[nodiscard]] auto ws_send_external(size_t slot, std::span<uint8_t const> payload, bool is_text) noexcept -> bool;
+
+    /// Begin the close handshake: send a close frame with @p code, then
+    /// close the connection once it drains.
+    void ws_close(size_t slot, uint16_t code) noexcept;
+
     /// Complete a held (asynchronous) request: valid only for a slot
     /// whose handler returned from on_complete without sending. Returns
     /// a writer bound to that slot, or nullopt when the slot is not
@@ -156,6 +175,12 @@ class HttpServer
         HttpHandler* handler;
     };
 
+    struct WsRoute
+    {
+        std::string path;
+        WsEndpoint* endpoint;
+    };
+
     struct Connection
     {
         std::vector<uint8_t> rx;  ///< head + buffered body + pipelined tail
@@ -181,6 +206,18 @@ class HttpServer
         bool head_started{false};
         int64_t head_start_ns{0};
         int64_t idle_since_ns{0};
+
+        // -- WebSocket mode --
+        std::vector<uint8_t> ws_msg;  ///< fragment reassembly (sized by add_ws_route)
+        WsEndpoint* ws_endpoint{nullptr};
+        size_t ws_msg_len{0};
+        WsOpcode ws_msg_opcode{WsOpcode::text};
+        bool ws_mode{false};
+        bool ws_fragmented{false};
+        bool ws_closing{false};
+        bool upgrade_pending{false};
+        int64_t ws_last_rx_ns{0};
+        int64_t ws_last_ping_ns{0};
     };
 
     // -- TcpConnectionHandler --
@@ -197,6 +234,15 @@ class HttpServer
     void pump_tx(size_t slot, int64_t now_ns);
     void next_request(size_t slot, int64_t now_ns);
 
+    // WebSocket engine.
+    void try_upgrade(size_t slot, HttpRequest const& request, WsRoute const& route, int64_t now_ns);
+    void enter_ws_mode(size_t slot, int64_t now_ns);
+    void ws_process(size_t slot, int64_t now_ns);
+    auto ws_stage_frame(size_t slot, WsOpcode opcode, std::span<uint8_t const> payload, bool external, int64_t now_ns) noexcept
+        -> bool;
+    void ws_fail(size_t slot, uint16_t code, int64_t now_ns);
+    [[nodiscard]] auto find_ws_route(std::string_view path) const noexcept -> WsRoute const*;
+
     // ResponseWriter backends.
     auto writer_add_header(size_t slot, std::string_view name, std::string_view value) noexcept -> bool;
     auto writer_send(
@@ -210,6 +256,7 @@ class HttpServer
     HttpLimits limits_;
     StaticManifest const* static_{nullptr};
     std::vector<Route> routes_;  ///< registered before start
+    std::vector<WsRoute> ws_routes_;
     std::vector<Connection> connections_;
     std::vector<HttpParser> parsers_;
     std::vector<uint8_t> discard_;

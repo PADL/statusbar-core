@@ -3,6 +3,8 @@
 
 #include "statusbar/http/http_server.hpp"
 
+#include "statusbar/http/http_sha1.hpp"
+
 #include <unistd.h>
 
 #include <algorithm>
@@ -55,6 +57,20 @@ namespace {
         default:
             return "Status";
     }
+}
+
+[[nodiscard]] auto iequals(std::string_view a, std::string_view b) noexcept -> bool
+{
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        auto const lower = [](char c) { return (c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : c; };
+        if (lower(a[i]) != lower(b[i])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 [[nodiscard]] auto method_name(HttpMethod method) noexcept -> char const*
@@ -149,6 +165,37 @@ auto HttpServer::add_route(HttpMethod method, std::string path, HttpHandler& han
     return true;
 }
 
+auto HttpServer::add_ws_route(std::string path, WsEndpoint& endpoint) -> bool
+{
+    if (path.empty() || path.front() != '/') {
+        return false;
+    }
+    for (auto const& route : ws_routes_) {
+        if (route.path == path) {
+            return false;
+        }
+    }
+    // First WebSocket route: size the per-slot reassembly buffers (still
+    // startup — the reactor is not running yet).
+    if (!connections_.empty() && connections_.front().ws_msg.empty()) {
+        for (auto& c : connections_) {
+            c.ws_msg.resize(limits_.max_ws_message);
+        }
+    }
+    ws_routes_.push_back(WsRoute{.path = std::move(path), .endpoint = &endpoint});
+    return true;
+}
+
+auto HttpServer::find_ws_route(std::string_view path) const noexcept -> WsRoute const*
+{
+    for (auto const& route : ws_routes_) {
+        if (route.path == path) {
+            return &route;
+        }
+    }
+    return nullptr;
+}
+
 auto HttpServer::find_route(HttpMethod method, std::string_view path) const noexcept -> HttpHandler*
 {
     for (auto const& route : routes_) {
@@ -218,6 +265,12 @@ void HttpServer::on_accept(size_t slot, net::SocketAddress const& /*peer*/, int6
     c.head_started = false;
     c.head_start_ns = 0;
     c.idle_since_ns = now_ns;
+    c.ws_endpoint = nullptr;
+    c.ws_msg_len = 0;
+    c.ws_mode = false;
+    c.ws_fragmented = false;
+    c.ws_closing = false;
+    c.upgrade_pending = false;
     parsers_[slot].reset();
 }
 
@@ -230,9 +283,15 @@ void HttpServer::on_writable(size_t slot, int64_t now_ns)
 {
     if (connections_[slot].state == ConnState::sending) {
         pump_tx(slot, now_ns);
-        // A drained response may leave a pipelined request already
-        // buffered; no readable event will come for it.
-        if (pool_.is_open(slot) && connections_[slot].state == ConnState::reading_head) {
+        if (!pool_.is_open(slot)) {
+            return;
+        }
+        auto& c = connections_[slot];
+        if (c.ws_mode && c.tx_sent >= c.tx_len && c.body_sent >= c.body_size) {
+            ws_process(slot, now_ns);  // frames queued behind the drained frame
+        } else if (c.state == ConnState::reading_head) {
+            // A drained response may leave a pipelined request already
+            // buffered; no readable event will come for it.
             process(slot, now_ns);
         }
     }
@@ -240,8 +299,14 @@ void HttpServer::on_writable(size_t slot, int64_t now_ns)
 
 void HttpServer::on_closed(size_t slot, int64_t /*now_ns*/)
 {
-    connections_[slot].state = ConnState::reading_head;
-    connections_[slot].handler = nullptr;
+    auto& c = connections_[slot];
+    if (c.ws_mode && c.ws_endpoint != nullptr) {
+        c.ws_endpoint->on_ws_closed(slot);
+    }
+    c.state = ConnState::reading_head;
+    c.handler = nullptr;
+    c.ws_mode = false;
+    c.ws_endpoint = nullptr;
 }
 
 void HttpServer::tick(int64_t now_ns)
@@ -251,7 +316,18 @@ void HttpServer::tick(int64_t now_ns)
         if (!pool_.is_open(slot)) {
             continue;
         }
-        auto const& c = connections_[slot];
+        auto& c = connections_[slot];
+        if (c.ws_mode) {
+            if ((now_ns - c.ws_last_rx_ns) > limits_.ws_drop_ns) {
+                pool_.close(slot);
+            } else if (
+                (now_ns - c.ws_last_rx_ns) > limits_.ws_ping_ns && (now_ns - c.ws_last_ping_ns) > limits_.ws_ping_ns &&
+                c.tx_sent >= c.tx_len && c.body_sent >= c.body_size && !c.ws_closing) {
+                c.ws_last_ping_ns = now_ns;
+                (void)ws_stage_frame(slot, WsOpcode::ping, {}, false, now_ns);
+            }
+            continue;
+        }
         if (c.state == ConnState::reading_head && c.head_started && (now_ns - c.head_start_ns) > limits_.header_read_timeout_ns) {
             respond_status(slot, 408, true, now_ns);
         } else if (
@@ -265,6 +341,10 @@ void HttpServer::process(size_t slot, int64_t now_ns)
 {
     auto& c = connections_[slot];
     auto& parser = parsers_[slot];
+    if (c.ws_mode) {
+        ws_process(slot, now_ns);
+        return;
+    }
     while (pool_.is_open(slot)) {
         switch (c.state) {
             case ConnState::sending:
@@ -348,12 +428,19 @@ void HttpServer::handle_complete_head(size_t slot, int64_t now_ns)
     uint64_t const body_len = request.has_content_length ? request.content_length : 0;
     uint64_t const body_in_rx = std::min<uint64_t>(body_len, c.rx_len - head_len);
 
-    c.handler = find_route(request.method, request.path);
     c.suppress_body = request.method == HttpMethod::head;
     c.pending_status = 0;
     c.response_staged = false;
     c.extra_len = 0;
 
+    if (request.method == HttpMethod::get && body_len == 0) {
+        if (auto const* ws_route = find_ws_route(request.path)) {
+            try_upgrade(slot, request, *ws_route, now_ns);
+            return;
+        }
+    }
+
+    c.handler = find_route(request.method, request.path);
     if (c.handler != nullptr) {
         ResponseWriter writer{*this, slot};
         auto const disposition = c.handler->on_headers(request, writer);
@@ -662,6 +749,14 @@ void HttpServer::pump_tx(size_t slot, int64_t now_ns)
         pool_.close(slot);
         return;
     }
+    if (c.upgrade_pending) {
+        c.upgrade_pending = false;
+        enter_ws_mode(slot, now_ns);
+        return;
+    }
+    if (c.ws_mode) {
+        return;  // frame drained; callers resume ws_process where needed
+    }
     next_request(slot, now_ns);
 }
 
@@ -688,6 +783,237 @@ void HttpServer::next_request(size_t slot, int64_t now_ns)
     // No recursive process() here: when this runs inside process()'s loop
     // the loop parses the leftover on its next iteration; the on_writable
     // and async-respond paths process explicitly afterwards.
+}
+
+// ---- WebSocket engine -----------------------------------------------------
+
+void HttpServer::try_upgrade(size_t slot, HttpRequest const& request, WsRoute const& route, int64_t now_ns)
+{
+    auto& c = connections_[slot];
+    auto const upgrade = request.header("upgrade");
+    auto const key = request.header("sec-websocket-key");
+    auto const version = request.header("sec-websocket-version");
+    if (upgrade.empty()) {
+        respond_status(slot, 426, !request.keep_alive, now_ns);  // plain GET on a WS path
+        return;
+    }
+    if (!iequals(upgrade, "websocket") || key.empty() || version != "13") {
+        respond_status(slot, 400, true, now_ns);
+        return;
+    }
+    auto const accept = ws_accept_key(key);
+    int const n = snprintf(
+        reinterpret_cast<char*>(c.tx.data()),  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+        c.tx.size(),
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: %.*s\r\n"
+        "\r\n",
+        int(accept.view().size()),
+        accept.view().data());
+    c.tx_len = std::min(size_t(n), c.tx.size());
+    c.tx_sent = 0;
+    c.leftover_at = parsers_[slot].consumed();
+    c.ws_endpoint = route.endpoint;
+    c.upgrade_pending = true;
+    c.close_after_send = false;
+    c.state = ConnState::sending;
+    pump_tx(slot, now_ns);
+}
+
+void HttpServer::enter_ws_mode(size_t slot, int64_t now_ns)
+{
+    auto& c = connections_[slot];
+    // The endpoint sees the request before rx is compacted (its views
+    // die with the compaction).
+    c.ws_mode = true;
+    c.ws_msg_len = 0;
+    c.ws_fragmented = false;
+    c.ws_closing = false;
+    c.ws_last_rx_ns = now_ns;
+    c.ws_last_ping_ns = now_ns;
+    if (c.ws_endpoint != nullptr) {
+        c.ws_endpoint->on_ws_open(slot, parsers_[slot].request());
+    }
+    size_t const leftover = c.rx_len > c.leftover_at ? c.rx_len - c.leftover_at : 0;
+    if (leftover > 0) {
+        std::memmove(c.rx.data(), c.rx.data() + c.leftover_at, leftover);
+    }
+    c.rx_len = leftover;
+    c.leftover_at = 0;
+    if (pool_.is_open(slot)) {
+        ws_process(slot, now_ns);  // frames may have ridden in with the upgrade
+    }
+}
+
+void HttpServer::ws_fail(size_t slot, uint16_t code, int64_t now_ns)
+{
+    auto& c = connections_[slot];
+    uint8_t reason[2] = {uint8_t(code >> 8), uint8_t(code)};
+    c.ws_closing = true;
+    c.close_after_send = true;
+    (void)ws_stage_frame(slot, WsOpcode::close, std::span<uint8_t const>{reason, 2}, false, now_ns);
+}
+
+auto HttpServer::ws_stage_frame(
+    size_t slot, WsOpcode opcode, std::span<uint8_t const> payload, bool external, int64_t now_ns) noexcept -> bool
+{
+    auto& c = connections_[slot];
+    if (c.tx_sent < c.tx_len || c.body_sent < c.body_size) {
+        return false;  // previous frame still draining — refuse, never queue
+    }
+    auto const header_len = ws_write_frame_header(c.tx, opcode, true, payload.size());
+    if (header_len == 0) {
+        return false;
+    }
+    c.tx_len = header_len;
+    c.tx_sent = 0;
+    c.body_map = {};
+    c.body_fd = -1;
+    c.body_size = 0;
+    c.body_sent = 0;
+    if (!payload.empty()) {
+        if (external) {
+            c.body_map = payload;
+            c.body_size = payload.size();
+        } else {
+            if (header_len + payload.size() > c.tx.size()) {
+                return false;
+            }
+            std::memcpy(c.tx.data() + c.tx_len, payload.data(), payload.size());
+            c.tx_len += payload.size();
+        }
+    }
+    c.state = ConnState::sending;
+    pump_tx(slot, now_ns);
+    return true;
+}
+
+auto HttpServer::ws_send(size_t slot, std::span<uint8_t const> payload, bool is_text) noexcept -> bool
+{
+    if (slot >= connections_.size() || !pool_.is_open(slot) || !connections_[slot].ws_mode || connections_[slot].ws_closing) {
+        return false;
+    }
+    return ws_stage_frame(slot, is_text ? WsOpcode::text : WsOpcode::binary, payload, false, connections_[slot].ws_last_rx_ns);
+}
+
+auto HttpServer::ws_send_external(size_t slot, std::span<uint8_t const> payload, bool is_text) noexcept -> bool
+{
+    if (slot >= connections_.size() || !pool_.is_open(slot) || !connections_[slot].ws_mode || connections_[slot].ws_closing) {
+        return false;
+    }
+    return ws_stage_frame(slot, is_text ? WsOpcode::text : WsOpcode::binary, payload, true, connections_[slot].ws_last_rx_ns);
+}
+
+void HttpServer::ws_close(size_t slot, uint16_t code) noexcept
+{
+    if (slot >= connections_.size() || !pool_.is_open(slot) || !connections_[slot].ws_mode || connections_[slot].ws_closing) {
+        return;
+    }
+    ws_fail(slot, code, connections_[slot].ws_last_rx_ns);
+}
+
+void HttpServer::ws_process(size_t slot, int64_t now_ns)
+{
+    auto& c = connections_[slot];
+    while (pool_.is_open(slot) && !(c.tx_sent < c.tx_len || c.body_sent < c.body_size)) {
+        WsFrameHeader header;
+        auto const parsed = ws_parse_frame_header(std::span<uint8_t const>{c.rx.data(), c.rx_len}, header);
+        if (parsed == WsParse::protocol_error) {
+            ws_fail(slot, 1002, now_ns);
+            return;
+        }
+        bool need_bytes = parsed == WsParse::need_more;
+        if (!need_bytes) {
+            if (header.payload_len > limits_.max_ws_message || header.header_len + header.payload_len > c.rx.size()) {
+                ws_fail(slot, 1009, now_ns);
+                return;
+            }
+            need_bytes = c.rx_len < header.header_len + header.payload_len;
+        }
+        if (need_bytes) {
+            auto n = pool_.read(slot, std::span<uint8_t>{c.rx.data() + c.rx_len, c.rx.size() - c.rx_len});
+            if (!n) {
+                return;  // would_block
+            }
+            if (*n == 0) {
+                pool_.close(slot);
+                return;
+            }
+            c.rx_len += *n;
+            c.ws_last_rx_ns = now_ns;
+            continue;
+        }
+        if (!header.masked) {
+            ws_fail(slot, 1002, now_ns);  // client frames must be masked
+            return;
+        }
+        auto payload = std::span<uint8_t>{c.rx.data() + header.header_len, size_t(header.payload_len)};
+        ws_unmask(payload, header.mask);
+        c.ws_last_rx_ns = now_ns;
+
+        bool close_now = false;
+        switch (header.opcode) {
+            case WsOpcode::ping:
+                (void)ws_stage_frame(slot, WsOpcode::pong, payload, false, now_ns);
+                break;
+            case WsOpcode::pong:
+                break;  // liveness already updated
+            case WsOpcode::close: {
+                if (c.ws_closing) {
+                    close_now = true;  // our close was already sent
+                    break;
+                }
+                uint16_t const code = payload.size() >= 2 ? uint16_t((uint16_t(payload[0]) << 8) | payload[1]) : uint16_t(1000);
+                ws_fail(slot, code, now_ns);
+                break;
+            }
+            case WsOpcode::text:
+            case WsOpcode::binary:
+                if (c.ws_fragmented) {
+                    ws_fail(slot, 1002, now_ns);  // new message inside a fragment
+                    return;
+                }
+                c.ws_msg_opcode = header.opcode;
+                c.ws_msg_len = 0;
+                [[fallthrough]];
+            case WsOpcode::continuation: {
+                if (header.opcode == WsOpcode::continuation && !c.ws_fragmented) {
+                    ws_fail(slot, 1002, now_ns);  // continuation of nothing
+                    return;
+                }
+                if (c.ws_msg_len + payload.size() > c.ws_msg.size()) {
+                    ws_fail(slot, 1009, now_ns);
+                    return;
+                }
+                std::memcpy(c.ws_msg.data() + c.ws_msg_len, payload.data(), payload.size());
+                c.ws_msg_len += payload.size();
+                c.ws_fragmented = !header.fin;
+                break;
+            }
+        }
+
+        // Consume the frame before any callback so re-entrant sends see a
+        // consistent buffer.
+        size_t const frame_len = header.header_len + size_t(header.payload_len);
+        std::memmove(c.rx.data(), c.rx.data() + frame_len, c.rx_len - frame_len);
+        c.rx_len -= frame_len;
+
+        if (close_now) {
+            pool_.close(slot);
+            return;
+        }
+        bool const message_done = !ws_is_control(header.opcode) && header.fin;
+        if (message_done && c.ws_endpoint != nullptr) {
+            c.ws_endpoint->on_ws_message(
+                slot, std::span<uint8_t const>{c.ws_msg.data(), c.ws_msg_len}, c.ws_msg_opcode == WsOpcode::text);
+            if (!pool_.is_open(slot)) {
+                return;
+            }
+            c.ws_msg_len = 0;
+        }
+    }
 }
 
 }  // namespace statusbar::http

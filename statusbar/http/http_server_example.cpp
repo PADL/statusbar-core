@@ -13,6 +13,7 @@
 
 #include "statusbar/http/http_server.hpp"
 #include "statusbar/http/http_static.hpp"
+#include "statusbar/http/http_ws.hpp"
 #include "statusbar/itc/itc_stop_token.hpp"
 #include "statusbar/net/net_message_reactor.hpp"
 #include "statusbar/net/net_server_config.hpp"
@@ -38,6 +39,24 @@ class ExampleServer : public http::HttpServer
     {
         return request.path == "/health" ? 200 : 404;
     }
+};
+
+/// /ws echoes every message back — point a browser's `new WebSocket()`
+/// at it, or wscat.
+class WsEcho : public http::WsEndpoint
+{
+  public:
+    explicit WsEcho(ExampleServer*& server)
+        : server_{server}
+    {}
+
+    void on_ws_message(size_t slot, std::span<uint8_t const> payload, bool is_text) override
+    {
+        (void)server_->ws_send_external(slot, payload, is_text);
+    }
+
+  private:
+    ExampleServer*& server_;
 };
 
 }  // namespace
@@ -79,6 +98,12 @@ auto main(int argc, char** argv) -> int
         std::println(stderr, "Serving {} static route(s) from {}", manifest->size(), manifest_path);
     }
     auto server = std::make_unique<ExampleServer>(*addr, limits, manifest ? &*manifest : nullptr);
+    static ExampleServer* server_raw = server.get();
+    static WsEcho ws_echo{server_raw};
+    if (!server->add_ws_route("/ws", ws_echo)) {
+        std::println(stderr, "Error: cannot register /ws");
+        return 1;
+    }
     if (!server->valid()) {
         std::println(stderr, "Error: Failed to listen on {}:{}", sc.bind_host, sc.port);
         return 1;
