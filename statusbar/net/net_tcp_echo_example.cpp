@@ -7,29 +7,26 @@
 /// - A-Z converted to Z-A (A->Z, B->Y, C->X, ...)
 /// - 0-9 converted to 9-0 (0->9, 1->8, 2->7, ...)
 ///
-/// Uses a single TcpEchoPollable with MessageReactor:
-/// The listener fd is polled by the reactor; client I/O is handled in tick().
+/// Built on TcpConnectionPool: the pool is ONE Pollable in the
+/// MessageReactor whose fd is a readiness multiplexer over the listener
+/// and every client, so client I/O is event-driven (no tick-cadence
+/// latency), connection slots are fixed at startup, and short writes are
+/// completed through on_writable instead of being dropped.
 ///
 /// Usage: statusbar-net-tcp-echo --bind=0.0.0.0 --port=8080
 /// Config: statusbar-net-tcp-echo --config-load=echo.toml
 
 #include "statusbar/itc/itc_stop_token.hpp"
-#include "statusbar/net/net_address.hpp"
 #include "statusbar/net/net_message_reactor.hpp"
 #include "statusbar/net/net_server_config.hpp"
-#include "statusbar/net/net_socket.hpp"
+#include "statusbar/net/net_tcp_server.hpp"
 
-#include <poll.h>
-#include <unistd.h>
-
-#include <algorithm>
 #include <array>
-#include <cerrno>
 #include <cstdint>
+#include <memory>
 #include <print>
+#include <span>
 #include <vector>
-
-#include <sys/socket.h>
 
 using namespace statusbar::net;
 
@@ -51,143 +48,115 @@ namespace {
     return ch;
 }
 
-/// A connected TCP client
-struct Client
-{
-    int fd{-1};
-    SocketAddress peer{};
-
-    void close_fd() noexcept
-    {
-        if (fd >= 0) {
-            ::close(fd);
-            fd = -1;
-        }
-    }
-};
-
-/// TCP echo server implementing Pollable for MessageReactor.
-///
-/// The listener fd is polled by the reactor (on_ready accepts new clients).
-/// Client I/O is handled in tick() using non-blocking reads/writes.
-class TcpEchoPollable : public Pollable
+/// Echo handler with a fixed per-slot pending buffer: a short write keeps
+/// the remainder and finishes from on_writable — nothing is dropped, and
+/// nothing allocates after construction.
+class MirrorEcho : public TcpConnectionHandler
 {
   public:
-    TcpEchoPollable(SocketAddress const& bind_addr, size_t max_clients, int dscp = -1)
-        : max_clients_{max_clients}
-        , dscp_{dscp}
+    explicit MirrorEcho(size_t max_clients)
+        : pending_(max_clients)
+    {}
+
+    void bind(TcpConnectionPool& pool) { pool_ = &pool; }
+
+    void on_accept(size_t slot, SocketAddress const& peer, int64_t) override
     {
-        auto result = create_tcp_listener(bind_addr);
-        if (result) {
-            listener_fd_ = result->release();
-            (void)set_nonblocking(listener_fd_);
-        }
+        pending_[slot].len = 0;
+        std::println(stderr, "Client {} connected (slot={})", peer.to_string(), slot);
     }
 
-    ~TcpEchoPollable() override
+    void on_readable(size_t slot, int64_t) override
     {
-        for (auto& c : clients_) {
-            c.close_fd();
-        }
-        if (listener_fd_ >= 0) {
-            ::close(listener_fd_);
-        }
-    }
-
-    // No copy
-    TcpEchoPollable(TcpEchoPollable const&) = delete;
-    auto operator=(TcpEchoPollable const&) -> TcpEchoPollable& = delete;
-
-    [[nodiscard]] auto fd() const noexcept -> int override { return listener_fd_; }
-
-    void on_ready(int64_t /*now_ns*/) override
-    {
-        // Accept new connections
-        while (true) {
-            SocketAddress peer;
-            peer.reset_length();
-
-            int const client_fd = ::accept(listener_fd_, peer.sockaddr(), peer.length_ptr());
-            if (client_fd < 0) {
-                break;  // No more pending connections (or error)
+        auto& pend = pending_[slot];
+        for (;;) {
+            if (pend.len > 0) {
+                return;  // backpressured: finish the pending echo first
             }
-
-            if (clients_.size() >= max_clients_) {
-                // At capacity — reject
-                ::close(client_fd);
-                std::println(stderr, "Rejected client {} (at capacity {})", peer.to_string(), max_clients_);
-                continue;
+            std::array<uint8_t, 4096> buf{};
+            auto n = pool_->read(slot, buf);
+            if (!n) {
+                return;  // would_block (a dead socket surfaces as EOF/error next event)
             }
-
-            (void)set_nonblocking(client_fd);
-
-            if (dscp_ >= 0) {
-                (void)set_dscp(client_fd, peer.family(), static_cast<uint8_t>(dscp_));
+            if (*n == 0) {
+                pool_->close(slot);
+                return;
             }
-
-            std::println(stderr, "Client {} connected (fd={})", peer.to_string(), client_fd);
-            clients_.push_back(Client{.fd = client_fd, .peer = peer});
-        }
-    }
-
-    void tick(int64_t /*now_ns*/) override
-    {
-        // Process I/O for each connected client
-        // Iterate in reverse so we can remove disconnected clients in-place
-        for (size_t i = clients_.size(); i > 0; --i) {
-            auto& client = clients_[i - 1];
-
-            // Non-blocking read
-            std::array<uint8_t, 1024> buf{};
-            ssize_t const n = ::recv(client.fd, buf.data(), buf.size(), 0);
-
-            if (n > 0) {
-                // Transform and echo
-                auto const len = static_cast<size_t>(n);
-                for (size_t j = 0; j < len; ++j) {
-                    buf[j] = mirror_char(buf[j]);
-                }
-                // Best-effort send
-                (void)::send(client.fd, buf.data(), len, 0);
-            } else if (n == 0) {
-                // EOF — client disconnected
-                std::println(stderr, "Client {} disconnected (EOF)", client.peer.to_string());
-                client.close_fd();
-                clients_.erase(clients_.begin() + static_cast<ptrdiff_t>(i - 1));
-            } else {
-                // n < 0
-                if (!would_block() && !was_interrupted()) {
-                    // Real error — disconnect
-                    std::println(stderr, "Client {} error, disconnecting", client.peer.to_string());
-                    client.close_fd();
-                    clients_.erase(clients_.begin() + static_cast<ptrdiff_t>(i - 1));
-                }
-                // EAGAIN/EINTR — no data yet, continue
+            for (size_t i = 0; i < *n; ++i) {
+                buf[i] = mirror_char(buf[i]);
+            }
+            auto sent = pool_->write(slot, std::span<uint8_t const>{buf.data(), *n});
+            if (!sent) {
+                pool_->close(slot);
+                return;
+            }
+            if (*sent < *n) {
+                pend.len = *n - *sent;
+                std::copy_n(buf.begin() + long(*sent), pend.len, pend.bytes.begin());
+                return;  // on_writable continues
             }
         }
     }
 
-    [[nodiscard]] auto finished() const noexcept -> bool override { return false; }
-
-    /// Get the listener's local address (resolves port 0).
-    [[nodiscard]] auto local_addr() const -> statusbar::StatusValue<SocketAddress>
+    void on_writable(size_t slot, int64_t now_ns) override
     {
-        if (listener_fd_ < 0) {
-            return statusbar::failure(NetError::not_connected);
+        auto& pend = pending_[slot];
+        if (pend.len == 0) {
+            return;
         }
-        SocketAddress addr;
-        addr.reset_length();
-        if (::getsockname(listener_fd_, addr.sockaddr(), addr.length_ptr()) < 0) {
-            return statusbar::failure(NetError::bind_failed);
+        auto sent = pool_->write(slot, std::span<uint8_t const>{pend.bytes.data(), pend.len});
+        if (!sent) {
+            pool_->close(slot);
+            return;
         }
-        return addr;
+        std::copy(pend.bytes.begin() + long(*sent), pend.bytes.begin() + long(pend.len), pend.bytes.begin());
+        pend.len -= *sent;
+        if (pend.len == 0) {
+            on_readable(slot, now_ns);  // resume anything the backpressure paused
+        }
+    }
+
+    void on_closed(size_t slot, int64_t) override
+    {
+        std::println(stderr, "Client {} disconnected (slot={})", pool_->peer(slot).to_string(), slot);
+    }
+
+    void on_rejected(SocketAddress const& peer, int64_t) override
+    {
+        std::println(stderr, "Rejected client {} (at capacity)", peer.to_string());
     }
 
   private:
-    int listener_fd_{-1};
-    size_t max_clients_;
-    int dscp_;
-    std::vector<Client> clients_;
+    struct Pending
+    {
+        std::array<uint8_t, 4096> bytes{};
+        size_t len{0};
+    };
+
+    TcpConnectionPool* pool_{nullptr};
+    std::vector<Pending> pending_;  ///< sized once, at construction
+};
+
+/// Adapts the pool + handler pair into the reactor's ownership model.
+class EchoPollable : public Pollable
+{
+  public:
+    EchoPollable(SocketAddress const& bind_addr, size_t max_clients, int dscp)
+        : handler_{max_clients}
+        , pool_{bind_addr, max_clients, handler_, TcpServerOptions{.dscp = dscp}}
+    {
+        handler_.bind(pool_);
+    }
+
+    [[nodiscard]] auto pool() -> TcpConnectionPool& { return pool_; }
+    [[nodiscard]] auto fd() const noexcept -> int override { return pool_.fd(); }
+    void on_ready(int64_t now_ns) override { pool_.on_ready(now_ns); }
+    void tick(int64_t now_ns) override { pool_.tick(now_ns); }
+    [[nodiscard]] auto finished() const noexcept -> bool override { return false; }
+
+  private:
+    MirrorEcho handler_;
+    TcpConnectionPool pool_;
 };
 
 }  // namespace
@@ -203,15 +172,13 @@ auto main(int argc, char** argv) -> int
         return 1;
     }
 
-    auto handler = std::make_unique<TcpEchoPollable>(*addr, sc.max_clients, sc.dscp);
-
-    if (handler->fd() < 0) {
+    auto handler = std::make_unique<EchoPollable>(*addr, sc.max_clients, sc.dscp);
+    if (!handler->pool().valid()) {
         std::println(stderr, "Error: Failed to create TCP listener on {}:{}", sc.bind_host, sc.port);
         return 1;
     }
 
-    auto local = handler->local_addr();
-    if (local) {
+    if (auto local = handler->pool().local_addr()) {
         std::println(stderr, "Echo server listening on {}", local->to_string());
     }
     if (sc.dscp >= 0) {
