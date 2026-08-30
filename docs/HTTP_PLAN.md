@@ -1,7 +1,12 @@
 # statusbar/http — Embedded HTTP/1.1 + WebSocket Server Plan
 
-Status: DRAFT — design plan for a new core module. Milestones M0–M5 land
-in this repo; M6 is the first real consumer and lives outside core.
+Status: IMPLEMENTED — milestones M0–M5 are landed in this repo. M6 is
+the first real consumer and lives outside core. Measured on an M-series
+Mac (Release): ~210 ns per parsed request head, ~25k req/s sequential
+keep-alive on loopback (syscall-bound, client and server sharing one
+thread), ~140k req/s pipelined ×8; `statusbar-http-bench --check` gates
+regressions in CI-shaped optimized builds, and
+`http_alloc_gate_test.cpp` proves the zero-allocation steady state.
 
 ## 0. Purpose
 
