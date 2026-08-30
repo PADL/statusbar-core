@@ -3,6 +3,8 @@
 
 #include "statusbar/http/http_server.hpp"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -49,8 +51,13 @@ namespace {
 
 }  // namespace
 
-HttpServer::HttpServer(net::SocketAddress const& bind_addr, HttpLimits const& limits, net::TcpServerOptions tcp_options)
+HttpServer::HttpServer(
+    net::SocketAddress const& bind_addr,
+    HttpLimits const& limits,
+    StaticManifest const* static_manifest,
+    net::TcpServerOptions tcp_options)
     : limits_{limits}
+    , static_{static_manifest}
     , discard_(4096)
     , pool_{bind_addr, limits.max_connections, *this, [&] {
                 // The server owns connection lifetime (408 vs silent idle
@@ -80,6 +87,10 @@ void HttpServer::on_accept(size_t slot, net::SocketAddress const& /*peer*/, int6
     c.discard_remaining = 0;
     c.state = ConnState::reading_head;
     c.close_after_send = false;
+    c.body_map = {};
+    c.body_fd = -1;
+    c.body_size = 0;
+    c.body_sent = 0;
     c.head_started = false;
     c.head_start_ns = 0;
     c.idle_since_ns = now_ns;
@@ -214,8 +225,70 @@ void HttpServer::handle_complete_head(size_t slot, int64_t now_ns)
 void HttpServer::finish_body_and_respond(size_t slot, int64_t now_ns)
 {
     auto const& request = parsers_[slot].request();
+    if (static_ != nullptr && (request.method == HttpMethod::get || request.method == HttpMethod::head)) {
+        if (auto const* route = static_->find(request.path)) {
+            serve_static(slot, *route, request, now_ns);
+            return;
+        }
+    }
     auto const status = dispatch(slot, request);
     respond_status(slot, status, !request.keep_alive, now_ns);
+}
+
+void HttpServer::serve_static(size_t slot, StaticRoute const& route, HttpRequest const& request, int64_t now_ns)
+{
+    auto& c = connections_[slot];
+    bool const close_after = !request.keep_alive;
+    char const* const connection = close_after ? "close" : "keep-alive";
+
+    if (request.header("if-none-match") == route.etag) {
+        int const n = snprintf(
+            reinterpret_cast<char*>(c.tx.data()),  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+            c.tx.size(),
+            "HTTP/1.1 304 Not Modified\r\nETag: %s\r\nConnection: %s\r\n\r\n",
+            route.etag.c_str(),
+            connection);
+        c.tx_len = std::min(size_t(n), c.tx.size());
+        c.tx_sent = 0;
+        c.close_after_send = close_after;
+        c.state = ConnState::sending;
+        pump_tx(slot, now_ns);
+        return;
+    }
+
+    char cache_line[160];
+    cache_line[0] = '\0';
+    if (!route.cache_control.empty()) {
+        (void)snprintf(cache_line, sizeof cache_line, "Cache-Control: %s\r\n", route.cache_control.c_str());
+    }
+    int const n = snprintf(
+        reinterpret_cast<char*>(c.tx.data()),  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+        c.tx.size(),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %llu\r\n"
+        "ETag: %s\r\n"
+        "Last-Modified: %s\r\n"
+        "%s"
+        "Connection: %s\r\n"
+        "\r\n",
+        route.content_type.c_str(),
+        (unsigned long long)route.size,
+        route.etag.c_str(),
+        route.last_modified.c_str(),
+        cache_line,
+        connection);
+    c.tx_len = std::min(size_t(n), c.tx.size());
+    c.tx_sent = 0;
+    if (request.method == HttpMethod::get) {
+        c.body_map = route.data;
+        c.body_fd = route.fd;
+        c.body_size = route.size;
+        c.body_sent = 0;
+    }
+    c.close_after_send = close_after;
+    c.state = ConnState::sending;
+    pump_tx(slot, now_ns);
 }
 
 void HttpServer::respond_status(size_t slot, uint16_t status, bool close_after, int64_t now_ns)
@@ -238,6 +311,10 @@ void HttpServer::respond_status(size_t slot, uint16_t status, bool close_after, 
         body);
     c.tx_len = std::min(size_t(head_len), c.tx.size());
     c.tx_sent = 0;
+    c.body_map = {};
+    c.body_fd = -1;
+    c.body_size = 0;
+    c.body_sent = 0;
     c.close_after_send = close_after;
     c.state = ConnState::sending;
     pump_tx(slot, now_ns);
@@ -246,16 +323,47 @@ void HttpServer::respond_status(size_t slot, uint16_t status, bool close_after, 
 void HttpServer::pump_tx(size_t slot, int64_t now_ns)
 {
     auto& c = connections_[slot];
-    while (c.tx_sent < c.tx_len) {
-        auto n = pool_.write(slot, std::span<uint8_t const>{c.tx.data() + c.tx_sent, c.tx_len - c.tx_sent});
-        if (!n) {
-            pool_.close(slot);
-            return;
+    for (;;) {
+        // Phase 1: drain the tx buffer (response head, inline bodies, or
+        // a pread-staged chunk).
+        while (c.tx_sent < c.tx_len) {
+            auto n = pool_.write(slot, std::span<uint8_t const>{c.tx.data() + c.tx_sent, c.tx_len - c.tx_sent});
+            if (!n) {
+                pool_.close(slot);
+                return;
+            }
+            c.tx_sent += *n;
+            if (*n == 0) {
+                return;  // backpressured: on_writable continues
+            }
         }
-        c.tx_sent += *n;
-        if (*n == 0) {
-            return;  // backpressured: on_writable continues
+        // Phase 2a: mmap-backed body — written straight from the map.
+        if (!c.body_map.empty() && c.body_sent < c.body_size) {
+            auto const remaining = c.body_map.subspan(size_t(c.body_sent));
+            auto n = pool_.write(slot, remaining);
+            if (!n) {
+                pool_.close(slot);
+                return;
+            }
+            c.body_sent += *n;
+            if (c.body_sent < c.body_size) {
+                return;  // backpressured
+            }
         }
+        // Phase 2b: pread-backed body — staged through the tx buffer.
+        if (c.body_fd >= 0 && c.body_sent < c.body_size) {
+            auto const chunk = size_t(std::min<uint64_t>(c.body_size - c.body_sent, c.tx.size()));
+            auto const n = ::pread(c.body_fd, c.tx.data(), chunk, off_t(c.body_sent));
+            if (n <= 0) {
+                pool_.close(slot);  // truncated behind our back
+                return;
+            }
+            c.body_sent += uint64_t(n);
+            c.tx_len = size_t(n);
+            c.tx_sent = 0;
+            continue;  // drain the staged chunk
+        }
+        break;  // everything sent
     }
     if (c.close_after_send) {
         pool_.close(slot);

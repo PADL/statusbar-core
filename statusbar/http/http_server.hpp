@@ -29,6 +29,7 @@
 
 #include "statusbar/http/http_limits.hpp"
 #include "statusbar/http/http_parser.hpp"
+#include "statusbar/http/http_static.hpp"
 #include "statusbar/net/net_tcp_server.hpp"
 
 #include <cstdint>
@@ -41,7 +42,13 @@ class HttpServer
     , private net::TcpConnectionHandler
 {
   public:
-    HttpServer(net::SocketAddress const& bind_addr, HttpLimits const& limits, net::TcpServerOptions tcp_options = {});
+    /// @param static_manifest Optional manifest served to GET/HEAD before
+    ///        the dispatch seam; borrowed — must outlive the server.
+    HttpServer(
+        net::SocketAddress const& bind_addr,
+        HttpLimits const& limits,
+        StaticManifest const* static_manifest = nullptr,
+        net::TcpServerOptions tcp_options = {});
 
     HttpServer(HttpServer const&) = delete;
     auto operator=(HttpServer const&) -> HttpServer& = delete;
@@ -84,6 +91,10 @@ class HttpServer
         size_t tx_sent{0};
         size_t leftover_at{0};  ///< start of pipelined bytes once the request is framed
         uint64_t discard_remaining{0};
+        std::span<uint8_t const> body_map{};  ///< mmap-backed response body
+        int body_fd{-1};                      ///< pread-backed response body
+        uint64_t body_size{0};
+        uint64_t body_sent{0};
         ConnState state{ConnState::reading_head};
         bool close_after_send{false};
         bool head_started{false};  ///< first request byte seen (arms the 408 clock)
@@ -101,10 +112,12 @@ class HttpServer
     void handle_complete_head(size_t slot, int64_t now_ns);
     void finish_body_and_respond(size_t slot, int64_t now_ns);
     void respond_status(size_t slot, uint16_t status, bool close_after, int64_t now_ns);
+    void serve_static(size_t slot, StaticRoute const& route, HttpRequest const& request, int64_t now_ns);
     void pump_tx(size_t slot, int64_t now_ns);
     void next_request(size_t slot, int64_t now_ns);
 
     HttpLimits limits_;
+    StaticManifest const* static_{nullptr};
     std::vector<Connection> connections_;  ///< sized max_connections at construction
     std::vector<HttpParser> parsers_;      ///< one per slot, sized at construction
     std::vector<uint8_t> discard_;         ///< shared body-discard scratch
