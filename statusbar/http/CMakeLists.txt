@@ -12,6 +12,7 @@ statusbar_add_module(
   statusbar-net
   statusbar-toml
   TESTS
+  http_handler_test.cpp
   http_parser_test.cpp
   http_server_test.cpp
   http_static_test.cpp)
