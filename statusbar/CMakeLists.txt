@@ -59,6 +59,7 @@ add_subdirectory(itc)
 add_subdirectory(logging)
 add_subdirectory(mem)
 add_subdirectory(net)
+add_subdirectory(http)
 add_subdirectory(realtime)
 add_subdirectory(sm)
 add_subdirectory(tui)
@@ -90,6 +91,7 @@ if(NOT STATUSBAR_AGGREGATE_BUILD)
               statusbar-itc
               statusbar-mem
               statusbar-net
+              statusbar-http
               statusbar-realtime
               statusbar-sm
               statusbar-tui)
