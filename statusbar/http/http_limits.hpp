@@ -32,6 +32,10 @@ struct HttpLimits
     /// chunk by chunk) -> 413.
     size_t max_body = size_t{64} * 1024;
 
+    /// Response head + inline error/status bodies (the per-connection tx
+    /// buffer). Static and streamed bodies do not pass through it.
+    size_t max_response_head = 4096;
+
     /// Reassembled WebSocket message bytes -> close 1009.
     size_t max_ws_message = size_t{64} * 1024;
 
