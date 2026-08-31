@@ -260,7 +260,11 @@ clean, through the ci/ flow.
   GET/SET over the socket, unsolicited notifications as live updates.
   Listed here only because it shapes M3/M4 API decisions: async
   handler completion, and the `ws_send` refusal policy for meter-rate
-  streams.
+  streams. SHIPPED 2026-08-31 as atdecc-control's `widget_bridge`
+  (its PLAN §12), live-verified against real 1722.1 hardware — this
+  module's first consumer, exercising the WS layer, streaming
+  handlers, and the refusal-based send under real meter-rate
+  unsolicited traffic.
 
 ## 8. Layering rule
 
