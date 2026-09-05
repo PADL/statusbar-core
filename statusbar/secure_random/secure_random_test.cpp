@@ -44,15 +44,20 @@ TEST(statusbar_secure_random, two_calls_differ)
 
 TEST(statusbar_secure_random, small_lengths_work)
 {
-    // Exercises the loop boundary on Linux (getrandom may return short).
+    // Exercises the loop boundary on Linux (getrandom may return short). A
+    // short buffer is legitimately all-zero now and then (1 byte: 1 in 256 —
+    // this failed a CI run), so the fill check is on the union of a few draws:
+    // 8 draws of 1 byte all zero is 2^-64.
     for (size_t n : {1U, 7U, 15U, 16U, 17U, 31U, 32U, 33U, 257U}) {
         std::vector<uint8_t> buf(n, 0);
-        secure_random_bytes(buf);
         bool any_nonzero = false;
-        for (auto v : buf) {
-            if (v != 0) {
-                any_nonzero = true;
-                break;
+        for (int draw = 0; draw < 8 && !any_nonzero; ++draw) {
+            secure_random_bytes(buf);
+            for (auto v : buf) {
+                if (v != 0) {
+                    any_nonzero = true;
+                    break;
+                }
             }
         }
         EXPECT_TRUE(any_nonzero);
