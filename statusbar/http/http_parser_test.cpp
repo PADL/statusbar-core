@@ -169,6 +169,20 @@ TEST(http_parser, rejections_carry_specific_statuses)
     EXPECT_EQ(status_of("POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n"), 400);
     EXPECT_EQ(status_of("POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 99999999999999999999\r\n\r\n"), 400);  // overflow
     EXPECT_EQ(status_of("POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"), 501);
+
+    // Field values: controls are refused, obs-text (bytes >= 0x80) is
+    // not — and the verdict must not depend on the signedness of char.
+    EXPECT_EQ(
+        status_of("GET /x HTTP/1.1\r\nHost: h\r\nX-A: a\x01"
+                  "b\r\n\r\n"),
+        400);
+    EXPECT_EQ(
+        status_of("GET /x HTTP/1.1\r\nHost: h\r\nX-A: a\x7f"
+                  "b\r\n\r\n"),
+        400);
+    EXPECT_EQ(status_of("GET /x HTTP/1.1\r\nHost: h\r\nX-A: caf\xc3\xa9\r\n\r\n"), 0);
+    EXPECT_TRUE(p.request().header("x-a") == "caf\xc3\xa9");
+    EXPECT_EQ(status_of("GET /caf\xc3\xa9 HTTP/1.1\r\nHost: h\r\n\r\n"), 400);  // raw non-ASCII in the target
 }
 
 TEST(http_parser, limits_are_enforced_even_mid_line)

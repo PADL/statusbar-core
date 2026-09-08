@@ -66,6 +66,16 @@ struct Client
         }
         return out;
     }
+
+    [[nodiscard]] auto at_eof() const -> bool
+    {
+        std::array<char, 16> buf{};
+        struct pollfd pfd{.fd = fd, .events = POLLIN, .revents = 0};
+        if (::poll(&pfd, 1, 50) <= 0) {
+            return false;
+        }
+        return ::recv(fd, buf.data(), buf.size(), 0) == 0;
+    }
 };
 
 void pump(HttpServer& server, int rounds = 20, int64_t now0 = 1)
@@ -167,16 +177,75 @@ class AsyncHandler : public HttpHandler
     long held_slot{-1};
 };
 
+/// Eager: tries to answer from on_headers (refused), then answers
+/// properly from on_complete.
+class EagerHandler : public HttpHandler
+{
+  public:
+    auto on_headers(HttpRequest const&, ResponseWriter& writer) -> Disposition override
+    {
+        early_sent = writer.send(200, "text/plain", {});
+        early_marked = writer.sent();
+        return Disposition::buffer();
+    }
+
+    void on_complete(HttpRequest const&, ResponseWriter& writer) override
+    {
+        std::string_view const done{"late"};
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+        late_sent = writer.send(200, "text/plain", {reinterpret_cast<uint8_t const*>(done.data()), done.size()});
+    }
+
+    bool early_sent{true};
+    bool early_marked{true};
+    bool late_sent{false};
+};
+
+/// Overflow: builds a response the tx buffer cannot hold — a head made
+/// too long by an extra header, or an inline body that does not fit
+/// beside the head — then tries a second send.
+class OverflowHandler : public HttpHandler
+{
+  public:
+    explicit OverflowHandler(bool long_header)
+        : long_header_{long_header}
+    {}
+
+    auto on_headers(HttpRequest const&, ResponseWriter&) -> Disposition override { return Disposition::buffer(); }
+
+    void on_complete(HttpRequest const&, ResponseWriter& writer) override
+    {
+        std::string const header(300, 'h');
+        std::vector<uint8_t> const body(long_header_ ? 4 : 300, 'b');
+        if (long_header_) {
+            header_added = writer.add_header("X-Long", header);
+        }
+        first_sent = writer.send(200, "text/plain", body);
+        marked = writer.sent();
+        second_sent = writer.send(200, "text/plain", {});
+    }
+
+    bool header_added{false};
+    bool first_sent{true};
+    bool marked{false};
+    bool second_sent{true};
+
+  private:
+    bool long_header_;
+};
+
 struct Fixture
 {
     HttpLimits limits;
     std::unique_ptr<HttpServer> server;
     net::SocketAddress addr{};
 
-    explicit Fixture(size_t max_body = 64)
+    explicit Fixture(size_t max_body = 64, size_t max_response_head = 4096, int64_t keep_alive_idle_ns = 30'000'000'000)
     {
         limits.max_connections = 2;
         limits.max_body = max_body;
+        limits.max_response_head = max_response_head;
+        limits.keep_alive_idle_ns = keep_alive_idle_ns;
         server = std::make_unique<HttpServer>(net::SocketAddress::ipv4_loopback(0), limits);
         EXPECT_TRUE(server->valid());
         addr = *server->local_addr();
@@ -324,6 +393,101 @@ TEST(http_handler, handlers_take_precedence_and_head_suppresses_body)
     EXPECT_TRUE(status_line(head) == "HTTP/1.1 200 OK");
     EXPECT_TRUE(header_value(head, "Content-Length") == "7");  // "count=0"
     EXPECT_TRUE(head.ends_with("\r\n\r\n"));                   // no body bytes
+}
+
+TEST(http_handler, reject_of_an_oversize_body_answers_and_closes)
+{
+    Fixture fx{64};
+    RejectHandler teapot;
+    EXPECT_TRUE(fx.server->add_route(HttpMethod::post, "/brew", teapot));
+
+    // The declared body exceeds max_body and never arrives: the rejection
+    // must not wait to drain it (that would be an unbounded read of
+    // attacker-sized junk); it answers at once and closes.
+    Client c{fx.addr};
+    c.send_all("POST /brew HTTP/1.1\r\nHost: t\r\nContent-Length: 100000\r\n\r\n");
+    pump(*fx.server);
+    auto const response = c.recv_for(150);
+    EXPECT_TRUE(status_line(response) == "HTTP/1.1 418 I'm a teapot");
+    EXPECT_TRUE(header_value(response, "Connection") == "close");
+    EXPECT_TRUE(c.at_eof());
+    EXPECT_EQ(fx.server->active_connections(), 0U);
+}
+
+TEST(http_handler, handler_responses_keep_the_idle_clock_current)
+{
+    Fixture fx{64, 4096, 5000};
+    EchoHandler echo;
+    EXPECT_TRUE(fx.server->add_route(HttpMethod::get, "/ping", echo));
+
+    // Two requests, well apart on the injected clock. The idle timer must
+    // run from the SECOND response — a send that used a stale "now" would
+    // leave the connection looking idle since the first.
+    Client c{fx.addr};
+    c.send_all("GET /ping HTTP/1.1\r\nHost: t\r\n\r\n");
+    pump(*fx.server, 3, 100);
+    EXPECT_TRUE(status_line(c.recv_for(100)) == "HTTP/1.1 200 OK");
+    c.send_all("GET /ping HTTP/1.1\r\nHost: t\r\n\r\n");
+    pump(*fx.server, 3, 3000);
+    EXPECT_TRUE(status_line(c.recv_for(100)) == "HTTP/1.1 200 OK");
+
+    fx.server->tick(7000);  // 4000 since the second response: still alive
+    EXPECT_EQ(fx.server->active_connections(), 1U);
+    c.send_all("GET /ping HTTP/1.1\r\nHost: t\r\n\r\n");
+    pump(*fx.server, 3, 7001);
+    EXPECT_TRUE(status_line(c.recv_for(100)) == "HTTP/1.1 200 OK");
+
+    fx.server->tick(7001 + 5001);  // and now it really is idle
+    EXPECT_TRUE(c.at_eof());
+    EXPECT_EQ(fx.server->active_connections(), 0U);
+}
+
+TEST(http_handler, send_from_on_headers_is_refused)
+{
+    Fixture fx;
+    EagerHandler eager;
+    EXPECT_TRUE(fx.server->add_route(HttpMethod::post, "/eager", eager));
+
+    Client c{fx.addr};
+    c.send_all("POST /eager HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\n\r\nabc");
+    pump(*fx.server);
+    EXPECT_FALSE(eager.early_sent);
+    EXPECT_FALSE(eager.early_marked);
+    EXPECT_TRUE(eager.late_sent);
+    auto const response = c.recv_for(150);
+    EXPECT_TRUE(status_line(response) == "HTTP/1.1 200 OK");
+    EXPECT_TRUE(body_of(response) == "late");
+    EXPECT_TRUE(response.find("HTTP/1.1", 1) == std::string::npos);  // exactly one response
+
+    // The connection is intact for the next request.
+    c.send_all("POST /eager HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n");
+    pump(*fx.server);
+    EXPECT_TRUE(body_of(c.recv_for(150)) == "late");
+}
+
+TEST(http_handler, unbuildable_responses_become_a_fixed_500)
+{
+    for (bool const long_header : {true, false}) {
+        Fixture fx{64, 128};  // tx buffer: 128 bytes
+        OverflowHandler overflow{long_header};
+        EXPECT_TRUE(fx.server->add_route(HttpMethod::get, "/big", overflow));
+
+        Client c{fx.addr};
+        c.send_all("GET /big HTTP/1.1\r\nHost: t\r\n\r\n");
+        pump(*fx.server);
+        EXPECT_EQ(overflow.header_added, long_header);  // queued fine; the head is what overflows
+        EXPECT_FALSE(overflow.first_sent);
+        EXPECT_TRUE(overflow.marked);        // the 500 IS the response
+        EXPECT_FALSE(overflow.second_sent);  // single-shot still holds
+        auto const response = c.recv_for(150);
+        EXPECT_TRUE(status_line(response) == "HTTP/1.1 500 Internal Server Error");
+        EXPECT_TRUE(header_value(response, "Content-Length") == "0");
+        EXPECT_TRUE(header_value(response, "Connection") == "close");
+        EXPECT_TRUE(response.ends_with("\r\n\r\n"));
+        EXPECT_TRUE(response.find("X-Long") == std::string::npos);  // nothing of the failed head leaks
+        EXPECT_TRUE(c.at_eof());
+        EXPECT_EQ(fx.server->active_connections(), 0U);
+    }
 }
 
 TEST_MAIN(statusbar_http, http_handler_test)

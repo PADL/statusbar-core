@@ -265,6 +265,7 @@ void HttpServer::on_accept(size_t slot, net::SocketAddress const& /*peer*/, int6
     c.head_started = false;
     c.head_start_ns = 0;
     c.idle_since_ns = now_ns;
+    c.last_event_ns = now_ns;
     c.ws_endpoint = nullptr;
     c.ws_msg_len = 0;
     c.ws_mode = false;
@@ -276,11 +277,13 @@ void HttpServer::on_accept(size_t slot, net::SocketAddress const& /*peer*/, int6
 
 void HttpServer::on_readable(size_t slot, int64_t now_ns)
 {
+    connections_[slot].last_event_ns = now_ns;
     process(slot, now_ns);
 }
 
 void HttpServer::on_writable(size_t slot, int64_t now_ns)
 {
+    connections_[slot].last_event_ns = now_ns;
     if (connections_[slot].state == ConnState::sending) {
         pump_tx(slot, now_ns);
         if (!pool_.is_open(slot)) {
@@ -317,6 +320,7 @@ void HttpServer::tick(int64_t now_ns)
             continue;
         }
         auto& c = connections_[slot];
+        c.last_event_ns = now_ns;
         if (c.ws_mode) {
             if ((now_ns - c.ws_last_rx_ns) > limits_.ws_drop_ns) {
                 pool_.close(slot);
@@ -355,24 +359,16 @@ void HttpServer::process(size_t slot, int64_t now_ns)
                 if (c.body_mode == BodyMode::buffered) {
                     auto const room = c.rx.size() - c.rx_len;
                     auto const want = size_t(std::min<uint64_t>(c.body_remaining, room));
-                    auto n = pool_.read(slot, std::span<uint8_t>{c.rx.data() + c.rx_len, want});
+                    auto const n = read_some(slot, std::span<uint8_t>{c.rx.data() + c.rx_len, want});
                     if (!n) {
-                        return;
-                    }
-                    if (*n == 0) {
-                        pool_.close(slot);
                         return;
                     }
                     c.rx_len += *n;
                     c.body_remaining -= *n;
                 } else {
                     auto const want = size_t(std::min<uint64_t>(c.body_remaining, discard_.size()));
-                    auto n = pool_.read(slot, std::span<uint8_t>{discard_.data(), want});
+                    auto const n = read_some(slot, std::span<uint8_t>{discard_.data(), want});
                     if (!n) {
-                        return;
-                    }
-                    if (*n == 0) {
-                        pool_.close(slot);
                         return;
                     }
                     c.body_remaining -= *n;
@@ -400,12 +396,8 @@ void HttpServer::process(size_t slot, int64_t now_ns)
                     respond_status(slot, 431, true, now_ns);  // defensive; parser limits are smaller
                     break;
                 }
-                auto n = pool_.read(slot, std::span<uint8_t>{c.rx.data() + c.rx_len, c.rx.size() - c.rx_len});
+                auto const n = read_some(slot, std::span<uint8_t>{c.rx.data() + c.rx_len, c.rx.size() - c.rx_len});
                 if (!n) {
-                    return;
-                }
-                if (*n == 0) {
-                    pool_.close(slot);
                     return;
                 }
                 if (!c.head_started) {
@@ -442,12 +434,21 @@ void HttpServer::handle_complete_head(size_t slot, int64_t now_ns)
 
     c.handler = find_route(request.method, request.path);
     if (c.handler != nullptr) {
+        // A send from on_headers is refused by writer_send (the state is
+        // still reading_head), so the disposition alone decides here.
         ResponseWriter writer{*this, slot};
         auto const disposition = c.handler->on_headers(request, writer);
         switch (disposition.kind()) {
             case Disposition::Kind::reject:
                 c.handler = nullptr;
                 c.body_mode = BodyMode::discard;
+                if (body_len > limits_.max_body) {
+                    // Draining is what keeps keep-alive framing, but only
+                    // up to the buffered cap — not a rejected upload of
+                    // any size, at 4 KiB per pass with no timeout.
+                    respond_status(slot, disposition.status(), true, now_ns);
+                    return;
+                }
                 c.pending_status = disposition.status();
                 break;
             case Disposition::Kind::buffer:
@@ -540,8 +541,9 @@ void HttpServer::serve_static(size_t slot, StaticRoute const& route, HttpRequest
             "HTTP/1.1 304 Not Modified\r\nETag: %s\r\nConnection: %s\r\n\r\n",
             route.etag.c_str(),
             connection);
-        c.tx_len = std::min(size_t(n), c.tx.size());
-        c.tx_sent = 0;
+        if (!stage_head(slot, n, now_ns)) {
+            return;
+        }
         c.close_after_send = close_after;
         c.state = ConnState::sending;
         pump_tx(slot, now_ns);
@@ -570,8 +572,9 @@ void HttpServer::serve_static(size_t slot, StaticRoute const& route, HttpRequest
         route.last_modified.c_str(),
         cache_line,
         connection);
-    c.tx_len = std::min(size_t(n), c.tx.size());
-    c.tx_sent = 0;
+    if (!stage_head(slot, n, now_ns)) {
+        return;
+    }
     if (!c.suppress_body) {
         c.body_map = route.data;
         c.body_fd = route.fd;
@@ -588,7 +591,9 @@ void HttpServer::respond_status(size_t slot, uint16_t status, bool close_after, 
     auto& c = connections_[slot];
     char body[64];
     int const body_len = snprintf(body, sizeof body, "%u %s\n", status, reason_phrase(status));
-    bool const with_body = !c.suppress_body || status >= 400;
+    // HEAD never carries a body, whatever the status (RFC 9110 §9.3.2):
+    // one after a 404 would be read as the start of the next response.
+    bool const with_body = !c.suppress_body;
     int const head_len = snprintf(
         reinterpret_cast<char*>(c.tx.data()),  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
         c.tx.size(),
@@ -605,13 +610,69 @@ void HttpServer::respond_status(size_t slot, uint16_t status, bool close_after, 
         c.extra.data(),
         close_after ? "close" : "keep-alive",
         with_body ? body : "");
-    c.tx_len = std::min(size_t(head_len), c.tx.size());
-    c.tx_sent = 0;
+    if (!stage_head(slot, head_len, now_ns)) {
+        return;
+    }
     c.body_map = {};
     c.body_fd = -1;
     c.body_size = 0;
     c.body_sent = 0;
     c.close_after_send = close_after;
+    c.state = ConnState::sending;
+    pump_tx(slot, now_ns);
+}
+
+auto HttpServer::read_some(size_t slot, std::span<uint8_t> out) noexcept -> std::optional<size_t>
+{
+    auto const n = pool_.read(slot, out);
+    if (n && *n > 0) {
+        return *n;
+    }
+    // Orderly EOF, or a hard error: either way the slot is finished. An
+    // error left open would keep reporting readable (level-triggered) —
+    // only would-block means "come back later".
+    if (!n && n.error() == net::NetError::would_block) {
+        return std::nullopt;
+    }
+    pool_.close(slot);
+    return std::nullopt;
+}
+
+auto HttpServer::stage_head(size_t slot, int head_len, int64_t now_ns) noexcept -> bool
+{
+    auto& c = connections_[slot];
+    if (head_len >= 0 && size_t(head_len) < c.tx.size()) {
+        c.tx_len = size_t(head_len);
+        c.tx_sent = 0;
+        return true;
+    }
+    // Truncated by snprintf: shipping it would send a head with no blank
+    // line, followed by a body.
+    fail_response(slot, now_ns);
+    return false;
+}
+
+void HttpServer::fail_response(size_t slot, int64_t now_ns) noexcept
+{
+    auto& c = connections_[slot];
+    // Fixed bytes, no formatting: this is the path for "the tx buffer
+    // cannot hold what the response needs", so it must not need it either.
+    static constexpr std::string_view OVERFLOW_500 =
+        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    c.extra_len = 0;
+    c.response_staged = true;  // single-shot: a retry after this is refused
+    c.body_map = {};
+    c.body_fd = -1;
+    c.body_size = 0;
+    c.body_sent = 0;
+    c.close_after_send = true;
+    if (c.tx.size() < OVERFLOW_500.size()) {
+        pool_.close(slot);  // a tx buffer too small even for this
+        return;
+    }
+    std::memcpy(c.tx.data(), OVERFLOW_500.data(), OVERFLOW_500.size());
+    c.tx_len = OVERFLOW_500.size();
+    c.tx_sent = 0;
     c.state = ConnState::sending;
     pump_tx(slot, now_ns);
 }
@@ -640,10 +701,16 @@ auto HttpServer::writer_send(
     size_t slot, uint16_t status, std::string_view content_type, std::span<uint8_t const> body, bool external) noexcept -> bool
 {
     auto& c = connections_[slot];
-    if (c.response_staged || !pool_.is_open(slot)) {
+    // Only on_complete (reading_body) and an asynchronous respond()
+    // (awaiting_response) may send: a send from on_headers, before the
+    // body is framed, would leave handle_complete_head to clobber the
+    // state machine behind it.
+    bool const may_send = c.state == ConnState::reading_body || c.state == ConnState::awaiting_response;
+    if (c.response_staged || !may_send || !pool_.is_open(slot)) {
         return false;
     }
     bool const was_awaiting = c.state == ConnState::awaiting_response;
+    int64_t const now_ns = c.last_event_ns;
     auto const& request = parsers_[slot].request();
     bool const close_after = !request.keep_alive;
     int const head_len = snprintf(
@@ -663,12 +730,9 @@ auto HttpServer::writer_send(
         int(c.extra_len),
         c.extra.data(),
         close_after ? "close" : "keep-alive");
-    if (size_t(head_len) >= c.tx.size()) {
-        respond_status(slot, 500, true, c.idle_since_ns);
+    if (!stage_head(slot, head_len, now_ns)) {
         return false;
     }
-    c.tx_len = size_t(head_len);
-    c.tx_sent = 0;
     c.body_map = {};
     c.body_fd = -1;
     c.body_size = 0;
@@ -679,7 +743,7 @@ auto HttpServer::writer_send(
             c.body_size = body.size();
         } else {
             if (c.tx_len + body.size() > c.tx.size()) {
-                respond_status(slot, 500, true, c.idle_since_ns);
+                fail_response(slot, now_ns);
                 return false;
             }
             std::memcpy(c.tx.data() + c.tx_len, body.data(), body.size());
@@ -689,12 +753,12 @@ auto HttpServer::writer_send(
     c.response_staged = true;
     c.close_after_send = close_after;
     c.state = ConnState::sending;
-    pump_tx(slot, c.idle_since_ns);
+    pump_tx(slot, now_ns);
     // An asynchronous completion has no surrounding process() loop: a
     // pipelined request already in rx would otherwise wait forever. The
     // synchronous path must NOT re-enter process (its loop continues).
     if (was_awaiting && pool_.is_open(slot) && c.state == ConnState::reading_head) {
-        process(slot, c.idle_since_ns);
+        process(slot, now_ns);
     }
     return true;
 }
@@ -812,8 +876,9 @@ void HttpServer::try_upgrade(size_t slot, HttpRequest const& request, WsRoute co
         "\r\n",
         int(accept.view().size()),
         accept.view().data());
-    c.tx_len = std::min(size_t(n), c.tx.size());
-    c.tx_sent = 0;
+    if (!stage_head(slot, n, now_ns)) {
+        return;
+    }
     c.leftover_at = parsers_[slot].consumed();
     c.ws_endpoint = route.endpoint;
     c.upgrade_pending = true;
@@ -895,7 +960,7 @@ auto HttpServer::ws_send(size_t slot, std::span<uint8_t const> payload, bool is_
     if (slot >= connections_.size() || !pool_.is_open(slot) || !connections_[slot].ws_mode || connections_[slot].ws_closing) {
         return false;
     }
-    return ws_stage_frame(slot, is_text ? WsOpcode::text : WsOpcode::binary, payload, false, connections_[slot].ws_last_rx_ns);
+    return ws_stage_frame(slot, is_text ? WsOpcode::text : WsOpcode::binary, payload, false, connections_[slot].last_event_ns);
 }
 
 auto HttpServer::ws_send_external(size_t slot, std::span<uint8_t const> payload, bool is_text) noexcept -> bool
@@ -903,7 +968,7 @@ auto HttpServer::ws_send_external(size_t slot, std::span<uint8_t const> payload,
     if (slot >= connections_.size() || !pool_.is_open(slot) || !connections_[slot].ws_mode || connections_[slot].ws_closing) {
         return false;
     }
-    return ws_stage_frame(slot, is_text ? WsOpcode::text : WsOpcode::binary, payload, true, connections_[slot].ws_last_rx_ns);
+    return ws_stage_frame(slot, is_text ? WsOpcode::text : WsOpcode::binary, payload, true, connections_[slot].last_event_ns);
 }
 
 void HttpServer::ws_close(size_t slot, uint16_t code) noexcept
@@ -911,13 +976,13 @@ void HttpServer::ws_close(size_t slot, uint16_t code) noexcept
     if (slot >= connections_.size() || !pool_.is_open(slot) || !connections_[slot].ws_mode || connections_[slot].ws_closing) {
         return;
     }
-    ws_fail(slot, code, connections_[slot].ws_last_rx_ns);
+    ws_fail(slot, code, connections_[slot].last_event_ns);
 }
 
 void HttpServer::ws_process(size_t slot, int64_t now_ns)
 {
     auto& c = connections_[slot];
-    while (pool_.is_open(slot) && !(c.tx_sent < c.tx_len || c.body_sent < c.body_size)) {
+    while (pool_.is_open(slot) && c.tx_sent >= c.tx_len && c.body_sent >= c.body_size) {
         WsFrameHeader header;
         auto const parsed = ws_parse_frame_header(std::span<uint8_t const>{c.rx.data(), c.rx_len}, header);
         if (parsed == WsParse::protocol_error) {
@@ -933,13 +998,9 @@ void HttpServer::ws_process(size_t slot, int64_t now_ns)
             need_bytes = c.rx_len < header.header_len + header.payload_len;
         }
         if (need_bytes) {
-            auto n = pool_.read(slot, std::span<uint8_t>{c.rx.data() + c.rx_len, c.rx.size() - c.rx_len});
+            auto const n = read_some(slot, std::span<uint8_t>{c.rx.data() + c.rx_len, c.rx.size() - c.rx_len});
             if (!n) {
-                return;  // would_block
-            }
-            if (*n == 0) {
-                pool_.close(slot);
-                return;
+                return;  // would-block, or closed
             }
             c.rx_len += *n;
             c.ws_last_rx_ns = now_ns;

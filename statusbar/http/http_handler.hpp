@@ -15,8 +15,9 @@
 ///       (engine assembles up to max_body, then on_complete once),
 ///       stream it (on_body_chunk per read — bodies larger than
 ///       max_body are the POINT of this mode), or reject with a status
-///       (the engine still consumes the body so keep-alive survives).
-///       Do not send from on_headers.
+///       (the engine still consumes the body so keep-alive survives —
+///       up to max_body; a larger rejected body is answered and closed).
+///       A send from on_headers is refused (the writer returns false).
 ///
 ///   on_body_chunk(request, chunk)
 ///       Streamed mode only; chunk boundaries are transport artifacts.

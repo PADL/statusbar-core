@@ -20,7 +20,9 @@
 /// streamed to the handler, or discarded — so keep-alive framing
 /// survives every outcome. Streamed handlers may accept bodies larger
 /// than max_body; buffered acceptance and unhandled requests are capped
-/// by it (413). Parse failures answer their status and close.
+/// by it (413), and a rejected request whose body exceeds it is answered
+/// at once and closed rather than drained. Parse failures answer their
+/// status and close.
 ///
 /// Timeouts run on the injected reactor clock: header-read (408 + close)
 /// armed by the first request byte, keep-alive idle (silent close)
@@ -60,6 +62,12 @@ class HttpServer;
 /// add_header() queues extra response headers (fixed per-connection
 /// space; false when full). On HEAD requests the body is suppressed but
 /// Content-Length still describes it.
+///
+/// A send is accepted only from on_complete or an asynchronous
+/// respond(); one from on_headers is refused (false) and the request
+/// proceeds as its disposition says. A response that cannot be built
+/// (head or inline body too large for the tx buffer) becomes a fixed
+/// 500 + close; sent() is true afterwards and further sends are refused.
 class ResponseWriter
 {
   public:
@@ -206,6 +214,7 @@ class HttpServer
         bool head_started{false};
         int64_t head_start_ns{0};
         int64_t idle_since_ns{0};
+        int64_t last_event_ns{0};  ///< the reactor's clock at the latest callback: the "now" for sends from handlers
 
         // -- WebSocket mode --
         std::vector<uint8_t> ws_msg;  ///< fragment reassembly (sized by add_ws_route)
@@ -233,6 +242,14 @@ class HttpServer
     void serve_static(size_t slot, StaticRoute const& route, HttpRequest const& request, int64_t now_ns);
     void pump_tx(size_t slot, int64_t now_ns);
     void next_request(size_t slot, int64_t now_ns);
+
+    /// pool_.read that closes the slot on a hard error (only would-block
+    /// leaves it open); nullopt means stop reading for now.
+    [[nodiscard]] auto read_some(size_t slot, std::span<uint8_t> out) noexcept -> std::optional<size_t>;
+    /// Commits a head snprintf'd into tx (true), or — when it did not fit
+    /// — stages a fixed 500 + close instead (false).
+    [[nodiscard]] auto stage_head(size_t slot, int head_len, int64_t now_ns) noexcept -> bool;
+    void fail_response(size_t slot, int64_t now_ns) noexcept;
 
     // WebSocket engine.
     void try_upgrade(size_t slot, HttpRequest const& request, WsRoute const& route, int64_t now_ns);

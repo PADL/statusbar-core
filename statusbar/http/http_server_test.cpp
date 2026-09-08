@@ -249,6 +249,60 @@ TEST(http_server, bodies_are_consumed_and_capped)
     EXPECT_EQ(server->paths.size(), before);
 }
 
+TEST(http_server, head_error_responses_carry_no_body)
+{
+    TestServer* server = nullptr;
+    auto const addr = make(server, small_limits());
+
+    // A HEAD that misses answers 404 with the body's Content-Length but
+    // no body bytes — otherwise the client would read "404 Not Found\n"
+    // as the start of the next response on this keep-alive connection.
+    Client c{addr};
+    c.send_all("HEAD /missing HTTP/1.1\r\nHost: t\r\n\r\n");
+    pump(*server);
+    auto const head = c.recv_for(100);
+    EXPECT_TRUE(status_line(head) == "HTTP/1.1 404 Not Found");
+    EXPECT_TRUE(head.find("Content-Length: 14") != std::string::npos);
+    EXPECT_TRUE(head.ends_with("\r\n\r\n"));
+
+    // Framing intact: the next response starts cleanly.
+    c.send_all("GET /ok HTTP/1.1\r\nHost: t\r\n\r\n");
+    pump(*server);
+    auto const next = c.recv_for(100);
+    EXPECT_TRUE(status_line(next) == "HTTP/1.1 200 OK");
+    EXPECT_TRUE(next.ends_with("200 OK\n"));
+    EXPECT_EQ(server->active_connections(), 1U);
+}
+
+TEST(http_server, reset_mid_body_closes_the_slot)
+{
+    TestServer* server = nullptr;
+    auto const addr = make(server, small_limits());
+
+    {
+        Client c{addr};
+        c.send_all("POST /ok HTTP/1.1\r\nHost: t\r\nContent-Length: 10\r\n\r\n12345");
+        pump(*server, 5);
+        EXPECT_EQ(server->active_connections(), 1U);
+        // Abort rather than close: linger 0 makes close() send RST, so the
+        // server's next read fails hard instead of seeing EOF.
+        struct linger const rst{.l_onoff = 1, .l_linger = 0};
+        EXPECT_EQ(::setsockopt(c.fd, SOL_SOCKET, SO_LINGER, &rst, sizeof rst), 0);
+    }
+    pump(*server);
+    // A hard read error must release the slot (a level-triggered reactor
+    // would otherwise keep reporting it readable), and dispatch never
+    // saw the half request.
+    EXPECT_EQ(server->active_connections(), 0U);
+    EXPECT_EQ(server->paths.size(), 0U);
+
+    // The pool is healthy afterwards.
+    Client c{addr};
+    c.send_all("GET /ok HTTP/1.1\r\nHost: t\r\n\r\n");
+    pump(*server);
+    EXPECT_TRUE(status_line(c.recv_for(100)) == "HTTP/1.1 200 OK");
+}
+
 TEST(http_server, slow_loris_gets_408_and_idle_gets_closed)
 {
     TestServer* server = nullptr;

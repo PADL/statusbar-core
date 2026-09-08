@@ -253,7 +253,8 @@ auto HttpParser::parse_request_line(std::string_view line) noexcept -> bool
         return fail(400), false;
     }
     for (char const c : target) {
-        if (c < 0x21 || c > 0x7E) {
+        auto const b = uint8_t(c);
+        if (b < 0x21 || b > 0x7E) {
             return fail(400), false;  // control bytes, space, or non-ASCII
         }
     }
@@ -346,8 +347,12 @@ auto HttpParser::parse_header_line(std::string_view line) noexcept -> bool
         return fail(400), false;
     }
     auto const value = trim_ows(line.substr(colon + 1));
+    // field-value = VCHAR / SP / HTAB / obs-text (RFC 9110 §5.5): only
+    // controls are refused. Compared as unsigned so that bytes >= 0x80
+    // (obs-text) get the same verdict whether char is signed or not.
     for (char const c : value) {
-        if ((c < 0x20 || c == 0x7F) && c != '\t') {
+        auto const b = uint8_t(c);
+        if ((b < 0x20 || b == 0x7F) && b != '\t') {
             return fail(400), false;
         }
     }
