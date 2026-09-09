@@ -239,6 +239,19 @@ template <typename... Fields>
 //
 
 ///
+/// Compute the serialized wire size of a field value.
+///
+template <typename T>
+constexpr size_t serialized_field_size(T const& value) noexcept
+{
+    if constexpr (traits::SerializableStruct<T>) {
+        return protocol::wire_size(value);
+    } else {
+        return sizeof(T);
+    }
+}
+
+///
 /// Field serializer with value supplier for compile-time serializer definitions.
 /// Stores a function that provides the value to write to the buffer.
 ///
@@ -274,14 +287,7 @@ class FieldSerializer
     {
         T const value = supplier_();
 
-        // Calculate required size
-        constexpr bool is_serializable = traits::SerializableStruct<T>;
-        size_t required_size = 0;
-        if constexpr (is_serializable) {
-            required_size = protocol::wire_size(value);
-        } else {
-            required_size = sizeof(T);
-        }
+        size_t const required_size = serialized_field_size(value);
 
         // Get writable span
         auto const available_span = buffer.span_of_available_space(required_size);
@@ -363,14 +369,7 @@ class ConditionalFieldSerializer
         if (condition_()) {
             T const value = supplier_();
 
-            // Calculate required size
-            constexpr bool is_serializable = traits::SerializableStruct<T>;
-            size_t required_size = 0;
-            if constexpr (is_serializable) {
-                required_size = protocol::wire_size(value);
-            } else {
-                required_size = sizeof(T);
-            }
+            size_t const required_size = serialized_field_size(value);
 
             // Get writable span
             auto const available_span = buffer.span_of_available_space(required_size);

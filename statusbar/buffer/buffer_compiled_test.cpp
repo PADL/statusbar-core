@@ -637,5 +637,80 @@ TEST(compiled_serializer_safety, multi_field_failure_at_second_does_not_run_thir
     EXPECT_EQ(buf.get_span()[0], uint8_t{0xAA});
 }
 
+//
+// serialized_field_size(): the compiled serializers reserve wire bytes,
+// not sizeof bytes. A fixed struct whose in-memory size exceeds its
+// LENGTH (uint32 + uint8 pads to 8, the wire form is 5) tells the two
+// apart.
+//
+
+struct PaddedFixedStruct
+{
+    static constexpr size_t LENGTH = 5;
+    uint32_t word;
+    uint8_t tail;
+};
+static_assert(sizeof(PaddedFixedStruct) > PaddedFixedStruct::LENGTH);
+
+template <>
+struct statusbar::traits::is_serializable_fixed_struct<PaddedFixedStruct> : std::true_type
+{};
+
+[[nodiscard]] auto store_unchecked(std::span<uint8_t> const buf, PaddedFixedStruct const& item) noexcept
+{
+    BufferSerializerBuilderWithBuffer{buf}.append_unchecked(item.word).append_unchecked(item.tail);
+    return item.LENGTH;
+}
+
+TEST(compiled_serializer_field_size, scalars_measure_sizeof)
+{
+    static_assert(serialized_field_size(uint8_t{0}) == 1);
+    static_assert(serialized_field_size(uint16_t{0}) == 2);
+    static_assert(serialized_field_size(uint32_t{0}) == 4);
+    static_assert(serialized_field_size(uint64_t{0}) == 8);
+    EXPECT_EQ(serialized_field_size(double{0}), sizeof(double));
+}
+
+TEST(compiled_serializer_field_size, serializable_structs_measure_wire_size)
+{
+    PaddedFixedStruct const item{.word = 0x01020304, .tail = 0x05};
+    EXPECT_EQ(serialized_field_size(item), size_t{5});
+    EXPECT_NE(serialized_field_size(item), sizeof(item));
+}
+
+TEST(compiled_serializer_field_size, struct_field_fits_a_buffer_of_exactly_its_wire_size)
+{
+    // sizeof would demand 8 bytes and refuse this 5-byte buffer.
+    std::array<uint8_t, 5> data{};
+    MutableBuffer buf{data};
+    auto const serializer =
+        make_serializer(serialize_field<PaddedFixedStruct>([]() { return PaddedFixedStruct{.word = 0x01020304, .tail = 0x05}; }));
+    EXPECT_TRUE(serializer.serialize(buf));
+    EXPECT_EQ(buf.size(), size_t{5});
+    // append_unchecked writes the raw word in host order; the tail lands
+    // right behind it with no padding.
+    uint32_t const word = 0x01020304;
+    EXPECT_EQ(std::memcmp(buf.get_span().data(), &word, sizeof word), 0);
+    EXPECT_EQ(buf.get_span()[4], uint8_t{0x05});
+
+    // One byte short of the wire size still fails, and writes nothing.
+    std::array<uint8_t, 4> small{};
+    MutableBuffer small_buf{small};
+    EXPECT_FALSE(serializer.serialize(small_buf));
+    EXPECT_EQ(small_buf.size(), size_t{0});
+}
+
+TEST(compiled_serializer_field_size, conditional_struct_field_reserves_wire_size)
+{
+    std::array<uint8_t, 5> data{};
+    MutableBuffer buf{data};
+    bool const on = true;
+    auto const serializer = make_serializer(serialize_conditional_field<PaddedFixedStruct>(
+        [&on]() { return on; }, []() { return PaddedFixedStruct{.word = 0xAABBCCDD, .tail = 0xEE}; }));
+    EXPECT_TRUE(serializer.serialize(buf));
+    EXPECT_EQ(buf.size(), size_t{5});
+    EXPECT_EQ(buf.get_span()[4], uint8_t{0xEE});
+}
+
 // Main test runner function required by create_test_sourcelist
 TEST_MAIN(statusbar_buffer, buffer_compiled_test)
