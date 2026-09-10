@@ -23,6 +23,28 @@
 
 namespace statusbar {
 
+namespace traits {
+
+/// Type trait to check if a type is any std::span (any element, any extent).
+/// A span is trivially copyable, but its bytes are a pointer and a length,
+/// not the elements it views — every byte-reinterpreting helper here and in
+/// buffer_traits.hpp refuses it so the view is never serialized in place of
+/// the viewed bytes.
+template <typename T>
+struct is_std_span : std::false_type
+{};
+
+/// Specialization for std::span.
+template <typename U, std::size_t N>
+struct is_std_span<std::span<U, N>> : std::true_type
+{};
+
+/// Concept for any std::span, whatever it views.
+template <typename T>
+concept StdSpan = is_std_span<std::remove_cvref_t<T>>::value;
+
+}  // namespace traits
+
 //
 // Sub-range descriptor
 //
@@ -66,11 +88,13 @@ struct octet_range_t
 //
 
 /// Reinterpret a trivially-copyable object as a read-only byte span.
+/// std::span is refused: viewing a span's own bytes (pointer + length) is
+/// never what a caller means — pass the span itself.
 /// @tparam T The type to reinterpret (must be trivially copyable).
 /// @param obj The object to view as bytes.
 /// @return A fixed-extent span of sizeof(T) const bytes.
 template <typename T>
-    requires std::is_trivially_copyable_v<T>
+    requires std::is_trivially_copyable_v<T> && (!traits::StdSpan<T>)
 inline auto make_const_span(T const& obj) -> std::span<uint8_t const, sizeof(T)>
 {
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
@@ -78,11 +102,12 @@ inline auto make_const_span(T const& obj) -> std::span<uint8_t const, sizeof(T)>
 }
 
 /// Reinterpret a trivially-copyable object as a mutable byte span.
+/// std::span is refused for the same reason as make_const_span.
 /// @tparam T The type to reinterpret (must be trivially copyable).
 /// @param obj The object to view as bytes.
 /// @return A fixed-extent span of sizeof(T) mutable bytes.
 template <typename T>
-    requires std::is_trivially_copyable_v<T>
+    requires std::is_trivially_copyable_v<T> && (!traits::StdSpan<T>)
 inline auto make_span(T& obj) -> std::span<uint8_t, sizeof(T)>
 {
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
@@ -360,8 +385,12 @@ inline auto span_compare_constant_time(std::span<uint8_t const> a, std::span<uin
 /// the network must validate the size first (e.g. via `can_load`). The
 /// assert turns the "footgun" into an immediate, debuggable abort under
 /// a debug build instead of a silent read past the span.
+///
+/// std::span destinations are refused: loading INTO a span would overwrite
+/// its pointer and length with wire bytes. Use span_copy to fill the bytes
+/// a span views.
 template <typename T>
-    requires std::is_trivially_copyable_v<T>
+    requires std::is_trivially_copyable_v<T> && (!traits::StdSpan<T>)
 auto span_load(T& dest, std::span<uint8_t const> const src) noexcept -> void
 {
     auto const src_size = src.size();
@@ -370,10 +399,12 @@ auto span_load(T& dest, std::span<uint8_t const> const src) noexcept -> void
 }
 
 /// Store a trivially copyable type to a byte span.
+/// std::span sources are refused (that would store the view, not the viewed
+/// bytes) — use span_copy.
 /// @param dest Destination span (must be at least sizeof(T) bytes).
 /// @param src Source object to copy from.
 template <typename T>
-    requires std::is_trivially_copyable_v<T>
+    requires std::is_trivially_copyable_v<T> && (!traits::StdSpan<T>)
 auto span_store(std::span<uint8_t> const dest, T const& src) noexcept -> void
 {
     auto const dest_size = dest.size();
@@ -449,13 +480,13 @@ inline void span_zero(statusbar::sg14::inplace_vector<uint8_t, N>& vec) noexcept
 /// n..sizeof(T)-1 are zeroed. If src is longer than sizeof(T), the
 /// trailing bytes are ignored.
 template <typename T>
-    requires std::is_trivially_copyable_v<T>
+    requires std::is_trivially_copyable_v<T> && (!traits::StdSpan<T>)
 auto span_load_padded(T& dest, std::span<uint8_t const> const src) noexcept -> void
 {
     auto const dest_span = make_span(dest);
-    span_zero(dest_span);
     auto const n = std::min(src.size(), sizeof(T));
     span_copy(dest_span.first(n), src.first(n));
+    span_zero(dest_span.subspan(n));
 }
 
 //
@@ -541,7 +572,7 @@ template <typename T>
 /// wire-format header length — typically enforced via static_assert at the
 /// PDU type definition (e.g. `static_assert(sizeof(Am824Pdu) == 32)`).
 template <typename Header>
-    requires std::is_trivially_copyable_v<Header>
+    requires std::is_trivially_copyable_v<Header> && (!traits::StdSpan<Header>)
 [[nodiscard]] inline auto span_pack_header_payload(
     std::span<uint8_t> frame, Header const& header, std::span<uint8_t const> payload) noexcept -> std::span<uint8_t const>
 {
@@ -555,29 +586,13 @@ template <typename Header>
     return frame.first(sizeof(Header) + payload.size());
 }
 
-/// Overload for std::array<uint8_t, N> destination — no make_span needed at the call site.
-template <typename Header, size_t N>
-    requires std::is_trivially_copyable_v<Header>
-[[nodiscard]] inline auto span_pack_header_payload(
-    std::array<uint8_t, N>& frame, Header const& header, std::span<uint8_t const> payload) noexcept -> std::span<uint8_t const>
-{
-    return span_pack_header_payload(make_span(frame), header, payload);
-}
-
-/// Overload for std::vector<uint8_t> destination.
-template <typename Header>
-    requires std::is_trivially_copyable_v<Header>
-[[nodiscard]] inline auto span_pack_header_payload(
-    std::vector<uint8_t>& frame, Header const& header, std::span<uint8_t const> payload) noexcept -> std::span<uint8_t const>
-{
-    return span_pack_header_payload(make_span(frame), header, payload);
-}
-
-/// Overload for statusbar::sg14::inplace_vector<uint8_t, N> destination.
-template <typename Header, size_t N>
-    requires std::is_trivially_copyable_v<Header>
-[[nodiscard]] inline auto span_pack_header_payload(
-    statusbar::sg14::inplace_vector<uint8_t, N>& frame, Header const& header, std::span<uint8_t const> payload) noexcept
+/// Overload for any byte container with a make_span overload (std::array,
+/// std::vector, statusbar::sg14::inplace_vector, …) — no make_span needed at
+/// the call site.
+template <typename Header, typename C>
+    requires std::is_trivially_copyable_v<Header> && (!traits::StdSpan<Header>) && (!traits::StdSpan<C>) &&
+    requires(C& c) { make_span(c); }
+[[nodiscard]] inline auto span_pack_header_payload(C& frame, Header const& header, std::span<uint8_t const> payload) noexcept
     -> std::span<uint8_t const>
 {
     return span_pack_header_payload(make_span(frame), header, payload);

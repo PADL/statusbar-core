@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "statusbar/buffer/buffer_error.hpp"
+#include "statusbar/buffer/span_utils.hpp"
 #include "statusbar/sg14/inplace_vector.h"
 #include "statusbar/status/status.hpp"
 
@@ -87,7 +88,8 @@ concept UnsignedIntegerType = std::unsigned_integral<T> && !std::is_same_v<T, bo
 template <typename T>
 concept PlainStdArray = is_plain_std_array<std::remove_cvref_t<T>>::value;
 
-/// Concept for std::span of plain elements.
+/// Concept for std::span of plain elements. A view over plain bytes, NOT a
+/// plain type itself — see PlainLinearCollection.
 template <typename T>
 concept PlainStdSpan = is_plain_std_span<std::remove_cvref_t<T>>::value;
 
@@ -119,9 +121,15 @@ concept PlainInplaceVector = is_plain_inplace_vector<std::remove_cvref_t<T>>::va
 template <typename T>
 concept PlainSizedContiguous = PlainStdVector<T> || PlainInplaceVector<T>;
 
-/// Concept for any linear collection of plain elements.
+/// Concept for any linear collection of plain elements whose object bytes
+/// ARE its elements: std::array and C arrays. std::span is deliberately not
+/// one — it is trivially copyable, but its bytes are a pointer and a length,
+/// so treating it as plain would serialize the view instead of the viewed
+/// bytes. Raw pointers are excluded for the same reason (and carry no length).
+/// Spans are appended through the dedicated std::span<uint8_t const>
+/// overloads on MutableBuffer and BufferSerializerBuilder.
 template <typename T>
-concept PlainLinearCollection = PlainStdArray<T> || PlainStdSpan<T> || PlainCArray<T>;
+concept PlainLinearCollection = PlainStdArray<T> || PlainCArray<T>;
 
 /// Concept for any plain type that can be directly serialized.
 /// Includes plain elements and linear collections of plain elements.
@@ -149,7 +157,7 @@ concept SerializableFixedStruct = is_serializable_fixed_struct<std::remove_cvref
 /// Trait for structs with variable-size serialization.
 /// Types opting into this trait must provide:
 /// - `wire_size(T const&)` - get the wire size for this instance
-/// - `can_load(span, T*)` - check if buffer has sufficient data
+/// - `can_load(span, T const*)` - check if buffer has sufficient data (never writes)
 /// - `can_store(span, T const&)` - check if buffer has sufficient space
 /// - `load_unchecked(span, T*)` - deserialize from buffer
 /// - `store_unchecked(span, T const&)` - serialize to buffer
@@ -165,6 +173,14 @@ concept SerializableVariableStruct = is_serializable_variable_struct<std::remove
 template <typename T>
 concept SerializableStruct =
     is_serializable_fixed_struct<std::remove_cvref_t<T>>::value || is_serializable_variable_struct<std::remove_cvref_t<T>>::value;
+
+/// Concept for a value the builders and compiled serdes can move to or from
+/// the wire as a unit: a SerializableStruct (sized by wire_size()) or a
+/// trivially copyable object whose bytes are its wire image (sized by
+/// sizeof). std::span is excluded explicitly: it is trivially copyable, but
+/// its bytes are a pointer and a length, not the elements it views.
+template <typename T>
+concept WireValue = !StdSpan<T> && (SerializableStruct<T> || std::is_trivially_copyable_v<std::remove_cvref_t<T>>);
 
 /// Trait for fixed-size structs that are packed to match wire format exactly.
 /// These structs can be serialized/deserialized with a single memcpy.

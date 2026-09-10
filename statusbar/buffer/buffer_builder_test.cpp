@@ -82,6 +82,140 @@ TEST(buffer_builder_with_buffer, handles_errors)
 }
 
 //
+// Appending a span writes the bytes it views, never the span object.
+//
+
+TEST(buffer_builder_span, append_span_writes_viewed_bytes)
+{
+    std::array<uint8_t, 4> const payload{0xAA, 0xBB, 0xCC, 0xDD};
+    std::span<uint8_t const> const payload_span{payload};
+
+    BufferSerializerBuilderWithStorage<32> builder{};
+    builder.append(uint8_t{0x01}).append(payload_span).append(uint8_t{0x02});
+
+    EXPECT_TRUE(builder.status());
+    EXPECT_EQ(builder.get_span().size(), 6);
+    EXPECT_EQ(builder.get_span()[0], 0x01);
+    EXPECT_EQ(builder.get_span()[1], 0xAA);
+    EXPECT_EQ(builder.get_span()[4], 0xDD);
+    EXPECT_EQ(builder.get_span()[5], 0x02);
+}
+
+TEST(buffer_builder_span, append_mutable_span_and_vector)
+{
+    std::array<uint8_t, 2> data{0x11, 0x22};
+    std::vector<uint8_t> const vec{0x33, 0x44, 0x55};
+
+    BufferSerializerBuilderWithStorage<32> builder{};
+    builder.append(std::span<uint8_t>{data}).append(vec);
+
+    EXPECT_TRUE(builder.status());
+    EXPECT_EQ(builder.get_span().size(), 5);
+    EXPECT_EQ(builder.get_span()[0], 0x11);
+    EXPECT_EQ(builder.get_span()[2], 0x33);
+    EXPECT_EQ(builder.get_span()[4], 0x55);
+}
+
+TEST(buffer_builder_span, append_span_insufficient_space_writes_nothing)
+{
+    std::array<uint8_t, 8> const payload{};
+
+    BufferSerializerBuilderWithStorage<4> builder{};
+    builder.append(std::span<uint8_t const>{payload});
+
+    EXPECT_FALSE(builder.status());
+    EXPECT_EQ(builder.error(), std::error_code{BufferError::insufficient_space});
+    EXPECT_EQ(builder.get_span().size(), 0);
+}
+
+TEST(buffer_builder_span, append_unchecked_span_writes_viewed_bytes)
+{
+    std::array<uint8_t, 3> const payload{0x0A, 0x0B, 0x0C};
+
+    BufferSerializerBuilderWithStorage<8> builder{};
+    builder.append_unchecked(std::span<uint8_t const>{payload});
+
+    EXPECT_TRUE(builder.status());
+    EXPECT_EQ(builder.get_span().size(), 3);
+    EXPECT_EQ(builder.get_span()[2], 0x0C);
+}
+
+// The templated append never sees a span (a span's own bytes are a pointer
+// and a length): the only viable overload is the non-template one, whose
+// parameter is std::span<uint8_t const>. So a span of anything but bytes
+// cannot be appended at all.
+template <typename T>
+concept CanAppend = requires(BufferSerializerBuilder& b, T const& v) { b.append(v); };
+template <typename T>
+concept CanAppendUnchecked = requires(BufferSerializerBuilder& b, T const& v) { b.append_unchecked(v); };
+
+static_assert(CanAppend<uint32_t>);
+static_assert(CanAppend<std::array<uint8_t, 6>>);
+static_assert(CanAppend<std::span<uint8_t const>>);
+static_assert(CanAppend<std::span<uint8_t>>);
+static_assert(CanAppend<std::vector<uint8_t>>);
+static_assert(!CanAppend<std::span<uint16_t const>>);
+static_assert(!CanAppend<std::span<uint32_t>>);
+static_assert(CanAppendUnchecked<uint32_t>);
+static_assert(CanAppendUnchecked<std::span<uint8_t const>>);
+static_assert(!CanAppendUnchecked<std::span<uint16_t const>>);
+
+// Parsing into a span would overwrite the view; refused at compile time.
+template <typename T>
+concept CanParse = requires(BufferDeserializer& d, T* p) { d.parse(p); };
+template <typename T>
+concept CanBuilderParse = requires(BufferDeserializerBuilder& d, T* p) { d.parse(p); };
+template <typename T>
+concept CanParseUnchecked = requires(BufferDeserializer& d, T* p) { d.parse_unchecked(p); };
+template <typename T>
+concept CanCanParse = requires(BufferDeserializer const& d, T const* p) { d.can_parse(p); };
+
+static_assert(CanParse<uint32_t>);
+static_assert(CanParse<std::array<uint8_t, 4>>);
+static_assert(CanBuilderParse<uint32_t>);
+static_assert(!CanParse<std::span<uint8_t>>);
+static_assert(!CanParse<std::span<uint8_t const>>);
+static_assert(!CanParse<std::span<uint8_t, 4>>);
+static_assert(!CanBuilderParse<std::span<uint8_t>>);
+static_assert(!CanParseUnchecked<std::span<uint8_t>>);
+static_assert(!CanCanParse<std::span<uint8_t>>);
+
+//
+// MutableBuffer::rewind / set_span
+//
+
+TEST(mutable_buffer_rewind, rewind_empties_and_keeps_storage)
+{
+    std::array<uint8_t, 8> data{};
+    MutableBuffer buf{data};
+    EXPECT_TRUE(buf.append(std::array<uint8_t, 3>{1, 2, 3}));
+    EXPECT_EQ(buf.size(), 3);
+    EXPECT_EQ(buf.available_space(), 5);
+
+    buf.rewind();
+
+    EXPECT_EQ(buf.size(), 0);
+    EXPECT_EQ(buf.available_space(), 8);
+    EXPECT_EQ(buf.get_span().data(), data.data());
+    EXPECT_EQ(data[0], 1);  // bytes are not cleared
+
+    EXPECT_TRUE(buf.append(std::array<uint8_t, 1>{9}));
+    EXPECT_EQ(buf.size(), 1);
+    EXPECT_EQ(data[0], 9);
+}
+
+TEST(mutable_buffer_rewind, set_span_prefix)
+{
+    std::array<uint8_t, 8> data{};
+    MutableBuffer buf{data};
+    buf.set_span(buf.total_buffer_span().first(5));
+    EXPECT_EQ(buf.size(), 5);
+    EXPECT_EQ(buf.available_space(), 3);
+    buf.set_span(buf.total_buffer_span().first(0));
+    EXPECT_EQ(buf.available_space(), 8);
+}
+
+//
 // buffer.cppm tests - BufferDeserializerBuilder
 //
 

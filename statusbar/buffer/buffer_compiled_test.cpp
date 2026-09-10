@@ -10,6 +10,7 @@
 #include <cstring>
 #include <expected>
 #include <span>
+#include <utility>
 #include <vector>
 
 using namespace statusbar;
@@ -638,7 +639,7 @@ TEST(compiled_serializer_safety, multi_field_failure_at_second_does_not_run_thir
 }
 
 //
-// serialized_field_size(): the compiled serializers reserve wire bytes,
+// protocol::serialized_size(): the compiled serializers reserve wire bytes,
 // not sizeof bytes. A fixed struct whose in-memory size exceeds its
 // LENGTH (uint32 + uint8 pads to 8, the wire form is 5) tells the two
 // apart.
@@ -662,23 +663,23 @@ struct statusbar::traits::is_serializable_fixed_struct<PaddedFixedStruct> : std:
     return item.LENGTH;
 }
 
-TEST(compiled_serializer_field_size, scalars_measure_sizeof)
+TEST(serialized_size, scalars_measure_sizeof)
 {
-    static_assert(serialized_field_size(uint8_t{0}) == 1);
-    static_assert(serialized_field_size(uint16_t{0}) == 2);
-    static_assert(serialized_field_size(uint32_t{0}) == 4);
-    static_assert(serialized_field_size(uint64_t{0}) == 8);
-    EXPECT_EQ(serialized_field_size(double{0}), sizeof(double));
+    static_assert(protocol::serialized_size(uint8_t{0}) == 1);
+    static_assert(protocol::serialized_size(uint16_t{0}) == 2);
+    static_assert(protocol::serialized_size(uint32_t{0}) == 4);
+    static_assert(protocol::serialized_size(uint64_t{0}) == 8);
+    EXPECT_EQ(protocol::serialized_size(double{0}), sizeof(double));
 }
 
-TEST(compiled_serializer_field_size, serializable_structs_measure_wire_size)
+TEST(serialized_size, serializable_structs_measure_wire_size)
 {
     PaddedFixedStruct const item{.word = 0x01020304, .tail = 0x05};
-    EXPECT_EQ(serialized_field_size(item), size_t{5});
-    EXPECT_NE(serialized_field_size(item), sizeof(item));
+    EXPECT_EQ(protocol::serialized_size(item), size_t{5});
+    EXPECT_NE(protocol::serialized_size(item), sizeof(item));
 }
 
-TEST(compiled_serializer_field_size, struct_field_fits_a_buffer_of_exactly_its_wire_size)
+TEST(serialized_size, struct_field_fits_a_buffer_of_exactly_its_wire_size)
 {
     // sizeof would demand 8 bytes and refuse this 5-byte buffer.
     std::array<uint8_t, 5> data{};
@@ -700,7 +701,7 @@ TEST(compiled_serializer_field_size, struct_field_fits_a_buffer_of_exactly_its_w
     EXPECT_EQ(small_buf.size(), size_t{0});
 }
 
-TEST(compiled_serializer_field_size, conditional_struct_field_reserves_wire_size)
+TEST(serialized_size, conditional_struct_field_reserves_wire_size)
 {
     std::array<uint8_t, 5> data{};
     MutableBuffer buf{data};
@@ -711,6 +712,32 @@ TEST(compiled_serializer_field_size, conditional_struct_field_reserves_wire_size
     EXPECT_EQ(buf.size(), size_t{5});
     EXPECT_EQ(buf.get_span()[4], uint8_t{0xEE});
 }
+
+//
+// A std::span is not a wire value: serializing one would write the view
+// (pointer + length) instead of the bytes it views, and parsing into one
+// would overwrite the view. None of the field factories accept it.
+//
+
+// Plain function-pointer callables: a lambda body is outside the immediate
+// context, so an invalid `T{}` in one would be a hard error, not `false`.
+template <typename T>
+concept CanFieldExtract = requires { field<T>(std::declval<void (*)(T const&)>()); };
+template <typename T>
+concept CanSerializeField = requires { serialize_field<T>(std::declval<T (*)()>()); };
+template <typename T>
+concept CanSerializeConditionalField =
+    requires { serialize_conditional_field<T>(std::declval<bool (*)()>(), std::declval<T (*)()>()); };
+
+static_assert(CanFieldExtract<uint32_t>);
+static_assert(CanSerializeField<uint32_t>);
+static_assert(CanSerializeConditionalField<uint32_t>);
+static_assert(CanSerializeField<PaddedFixedStruct>);
+static_assert(!CanFieldExtract<std::span<uint8_t>>);
+static_assert(!CanFieldExtract<std::span<uint8_t const>>);
+static_assert(!CanSerializeField<std::span<uint8_t const>>);
+static_assert(!CanSerializeField<std::span<uint8_t, 4>>);
+static_assert(!CanSerializeConditionalField<std::span<uint8_t const>>);
 
 // Main test runner function required by create_test_sourcelist
 TEST_MAIN(statusbar_buffer, buffer_compiled_test)

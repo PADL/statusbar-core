@@ -83,6 +83,11 @@ class BufferDeserializer
     /// \return true if reset to a valid position, false if position was out of bounds
     ///         (deserializer is set to EOF in that case).
     ///
+    /// `position == size()` is out of bounds (nothing left to parse) for a
+    /// non-empty buffer. An empty buffer is the one exception: position 0 is
+    /// its only valid position, so reset(0) on it succeeds (at EOF) while any
+    /// other position fails.
+    ///
     [[nodiscard]] auto reset(size_t const position = 0) noexcept -> bool
     {
         if (position >= buffer_.size() && !buffer_.empty()) {
@@ -164,7 +169,7 @@ class BufferDeserializer
     /// \return Status indicating success or insufficient data error.
     ///
     template <typename T>
-        requires std::is_trivially_copyable_v<T> && (!traits::SerializableStruct<T>)
+        requires std::is_trivially_copyable_v<T> && (!traits::SerializableStruct<T>) && (!traits::StdSpan<T>)
     [[nodiscard]] auto parse(T* const result) noexcept -> Status
     {
         if (next_span_.size() < sizeof(T)) {
@@ -182,7 +187,7 @@ class BufferDeserializer
     /// \return Status indicating if parsing would succeed.
     ///
     template <typename T>
-        requires std::is_trivially_copyable_v<T> && (!traits::SerializableStruct<T>)
+        requires std::is_trivially_copyable_v<T> && (!traits::SerializableStruct<T>) && (!traits::StdSpan<T>)
     [[nodiscard]] auto can_parse([[maybe_unused]] T const* const value) const noexcept -> Status
     {
         if (next_span_.size() < sizeof(T)) {
@@ -200,7 +205,7 @@ class BufferDeserializer
     /// \param result Pointer to store the parsed value.
     ///
     template <typename T>
-        requires std::is_trivially_copyable_v<T> && (!traits::SerializableStruct<T>)
+        requires std::is_trivially_copyable_v<T> && (!traits::SerializableStruct<T>) && (!traits::StdSpan<T>)
     auto parse_unchecked(T* const result) noexcept -> void
     {
         auto const required_length = sizeof(T);
@@ -382,7 +387,7 @@ class BufferDeserializerBuilder
     /// \return Reference to this builder for chaining.
     ///
     template <typename T>
-        requires std::is_trivially_copyable_v<T> && (!traits::SerializableStruct<T>)
+        requires std::is_trivially_copyable_v<T> && (!traits::SerializableStruct<T>) && (!traits::StdSpan<T>)
     auto parse(T* const result) noexcept -> BufferDeserializerBuilder&
     {
         if (!error_) {
@@ -443,7 +448,7 @@ class BufferDeserializerBuilder
     /// \return Reference to this builder for chaining.
     ///
     template <typename T>
-        requires std::is_trivially_copyable_v<T> && (!traits::SerializableStruct<T>)
+        requires std::is_trivially_copyable_v<T> && (!traits::SerializableStruct<T>) && (!traits::StdSpan<T>)
     auto parse_unchecked(T* const result) noexcept -> BufferDeserializerBuilder&
     {
         if (!error_) {

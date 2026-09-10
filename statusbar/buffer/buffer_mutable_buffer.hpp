@@ -111,11 +111,36 @@ class MutableBuffer
     [[nodiscard]] constexpr auto get_span() const noexcept -> std::span<uint8_t const> { return immutable_span_; }
 
     ///
-    /// Set a new span for this buffer.
+    /// Set the used-bytes span of this buffer.
     ///
-    /// \param new_span The new span to use.
+    /// The invariant every other member relies on is that the used span is a
+    /// prefix of the total buffer: `available_space()` is
+    /// `total.size() - used.size()` and would wrap for a longer span, and
+    /// `span_of_available_space()` indexes the total buffer at
+    /// `used.size()`. Asserted in debug builds. To discard the contents use
+    /// rewind().
     ///
-    constexpr auto set_span(std::span<uint8_t const> const new_span) noexcept -> void { immutable_span_ = new_span; }
+    /// \param new_span The new used span (must start at total_buffer_span().data()
+    ///                 and be no longer than the total buffer).
+    ///
+    constexpr auto set_span(std::span<uint8_t const> const new_span) noexcept -> void
+    {
+        // Hoisted into locals: STATUSBAR_ASSERT may expand to [[assume]],
+        // which ignores expressions with potential side effects.
+        auto const* const new_data = new_span.data();
+        auto const* const total_data = mutable_total_span_.data();
+        auto const new_size = new_span.size();
+        auto const total_size = mutable_total_span_.size();
+        STATUSBAR_ASSERT(new_data == total_data && "set_span: span must start at the buffer start");
+        STATUSBAR_ASSERT(new_size <= total_size && "set_span: span longer than the buffer");
+        immutable_span_ = new_span;
+    }
+
+    ///
+    /// Discard the contents: the used span becomes empty and the whole
+    /// buffer is available again. The bytes themselves are not cleared.
+    ///
+    constexpr auto rewind() noexcept -> void { immutable_span_ = std::span<uint8_t const>(mutable_total_span_.data(), 0); }
 
     ///
     /// Get the size of the buffer in bytes.

@@ -49,6 +49,7 @@ namespace statusbar {
 //
 
 template <typename T, typename Fn>
+    requires traits::WireValue<T>
 class FieldExtractor
 {
   public:
@@ -69,6 +70,11 @@ class FieldExtractor
 
     ///
     /// Extract a value from the deserializer and invoke the callback.
+    ///
+    /// The callback runs as soon as this field parses; if a later field in
+    /// the same CompiledDeserializer fails, callbacks for earlier fields
+    /// have already run. Callers stage into locals and commit only on a
+    /// successful overall Status.
     ///
     /// \param deserializer The buffer deserializer to read from.
     /// \return Status indicating success or parse error.
@@ -239,19 +245,6 @@ template <typename... Fields>
 //
 
 ///
-/// Compute the serialized wire size of a field value.
-///
-template <typename T>
-constexpr size_t serialized_field_size(T const& value) noexcept
-{
-    if constexpr (traits::SerializableStruct<T>) {
-        return protocol::wire_size(value);
-    } else {
-        return sizeof(T);
-    }
-}
-
-///
 /// Field serializer with value supplier for compile-time serializer definitions.
 /// Stores a function that provides the value to write to the buffer.
 ///
@@ -259,6 +252,7 @@ constexpr size_t serialized_field_size(T const& value) noexcept
 /// \tparam Fn The value supplier function type (typically a lambda returning T).
 ///
 template <typename T, typename Fn>
+    requires traits::WireValue<T>
 class FieldSerializer
 {
   public:
@@ -287,7 +281,7 @@ class FieldSerializer
     {
         T const value = supplier_();
 
-        size_t const required_size = serialized_field_size(value);
+        size_t const required_size = protocol::serialized_size(value);
 
         // Get writable span
         auto const available_span = buffer.span_of_available_space(required_size);
@@ -336,6 +330,7 @@ class SkipSerializer
 /// \tparam Fn The value supplier function type.
 ///
 template <typename T, typename CondFn, typename Fn>
+    requires traits::WireValue<T>
 class ConditionalFieldSerializer
 {
   public:
@@ -369,7 +364,7 @@ class ConditionalFieldSerializer
         if (condition_()) {
             T const value = supplier_();
 
-            size_t const required_size = serialized_field_size(value);
+            size_t const required_size = protocol::serialized_size(value);
 
             // Get writable span
             auto const available_span = buffer.span_of_available_space(required_size);

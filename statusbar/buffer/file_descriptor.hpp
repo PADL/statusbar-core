@@ -65,6 +65,11 @@ class FileDescriptor
 
     /// Close the descriptor if it is valid, then set to -1.
     /// Safe to call multiple times.
+    ///
+    /// The return value is ignored and EINTR is deliberately not retried:
+    /// on Linux and XNU the descriptor is released before EINTR is reported,
+    /// and close(2) warns that a retry could close a number another thread
+    /// has already reused.
     void close() noexcept
     {
         if (fd_ >= 0) {

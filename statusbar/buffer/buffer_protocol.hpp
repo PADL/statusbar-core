@@ -122,9 +122,12 @@ template <PlainType T, size_t N>
     auto constexpr required_len = sizeof(T) * N;
     auto const buf_size = buf.size();
     STATUSBAR_ASSERT(buf_size >= required_len && "load_unchecked: insufficient buffer size for array");
-    for (size_t i = 0; i < N; ++i) {
-        std::span<uint8_t const> const pos = buf.subspan(i * sizeof(T), sizeof(T));
-        (void)load_unchecked(pos, &(*result)[i]);
+    // A std::array of plain elements is itself a plain object whose bytes are
+    // exactly its elements, so the whole array is one span_load. (N == 0 is
+    // the one exception: sizeof(std::array<T, 0>) is 1, not 0.)
+    if constexpr (N > 0) {
+        static_assert(sizeof(std::array<T, N>) == required_len);
+        span_load(*result, buf);
     }
     return required_len;
 }
@@ -187,10 +190,12 @@ template <traits::PlainSizedContiguous ContainerT>
     auto const required_len = sizeof(typename ContainerT::value_type) * count;
     auto const buf_size = buf.size();
     STATUSBAR_ASSERT(buf_size >= required_len && "load_unchecked: insufficient buffer size for container");
-    for (size_t i = 0; i < count; ++i) {
-        std::span<uint8_t const> const pos =
-            buf.subspan(i * sizeof(typename ContainerT::value_type), sizeof(typename ContainerT::value_type));
-        (void)load_unchecked(pos, &(*result)[i]);
+    // The elements are contiguous plain objects, so the whole range is one
+    // byte copy into the container's storage.
+    if (count > 0) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+        auto const dest = std::span<uint8_t>(reinterpret_cast<uint8_t*>(result->data()), required_len);
+        span_copy(dest, buf.first(required_len));
     }
     return required_len;
 }
@@ -553,6 +558,29 @@ template <SerializableWireFixedStruct T>
         return failure(BufferError::insufficient_space);
     }
     return success(store_unchecked(buf, item));
+}
+
+//
+// Serialized size of any wire value
+//
+///
+/// Number of bytes `store_unchecked(buf, value)` will write for a value the
+/// builders and compiled serdes handle as a unit: `wire_size(value)` for a
+/// SerializableStruct (found via ADL for user types), `sizeof(T)` for any
+/// other trivially copyable type. std::span is rejected by WireValue.
+///
+/// \tparam T A traits::WireValue type.
+/// \param value The value to size.
+/// \return The number of bytes the value occupies on the wire.
+///
+template <traits::WireValue T>
+[[nodiscard]] constexpr auto serialized_size(T const& value) noexcept -> size_t
+{
+    if constexpr (traits::SerializableStruct<T>) {
+        return wire_size(value);
+    } else {
+        return sizeof(T);
+    }
 }
 
 }  // namespace protocol

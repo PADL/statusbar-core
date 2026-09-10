@@ -55,23 +55,20 @@ class BufferSerializerBuilder
     /// If T is a SerializableStruct, uses wire_size() to determine size.
     /// Otherwise uses sizeof(T) for trivially copyable types.
     ///
+    /// std::span is not a WireValue: appending one would store the view
+    /// (pointer + length), not the bytes it views. Byte spans go through the
+    /// non-template `append(std::span<uint8_t const>)` overload below.
+    ///
     /// \tparam T The type to append (must be trivially copyable or SerializableStruct).
     /// \param value The value to append.
     /// \return Reference to this builder for chaining.
     ///
     template <typename T>
+        requires traits::WireValue<T>
     auto append(T const& value) noexcept -> BufferSerializerBuilder&
     {
         if (!error_) {
-            // Calculate required size
-            constexpr bool is_serializable = traits::SerializableStruct<T>;
-            size_t required_size = 0;
-            if constexpr (is_serializable) {
-                using protocol::wire_size;
-                required_size = wire_size(value);
-            } else {
-                required_size = sizeof(T);
-            }
+            auto const required_size = protocol::serialized_size(value);
 
             // Get writable span and call protocol function
             auto const available_span = destination_buffer_.span_of_available_space(required_size);
@@ -87,6 +84,23 @@ class BufferSerializerBuilder
     }
 
     ///
+    /// Append the bytes a span views. Records insufficient_space if the
+    /// buffer cannot hold all of them (nothing is written in that case).
+    ///
+    /// \param bytes The bytes to append.
+    /// \return Reference to this builder for chaining.
+    ///
+    auto append(std::span<uint8_t const> const bytes) noexcept -> BufferSerializerBuilder&
+    {
+        if (!error_) {
+            if (!destination_buffer_.append(bytes)) {
+                error_ = BufferError::insufficient_space;
+            }
+        }
+        return *this;
+    }
+
+    ///
     /// Append a value without bounds checking (unchecked).
     /// WARNING: Caller must ensure sufficient space is available.
     ///
@@ -95,17 +109,11 @@ class BufferSerializerBuilder
     /// \return Reference to this builder for chaining.
     ///
     template <typename T>
+        requires traits::WireValue<T>
     auto append_unchecked(T const& value) noexcept -> BufferSerializerBuilder&
     {
         if (!error_) {
-            constexpr bool is_serializable = traits::SerializableStruct<T>;
-            size_t required_size = 0;
-            if constexpr (is_serializable) {
-                using protocol::wire_size;
-                required_size = wire_size(value);
-            } else {
-                required_size = sizeof(T);
-            }
+            auto const required_size = protocol::serialized_size(value);
 
             // Caller's contract per the doc comment is to ensure there is room.
             // span_of_available_space() returns an empty span when too small, so
@@ -118,6 +126,21 @@ class BufferSerializerBuilder
             using protocol::store_unchecked;
             auto const bytes_written = store_unchecked(available_span, value);
             (void)destination_buffer_.advance_unchecked(bytes_written);
+        }
+        return *this;
+    }
+
+    ///
+    /// Append the bytes a span views without bounds checking.
+    /// WARNING: Caller must ensure sufficient space is available.
+    ///
+    /// \param bytes The bytes to append.
+    /// \return Reference to this builder for chaining.
+    ///
+    auto append_unchecked(std::span<uint8_t const> const bytes) noexcept -> BufferSerializerBuilder&
+    {
+        if (!error_) {
+            destination_buffer_.append_unchecked(bytes);
         }
         return *this;
     }
@@ -171,15 +194,33 @@ class BufferSerializerBuilder
 };
 
 ///
+/// Helper base class that holds the MutableBufferWithStorage.
+/// This must be inherited BEFORE BufferSerializerBuilder so it's initialized first.
+///
+template <size_t N>
+class BufferSerializerBuilderWithStorageBase
+{
+  protected:
+    MutableBufferWithStorage<N> mutable_buffer_with_storage_{};
+
+    BufferSerializerBuilderWithStorageBase() noexcept = default;
+};
+
+///
 /// BufferSerializerBuilder with built-in storage.
 /// Combines the builder pattern with internal fixed-size array storage.
+/// Uses the same "base class initialization helper" pattern as
+/// BufferSerializerBuilderWithBuffer so the MutableBuffer the base builder
+/// references is fully constructed before the reference is taken.
 ///
 /// \tparam N The size of the internal storage in bytes.
 ///
 template <size_t N>
-class BufferSerializerBuilderWithStorage : public BufferSerializerBuilder
+class BufferSerializerBuilderWithStorage
+    : private BufferSerializerBuilderWithStorageBase<N>
+    , public BufferSerializerBuilder
 {
-    MutableBufferWithStorage<N> mutable_buffer_with_storage_{};
+    using BufferSerializerBuilderWithStorageBase<N>::mutable_buffer_with_storage_;
 
   public:
     ///
@@ -187,8 +228,12 @@ class BufferSerializerBuilderWithStorage : public BufferSerializerBuilder
     /// The builder is initialized with N bytes of available space.
     ///
     BufferSerializerBuilderWithStorage() noexcept
-        : BufferSerializerBuilder(mutable_buffer_with_storage_)
+        : BufferSerializerBuilderWithStorageBase<N>()            // Initialize helper base first
+        , BufferSerializerBuilder(mutable_buffer_with_storage_)  // Pass already-initialized member
     {}
+
+    // Bring base class get_span into overload set (avoids shadowing warning)
+    using BufferSerializerBuilder::get_span;
 
     ///
     /// Get the underlying MutableBuffer.
