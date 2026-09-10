@@ -132,7 +132,7 @@ HttpServer::HttpServer(
     net::TcpServerOptions tcp_options)
     : limits_{limits}
     , static_{static_manifest}
-    , discard_(4096)
+    , discard_(limits.body_chunk)
     , pool_{bind_addr, limits.max_connections, *this, [&] {
                 // The server owns connection lifetime (408 vs silent idle
                 // close differ) — the pool's blunt idle sweep stays off.
@@ -146,7 +146,7 @@ HttpServer::HttpServer(
     for (auto& c : connections_) {
         c.rx.resize(rx_size);
         c.tx.resize(limits_.max_response_head);
-        c.extra.resize(512);
+        c.extra.resize(limits_.max_extra_headers);
         parsers_.emplace_back(limits_);
     }
 }

@@ -490,4 +490,43 @@ TEST(http_handler, unbuildable_responses_become_a_fixed_500)
     }
 }
 
+TEST(http_handler, extra_header_space_and_body_chunk_come_from_limits)
+{
+    HttpLimits limits;
+    limits.max_connections = 2;
+    limits.max_body = 64;
+    limits.max_extra_headers = 256;  // OverflowHandler's X-Long line is 310 bytes
+    limits.body_chunk = 1000;
+    HttpServer server{net::SocketAddress::ipv4_loopback(0), limits};
+    EXPECT_TRUE(server.valid());
+    auto const addr = *server.local_addr();
+
+    OverflowHandler overflow{true};
+    CountHandler counter;
+    EXPECT_TRUE(server.add_route(HttpMethod::get, "/big", overflow));
+    EXPECT_TRUE(server.add_route(HttpMethod::put, "/count", counter));
+
+    // The queued header no longer fits; the response itself (4-byte body,
+    // default tx buffer) is unaffected.
+    Client c{addr};
+    c.send_all("GET /big HTTP/1.1\r\nHost: t\r\n\r\n");
+    pump(server);
+    EXPECT_FALSE(overflow.header_added);
+    EXPECT_TRUE(overflow.first_sent);
+    auto const response = c.recv_for(150);
+    EXPECT_TRUE(status_line(response) == "HTTP/1.1 200 OK");
+    EXPECT_TRUE(response.find("X-Long") == std::string::npos);
+
+    // Streamed reads are capped at body_chunk. The first chunk is whatever
+    // rode in with the head (at most the rx buffer); everything after it
+    // arrives in body_chunk-sized reads.
+    size_t const rx_capacity = limits.max_request_line + limits.max_header_block + limits.max_body;
+    size_t const min_chunks = 1 + ((50000 - rx_capacity + limits.body_chunk - 1) / limits.body_chunk);
+    std::string const body(50000, 'x');
+    c.send_all("PUT /count HTTP/1.1\r\nHost: t\r\nContent-Length: 50000\r\n\r\n" + body);
+    pump(server, 80);
+    EXPECT_TRUE(body_of(c.recv_for(200)) == "count=50000");
+    EXPECT_TRUE(counter.chunks >= min_chunks);
+}
+
 TEST_MAIN(statusbar_http, http_handler_test)

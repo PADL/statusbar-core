@@ -108,6 +108,9 @@ Data flow rules:
 | max header block | 8 KiB | 431 |
 | max header count | 32 | 431 |
 | max body bytes | 64 KiB (buffered) / handler-declared (streamed) | 413 |
+| max response head | 4 KiB (tx buffer: head + inline bodies) | 500 + close |
+| max extra headers | 512 B per connection | `add_header()` false |
+| body chunk | 4 KiB (streamed/discarded body reads, shared) | — |
 | max WS message | 64 KiB | close 1009 |
 | header-read timeout | 10 s | 408 + close |
 | keep-alive idle | 30 s | close |

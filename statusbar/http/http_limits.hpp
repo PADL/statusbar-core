@@ -36,6 +36,15 @@ struct HttpLimits
     /// buffer). Static and streamed bodies do not pass through it.
     size_t max_response_head = 4096;
 
+    /// Bytes of writer-queued extra response headers per connection
+    /// ("Name: value\r\n" each) -> ResponseWriter::add_header() false.
+    size_t max_extra_headers = 512;
+
+    /// Read chunk for bodies that do not land in rx — streamed (the size
+    /// of each on_body_chunk span) and discarded. One buffer, shared by
+    /// all connections.
+    size_t body_chunk = 4096;
+
     /// Reassembled WebSocket message bytes -> close 1009.
     size_t max_ws_message = size_t{64} * 1024;
 

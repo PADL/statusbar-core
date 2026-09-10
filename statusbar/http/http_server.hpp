@@ -60,8 +60,9 @@ class HttpServer;
 ///                                      body.
 ///
 /// add_header() queues extra response headers (fixed per-connection
-/// space; false when full). On HEAD requests the body is suppressed but
-/// Content-Length still describes it.
+/// space of HttpLimits::max_extra_headers bytes; false when full). On
+/// HEAD requests the body is suppressed but Content-Length still
+/// describes it.
 ///
 /// A send is accepted only from on_complete or an asynchronous
 /// respond(); one from on_headers is refused (false) and the request
@@ -276,8 +277,8 @@ class HttpServer
     std::vector<WsRoute> ws_routes_;
     std::vector<Connection> connections_;
     std::vector<HttpParser> parsers_;
-    std::vector<uint8_t> discard_;
-    net::TcpConnectionPool pool_;  ///< constructed last: callbacks may fire on members above
+    std::vector<uint8_t> discard_;  ///< streamed/discarded body reads, body_chunk bytes, shared
+    net::TcpConnectionPool pool_;   ///< constructed last: callbacks may fire on members above
 };
 
 }  // namespace statusbar::http
