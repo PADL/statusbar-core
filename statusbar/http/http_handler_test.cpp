@@ -292,12 +292,16 @@ TEST(http_handler, streaming_accepts_beyond_max_body)
     EXPECT_TRUE(body_of(response) == "count=50000");
     EXPECT_TRUE(counter.chunks > 1U);  // genuinely chunked, not buffered
 
-    // The same request against a BUFFERED route answers 413.
+    // The same request against a BUFFERED route answers 413 and closes
+    // without draining the upload, like every other over-cap refusal.
     EchoHandler echo;
     EXPECT_TRUE(fx.server->add_route(HttpMethod::put, "/buffered", echo));
     c.send_all("PUT /buffered HTTP/1.1\r\nHost: t\r\nContent-Length: 50000\r\n\r\n" + body);
-    pump(*fx.server, 60);
-    EXPECT_TRUE(status_line(c.recv_for(200)) == "HTTP/1.1 413 Content Too Large");
+    pump(*fx.server);
+    auto const refused = c.recv_for(200);
+    EXPECT_TRUE(status_line(refused) == "HTTP/1.1 413 Content Too Large");
+    EXPECT_TRUE(header_value(refused, "Connection") == "close");
+    EXPECT_TRUE(c.at_eof());
 }
 
 TEST(http_handler, reject_consumes_body_and_keeps_alive)

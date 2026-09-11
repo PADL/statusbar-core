@@ -464,10 +464,10 @@ void HttpServer::handle_complete_head(size_t slot, int64_t now_ns)
                 break;
             case Disposition::Kind::buffer:
                 if (body_len > limits_.max_body) {
-                    c.handler = nullptr;
-                    c.body_mode = BodyMode::discard;
-                    c.pending_status = 413;  // buffered acceptance is capped
-                    break;
+                    // Buffered acceptance is capped, and like every other
+                    // refusal of an over-cap body this does not drain it.
+                    respond_status(slot, 413, true, now_ns);
+                    return;
                 }
                 c.body_mode = BodyMode::buffered;
                 break;
@@ -494,9 +494,8 @@ void HttpServer::handle_complete_head(size_t slot, int64_t now_ns)
 
     if (expects_continue) {
         if (c.handler == nullptr) {
-            // Nothing wants the body (no route, or a buffered cap it
-            // exceeds): the final status now, and close — the same
-            // "do not send it" answer the reject path gives.
+            // No route wants the body: the final status now, and close
+            // — the same "do not send it" answer the reject path gives.
             respond_unhandled(slot, true, now_ns);
             return;
         }
