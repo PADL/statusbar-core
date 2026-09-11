@@ -103,6 +103,60 @@ Data flow rules:
   body is read; a reject, a 413, or an unrouted request answers with
   its final status at once and closes (RFC 9110 §10.1.1).
 
+### Connection lifecycle
+
+One slot, one `ConnState` plus a few orthogonal flags (`close_after_send`,
+`upgrade_pending`, `ws_mode`, `ws_closing`, `BodyMode`). Every arrow
+below is chosen by data — a syscall result, `Content-Length` against
+what already arrived, the handler's disposition, the flags after a
+drain — which is why this is hand-written control flow rather than a
+`statusbar/sm` table (that engine has fixed next-states and no guards,
+and its action-then-assign order cannot express the synchronous
+fast path in `body_finished`).
+
+```mermaid
+stateDiagram-v2
+    [*] --> reading_head : accept
+
+    reading_head --> reading_head : read; head incomplete
+    reading_head --> sending : parse failed (4xx + close)
+    reading_head --> sending : 413 / reject / 426 / 400\n(answered from the head)
+    reading_head --> sending : WS upgrade (101, upgrade_pending)
+    reading_head --> reading_body : head complete\n(100 Continue if expected)
+
+    reading_body --> reading_body : read; body_remaining > 0
+    reading_body --> sending : body done, handler sent\n(or pending status / static / 405 / 404)
+    reading_body --> awaiting_response : body done, handler deferred
+    reading_body --> reading_head : body done, fast completion\n(response drained synchronously)
+
+    awaiting_response --> sending : HttpServer::respond() + send
+    awaiting_response --> reading_head : respond() drained synchronously
+
+    sending --> sending : EAGAIN; on_writable continues
+    sending --> reading_head : drained, keep-alive\n(next_request: pipelined tail re-parsed)
+    sending --> ws_open : drained, upgrade_pending
+    sending --> [*] : drained, close_after_send
+
+    state ws_open {
+        [*] --> idle
+        idle --> idle : data frame → on_ws_message\nping → pong
+        idle --> tx_busy : frame staged (ws_send / pong / ping)
+        tx_busy --> idle : frame drained; queued frames resume
+    }
+    ws_open --> ws_closing : ws_close() / peer close /\nprotocol error (1002) / too big (1009)
+    ws_closing --> [*] : close frame drained\nor peer close received
+
+    reading_head --> sending : header-read timeout (408 + close)
+    reading_head --> [*] : keep-alive idle (30 s)
+    reading_body --> [*] : read error
+    sending --> [*] : write error
+    ws_open --> [*] : drop timeout (60 s) / error
+```
+
+Not shown: `on_closed` from any state resets the slot for reuse; a
+handler's `writer.send()` is what moves reading_body /
+awaiting_response into sending.
+
 ### HttpLimits (all init-time)
 
 | limit | default | on violation |
