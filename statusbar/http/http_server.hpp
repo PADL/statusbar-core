@@ -239,8 +239,11 @@ class HttpServer
     void process(size_t slot, int64_t now_ns);
     void handle_complete_head(size_t slot, int64_t now_ns);
     void body_finished(size_t slot, int64_t now_ns);
+    /// The answer for a request no handler took: pending status, static
+    /// manifest, 405, or 404.
+    void respond_unhandled(size_t slot, bool close_after, int64_t now_ns);
     void respond_status(size_t slot, uint16_t status, bool close_after, int64_t now_ns);
-    void serve_static(size_t slot, StaticRoute const& route, HttpRequest const& request, int64_t now_ns);
+    void serve_static(size_t slot, StaticRoute const& route, HttpRequest const& request, bool close_after, int64_t now_ns);
     void pump_tx(size_t slot, int64_t now_ns);
     void next_request(size_t slot, int64_t now_ns);
 

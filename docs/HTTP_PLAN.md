@@ -98,6 +98,10 @@ Data flow rules:
 - A slot serves one request at a time. Pipelined bytes beyond the
   current request stay in the rx buffer and are parsed after the
   response finishes (correct, but no concurrent handling).
+- `Expect: 100-continue` (HTTP/1.1, no body byte yet received): a
+  buffer/stream disposition writes a fixed `100 Continue` before the
+  body is read; a reject, a 413, or an unrouted request answers with
+  its final status at once and closes (RFC 9110 §10.1.1).
 
 ### HttpLimits (all init-time)
 

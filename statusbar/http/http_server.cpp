@@ -420,6 +420,14 @@ void HttpServer::handle_complete_head(size_t slot, int64_t now_ns)
     uint64_t const body_len = request.has_content_length ? request.content_length : 0;
     uint64_t const body_in_rx = std::min<uint64_t>(body_len, c.rx_len - head_len);
 
+    // RFC 9110 §10.1.1: a client that sent "Expect: 100-continue" holds
+    // the body back until it sees an interim 100 or a final status (curl
+    // gives up waiting after ~1 s and sends anyway). HTTP/1.1 only — a
+    // 1xx to a 1.0 client is a framing error — and moot once any body
+    // byte has arrived with the head.
+    bool const expects_continue =
+        request.version_minor == 1 && body_len > body_in_rx && iequals(request.header("expect"), "100-continue");
+
     c.suppress_body = request.method == HttpMethod::head;
     c.pending_status = 0;
     c.response_staged = false;
@@ -442,10 +450,13 @@ void HttpServer::handle_complete_head(size_t slot, int64_t now_ns)
             case Disposition::Kind::reject:
                 c.handler = nullptr;
                 c.body_mode = BodyMode::discard;
-                if (body_len > limits_.max_body) {
+                if (body_len > limits_.max_body || expects_continue) {
                     // Draining is what keeps keep-alive framing, but only
                     // up to the buffered cap — not a rejected upload of
-                    // any size, at 4 KiB per pass with no timeout.
+                    // any size, at 4 KiB per pass with no timeout. A
+                    // client waiting on its Expect gets the final status
+                    // now instead of a 100, and the close tells it not to
+                    // send the body at all.
                     respond_status(slot, disposition.status(), true, now_ns);
                     return;
                 }
@@ -480,6 +491,31 @@ void HttpServer::handle_complete_head(size_t slot, int64_t now_ns)
     c.leftover_at = c.body_mode == BodyMode::buffered ? head_len + size_t(body_len) : head_len + size_t(body_in_rx);
     c.body_remaining = body_len - body_in_rx;
     c.state = ConnState::reading_body;
+
+    if (expects_continue) {
+        if (c.handler == nullptr) {
+            // Nothing wants the body (no route, or a buffered cap it
+            // exceeds): the final status now, and close — the same
+            // "do not send it" answer the reject path gives.
+            respond_unhandled(slot, true, now_ns);
+            return;
+        }
+        // Fixed bytes straight to the socket: tx is idle between
+        // responses and the interim must not disturb the response the
+        // handler will stage. A short write of 25 bytes into an idle
+        // socket only happens on a dead peer.
+        static constexpr std::string_view CONTINUE_100 = "HTTP/1.1 100 Continue\r\n\r\n";
+        auto const n = pool_.write(
+            slot,
+            std::span<uint8_t const>{
+                reinterpret_cast<uint8_t const*>(CONTINUE_100.data()),  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+                CONTINUE_100.size()});
+        if (!n || *n != CONTINUE_100.size()) {
+            pool_.close(slot);
+            return;
+        }
+    }
+
     if (c.body_remaining == 0) {
         body_finished(slot, now_ns);
     }
@@ -510,28 +546,35 @@ void HttpServer::body_finished(size_t slot, int64_t now_ns)
         }
         return;
     }
+    respond_unhandled(slot, !request.keep_alive, now_ns);
+}
+
+void HttpServer::respond_unhandled(size_t slot, bool close_after, int64_t now_ns)
+{
+    auto& c = connections_[slot];
+    auto const& request = parsers_[slot].request();
+
     if (c.pending_status != 0) {
-        respond_status(slot, c.pending_status, !request.keep_alive, now_ns);
+        respond_status(slot, c.pending_status, close_after, now_ns);
         return;
     }
     if (static_ != nullptr && (request.method == HttpMethod::get || request.method == HttpMethod::head)) {
         if (auto const* route = static_->find(request.path)) {
-            serve_static(slot, *route, request, now_ns);
+            serve_static(slot, *route, request, close_after, now_ns);
             return;
         }
     }
     if (path_registered(request.path)) {
         append_allow_header(slot, request.path);
-        respond_status(slot, 405, !request.keep_alive, now_ns);
+        respond_status(slot, 405, close_after, now_ns);
         return;
     }
-    respond_status(slot, dispatch(slot, request), !request.keep_alive, now_ns);
+    respond_status(slot, dispatch(slot, request), close_after, now_ns);
 }
 
-void HttpServer::serve_static(size_t slot, StaticRoute const& route, HttpRequest const& request, int64_t now_ns)
+void HttpServer::serve_static(size_t slot, StaticRoute const& route, HttpRequest const& request, bool close_after, int64_t now_ns)
 {
     auto& c = connections_[slot];
-    bool const close_after = !request.keep_alive;
     char const* const connection = close_after ? "close" : "keep-alive";
 
     if (request.header("if-none-match") == route.etag) {

@@ -529,4 +529,91 @@ TEST(http_handler, extra_header_space_and_body_chunk_come_from_limits)
     EXPECT_TRUE(counter.chunks >= min_chunks);
 }
 
+TEST(http_handler, expect_continue_gets_an_interim_100_before_the_body)
+{
+    Fixture fx;
+    EchoHandler echo;
+    EXPECT_TRUE(fx.server->add_route(HttpMethod::post, "/echo", echo));
+    CountHandler counter;
+    EXPECT_TRUE(fx.server->add_route(HttpMethod::put, "/count", counter));
+
+    // Buffered: the client holds the body back until the 100 arrives.
+    Client c{fx.addr};
+    c.send_all("POST /echo HTTP/1.1\r\nHost: t\r\nExpect: 100-Continue\r\nContent-Length: 5\r\n\r\n");
+    pump(*fx.server);
+    EXPECT_TRUE(c.recv_for(100) == "HTTP/1.1 100 Continue\r\n\r\n");
+    c.send_all("hello");
+    pump(*fx.server);
+    auto const echoed = c.recv_for(150);
+    EXPECT_TRUE(status_line(echoed) == "HTTP/1.1 200 OK");
+    EXPECT_TRUE(body_of(echoed) == "hello");
+
+    // Streamed, same connection: the 100 sits alone, then the body.
+    c.send_all("PUT /count HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 7\r\n\r\n");
+    pump(*fx.server);
+    EXPECT_TRUE(c.recv_for(100) == "HTTP/1.1 100 Continue\r\n\r\n");
+    c.send_all("1234567");
+    pump(*fx.server);
+    EXPECT_TRUE(body_of(c.recv_for(150)) == "count=7");
+
+    // Body already riding with the head: no interim, the client was not
+    // waiting for one.
+    c.send_all("POST /echo HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nok");
+    pump(*fx.server);
+    auto const direct = c.recv_for(150);
+    EXPECT_TRUE(status_line(direct) == "HTTP/1.1 200 OK");
+    EXPECT_TRUE(body_of(direct) == "ok");
+    EXPECT_FALSE(c.at_eof());
+}
+
+TEST(http_handler, expect_continue_on_a_refused_body_is_the_final_status_and_close)
+{
+    Fixture fx;
+    RejectHandler teapot;
+    EXPECT_TRUE(fx.server->add_route(HttpMethod::post, "/brew", teapot));
+    EchoHandler echo;
+    EXPECT_TRUE(fx.server->add_route(HttpMethod::post, "/echo", echo));
+
+    // Rejected from on_headers: no 100, the status right away, closed.
+    {
+        Client c{fx.addr};
+        c.send_all("POST /brew HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 8\r\n\r\n");
+        pump(*fx.server);
+        auto const resp = c.recv_for(150);
+        EXPECT_TRUE(status_line(resp) == "HTTP/1.1 418 I'm a teapot");
+        EXPECT_TRUE(header_value(resp, "Connection") == "close");
+        EXPECT_TRUE(c.at_eof());
+    }
+    // Buffered but over max_body: 413 without waiting for the upload.
+    {
+        Client c{fx.addr};
+        c.send_all("POST /echo HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 65\r\n\r\n");
+        pump(*fx.server);
+        auto const resp = c.recv_for(150);
+        EXPECT_TRUE(status_line(resp) == "HTTP/1.1 413 Content Too Large");
+        EXPECT_TRUE(header_value(resp, "Connection") == "close");
+        EXPECT_TRUE(c.at_eof());
+    }
+    // No route: the 404 without draining a body nobody wants.
+    {
+        Client c{fx.addr};
+        c.send_all("POST /nowhere HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 8\r\n\r\n");
+        pump(*fx.server);
+        auto const resp = c.recv_for(150);
+        EXPECT_TRUE(status_line(resp) == "HTTP/1.1 404 Not Found");
+        EXPECT_TRUE(header_value(resp, "Connection") == "close");
+        EXPECT_TRUE(c.at_eof());
+    }
+    // HTTP/1.0 never gets a 1xx: the engine reads the body as usual.
+    {
+        Client c{fx.addr};
+        c.send_all("POST /echo HTTP/1.0\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n");
+        pump(*fx.server);
+        EXPECT_TRUE(c.recv_for(100).empty());
+        c.send_all("ok");
+        pump(*fx.server);
+        EXPECT_TRUE(body_of(c.recv_for(150)) == "ok");
+    }
+}
+
 TEST_MAIN(statusbar_http, http_handler_test)

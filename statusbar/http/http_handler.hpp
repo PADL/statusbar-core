@@ -18,6 +18,10 @@
 ///       (the engine still consumes the body so keep-alive survives —
 ///       up to max_body; a larger rejected body is answered and closed).
 ///       A send from on_headers is refused (the writer returns false).
+///       "Expect: 100-continue" is answered here from the disposition:
+///       buffer/stream get an interim 100 before the body is read; a
+///       reject (or a body nothing wants) gets its final status at once,
+///       with close, so the client never sends the body.
 ///
 ///   on_body_chunk(request, chunk)
 ///       Streamed mode only; chunk boundaries are transport artifacts.
