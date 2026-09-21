@@ -145,7 +145,31 @@ if(ENABLE_AVX
   list(APPEND _STATUSBAR_CXX_FLAGS -mavx2 -mfma)
 endif()
 
-# Warnings
+# Warnings Statically link the C++ runtime into executables. One flag pair
+# covers both toolchains: GCC links libstdc++ and libgcc; clang links libc++,
+# libc++abi and the libgcc unwinder. Either way the C++ runtime leaves the
+# binary's dynamic dependencies entirely.
+#
+# This decouples the build compiler from the runtime present on the target. A
+# C++26 GCC 16 binary needs GLIBCXX_3.4.36, which Debian trixie (libstdc++
+# 14.2.0) does not provide, so a dynamically linked package will not even
+# install there; the same applies to a newer clang's libc++ without shipping a
+# matching libc++1. With this ON the generated .deb drops its libstdc++6 and
+# libgcc-s1 dependencies and installs on an older target unchanged. Costs
+# roughly 1.4 MB per executable.
+#
+# Executables only, deliberately. Giving each shared object a private copy of
+# the C++ runtime breaks exception propagation and type identity across .so
+# boundaries. Every statusbar module is a STATIC library, so executables are the
+# only place this belongs.
+option(ENABLE_STATIC_CXX_RUNTIME
+       "Statically link the C++ runtime into executables" OFF)
+set(_STATUSBAR_EXE_LINKER_FLAGS "")
+if(ENABLE_STATIC_CXX_RUNTIME)
+  message(STATUS "Static C++ runtime enabled (executables)")
+  list(APPEND _STATUSBAR_EXE_LINKER_FLAGS -static-libstdc++ -static-libgcc)
+endif()
+
 option(ENABLE_WARNINGS_AS_ERRORS "Warning is an error" ON)
 if(ENABLE_WARNINGS_AS_ERRORS)
   list(APPEND _STATUSBAR_CXX_FLAGS -Werror)
@@ -174,6 +198,11 @@ include("${CMAKE_CURRENT_LIST_DIR}/sanitizers.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/coverage.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/fuzzing.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/clang_tidy.cmake")
+
+if(_STATUSBAR_EXE_LINKER_FLAGS)
+  list(JOIN _STATUSBAR_EXE_LINKER_FLAGS " " _STATUSBAR_EXE_LINKER_FLAGS_STR)
+  string(APPEND CMAKE_EXE_LINKER_FLAGS " ${_STATUSBAR_EXE_LINKER_FLAGS_STR}")
+endif()
 
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "CXX flags: ${CMAKE_CXX_FLAGS}")
