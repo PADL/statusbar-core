@@ -67,9 +67,28 @@ inline auto do_not_optimize(T const& value)
 template <class T>
 inline auto do_not_optimize(T& value)
 {
-#if defined(__clang__) || defined(__GNUC__)
+#if defined(__clang__)
     // "+r,m" = value is both read and written
     asm volatile("" : "+r,m"(value) : : "memory");
+#elif defined(__GNUC__)
+    // GCC gets the single "m" alternative, not clang's "+r,m" multi-alternative
+    // form. Two distinct GCC behaviours force this:
+    //
+    //   "+r,m"  rejected outright at compile time ("impossible constraint in
+    //           'asm'") for any T that cannot live in a register.
+    //   "+m,r"  compiles, but is miscompiled at -O1/-O2 on GCC 16.2 aarch64:
+    //           the write-back for the selected alternative clobbers the
+    //           operand, so `int v = 42; do_not_optimize(v);` leaves v holding
+    //           garbage, and a counter incremented in a benchmark loop reads
+    //           back as 0. (-O0 and -O3 happen to be fine, which is what makes
+    //           it so easy to miss.)
+    //
+    // "+m" is always satisfiable, needs no alternative selection, and is the
+    // stronger barrier anyway: it forces the value to memory and marks it
+    // read-written, which is exactly the guarantee this function exists to
+    // provide. The input-only const overload above keeps "r,m" — only the
+    // read-write write-back path is affected.
+    asm volatile("" : "+m"(value) : : "memory");
 #else
     // Fallback for other compilers
     auto volatile tmp = &value;
