@@ -76,18 +76,22 @@ inline auto do_not_optimize(T& value)
     //
     //   "+r,m"  rejected outright at compile time ("impossible constraint in
     //           'asm'") for any T that cannot live in a register.
-    //   "+m,r"  compiles, but is miscompiled at -O1/-O2 on GCC 16.2 aarch64:
-    //           the write-back for the selected alternative clobbers the
-    //           operand, so `int v = 42; do_not_optimize(v);` leaves v holding
-    //           garbage, and a counter incremented in a benchmark loop reads
-    //           back as 0. (-O0 and -O3 happen to be fine, which is what makes
-    //           it so easy to miss.)
+    //   "+m,r"  compiles, but is silently miscompiled on GCC 16.2 aarch64:
+    //           although "+" marks the operand read-write, GCC treats it as
+    //           write-only and eliminates the store that initialises it, so
+    //           the asm reads uninitialised stack. `int v = 42;
+    //           do_not_optimize(v);` leaves v holding garbage, and a counter
+    //           incremented in a benchmark loop reads back as 0 -- benchmark
+    //           results would be wrong, not just the tests.
     //
     // "+m" is always satisfiable, needs no alternative selection, and is the
     // stronger barrier anyway: it forces the value to memory and marks it
     // read-written, which is exactly the guarantee this function exists to
-    // provide. The input-only const overload above keeps "r,m" — only the
-    // read-write write-back path is affected.
+    // provide. The input-only const overload above keeps "r,m" -- only
+    // read-write operands are affected.
+    //
+    // Full analysis, constraint matrix and a 9-line reproducer:
+    // docs/GCC_INLINE_ASM_MULTI_ALTERNATIVE_BUG.md
     asm volatile("" : "+m"(value) : : "memory");
 #else
     // Fallback for other compilers

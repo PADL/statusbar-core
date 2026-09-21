@@ -44,3 +44,4 @@ In-depth references that go beyond the per-module overviews:
 ## Build system
 
 - [BUILD_SYSTEM.md](BUILD_SYSTEM.md) — reference for the shared CMake scripts in `core/cmake/` (toolchain, `statusbar_add_module()`, sanitizers, coverage, fuzzing).
+- [GCC_INLINE_ASM_MULTI_ALTERNATIVE_BUG.md](GCC_INLINE_ASM_MULTI_ALTERNATIVE_BUG.md) — GCC 16 wrong-code bug on read-write inline-asm operands with mixed `m`/`r` alternatives, why `do_not_optimize()` is spelled the way it is, and the reproducer.
