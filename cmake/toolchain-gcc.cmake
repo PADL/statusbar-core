@@ -25,29 +25,54 @@ set(STATUSBAR_TOOLCHAIN_LOADED TRUE)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Compiler selection. GCC_PATH (env var) is the single override knob, mirroring
-# LLVM_PATH in the clang toolchain: point it at a prefix containing bin/gcc and
-# bin/g++ (e.g. a self-built or Homebrew GCC). Otherwise find g++ on PATH and
-# walk back to its prefix via REALPATH, which handles symlinks of any depth and
-# ccache shim directories.
-if(DEFINED ENV{GCC_PATH})
-  set(CMAKE_GCC_PATH "$ENV{GCC_PATH}")
-else()
-  find_program(
-    _gxx_exe
-    NAMES g++
-    DOC "GNU C++ compiler")
-  if(_gxx_exe)
-    get_filename_component(_gxx_real "${_gxx_exe}" REALPATH)
-    get_filename_component(_gxx_bin "${_gxx_real}" DIRECTORY)
-    get_filename_component(CMAKE_GCC_PATH "${_gxx_bin}" DIRECTORY)
+# Compiler selection, in precedence order:
+#
+# 1. CMAKE_CXX_COMPILER already set — a cross toolchain that include()s this file
+#    names the cross binaries itself, and -DCMAKE_CXX_COMPILER=g++-16 likewise
+#    wins. Never overwritten.
+# 2. CXX / CC environment variables. Debian ships versioned binaries with no
+#    unversioned g++, so CXX=g++-16 works with no prefix layout needed.
+# 3. GCC_PATH — a prefix containing bin/gcc and bin/g++ (a self-built or Homebrew
+#    GCC), mirroring LLVM_PATH in the clang toolchain.
+# 4. g++ found on PATH, walked back to its prefix via REALPATH, which handles
+#    symlinks of any depth and ccache shim directories.
+if(NOT CMAKE_CXX_COMPILER)
+  if(DEFINED ENV{CXX})
+    set(CMAKE_CXX_COMPILER "$ENV{CXX}")
+  elseif(DEFINED ENV{GCC_PATH})
+    set(CMAKE_CXX_COMPILER "$ENV{GCC_PATH}/bin/g++")
   else()
-    set(CMAKE_GCC_PATH "/usr") # last resort
+    find_program(
+      _gxx_exe
+      NAMES g++
+      DOC "GNU C++ compiler")
+    if(_gxx_exe)
+      get_filename_component(_gxx_real "${_gxx_exe}" REALPATH)
+      get_filename_component(_gxx_bin "${_gxx_real}" DIRECTORY)
+      get_filename_component(_gcc_prefix "${_gxx_bin}" DIRECTORY)
+    else()
+      set(_gcc_prefix "/usr") # last resort
+    endif()
+    set(CMAKE_CXX_COMPILER "${_gcc_prefix}/bin/g++")
   endif()
 endif()
-
-set(CMAKE_C_COMPILER "${CMAKE_GCC_PATH}/bin/gcc")
-set(CMAKE_CXX_COMPILER "${CMAKE_GCC_PATH}/bin/g++")
+if(NOT CMAKE_C_COMPILER)
+  if(DEFINED ENV{CC})
+    set(CMAKE_C_COMPILER "$ENV{CC}")
+  elseif(DEFINED ENV{GCC_PATH})
+    set(CMAKE_C_COMPILER "$ENV{GCC_PATH}/bin/gcc")
+  else()
+    find_program(
+      _gcc_exe
+      NAMES gcc
+      DOC "GNU C compiler")
+    if(_gcc_exe)
+      set(CMAKE_C_COMPILER "${_gcc_exe}")
+    else()
+      set(CMAKE_C_COMPILER "/usr/bin/gcc") # last resort
+    endif()
+  endif()
+endif()
 
 # Fail early and legibly on a GCC too old for the C++26 default. Without this
 # the build dies in a flood of syntax errors several hundred lines deep.
@@ -189,8 +214,17 @@ endif()
 # not affect a clang build. Cross builds and x86 are left alone: crypto's
 # cross-compile default (-march=armv8-a+crypto) and its x86 flags (-maes
 # -mpclmul -msha -msse4.1) are accepted by GCC as-is.
-if(NOT CMAKE_CROSSCOMPILING AND _STATUSBAR_TARGET_PROC MATCHES
-                                "aarch64|arm64|ARM64")
+#
+# Native builds only, and the native test is deliberately NOT
+# CMAKE_CROSSCOMPILING: CMake does not define that until project() runs, so on
+# the first toolchain pass it is empty and `NOT CMAKE_CROSSCOMPILING` is true
+# even for a cross build — which would seed -mcpu=native for a cross compiler
+# that cannot read the target CPU off the build host. Compare the resolved
+# target against the host instead. A cross toolchain sets CMAKE_SYSTEM_PROCESSOR
+# before including this file, so the two differ there and crypto's own cross
+# default applies untouched.
+if(_STATUSBAR_TARGET_PROC MATCHES "aarch64|arm64|ARM64"
+   AND _STATUSBAR_TARGET_PROC STREQUAL "${CMAKE_HOST_SYSTEM_PROCESSOR}")
   set(STATUSBAR_CRYPTO_ARCH_FLAGS
       "-mcpu=native"
       CACHE

@@ -9,7 +9,29 @@
 set -euo pipefail
 
 PKG="core"
-DEBIAN_VERSION="${DEBIAN_VERSION:-trixie}"
+# STATUSBAR_TOOLCHAIN picks the compiler: clang (default) or gcc. clang
+# cross-targets with a single multi-target driver; gcc needs Debian's
+# aarch64-linux-gnu cross compiler, which only forky and later ship, so the
+# base image default follows the toolchain.
+STATUSBAR_TOOLCHAIN="${STATUSBAR_TOOLCHAIN:-clang}"
+case "$STATUSBAR_TOOLCHAIN" in
+  clang) _default_debian="trixie" ;;
+  gcc)   _default_debian="forky" ;;
+  *)
+    echo "error: STATUSBAR_TOOLCHAIN must be 'clang' or 'gcc'" >&2
+    exit 1
+    ;;
+esac
+
+# Statically link the C++ runtime for gcc cross builds by default, for the same
+# reason as the native path: a C++26 GCC 16 binary needs a newer libstdc++ than
+# the deployment target carries. See scripts/container-build.sh.
+case "$STATUSBAR_TOOLCHAIN" in
+  gcc) STATUSBAR_STATIC_CXX="${STATUSBAR_STATIC_CXX:-ON}" ;;
+  *)   STATUSBAR_STATIC_CXX="${STATUSBAR_STATIC_CXX:-OFF}" ;;
+esac
+
+DEBIAN_VERSION="${DEBIAN_VERSION:-$_default_debian}"
 TARGET_ARCH="${TARGET_ARCH:-arm64}"
 ENGINE="${CONTAINER_ENGINE:-podman}"
 
@@ -17,7 +39,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TREE_DIR="$(dirname "$SCRIPT_DIR")"
 EXPORT_ROOT="$(dirname "$TREE_DIR")"
 DEB_OUTPUT="${DEB_OUTPUT:-$EXPORT_ROOT/deb-output}"
-IMAGE="localhost/statusbar-deb-builder-cross:$DEBIAN_VERSION-$TARGET_ARCH"
+IMAGE="localhost/statusbar-deb-builder-cross:$DEBIAN_VERSION-$TARGET_ARCH-$STATUSBAR_TOOLCHAIN"
 
 MOUNT_OPT=""
 if [ "$(uname -s)" = "Linux" ]; then
@@ -39,6 +61,7 @@ if [ "$("$ENGINE" image inspect \
     --platform linux/amd64 \
     --build-arg "DEBIAN_VERSION=$DEBIAN_VERSION" \
     --build-arg "TARGET_ARCH=$TARGET_ARCH" \
+    --build-arg "STATUSBAR_TOOLCHAIN=$STATUSBAR_TOOLCHAIN" \
     --label "statusbar.containerfile=$CF_SUM" \
     -f "$TREE_DIR/Containerfile.cross" "$TREE_DIR"
 fi
@@ -48,13 +71,16 @@ echo "=== cross-building statusbar-$PKG .deb (target $TARGET_ARCH) ==="
   --platform linux/amd64 \
   -v "$TREE_DIR:/src:ro$MOUNT_OPT" \
   -v "$DEB_OUTPUT:/debs:rw$MOUNT_OPT" \
-  -v "statusbar-deb-ccache-cross-$TARGET_ARCH:/root/.ccache" \
+  -v "statusbar-deb-ccache-cross-$TARGET_ARCH-$STATUSBAR_TOOLCHAIN:/root/.ccache" \
   -e "PKG=$PKG" \
   -e "TARGET_ARCH=$TARGET_ARCH" \
+  -e "STATUSBAR_TOOLCHAIN=$STATUSBAR_TOOLCHAIN" \
+  -e "STATUSBAR_STATIC_CXX=$STATUSBAR_STATIC_CXX" \
   "$IMAGE" bash -euo pipefail -c '
     cmake -Wno-dev -S /src -B /build -G Ninja \
-      --toolchain /src/cmake/toolchain-clang-aarch64.cmake \
+      --toolchain /src/cmake/toolchain-"$STATUSBAR_TOOLCHAIN"-aarch64.cmake \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DENABLE_STATIC_CXX_RUNTIME="$STATUSBAR_STATIC_CXX" \
       -DCMAKE_C_COMPILER_LAUNCHER=ccache \
       -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
       -DCPACK_DEBIAN_PACKAGE_ARCHITECTURE="$TARGET_ARCH"
