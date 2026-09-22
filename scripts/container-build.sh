@@ -10,7 +10,33 @@ set -euo pipefail
 
 PKG="core"
 DEPS=""
-DEBIAN_VERSION="${DEBIAN_VERSION:-trixie}"
+# STATUSBAR_TOOLCHAIN picks the compiler: clang (default) or gcc. It selects
+# the toolchain file, the base image, the image tag and the ccache volume, so
+# the two toolchains never share build state.
+STATUSBAR_TOOLCHAIN="${STATUSBAR_TOOLCHAIN:-clang}"
+case "$STATUSBAR_TOOLCHAIN" in
+  clang) _default_debian="trixie" ;;
+  # trixie stops at g++-14; the C++26 build needs g++ >= 15, first available in
+  # forky. Override DEBIAN_VERSION to use a different base.
+  gcc)   _default_debian="forky" ;;
+  *)
+    echo "error: STATUSBAR_TOOLCHAIN must be 'clang' or 'gcc'" >&2
+    exit 1
+    ;;
+esac
+
+# Statically link the C++ runtime into the packaged executables. Defaults ON
+# for gcc: a C++26 GCC 16 binary needs GLIBCXX_3.4.36, newer than the
+# libstdc++ any current Debian stable ships, so a dynamically linked .deb
+# declares an unsatisfiable libstdc++6 dependency and will not install on the
+# target at all. OFF for clang, whose libc++ runtime the current deployment
+# already carries. Override with STATUSBAR_STATIC_CXX=ON|OFF.
+case "$STATUSBAR_TOOLCHAIN" in
+  gcc) STATUSBAR_STATIC_CXX="${STATUSBAR_STATIC_CXX:-ON}" ;;
+  *)   STATUSBAR_STATIC_CXX="${STATUSBAR_STATIC_CXX:-OFF}" ;;
+esac
+
+DEBIAN_VERSION="${DEBIAN_VERSION:-$_default_debian}"
 TARGET_PLATFORM="${TARGET_PLATFORM:-linux/arm64}"
 ENGINE="${CONTAINER_ENGINE:-podman}"
 
@@ -19,7 +45,7 @@ TREE_DIR="$(dirname "$SCRIPT_DIR")"
 EXPORT_ROOT="$(dirname "$TREE_DIR")"
 DEB_OUTPUT="${DEB_OUTPUT:-$EXPORT_ROOT/deb-output}"
 TARGET_ARCH="${TARGET_PLATFORM##*/}"
-IMAGE="localhost/statusbar-deb-builder:$DEBIAN_VERSION-$TARGET_ARCH"
+IMAGE="localhost/statusbar-deb-builder:$DEBIAN_VERSION-$TARGET_ARCH-$STATUSBAR_TOOLCHAIN"
 
 # Debian package revision: a monotonic build id appended as the package's Debian
 # revision (version becomes 1.2.0-<rev>), so every rebuild produces a
@@ -77,6 +103,7 @@ if [ "$("$ENGINE" image inspect \
   "$ENGINE" build -t "$IMAGE" \
     --platform "$TARGET_PLATFORM" \
     --build-arg "DEBIAN_VERSION=$DEBIAN_VERSION" \
+    --build-arg "STATUSBAR_TOOLCHAIN=$STATUSBAR_TOOLCHAIN" \
     --label "statusbar.containerfile=$CF_SUM" \
     -f "$TREE_DIR/Containerfile" "$TREE_DIR"
 fi
@@ -112,9 +139,11 @@ echo "=== building statusbar-$PKG .deb packages (Debian $DEBIAN_VERSION) ==="
   --platform "$TARGET_PLATFORM" \
   -v "$TREE_DIR:/src:ro$MOUNT_OPT" \
   -v "$DEB_OUTPUT:/debs:rw$MOUNT_OPT" \
-  -v "statusbar-deb-ccache-$TARGET_ARCH:/root/.ccache" \
+  -v "statusbar-deb-ccache-$TARGET_ARCH-$STATUSBAR_TOOLCHAIN:/root/.ccache" \
   -e "DEPS=$DEPS" \
   -e "PKG=$PKG" \
+  -e "STATUSBAR_TOOLCHAIN=$STATUSBAR_TOOLCHAIN" \
+  -e "STATUSBAR_STATIC_CXX=$STATUSBAR_STATIC_CXX" \
   -e "DEB_REVISION=$DEB_REVISION" \
   -e "EXTRA_CMAKE_ARGS=${EXTRA_CMAKE_ARGS:-}" \
   "$IMAGE" bash -euo pipefail -c '
@@ -127,9 +156,10 @@ echo "=== building statusbar-$PKG .deb packages (Debian $DEBIAN_VERSION) ==="
       apt-get install -y --no-install-recommends "${debs[@]}"
     fi
     cmake -Wno-dev -S /src -B /build -G Ninja \
-      --toolchain /src/cmake/toolchain-clang.cmake \
+      --toolchain /src/cmake/toolchain-"$STATUSBAR_TOOLCHAIN".cmake \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
       -DENABLE_FUZZING=OFF \
+      -DENABLE_STATIC_CXX_RUNTIME="$STATUSBAR_STATIC_CXX" \
       -DCMAKE_C_COMPILER_LAUNCHER=ccache \
       -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
       ${EXTRA_CMAKE_ARGS}
