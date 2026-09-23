@@ -46,6 +46,14 @@ if [ "$(uname -s)" = "Linux" ]; then
   MOUNT_OPT=",z"
 fi
 
+# Debian package revision: a monotonic build id appended as the package's
+# Debian revision (version becomes x.y.z-<rev>), so every rebuild produces a
+# strictly-newer package and apt always upgrades instead of refusing an
+# equal-or-older version. The umbrella container-build-cross.sh exports one
+# shared STATUSBAR_DEB_REVISION per run so a multi-package build gets a
+# consistent revision.
+DEB_REVISION="${STATUSBAR_DEB_REVISION:-$(date -u +%Y%m%d%H%M%S)}"
+
 mkdir -p "$DEB_OUTPUT"
 
 # Rebuild the cross builder image when it is missing or its Containerfile
@@ -76,6 +84,7 @@ echo "=== cross-building statusbar-$PKG .deb (target $TARGET_ARCH) ==="
   -e "TARGET_ARCH=$TARGET_ARCH" \
   -e "STATUSBAR_TOOLCHAIN=$STATUSBAR_TOOLCHAIN" \
   -e "STATUSBAR_STATIC_CXX=$STATUSBAR_STATIC_CXX" \
+  -e "DEB_REVISION=$DEB_REVISION" \
   "$IMAGE" bash -euo pipefail -c '
     cmake -Wno-dev -S /src -B /build -G Ninja \
       --toolchain /src/cmake/toolchain-"$STATUSBAR_TOOLCHAIN"-aarch64.cmake \
@@ -85,7 +94,7 @@ echo "=== cross-building statusbar-$PKG .deb (target $TARGET_ARCH) ==="
       -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
       -DCPACK_DEBIAN_PACKAGE_ARCHITECTURE="$TARGET_ARCH"
     cmake --build /build
-    ( cd /build && cpack -G DEB )
+    ( cd /build && cpack -G DEB -D CPACK_DEBIAN_PACKAGE_RELEASE="$DEB_REVISION" )
     rm -f /debs/statusbar-"$PKG"_*_"$TARGET_ARCH".deb \
           /debs/statusbar-"$PKG"-dev_*_"$TARGET_ARCH".deb
     cp -v /build/*.deb /debs/
