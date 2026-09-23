@@ -45,9 +45,10 @@ RUN dpkg --add-architecture "${TARGET_ARCH}" \
     fi \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /opt/cross-tools \
- && cp "$(command -v clang-scan-deps \
+ && SD="$(command -v clang-scan-deps \
           || ls -1 /usr/bin/clang-scan-deps-* /usr/lib/llvm-*/bin/clang-scan-deps \
                2>/dev/null | sort -V | tail -1)" \
-       /opt/cross-tools/clang-scan-deps
+ && cp "$SD" /opt/cross-tools/clang-scan-deps \
+ && printf '%s\n' "$SD" > /opt/cross-tools/clang-scan-deps.path
 
 WORKDIR /build
