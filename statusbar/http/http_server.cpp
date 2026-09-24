@@ -908,6 +908,21 @@ void HttpServer::try_upgrade(size_t slot, HttpRequest const& request, WsRoute co
         return;
     }
     auto const accept = ws_accept_key(key);
+    // RFC 6455 §4.2.2: when the client offers subprotocols the server
+    // must select one, or the client MUST fail the connection — Chrome
+    // enforces this and closes the socket right after the 101. The
+    // endpoints here don't dispatch on subprotocol, so select the
+    // client's first offer.
+    auto chosen = request.header("sec-websocket-protocol");
+    if (auto const comma = chosen.find(','); comma != std::string_view::npos) {
+        chosen = chosen.substr(0, comma);
+    }
+    while (!chosen.empty() && (chosen.front() == ' ' || chosen.front() == '\t')) {
+        chosen.remove_prefix(1);
+    }
+    while (!chosen.empty() && (chosen.back() == ' ' || chosen.back() == '\t')) {
+        chosen.remove_suffix(1);
+    }
     int const n = snprintf(
         reinterpret_cast<char*>(c.tx.data()),  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
         c.tx.size(),
@@ -915,9 +930,14 @@ void HttpServer::try_upgrade(size_t slot, HttpRequest const& request, WsRoute co
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
         "Sec-WebSocket-Accept: %.*s\r\n"
+        "%s%.*s%s"
         "\r\n",
         int(accept.view().size()),
-        accept.view().data());
+        accept.view().data(),
+        chosen.empty() ? "" : "Sec-WebSocket-Protocol: ",
+        int(chosen.size()),
+        chosen.data(),
+        chosen.empty() ? "" : "\r\n");
     if (!stage_head(slot, n, now_ns)) {
         return;
     }

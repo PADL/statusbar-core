@@ -293,6 +293,8 @@ TEST(http_ws, upgrade_and_text_echo)
     auto const response = fx.upgrade(c);
     EXPECT_TRUE(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
     EXPECT_TRUE(response.find("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n") != std::string::npos);
+    // No subprotocol offered — none may be selected.
+    EXPECT_TRUE(response.find("Sec-WebSocket-Protocol") == std::string::npos);
     EXPECT_EQ(fx.echo.opens.size(), 1U);
     EXPECT_TRUE(fx.echo.open_path == "/ws");
 
@@ -303,6 +305,27 @@ TEST(http_ws, upgrade_and_text_echo)
     EXPECT_TRUE(frames[0].opcode == WsOpcode::text);
     EXPECT_TRUE(frames[0].payload == "ping pong");
     EXPECT_TRUE(fx.echo.last_text);
+}
+
+// RFC 6455 §4.2.2: a client that offered subprotocols MUST fail the
+// connection when the 101 selects none — Chrome enforces this and
+// closes right after the handshake (found live: the widget-bridge page
+// could never connect from Chrome). Endpoints here don't dispatch on
+// subprotocol, so the server selects the client's first offer.
+TEST(http_ws, upgrade_echoes_first_offered_subprotocol)
+{
+    Fixture fx;
+    Client c{fx.addr};
+    c.send_text("GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                "Sec-WebSocket-Protocol: statusbar.widgets.v1 , other.v2\r\n"
+                "Sec-WebSocket-Version: 13\r\n\r\n");
+    pump(*fx.server);
+    auto const raw = c.recv_for(100);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    std::string const response{reinterpret_cast<char const*>(raw.data()), raw.size()};
+    EXPECT_TRUE(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+    EXPECT_TRUE(response.find("Sec-WebSocket-Protocol: statusbar.widgets.v1\r\n") != std::string::npos);
 }
 
 TEST(http_ws, fragmentation_reassembles_with_interleaved_ping)
