@@ -22,8 +22,13 @@ SEEDS_DIR="$2"
 
 mkdir -p "$SEEDS_DIR"
 
-fuzzers=$(find "$FUZZ_BIN_DIR" -type f -name '*_fuzzer' 2>/dev/null | sort)
-if [ -z "$fuzzers" ]; then
+# One fuzzer per line via a temp file: `for f in $(find ...)` would word-split
+# paths containing spaces, and piping find into a while loop would run the
+# loop in a subshell, losing the counters.
+fuzzer_list=$(mktemp)
+trap 'rm -f "$fuzzer_list"' EXIT
+find "$FUZZ_BIN_DIR" -type f -name '*_fuzzer' 2>/dev/null | sort > "$fuzzer_list"
+if [ ! -s "$fuzzer_list" ]; then
     echo "ERROR: no *_fuzzer executables found under $FUZZ_BIN_DIR" >&2
     echo "       Did you build with -DENABLE_FUZZING=ON?" >&2
     exit 1
@@ -31,7 +36,7 @@ fi
 
 failed=0
 count=0
-for fuzzer in $fuzzers; do
+while IFS= read -r fuzzer; do
     count=$((count + 1))
     name=$(basename "$fuzzer")
     seed="$SEEDS_DIR/${name}_seed.bin"
@@ -47,8 +52,10 @@ for fuzzer in $fuzzers; do
         echo "  FAILED: $name" >&2
         failed=$((failed + 1))
     fi
-done
+done < "$fuzzer_list"
 
 echo ""
 echo "Smoke ran $count fuzzer(s); $failed failure(s)."
-exit $failed
+# Not `exit $failed`: shell exit codes wrap mod 256, so 256 failures would
+# report success.
+[ "$failed" -eq 0 ] || exit 1

@@ -45,12 +45,20 @@ echo "Running clang-tidy ($JOBS parallel jobs)..."
 rm -rf "$TMPDIR"
 mkdir -p "$TMPDIR"
 
-python3 -c "import json,sys; \
+files=$(python3 -c "import json,sys; \
     entries=json.load(open('$BUILD_DIR/compile_commands.json')); \
     files=[e['file'] for e in entries \
         if e['file'].endswith('.cpp') \
         and not e['file'].endswith(('_test.cpp','_tool.cpp','_example.cpp','test.cpp','_fuzzer.cpp'))]; \
-    sys.stdout.write('\n'.join(sorted(set(files))))" \
+    sys.stdout.write('\n'.join(sorted(set(files))))")
+if [ -z "$files" ]; then
+    # Guarded by hand: GNU xargs (unlike BSD) still invokes the command once
+    # on empty input, handing run-clang-tidy.sh an empty filename.
+    echo "No non-test .cpp files found in compile_commands.json" >&2
+    rm -rf "$TMPDIR"
+    exit 0
+fi
+printf '%s\n' "$files" \
     | xargs -P "$JOBS" -I {} \
     sh "$SCRIPT_DIR/run-clang-tidy.sh" "$CLANG_TIDY" "$BUILD_DIR" "$TMPDIR" {}
 
