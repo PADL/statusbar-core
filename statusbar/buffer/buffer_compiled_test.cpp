@@ -10,6 +10,7 @@
 #include <cstring>
 #include <expected>
 #include <span>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -738,6 +739,63 @@ static_assert(!CanFieldExtract<std::span<uint8_t const>>);
 static_assert(!CanSerializeField<std::span<uint8_t const>>);
 static_assert(!CanSerializeField<std::span<uint8_t, 4>>);
 static_assert(!CanSerializeConditionalField<std::span<uint8_t const>>);
+
+//
+// Factory value semantics: the make_* helpers decay, so lvalue extractors,
+// serializers and callbacks are COPIED into the compiled object — never
+// stored as references that dangle when the caller's locals die.
+//
+
+namespace {
+
+auto make_deserializer_from_locals(uint8_t& sink)
+{
+    // Every piece is a LOCAL lvalue; the returned object must own copies.
+    auto callback = [&sink](uint8_t v) { sink = v; };
+    auto f = field<uint8_t>(callback);
+    auto s = skip<1>();
+    return make_deserializer(f, s);
+}
+
+auto make_serializer_from_locals(uint8_t const& source)
+{
+    auto supplier = [&source]() { return source; };
+    auto f = serialize_field<uint8_t>(supplier);
+    return make_serializer(f);
+}
+
+}  // namespace
+
+TEST(compiled_factories, lvalue_pieces_are_copied_not_referenced)
+{
+    uint8_t sink = 0;
+    auto const des = make_deserializer_from_locals(sink);  // locals are gone
+    std::array<uint8_t, 2> const wire{0x5A, 0x00};
+    EXPECT_TRUE(des.parse(std::span<uint8_t const>{wire}));
+    EXPECT_EQ(sink, 0x5A);
+
+    uint8_t const source = 0xC3;
+    auto const ser = make_serializer_from_locals(source);
+    std::array<uint8_t, 4> data{};
+    MutableBuffer buf{data};
+    EXPECT_TRUE(ser.serialize(buf));
+    EXPECT_EQ(buf.get_span()[0], 0xC3);
+}
+
+TEST(compiled_factories, lvalue_and_rvalue_factory_calls_yield_the_same_type)
+{
+    // Pins the decay: without it the lvalue call would instantiate
+    // CompiledDeserializer<FieldExtractor<...>&> (a tuple of references).
+    auto f = field<uint8_t>([](uint8_t) {});
+    auto d_from_lvalue = make_deserializer(f);
+    static_assert(std::is_same_v<decltype(d_from_lvalue), decltype(make_deserializer(std::move(f)))>);
+
+    auto sf = serialize_field<uint8_t>([]() { return uint8_t{0}; });
+    auto s_from_lvalue = make_serializer(sf);
+    static_assert(std::is_same_v<decltype(s_from_lvalue), decltype(make_serializer(std::move(sf)))>);
+    (void)d_from_lvalue;
+    (void)s_from_lvalue;
+}
 
 // Main test runner function required by create_test_sourcelist
 TEST_MAIN(statusbar_buffer, buffer_compiled_test)

@@ -128,6 +128,22 @@ TEST(buffer_builder_span, append_span_insufficient_space_writes_nothing)
     EXPECT_EQ(builder.get_span().size(), 0);
 }
 
+TEST(buffer_builder_basic, reset_discards_contents_and_clears_error)
+{
+    BufferSerializerBuilderWithStorage<4> builder{};
+    std::array<uint8_t, 8> const oversize{};
+    builder.append(uint8_t{0xAA}).append(std::span<uint8_t const>{oversize});
+    EXPECT_FALSE(builder.status());  // second append overflowed
+    EXPECT_EQ(builder.position(), size_t{1});
+
+    builder.reset();  // mirrors BufferDeserializerBuilder::reset()
+    EXPECT_TRUE(builder.status());
+    EXPECT_EQ(builder.position(), size_t{0});
+    builder.append(uint16_t{0x1234});
+    EXPECT_TRUE(builder.status());
+    EXPECT_EQ(builder.position(), size_t{2});
+}
+
 TEST(buffer_builder_span, append_unchecked_span_writes_viewed_bytes)
 {
     std::array<uint8_t, 3> const payload{0x0A, 0x0B, 0x0C};

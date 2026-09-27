@@ -84,8 +84,9 @@ class BufferSerializerBuilder
     }
 
     ///
-    /// Append the bytes a span views. Records insufficient_space if the
-    /// buffer cannot hold all of them (nothing is written in that case).
+    /// Append the bytes a span views. Records the buffer's error (today
+    /// always insufficient_space) if it cannot hold all of them; nothing
+    /// is written in that case.
     ///
     /// \param bytes The bytes to append.
     /// \return Reference to this builder for chaining.
@@ -93,8 +94,11 @@ class BufferSerializerBuilder
     auto append(std::span<uint8_t const> const bytes) noexcept -> BufferSerializerBuilder&
     {
         if (!error_) {
-            if (!destination_buffer_.append(bytes)) {
-                error_ = BufferError::insufficient_space;
+            // Record the buffer's own error code rather than assuming
+            // insufficient_space, so a future MutableBuffer error kind is
+            // not masked here.
+            if (auto const status = destination_buffer_.append(bytes); !status) {
+                error_ = status.error();
             }
         }
         return *this;
@@ -143,6 +147,17 @@ class BufferSerializerBuilder
             destination_buffer_.append_unchecked(bytes);
         }
         return *this;
+    }
+
+    ///
+    /// Discard everything appended so far and clear the error state, so
+    /// the builder can be reused from the start of the buffer. Mirrors
+    /// BufferDeserializerBuilder::reset(). The bytes are not cleared.
+    ///
+    void reset() noexcept
+    {
+        destination_buffer_.rewind();
+        error_ = {};
     }
 
     ///
@@ -238,6 +253,10 @@ class BufferSerializerBuilderWithStorage
     ///
     /// Get the underlying MutableBuffer.
     ///
+    /// Deliberate escape hatch: unlike buffer() (const, store()-only), the
+    /// non-const reference allows direct append()s that bypass the
+    /// builder's error tracking — callers own the consequences.
+    ///
     /// \return Reference to the internal mutable buffer.
     ///
     [[nodiscard]] auto get_mutable_buffer() noexcept -> MutableBuffer& { return mutable_buffer_with_storage_; }
@@ -294,6 +313,10 @@ class BufferSerializerBuilderWithBuffer
 
     ///
     /// Get the underlying MutableBuffer.
+    ///
+    /// Deliberate escape hatch: unlike buffer() (const, store()-only), the
+    /// non-const reference allows direct append()s that bypass the
+    /// builder's error tracking — callers own the consequences.
     ///
     /// \return Reference to the internal mutable buffer.
     ///

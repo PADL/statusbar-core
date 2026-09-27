@@ -31,6 +31,7 @@
 #include "statusbar/status/status.hpp"
 
 #include <array>
+#include <concepts>
 #include <cstdint>
 #include <cstring>
 #include <expected>
@@ -39,6 +40,7 @@
 #include <string>
 #include <system_error>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -48,8 +50,11 @@ namespace statusbar {
 // Callback-based Compiled Deserializer
 //
 
+/// \note extract() is noexcept: the callback MUST NOT throw — a throwing
+///       callback terminates the process. T must be default-initializable
+///       (extract() value-initializes a T to parse into).
 template <typename T, typename Fn>
-    requires traits::WireValue<T>
+    requires traits::WireValue<T> && std::default_initializable<T>
 class FieldExtractor
 {
   public:
@@ -64,7 +69,7 @@ class FieldExtractor
     ///
     /// \param fn The callback function to invoke with parsed values.
     ///
-    constexpr explicit FieldExtractor(Fn fn) noexcept
+    constexpr explicit FieldExtractor(Fn fn) noexcept(std::is_nothrow_move_constructible_v<Fn>)
         : callback_(std::move(fn))
     {}
 
@@ -134,11 +139,13 @@ class CompiledDeserializer
   public:
     ///
     /// Construct a CompiledDeserializer with field extractors.
+    /// Extractors are taken BY VALUE and moved into the tuple: the compiled
+    /// object always owns its extractors, never references a caller's.
     ///
     /// \param fields The field extractors to apply during parsing.
     ///
-    constexpr explicit CompiledDeserializer(Fields&&... fields) noexcept
-        : fields_(std::forward<Fields>(fields)...)
+    constexpr explicit CompiledDeserializer(Fields... fields) noexcept((std::is_nothrow_move_constructible_v<Fields> && ...))
+        : fields_(std::move(fields)...)
     {}
 
     ///
@@ -178,6 +185,9 @@ class CompiledDeserializer
 /// \param fn The callback function to invoke with parsed values.
 /// \return A FieldExtractor that can be used with make_deserializer().
 ///
+/// The callback MUST NOT throw: the extraction path is noexcept, so a
+/// throwing callback terminates the process.
+///
 /// Example:
 /// \code
 /// auto f = field<uint32_t>([](uint32_t value) {
@@ -186,9 +196,12 @@ class CompiledDeserializer
 /// \endcode
 ///
 template <typename T, typename Fn>
-[[nodiscard]] constexpr auto field(Fn&& fn) noexcept -> FieldExtractor<T, Fn>
+[[nodiscard]] constexpr auto field(Fn&& fn) -> FieldExtractor<T, std::decay_t<Fn>>
 {
-    return FieldExtractor<T, Fn>(std::forward<Fn>(fn));
+    // decay_t: an lvalue callback is COPIED into the extractor. Deducing Fn
+    // as an lvalue reference would make callback_ a reference member that
+    // dangles once the caller's callback goes out of scope.
+    return FieldExtractor<T, std::decay_t<Fn>>(std::forward<Fn>(fn));
 }
 
 ///
@@ -235,9 +248,13 @@ template <size_t N>
 /// \endcode
 ///
 template <typename... Fields>
-[[nodiscard]] constexpr auto make_deserializer(Fields&&... fields) noexcept -> CompiledDeserializer<Fields...>
+[[nodiscard]] constexpr auto make_deserializer(Fields&&... fields) -> CompiledDeserializer<std::decay_t<Fields>...>
 {
-    return CompiledDeserializer<Fields...>(std::forward<Fields>(fields)...);
+    // decay_t (make_tuple semantics, not forward_as_tuple): lvalue
+    // extractors are copied. Deducing Fields as lvalue references would
+    // store a tuple of references that dangles once the caller's
+    // extractors go out of scope.
+    return CompiledDeserializer<std::decay_t<Fields>...>(std::forward<Fields>(fields)...);
 }
 
 //
@@ -251,6 +268,8 @@ template <typename... Fields>
 /// \tparam T The type of value to serialize (must be trivially copyable).
 /// \tparam Fn The value supplier function type (typically a lambda returning T).
 ///
+/// \note serialize() is noexcept: the supplier MUST NOT throw — a throwing
+///       supplier terminates the process.
 template <typename T, typename Fn>
     requires traits::WireValue<T>
 class FieldSerializer
@@ -267,7 +286,7 @@ class FieldSerializer
     ///
     /// \param fn The function that provides the value to serialize.
     ///
-    constexpr explicit FieldSerializer(Fn fn) noexcept
+    constexpr explicit FieldSerializer(Fn fn) noexcept(std::is_nothrow_move_constructible_v<Fn>)
         : supplier_(std::move(fn))
     {}
 
@@ -329,6 +348,8 @@ class SkipSerializer
 /// \tparam CondFn The condition function type (returns bool).
 /// \tparam Fn The value supplier function type.
 ///
+/// \note serialize() is noexcept: neither the condition nor the supplier
+///       may throw — a throwing callback terminates the process.
 template <typename T, typename CondFn, typename Fn>
     requires traits::WireValue<T>
 class ConditionalFieldSerializer
@@ -338,7 +359,7 @@ class ConditionalFieldSerializer
 
   private:
     CondFn condition_;
-    Fn supplier_;
+    FieldSerializer<T, Fn> field_;  ///< one store path — see serialize()
 
   public:
     ///
@@ -347,14 +368,18 @@ class ConditionalFieldSerializer
     /// \param cond The condition function to evaluate (must return bool).
     /// \param fn The function that provides the value to serialize.
     ///
-    constexpr explicit ConditionalFieldSerializer(CondFn cond, Fn fn) noexcept
+    constexpr explicit ConditionalFieldSerializer(CondFn cond, Fn fn) noexcept(
+        std::is_nothrow_move_constructible_v<CondFn> && std::is_nothrow_move_constructible_v<Fn>)
         : condition_(std::move(cond))
-        , supplier_(std::move(fn))
+        , field_(std::move(fn))
     {}
 
     ///
     /// Serialize a value if condition is true.
     /// If condition is false, no bytes are written.
+    ///
+    /// Delegates the store to FieldSerializer — one size/check/store/advance
+    /// path instead of a duplicated block that could drift.
     ///
     /// \param buffer The mutable buffer to write to.
     /// \return Status indicating success or write error.
@@ -362,20 +387,7 @@ class ConditionalFieldSerializer
     [[nodiscard]] auto serialize(MutableBuffer& buffer) const noexcept -> Status
     {
         if (condition_()) {
-            T const value = supplier_();
-
-            size_t const required_size = protocol::serialized_size(value);
-
-            // Get writable span
-            auto const available_span = buffer.span_of_available_space(required_size);
-            if (available_span.size() < required_size) {
-                return failure(BufferError::insufficient_space);
-            }
-
-            // Call protocol function via ADL
-            using protocol::store_unchecked;
-            auto const bytes_written = store_unchecked(available_span, value);
-            (void)buffer.advance_unchecked(bytes_written);
+            return field_.serialize(buffer);
         }
         // Condition false - don't write anything
         return success();
@@ -413,11 +425,13 @@ class CompiledSerializer
   public:
     ///
     /// Construct a CompiledSerializer with field serializers.
+    /// Serializers are taken BY VALUE and moved into the tuple: the compiled
+    /// object always owns its serializers, never references a caller's.
     ///
     /// \param fields The field serializers to apply during serialization.
     ///
-    constexpr explicit CompiledSerializer(Fields&&... fields) noexcept
-        : fields_(std::forward<Fields>(fields)...)
+    constexpr explicit CompiledSerializer(Fields... fields) noexcept((std::is_nothrow_move_constructible_v<Fields> && ...))
+        : fields_(std::move(fields)...)
     {}
 
     ///
@@ -455,10 +469,13 @@ class CompiledSerializer
 /// \param fn The function that returns the value to serialize.
 /// \return A FieldSerializer that can be used with make_serializer().
 ///
+/// The supplier MUST NOT throw: the serialization path is noexcept, so a
+/// throwing supplier terminates the process.
 template <typename T, typename Fn>
-[[nodiscard]] constexpr auto serialize_field(Fn&& fn) noexcept -> FieldSerializer<T, Fn>
+[[nodiscard]] constexpr auto serialize_field(Fn&& fn) -> FieldSerializer<T, std::decay_t<Fn>>
 {
-    return FieldSerializer<T, Fn>(std::forward<Fn>(fn));
+    // decay_t: an lvalue supplier is COPIED into the serializer (see field()).
+    return FieldSerializer<T, std::decay_t<Fn>>(std::forward<Fn>(fn));
 }
 
 ///
@@ -483,11 +500,14 @@ template <size_t N>
 /// \param fn The function that returns the value to serialize.
 /// \return A ConditionalFieldSerializer.
 ///
+/// Neither callback may throw: the serialization path is noexcept, so a
+/// throwing condition or supplier terminates the process.
 template <typename T, typename CondFn, typename Fn>
-[[nodiscard]] constexpr auto serialize_conditional_field(CondFn&& cond, Fn&& fn) noexcept
-    -> ConditionalFieldSerializer<T, CondFn, Fn>
+[[nodiscard]] constexpr auto serialize_conditional_field(CondFn&& cond, Fn&& fn)
+    -> ConditionalFieldSerializer<T, std::decay_t<CondFn>, std::decay_t<Fn>>
 {
-    return ConditionalFieldSerializer<T, CondFn, Fn>(std::forward<CondFn>(cond), std::forward<Fn>(fn));
+    // decay_t: lvalue callbacks are COPIED into the serializer (see field()).
+    return ConditionalFieldSerializer<T, std::decay_t<CondFn>, std::decay_t<Fn>>(std::forward<CondFn>(cond), std::forward<Fn>(fn));
 }
 
 ///
@@ -498,9 +518,11 @@ template <typename T, typename CondFn, typename Fn>
 /// \return A CompiledSerializer that can serialize to buffers with the defined structure.
 ///
 template <typename... Fields>
-[[nodiscard]] constexpr auto make_serializer(Fields&&... fields) noexcept -> CompiledSerializer<Fields...>
+[[nodiscard]] constexpr auto make_serializer(Fields&&... fields) -> CompiledSerializer<std::decay_t<Fields>...>
 {
-    return CompiledSerializer<Fields...>(std::forward<Fields>(fields)...);
+    // decay_t (make_tuple semantics): lvalue serializers are copied, never
+    // stored as references — see make_deserializer().
+    return CompiledSerializer<std::decay_t<Fields>...>(std::forward<Fields>(fields)...);
 }
 
 }  // namespace statusbar

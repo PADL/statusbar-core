@@ -64,7 +64,10 @@ class BufferDeserializer
     ///       deserializer. Do not use temporary Buffer objects or Buffers that may be
     ///       destroyed while the deserializer exists.
     ///
-    explicit BufferDeserializer(std::span<uint8_t const> const& buffer) noexcept
+    // By value: a span is a cheap view, and this matches
+    // BufferDeserializerBuilder's constructor. constexpr so the builder's
+    // constexpr constructor is actually usable in constant evaluation.
+    constexpr explicit BufferDeserializer(std::span<uint8_t const> const buffer) noexcept
         : buffer_{buffer}
         , next_span_{buffer_}
     {}
