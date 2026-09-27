@@ -44,24 +44,36 @@ concept TriviallyCopyableRange = requires(C& c) {
 /// Equivalent to
 ///   `os.write(reinterpret_cast<char const*>(c.data()), c.size() * sizeof(T))`
 /// but hides the pointer-type crossing. The total byte count written is
-/// `c.size() * sizeof(element_type)`.
+/// `c.size() * sizeof(element_type)` (unchecked multiply — callers with
+/// attacker-controlled sizes must bound them first).
+///
+/// \return true when the stream is still good after the write. Failures
+///         land in the stream state as usual; the return is a convenience
+///         so call sites can gate without a separate `os.good()`.
 template <TriviallyCopyableConstRange C>
-inline void stream_write(std::ostream& os, C const& c)
+inline auto stream_write(std::ostream& os, C const& c) -> bool
 {
     using T = typename C::value_type;
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
     os.write(reinterpret_cast<char const*>(c.data()), static_cast<std::streamsize>(c.size() * sizeof(T)));
+    return bool(os);
 }
 
 /// Read a range of trivially-copyable elements from an input stream.
 /// The range size is fixed at the call site (typically pre-sized before
 /// the call). The total byte count read is `c.size() * sizeof(element_type)`.
+///
+/// \return true when the full range was read (stream still good). On a
+///         short read the range is PARTIALLY overwritten and the stream
+///         is failed — check this return (or the stream) before using
+///         the contents.
 template <TriviallyCopyableRange C>
-inline void stream_read(std::istream& is, C& c)
+inline auto stream_read(std::istream& is, C& c) -> bool
 {
     using T = typename C::value_type;
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
     is.read(reinterpret_cast<char*>(c.data()), static_cast<std::streamsize>(c.size() * sizeof(T)));
+    return bool(is);
 }
 
 }  // namespace statusbar

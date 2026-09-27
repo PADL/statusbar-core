@@ -9,6 +9,7 @@ statusbar_add_module(
   DEPS
   statusbar-status
   TESTS
+  stream_utils_test.cpp
   buffer_basic_test.cpp
   buffer_builder_test.cpp
   buffer_compiled_test.cpp

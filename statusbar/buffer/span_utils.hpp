@@ -90,25 +90,30 @@ struct octet_range_t
 /// Reinterpret a trivially-copyable object as a read-only byte span.
 /// std::span is refused: viewing a span's own bytes (pointer + length) is
 /// never what a caller means — pass the span itself.
+/// NOTE: the view includes any PADDING bytes, whose values are
+/// indeterminate — comparing two logically-equal padded structs through
+/// this view (e.g. span_compare) can disagree. Compare fields, or use
+/// types with no padding, when equality matters.
 /// @tparam T The type to reinterpret (must be trivially copyable).
 /// @param obj The object to view as bytes.
 /// @return A fixed-extent span of sizeof(T) const bytes.
 template <typename T>
     requires std::is_trivially_copyable_v<T> && (!traits::StdSpan<T>)
-inline auto make_const_span(T const& obj) -> std::span<uint8_t const, sizeof(T)>
+inline auto make_const_span(T const& obj) noexcept -> std::span<uint8_t const, sizeof(T)>
 {
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
     return std::span<uint8_t const, sizeof(T)>(reinterpret_cast<uint8_t const*>(&obj), sizeof(T));
 }
 
 /// Reinterpret a trivially-copyable object as a mutable byte span.
-/// std::span is refused for the same reason as make_const_span.
+/// std::span is refused for the same reason as make_const_span (whose
+/// padding-bytes note applies here too).
 /// @tparam T The type to reinterpret (must be trivially copyable).
 /// @param obj The object to view as bytes.
 /// @return A fixed-extent span of sizeof(T) mutable bytes.
 template <typename T>
     requires std::is_trivially_copyable_v<T> && (!traits::StdSpan<T>)
-inline auto make_span(T& obj) -> std::span<uint8_t, sizeof(T)>
+inline auto make_span(T& obj) noexcept -> std::span<uint8_t, sizeof(T)>
 {
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
     return std::span<uint8_t, sizeof(T)>(reinterpret_cast<uint8_t*>(&obj), sizeof(T));
@@ -116,28 +121,28 @@ inline auto make_span(T& obj) -> std::span<uint8_t, sizeof(T)>
 
 /// Overload for std::array<uint8_t, N> — direct const span without reinterpret_cast.
 template <size_t N>
-inline auto make_const_span(std::array<uint8_t, N> const& arr) -> std::span<uint8_t const, N>
+inline auto make_const_span(std::array<uint8_t, N> const& arr) noexcept -> std::span<uint8_t const, N>
 {
     return std::span<uint8_t const, N>(arr);
 }
 
 /// Overload for std::array<uint8_t, N> — direct mutable span.
 template <size_t N>
-inline auto make_span(std::array<uint8_t, N>& arr) -> std::span<uint8_t, N>
+inline auto make_span(std::array<uint8_t, N>& arr) noexcept -> std::span<uint8_t, N>
 {
     return std::span<uint8_t, N>(arr);
 }
 
 /// Overload for statusbar::sg14::inplace_vector<uint8_t, N> — dynamic-extent const span over current contents.
 template <size_t N>
-inline auto make_const_span(statusbar::sg14::inplace_vector<uint8_t, N> const& vec) -> std::span<uint8_t const>
+inline auto make_const_span(statusbar::sg14::inplace_vector<uint8_t, N> const& vec) noexcept -> std::span<uint8_t const>
 {
     return std::span<uint8_t const>(vec.data(), vec.size());
 }
 
 /// Overload for statusbar::sg14::inplace_vector<uint8_t, N> — dynamic-extent mutable span over current contents.
 template <size_t N>
-inline auto make_span(statusbar::sg14::inplace_vector<uint8_t, N>& vec) -> std::span<uint8_t>
+inline auto make_span(statusbar::sg14::inplace_vector<uint8_t, N>& vec) noexcept -> std::span<uint8_t>
 {
     return std::span<uint8_t>(vec.data(), vec.size());
 }
@@ -227,9 +232,15 @@ inline auto span_copy(std::span<uint8_t> const dest, std::span<uint8_t const> co
 
 /// Copy N bytes between fixed-extent byte spans.
 template <size_t N>
-inline void span_copy(std::span<uint8_t, N> dest, std::span<uint8_t const, N> src)
+inline void span_copy(std::span<uint8_t, N> dest, std::span<uint8_t const, N> src) noexcept
 {
-    std::memcpy(dest.data(), src.data(), N);
+    // The N > 0 guards here and below match the dynamic overload: the mem*
+    // functions require valid (non-null) pointers even for a zero count,
+    // and a default-constructed span's data() is null — UBSan's nonnull
+    // checks flag the unguarded call.
+    if constexpr (N > 0) {
+        std::memcpy(dest.data(), src.data(), N);
+    }
 }
 
 /// Copy a dynamically-sized source span into a fixed-extent destination.
@@ -237,12 +248,14 @@ inline void span_copy(std::span<uint8_t, N> dest, std::span<uint8_t const, N> sr
 /// shorter than N, copies what is available and zero-fills the remainder so
 /// the destination is fully defined and no out-of-bounds read of src occurs.
 template <size_t N>
-inline void span_copy(std::span<uint8_t, N> dest, std::span<uint8_t const> src)
+inline void span_copy(std::span<uint8_t, N> dest, std::span<uint8_t const> src) noexcept
 {
     auto const src_size = src.size();
     STATUSBAR_ASSERT(src_size >= N && "span_copy: source span too small for fixed-extent destination");
     auto const n = std::min(src_size, N);
-    std::memcpy(dest.data(), src.data(), n);
+    if (n > 0) {
+        std::memcpy(dest.data(), src.data(), n);
+    }
     if (n < N) {
         std::memset(dest.data() + n, 0, N - n);
     }
@@ -262,13 +275,15 @@ inline void span_copy(std::span<uint8_t> dest, statusbar::sg14::inplace_vector<u
 /// shorter, copies what is available and zero-fills the rest of the destination range
 /// to avoid reading out-of-bounds.
 template <size_t N>
-inline void span_copy(statusbar::sg14::inplace_vector<uint8_t, N>& dest, std::span<uint8_t const> src)
+inline void span_copy(statusbar::sg14::inplace_vector<uint8_t, N>& dest, std::span<uint8_t const> src) noexcept
 {
     auto const src_size = src.size();
     auto const dest_size = dest.size();
     STATUSBAR_ASSERT(src_size >= dest_size && "span_copy: source span too small for inplace_vector destination");
     auto const n = std::min(src_size, dest_size);
-    std::memcpy(dest.data(), src.data(), n);
+    if (n > 0) {
+        std::memcpy(dest.data(), src.data(), n);
+    }
     if (n < dest_size) {
         std::memset(dest.data() + n, 0, dest_size - n);
     }
@@ -280,21 +295,22 @@ inline void span_copy(statusbar::sg14::inplace_vector<uint8_t, N>& dest, std::sp
 
 /// Check if a dynamically-sized source span can be copied into a fixed-extent destination.
 template <size_t N>
-inline auto can_span_copy([[maybe_unused]] std::span<uint8_t, N> dest, std::span<uint8_t const> src) -> bool
+inline auto can_span_copy([[maybe_unused]] std::span<uint8_t, N> dest, std::span<uint8_t const> src) noexcept -> bool
 {
     return src.size() == N;
 }
 
 /// Check if a dynamically-sized source span can be copied into a fixed-size array.
+/// (const&: this is a pure predicate — the destination is not touched.)
 template <size_t N>
-inline auto can_span_copy([[maybe_unused]] std::array<uint8_t, N>& dest, std::span<uint8_t const> src) -> bool
+inline auto can_span_copy([[maybe_unused]] std::array<uint8_t, N> const& dest, std::span<uint8_t const> src) noexcept -> bool
 {
     return src.size() == N;
 }
 
 /// Check if a dynamically-sized source span can be copied into an inplace_vector.
 template <size_t N>
-inline auto can_span_copy(statusbar::sg14::inplace_vector<uint8_t, N> const& dest, std::span<uint8_t const> src) -> bool
+inline auto can_span_copy(statusbar::sg14::inplace_vector<uint8_t, N> const& dest, std::span<uint8_t const> src) noexcept -> bool
 {
     return src.size() == dest.size();
 }
@@ -310,9 +326,13 @@ inline auto can_span_copy(statusbar::sg14::inplace_vector<uint8_t, N> const& des
 /// session tokens, or any other secret. Use `span_compare_constant_time`
 /// for those.
 template <size_t N>
-inline auto span_compare(std::span<uint8_t const, N> a, std::span<uint8_t const, N> b) -> bool
+inline auto span_compare(std::span<uint8_t const, N> a, std::span<uint8_t const, N> b) noexcept -> bool
 {
-    return std::memcmp(a.data(), b.data(), N) == 0;
+    if constexpr (N == 0) {
+        return true;  // memcmp requires valid pointers even for a zero count
+    } else {
+        return std::memcmp(a.data(), b.data(), N) == 0;
+    }
 }
 
 /// Compare two dynamic-extent byte spans for equality.
@@ -322,9 +342,11 @@ inline auto span_compare(std::span<uint8_t const, N> a, std::span<uint8_t const,
 /// dynamic-extent overload of that returns false in `O(b.size())` when
 /// the lengths mismatch, so an attacker still cannot probe the secret
 /// byte-by-byte.
-inline auto span_compare(std::span<uint8_t const> a, std::span<uint8_t const> b) -> bool
+inline auto span_compare(std::span<uint8_t const> a, std::span<uint8_t const> b) noexcept -> bool
 {
-    return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size()) == 0;
+    // The a.empty() short-circuit keeps memcmp away from null data()
+    // (two default-constructed spans are equal).
+    return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size()) == 0);
 }
 
 /// Constant-time N-byte comparison.
@@ -441,7 +463,9 @@ auto span_load(T& dest, std::array<uint8_t, N> const& src) noexcept -> void
 /// @param value Byte value to fill with.
 inline auto span_fill(std::span<uint8_t> const dest, uint8_t const value) noexcept -> void
 {
-    std::memset(dest.data(), value, dest.size());
+    if (!dest.empty()) {
+        std::memset(dest.data(), value, dest.size());
+    }
 }
 
 /// Fill an inplace_vector's current contents with a byte value.
@@ -456,7 +480,9 @@ inline void span_fill(statusbar::sg14::inplace_vector<uint8_t, N>& vec, uint8_t 
 /// @param dest Destination span.
 inline auto span_zero(std::span<uint8_t> dest) noexcept -> void
 {
-    std::memset(dest.data(), 0, dest.size());
+    if (!dest.empty()) {
+        std::memset(dest.data(), 0, dest.size());
+    }
 }
 
 /// Zero an inplace_vector's current contents.
@@ -554,7 +580,12 @@ template <typename T>
     requires std::is_trivially_copyable_v<T> && HasWireSize<T>
 [[nodiscard]] inline auto wire_span(T const& desc) noexcept -> std::span<uint8_t const>
 {
-    return make_const_span(desc).first(desc.wire_size());
+    // Same precondition span_store_wire asserts: a buggy wire_size() past
+    // sizeof(T) would otherwise be silent .first() UB here while trapping
+    // cleanly there.
+    size_t const wsize = desc.wire_size();
+    STATUSBAR_ASSERT(wsize <= sizeof(T) && "wire_span: wire_size exceeds source object");
+    return make_const_span(desc).first(wsize);
 }
 
 //
