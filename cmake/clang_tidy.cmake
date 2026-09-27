@@ -15,7 +15,14 @@ function(statusbar_register_clang_tidy_target)
   if(TARGET clang-tidy)
     return()
   endif()
-  find_program(CLANG_TIDY_EXE NAMES clang-tidy)
+  # Prefer the toolchain's own clang-tidy (CMAKE_LLVM_PATH is set by
+  # toolchain-clang.cmake) over whatever PATH offers: a PATH clang-tidy from a
+  # different LLVM generation than the build compiler produces noisy or wrong
+  # findings against this compile_commands.json.
+  find_program(
+    CLANG_TIDY_EXE
+    NAMES clang-tidy
+    HINTS "${CMAKE_LLVM_PATH}/bin")
   if(NOT CLANG_TIDY_EXE)
     return()
   endif()

@@ -7,6 +7,11 @@
 # per-file text file under output_dir. Filters out the noisy
 # "N warnings generated" / "Error while processing" trailing lines.
 #
+# clang-tidy's exit status is deliberately discarded (the trailing `|| true`):
+# the contract is the findings file, not the exit code — the aggregate
+# `clang-tidy` target always "succeeds" and the caller inspects the combined
+# findings output.
+#
 # Usage: run-clang-tidy.sh <clang-tidy> <build-dir> <output-dir> <source-file>
 
 CLANG_TIDY="$1"

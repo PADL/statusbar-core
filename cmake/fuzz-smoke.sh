@@ -37,7 +37,13 @@ for fuzzer in $fuzzers; do
     seed="$SEEDS_DIR/${name}_seed.bin"
     head -c 256 /dev/urandom > "$seed"
     echo "[$count] Running $name with random seed..."
-    if ! "$fuzzer" -runs=1 -timeout=5 -close_fd_mask=3 "$seed" 2>&1 | tail -3; then
+    # Capture the fuzzer's exit status before truncating its output: piping
+    # straight into tail would make the pipeline's status tail's (POSIX sh has
+    # no pipefail), silently turning every crash into a pass.
+    status=0
+    out=$("$fuzzer" -runs=1 -timeout=5 -close_fd_mask=3 "$seed" 2>&1) || status=$?
+    printf '%s\n' "$out" | tail -3
+    if [ "$status" -ne 0 ]; then
         echo "  FAILED: $name" >&2
         failed=$((failed + 1))
     fi
