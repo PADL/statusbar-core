@@ -16,6 +16,7 @@
 
 #include "statusbar/status/status.hpp"
 
+#include <climits>
 #include <cstdio>
 #include <exception>
 #include <string>
@@ -33,7 +34,10 @@ namespace statusbar {
     if (context.empty()) {
         std::fprintf(stderr, "fatal: %s\n", ec.message().c_str());
     } else {
-        std::fprintf(stderr, "fatal: %.*s: %s\n", static_cast<int>(context.size()), context.data(), ec.message().c_str());
+        // %.*s takes an int: clamp rather than let a pathological context's
+        // size wrap negative in the cast.
+        auto const context_len = static_cast<int>(context.size() > INT_MAX ? INT_MAX : context.size());
+        std::fprintf(stderr, "fatal: %.*s: %s\n", context_len, context.data(), ec.message().c_str());
     }
     std::terminate();
 #endif

@@ -28,24 +28,31 @@
 //
 // Putting [[assume(expr)]] in the non-hardened branches is deliberate: every
 // call site goes through the same side-effect / pure-function analysis, so a
-// predicate that accidentally calls a non-pure function fails to build where it
-// would otherwise silently mutate state in debug but evaporate in release.
+// predicate that accidentally calls a non-pure function is diagnosed (clang's
+// -Wassume) — a hard build error under -DENABLE_WARNINGS_AS_ERRORS (the
+// standalone package default), a warning otherwise — where it would otherwise
+// silently mutate state in debug but evaporate in release.
+//
+// Variadic so a predicate containing a bare comma (template argument lists:
+// STATUSBAR_ASSERT(check<A, B>(x))) survives the preprocessor; the expansion
+// re-joins the pieces, and a genuine top-level comma expression still fails to
+// compile inside [[assume]].
 
 #include <cassert>
 
 #if defined(STATUSBAR_HARDENED)
-#    define STATUSBAR_ASSERT(expr)                                                                                                 \
+#    define STATUSBAR_ASSERT(...)                                                                                                  \
         do {                                                                                                                       \
-            if (!(expr)) {                                                                                                         \
+            if (!(__VA_ARGS__)) {                                                                                                  \
                 __builtin_trap();                                                                                                  \
             }                                                                                                                      \
         } while (false)
 #elif defined(NDEBUG)
-#    define STATUSBAR_ASSERT(expr) [[assume(expr)]]
+#    define STATUSBAR_ASSERT(...) [[assume((__VA_ARGS__))]]
 #else
-#    define STATUSBAR_ASSERT(expr)                                                                                                 \
+#    define STATUSBAR_ASSERT(...)                                                                                                  \
         do {                                                                                                                       \
-            assert(expr);                                                                                                          \
-            [[assume(expr)]];                                                                                                      \
+            assert((__VA_ARGS__));                                                                                                 \
+            [[assume((__VA_ARGS__))]];                                                                                             \
         } while (false)
 #endif

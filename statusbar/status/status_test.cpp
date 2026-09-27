@@ -3,17 +3,66 @@
 
 #include "statusbar/status/status.hpp"
 
-#include "statusbar/buffer/buffer.hpp"
 #include "statusbar/status/catch_or_status.hpp"
+#include "statusbar/status/throw_or_abort.hpp"
 #include "statusbar/test/test.hpp"
 
 #include <cstdlib>
 #include <expected>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <utility>
 
 using namespace statusbar;
+
+//
+// A local error-code enum + category: the base status module's test must not
+// reach up into higher modules (buffer's BufferError previously stood in
+// here), and a self-contained enum exercises the full is_error_code_enum
+// integration path — specialization, ADL make_error_code, custom category.
+//
+enum class StatusTestError : int
+{
+    alpha = 1,
+    beta = 2,
+};
+
+namespace {
+
+class StatusTestErrorCategory final : public std::error_category
+{
+  public:
+    [[nodiscard]] auto name() const noexcept -> char const* override { return "statusbar.status_test"; }
+    [[nodiscard]] auto message(int condition) const -> std::string override
+    {
+        switch (StatusTestError{condition}) {
+            case StatusTestError::alpha:
+                return "alpha";
+            case StatusTestError::beta:
+                return "beta";
+        }
+        return "unknown";
+    }
+};
+
+auto status_test_error_category() -> std::error_category const&
+{
+    static StatusTestErrorCategory category;
+    return category;
+}
+
+}  // namespace
+
+auto make_error_code(StatusTestError e) -> std::error_code
+{
+    return {static_cast<int>(e), status_test_error_category()};
+}
+
+template <>
+struct std::is_error_code_enum<StatusTestError> : std::true_type
+{};
 
 //
 // Status (void) Tests
@@ -170,6 +219,19 @@ TEST(statusbar_status, zero_value)
     EXPECT_FALSE(is_failure(sv));
 }
 
+TEST(statusbar_status, move_only_value)
+{
+    // success() and StatusValue must work with move-only payloads.
+    StatusValue<std::unique_ptr<int>> sv = success(std::make_unique<int>(9));
+    EXPECT_TRUE(sv);
+    EXPECT_EQ(**sv, 9);
+    auto moved = std::move(sv);
+    EXPECT_TRUE(moved.has_value());
+    if (moved.has_value()) {
+        EXPECT_EQ(**moved, 9);
+    }
+}
+
 TEST(statusbar_status, multiple_error_forwards)
 {
     // Test forwarding errors through multiple type changes
@@ -195,22 +257,22 @@ TEST(statusbar_status, forward_failure_from_status_void)
 }
 
 //
-// Custom Error Code Enum Tests (using BufferError as example)
+// Custom Error Code Enum Tests (the local StatusTestError above)
 //
 TEST(statusbar_status, failure_custom_enum_implicit)
 {
     // Test failure(CustomEnum) -> std::unexpected (implicit conversion)
-    Status s = failure(BufferError::insufficient_data);
+    Status s = failure(StatusTestError::alpha);
     EXPECT_FALSE(s);
-    // Error code category should be buffer error category
-    EXPECT_EQ(s.error().category().name(), std::string_view("statusbar.buffer"));
+    // Error code category should be the enum's own category
+    EXPECT_EQ(s.error().category().name(), std::string_view("statusbar.status_test"));
 }
 
 TEST(statusbar_status, failure_custom_enum_preserves_value)
 {
     // Verify the error value is preserved through the conversion
-    Status s1 = failure(BufferError::insufficient_data);
-    Status s2 = failure(BufferError::insufficient_space);
+    Status s1 = failure(StatusTestError::alpha);
+    Status s2 = failure(StatusTestError::beta);
 
     // Different error values should produce different error codes
     EXPECT_NE(s1.error().value(), s2.error().value());
@@ -271,6 +333,44 @@ TEST(statusbar_status, run_guarded_swallows_exception)
         throw std::runtime_error("boom");
     });
     EXPECT_TRUE(ran);  // reached the throw, and control returned here normally
+}
+
+TEST(statusbar_status, catch_or_status_void_status_exception_path)
+{
+    // The Status (void) specialization of the exception path.
+    Status r = catch_or_status([]() -> Status { throw std::runtime_error("boom"); }, std::errc::invalid_argument);
+    EXPECT_FALSE(r);
+    EXPECT_EQ(r.error(), std::errc::invalid_argument);
+}
+
+//
+// throw_or_abort — under exceptions it throws std::system_error, so the
+// documented round trip (a value turned into an exception by
+// throw_or_abort(ec) comes back as failure(ec) through catch_or_status) is
+// directly testable, one test per overload.
+//
+TEST(statusbar_status, throw_or_abort_round_trips_error_code)
+{
+    auto const original = std::make_error_code(std::errc::timed_out);
+    StatusValue<int> r =
+        catch_or_status([&]() -> StatusValue<int> { throw_or_abort(original, "context string"); }, std::errc::io_error);
+    EXPECT_FALSE(r);
+    EXPECT_EQ(r.error(), original);
+}
+
+TEST(statusbar_status, throw_or_abort_round_trips_errc_overload)
+{
+    Status r = catch_or_status([]() -> Status { throw_or_abort(std::errc::address_in_use); }, std::errc::io_error);
+    EXPECT_FALSE(r);
+    EXPECT_EQ(r.error(), std::errc::address_in_use);
+}
+
+TEST(statusbar_status, throw_or_abort_round_trips_unexpected_overload)
+{
+    // The failure(...) result feeds throw_or_abort directly.
+    Status r = catch_or_status([]() -> Status { throw_or_abort(failure(StatusTestError::beta)); }, std::errc::io_error);
+    EXPECT_FALSE(r);
+    EXPECT_EQ(r.error(), make_error_code(StatusTestError::beta));
 }
 #endif
 

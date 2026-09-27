@@ -17,8 +17,10 @@
 
 #include "statusbar/status/status.hpp"
 
+#include <climits>
 #include <cstdio>
 #include <exception>
+#include <functional>
 #include <string_view>
 #include <system_error>
 #include <type_traits>
@@ -45,14 +47,17 @@ template <typename Fn>
         "catch_or_status: fn must return a Status or StatusValue<T> (constructible from statusbar::failure(...))");
 #if __cpp_exceptions
     try {
-        return std::forward<Fn>(fn)();
+        // std::invoke, matching the std::invoke_result_t in the signature —
+        // a bare fn() would reject the pointer-to-member callables the trait
+        // accepts.
+        return std::invoke(std::forward<Fn>(fn));
     } catch (std::system_error const& e) {
         return Result{failure(e.code())};
     } catch (...) {
         return Result{failure(ec_on_exception)};
     }
 #else
-    return std::forward<Fn>(fn)();
+    return std::invoke(std::forward<Fn>(fn));
 #endif
 }
 
@@ -73,16 +78,19 @@ template <typename Fn>
 template <typename Fn>
 void run_guarded(std::string_view thread_name, Fn&& fn) noexcept
 {
+    // %.*s takes an int: clamp rather than let a pathological name's size
+    // wrap negative in the cast.
+    auto const name_len = static_cast<int>(thread_name.size() > INT_MAX ? INT_MAX : thread_name.size());
 #if __cpp_exceptions
     try {
-        std::forward<Fn>(fn)();
+        std::invoke(std::forward<Fn>(fn));
     } catch (std::exception const& e) {
-        std::fprintf(stderr, "%.*s exited via exception: %s\n", static_cast<int>(thread_name.size()), thread_name.data(), e.what());
+        std::fprintf(stderr, "%.*s exited via exception: %s\n", name_len, thread_name.data(), e.what());
     } catch (...) {
-        std::fprintf(stderr, "%.*s exited via unknown exception\n", static_cast<int>(thread_name.size()), thread_name.data());
+        std::fprintf(stderr, "%.*s exited via unknown exception\n", name_len, thread_name.data());
     }
 #else
-    std::forward<Fn>(fn)();
+    std::invoke(std::forward<Fn>(fn));
 #endif
 }
 
