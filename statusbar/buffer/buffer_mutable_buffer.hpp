@@ -3,9 +3,9 @@
 // Copyright 2026 Jeff Koftinoff <jeff.koftinoff@statusbar.com>
 // SPDX-License-Identifier: MIT
 
-#include "statusbar/buffer/buffer_error.hpp"
-#include "statusbar/buffer/buffer_traits.hpp"
-#include "statusbar/buffer/span_utils.hpp"
+// buffer_base.hpp provides the buffer_error/buffer_traits/span_utils
+// includes and hoists the traits:: names used below into statusbar.
+#include "statusbar/buffer/buffer_base.hpp"
 #include "statusbar/status/status.hpp"
 #include "statusbar/status/throw_or_abort.hpp"
 
@@ -21,14 +21,6 @@
 #include <vector>
 
 namespace statusbar {
-
-using traits::PlainCArray;
-using traits::PlainElement;
-using traits::PlainLinearCollection;
-using traits::PlainStdArray;
-using traits::PlainStdSpan;
-using traits::PlainStdVector;
-using traits::PlainType;
 
 ///
 /// Mutable buffer wrapper providing read-write access to a contiguous sequence of bytes.
@@ -95,12 +87,16 @@ class MutableBuffer
     /// \throws std::system_error If data_size exceeds total_buffer_span size.
     ///
     MutableBuffer(std::span<uint8_t> const total_buffer_span, size_t const data_size)
-        : immutable_span_(std::span<uint8_t const>(total_buffer_span.data(), data_size))
+        : immutable_span_(std::span<uint8_t const>(total_buffer_span.data(), 0))
         , mutable_total_span_{total_buffer_span}
     {
+        // Validate BEFORE forming the used span: constructing a span of
+        // data_size bytes over a shorter buffer would violate std::span's
+        // precondition even though the object never escapes.
         if (data_size > total_buffer_span.size()) {
             throw_or_abort(BufferError::invalid_offset);
         }
+        immutable_span_ = std::span<uint8_t const>(total_buffer_span.data(), data_size);
     }
 
     ///
@@ -269,8 +265,14 @@ class MutableBuffer
     ///
     [[nodiscard]] auto can_store(size_t const offset, size_t const required_length) const noexcept -> Status
     {
-        // Check for integer overflow before comparing
-        if (required_length > get_span().size() || offset > get_span().size() - required_length) {
+        // The offset check first also guards the (size - offset)
+        // subtraction below against underflow. An out-of-range offset is
+        // invalid_offset; a length that does not fit after a valid offset
+        // is insufficient_space.
+        if (offset > get_span().size()) {
+            return failure(BufferError::invalid_offset);
+        }
+        if (required_length > get_span().size() - offset) {
             return failure(BufferError::insufficient_space);
         }
         return success();
@@ -286,9 +288,10 @@ class MutableBuffer
     [[nodiscard]] auto store(size_t const offset, std::span<uint8_t const> const src) const noexcept -> Status
     {
         auto const required_length = src.size();
-        // Check for integer overflow before comparing
-        if (required_length > get_span().size() || offset > get_span().size() - required_length) {
-            return failure(BufferError::insufficient_space);
+        // One bounds check, in can_store — an inline duplicate here would
+        // be a drift hazard.
+        if (auto const status = can_store(offset, required_length); !status) {
+            return status;
         }
         auto const destination_span = mutable_total_span_.subspan(offset, required_length);
         span_copy(destination_span, src);
@@ -342,6 +345,15 @@ class MutableBufferWithStorage
         : MutableBufferStorage<N>()
         , MutableBuffer(this->storage_)
     {}
+
+    // Non-copyable, non-movable: the defaulted operations would duplicate
+    // storage_ while the MutableBuffer subobject's spans still referenced
+    // the SOURCE object's storage — a silently aliasing copy that dangles
+    // once the source dies.
+    MutableBufferWithStorage(MutableBufferWithStorage const&) = delete;
+    auto operator=(MutableBufferWithStorage const&) -> MutableBufferWithStorage& = delete;
+    MutableBufferWithStorage(MutableBufferWithStorage&&) = delete;
+    auto operator=(MutableBufferWithStorage&&) -> MutableBufferWithStorage& = delete;
 };
 
 }  // namespace statusbar

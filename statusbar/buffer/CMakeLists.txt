@@ -14,7 +14,8 @@ statusbar_add_module(
   buffer_compiled_test.cpp
   buffer_deserializer_test.cpp
   buffer_protocol_test.cpp
-  buffer_traits_test.cpp)
+  buffer_traits_test.cpp
+  span_utils_test.cpp)
 
 add_executable(buffer_bench_tool
                ${CMAKE_CURRENT_LIST_DIR}/buffer_bench_tool.cpp)

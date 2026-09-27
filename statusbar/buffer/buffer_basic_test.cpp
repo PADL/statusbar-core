@@ -9,9 +9,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <expected>
+#include <limits>
 #include <span>
 #include <string>
 #include <system_error>
+#include <type_traits>
 #include <vector>
 
 using namespace statusbar;
@@ -647,6 +649,33 @@ TEST(mutable_buffer_safety, can_store_rejects_huge_offset_with_small_length)
     MutableBuffer buf(make_span(data), 8);
     EXPECT_FALSE(buf.can_store(std::numeric_limits<size_t>::max(), 4));
 }
+
+TEST(mutable_buffer_safety, can_store_error_codes_distinguish_offset_and_space)
+{
+    std::array<uint8_t, 8> data{};
+    MutableBuffer buf(make_span(data), 4);
+    // An offset beyond the used size is invalid_offset ...
+    auto const bad_offset = buf.can_store(5, 1);
+    EXPECT_FALSE(bad_offset);
+    EXPECT_EQ(bad_offset.error(), make_error_code(BufferError::invalid_offset));
+    // ... while a length that does not fit after a valid offset is
+    // insufficient_space. store() reports identically (it delegates).
+    auto const bad_length = buf.can_store(2, 3);
+    EXPECT_FALSE(bad_length);
+    EXPECT_EQ(bad_length.error(), make_error_code(BufferError::insufficient_space));
+    std::array<uint8_t, 3> src{0xAA, 0xBB, 0xCC};
+    auto const store_bad_length = buf.store(2, make_const_span(src));
+    EXPECT_FALSE(store_bad_length);
+    EXPECT_EQ(store_bad_length.error(), make_error_code(BufferError::insufficient_space));
+}
+
+// MutableBufferWithStorage owns its bytes; a defaulted copy or move would
+// duplicate the storage while the MutableBuffer subobject's spans still
+// referenced the SOURCE object's storage. Locked out at compile time.
+static_assert(!std::is_copy_constructible_v<MutableBufferWithStorage<8>>);
+static_assert(!std::is_copy_assignable_v<MutableBufferWithStorage<8>>);
+static_assert(!std::is_move_constructible_v<MutableBufferWithStorage<8>>);
+static_assert(!std::is_move_assignable_v<MutableBufferWithStorage<8>>);
 
 TEST(mutable_buffer_safety, append_full_then_again_returns_failure)
 {
