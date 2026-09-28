@@ -329,9 +329,12 @@ template <PlainType T>
 /// \return The wire size in bytes.
 ///
 template <SerializableFixedStruct T>
-[[nodiscard]] constexpr auto wire_size(T const& header) noexcept -> size_t
+[[nodiscard]] constexpr auto wire_size(T const& /* header */) noexcept -> size_t
 {
-    return header.LENGTH;
+    // T::LENGTH, matching the SerializableWireFixedStruct overload — the
+    // trait contract guarantees a static constexpr LENGTH, and never
+    // touching the object keeps size queries deref-free.
+    return T::LENGTH;
 }
 
 ///
@@ -343,9 +346,12 @@ template <SerializableFixedStruct T>
 /// \return The required size on success, or an error if buffer is too small.
 ///
 template <SerializableFixedStruct T>
-[[nodiscard]] constexpr auto can_load(std::span<uint8_t const> const buf, T const* item) noexcept -> StatusValue<size_t>
+[[nodiscard]] constexpr auto can_load(std::span<uint8_t const> const buf, T const* /* item */) noexcept -> StatusValue<size_t>
 {
-    auto const required = wire_size(*item);
+    // T::LENGTH directly: the pointer is a pure type tag here, and the
+    // PlainType overloads never dereference theirs — dereferencing a
+    // null tag for a size query must not be UB on this overload alone.
+    auto constexpr required = T::LENGTH;
     if (buf.size() < required) {
         return failure(BufferError::insufficient_data);
     }
@@ -537,8 +543,10 @@ template <SerializableWireFixedStruct T>
 template <SerializableWireFixedStruct T>
 [[nodiscard]] auto load(std::span<uint8_t const> const buf, T* const item) noexcept -> StatusValue<size_t>
 {
-    if (buf.size() < T::LENGTH) {
-        return failure(BufferError::insufficient_data);
+    // Delegate the bounds check, matching the SerializableFixedStruct
+    // load() above — one check, no inline duplicate to drift.
+    if (auto const status = can_load(buf, static_cast<T const*>(item)); !status) {
+        return status;
     }
     return success(load_unchecked(buf, item));
 }
@@ -554,8 +562,9 @@ template <SerializableWireFixedStruct T>
 template <SerializableWireFixedStruct T>
 [[nodiscard]] auto store(std::span<uint8_t> const buf, T const& item) noexcept -> StatusValue<size_t>
 {
-    if (buf.size() < T::LENGTH) {
-        return failure(BufferError::insufficient_space);
+    // Delegate the bounds check — see load() above.
+    if (auto const status = can_store(buf, item); !status) {
+        return status;
     }
     return success(store_unchecked(buf, item));
 }

@@ -12,6 +12,7 @@
 #include <expected>
 #include <span>
 #include <system_error>
+#include <vector>
 
 using namespace statusbar;
 
@@ -35,13 +36,13 @@ struct statusbar::traits::is_serializable_fixed_struct<TestFixedProtocol> : std:
 [[nodiscard]] auto load_unchecked(std::span<uint8_t const> const buf, TestFixedProtocol* const item) noexcept
 {
     BufferDeserializerBuilder{buf}.parse_unchecked(&item->field1).parse_unchecked(&item->field2);
-    return item->LENGTH;
+    return TestFixedProtocol::LENGTH;
 }
 
 [[nodiscard]] auto store_unchecked(std::span<uint8_t> const buf, TestFixedProtocol const& item) noexcept
 {
     BufferSerializerBuilderWithBuffer{buf}.append_unchecked(item.field1).append_unchecked(item.field2);
-    return item.LENGTH;
+    return TestFixedProtocol::LENGTH;
 }
 
 //
@@ -95,6 +96,68 @@ TEST(fixed_size_protocol, can_load_insufficient_buffer)
 
     EXPECT_FALSE(status);
     EXPECT_EQ(status.error(), BufferError::insufficient_data);
+}
+
+TEST(fixed_size_protocol, can_load_accepts_null_type_tag)
+{
+    // The pointer is a pure type tag: a size query must not dereference
+    // it (the PlainType overloads never dereference theirs either).
+    std::array<uint8_t, 10> data{};
+    auto const status = can_load(std::span<uint8_t const>{data}, static_cast<TestFixedProtocol const*>(nullptr));
+    EXPECT_TRUE(status);
+    EXPECT_EQ(status.value(), 8);
+}
+
+//
+// PlainSizedContiguous loads (std::vector / inplace_vector): pre-sized
+// container, bulk byte copy — previously only trait-asserted, untested.
+//
+
+TEST(sized_contiguous, vector_load_round_trip_and_short_buffer)
+{
+    std::array<uint8_t, 8> const wire{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
+    std::span<uint8_t const> const buf{wire};
+
+    std::vector<uint16_t> values(4);  // pre-sized: 4 x 2 bytes
+    auto const can = can_load(buf, &values);
+    EXPECT_TRUE(can);
+    EXPECT_EQ(can.value(), 8);
+
+    auto const status = load(buf, &values);
+    EXPECT_TRUE(status);
+    EXPECT_EQ(status.value(), 8);
+    if constexpr (std::endian::native == std::endian::little) {
+        EXPECT_EQ(values[0], 0x0201);
+        EXPECT_EQ(values[3], 0x0807);
+    } else {
+        EXPECT_EQ(values[0], 0x0102);
+        EXPECT_EQ(values[3], 0x0708);
+    }
+
+    std::vector<uint16_t> too_many(5);  // needs 10 bytes, buffer has 8
+    auto const short_status = load(buf, &too_many);
+    EXPECT_FALSE(short_status);
+    EXPECT_EQ(short_status.error(), BufferError::insufficient_data);
+}
+
+TEST(sized_contiguous, inplace_vector_load_and_empty)
+{
+    std::array<uint8_t, 4> const wire{0xAA, 0xBB, 0xCC, 0xDD};
+    std::span<uint8_t const> const buf{wire};
+
+    statusbar::sg14::inplace_vector<uint8_t, 8> values;
+    values.resize(3);  // pre-sized to 3 of the 4 available bytes
+    auto const status = load(buf, &values);
+    EXPECT_TRUE(status);
+    EXPECT_EQ(status.value(), 3);
+    EXPECT_EQ(values[0], 0xAA);
+    EXPECT_EQ(values[2], 0xCC);
+
+    // An empty pre-sized container loads zero bytes successfully.
+    statusbar::sg14::inplace_vector<uint8_t, 8> empty;
+    auto const empty_status = load(buf, &empty);
+    EXPECT_TRUE(empty_status);
+    EXPECT_EQ(empty_status.value(), 0);
 }
 
 //
@@ -151,9 +214,14 @@ TEST(fixed_size_protocol, load_deserializes_correctly)
 
     EXPECT_TRUE(status);
     EXPECT_EQ(status.value(), 8);
-    // Raw load, no byte-order conversion on little-endian systems
-    EXPECT_EQ(proto.field1, 0x78563412);
-    EXPECT_EQ(proto.field2, 0xF0DEBC9A);
+    // Raw load, no byte-order conversion — expectations follow the host.
+    if constexpr (std::endian::native == std::endian::little) {
+        EXPECT_EQ(proto.field1, 0x78563412);
+        EXPECT_EQ(proto.field2, 0xF0DEBC9A);
+    } else {
+        EXPECT_EQ(proto.field1, 0x12345678);
+        EXPECT_EQ(proto.field2, 0x9ABCDEF0);
+    }
 }
 
 TEST(fixed_size_protocol, load_insufficient_buffer)
@@ -182,15 +250,22 @@ TEST(fixed_size_protocol, store_serializes_correctly)
 
     EXPECT_TRUE(status);
     EXPECT_EQ(status.value(), 8);
-    // Raw store, no byte-order conversion on little-endian systems
-    EXPECT_EQ(data[0], 0x78);
-    EXPECT_EQ(data[1], 0x56);
-    EXPECT_EQ(data[2], 0x34);
-    EXPECT_EQ(data[3], 0x12);
-    EXPECT_EQ(data[4], 0xF0);
-    EXPECT_EQ(data[5], 0xDE);
-    EXPECT_EQ(data[6], 0xBC);
-    EXPECT_EQ(data[7], 0x9A);
+    // Raw store, no byte-order conversion — expectations follow the host.
+    if constexpr (std::endian::native == std::endian::little) {
+        EXPECT_EQ(data[0], 0x78);
+        EXPECT_EQ(data[1], 0x56);
+        EXPECT_EQ(data[2], 0x34);
+        EXPECT_EQ(data[3], 0x12);
+        EXPECT_EQ(data[4], 0xF0);
+        EXPECT_EQ(data[5], 0xDE);
+        EXPECT_EQ(data[6], 0xBC);
+        EXPECT_EQ(data[7], 0x9A);
+    } else {
+        EXPECT_EQ(data[0], 0x12);
+        EXPECT_EQ(data[3], 0x78);
+        EXPECT_EQ(data[4], 0x9A);
+        EXPECT_EQ(data[7], 0xF0);
+    }
 }
 
 TEST(fixed_size_protocol, store_insufficient_buffer)

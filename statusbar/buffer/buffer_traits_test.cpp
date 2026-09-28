@@ -91,6 +91,19 @@ static_assert(!traits::WireValue<std::span<uint8_t const>>);
 static_assert(!traits::WireValue<std::span<uint8_t, 4>>);
 static_assert(!traits::WireValue<std::vector<uint8_t>>);
 static_assert(!traits::WireValue<std::string>);
+// Pointers are trivially copyable but serializing one writes an ADDRESS,
+// never the pointee — refused for the same reason as spans.
+static_assert(!traits::WireValue<int*>);
+static_assert(!traits::WireValue<uint8_t const*>);
+static_assert(!traits::WireValue<void*>);
+static_assert(!traits::WireValue<std::nullptr_t>);
+static_assert(!traits::WireValue<int S::*>);
+
+// std::vector<bool> is a bit-packed proxy with no .data(): it must fail
+// the constraint, not the body of protocol::load_unchecked.
+static_assert(!PlainStdVector<std::vector<bool>>);
+static_assert(!traits::PlainSizedContiguous<std::vector<bool>>);
+static_assert(PlainType<bool>);  // scalar bool stays plain
 
 // Negative-compile checks. A requires-expression outside a template is
 // ill-formed when its body is invalid, so each probe is a concept.

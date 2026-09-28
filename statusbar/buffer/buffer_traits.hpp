@@ -74,9 +74,12 @@ template <typename T>
 struct is_plain_std_vector : std::false_type
 {};
 
-/// Specialization for std::vector of plain elements.
+/// Specialization for std::vector of plain elements. bool is excluded:
+/// std::vector<bool> is a bit-packed proxy container with no .data(), so
+/// admitting it would fail deep inside protocol::load_unchecked instead
+/// of at the constraint.
 template <typename U>
-struct is_plain_std_vector<std::vector<U>> : std::bool_constant<PlainElement<U>>
+struct is_plain_std_vector<std::vector<U>> : std::bool_constant<PlainElement<U> && !std::is_same_v<U, bool>>
 {};
 
 /// Concept for unsigned integer types (excluding bool).
@@ -179,8 +182,13 @@ concept SerializableStruct =
 /// trivially copyable object whose bytes are its wire image (sized by
 /// sizeof). std::span is excluded explicitly: it is trivially copyable, but
 /// its bytes are a pointer and a length, not the elements it views.
+/// Pointers (raw, member, nullptr_t) are excluded for the same reason —
+/// they are trivially copyable, but serializing one writes an ADDRESS to
+/// the wire, never the pointee.
 template <typename T>
-concept WireValue = !StdSpan<T> && (SerializableStruct<T> || std::is_trivially_copyable_v<std::remove_cvref_t<T>>);
+concept WireValue = !StdSpan<T> && !std::is_pointer_v<std::remove_cvref_t<T>> &&
+    !std::is_member_pointer_v<std::remove_cvref_t<T>> && !std::is_null_pointer_v<std::remove_cvref_t<T>> &&
+    (SerializableStruct<T> || std::is_trivially_copyable_v<std::remove_cvref_t<T>>);
 
 /// Trait for fixed-size structs that are packed to match wire format exactly.
 /// These structs can be serialized/deserialized with a single memcpy.
