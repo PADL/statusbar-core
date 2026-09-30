@@ -77,3 +77,50 @@ function(statusbar_add_module)
     set_property(GLOBAL APPEND PROPERTY STATUSBAR_TEST_FILES ${_abs_tests})
   endif()
 endfunction()
+
+#
+# SM documentation registry — decouples the workspace `docs-sm` target from the
+# packages that own state-machine tools. A tool's own CMakeLists calls
+# statusbar_register_sm_doc() with a package-relative docs directory; the
+# top-level (aggregate) or standalone-package CMakeLists then calls
+# statusbar_register_sm_docs_target() to build one `docs-sm` target from every
+# registered pair, without naming any tool itself.
+#
+
+# Register one SM tool and the docs/sm/ directory its output is committed to.
+# Entries are stored as "<tool>|<docs_dir>" ('|' because ';' is the CMake list
+# separator and paths never contain '|').
+function(statusbar_register_sm_doc tool docs_dir)
+  set_property(GLOBAL APPEND PROPERTY STATUSBAR_SM_DOCS "${tool}|${docs_dir}")
+endfunction()
+
+# Create the `docs-sm` custom target from every registered pair. Call once,
+# after all add_subdirectory() calls, passing the sm-docs-render.sh to use.
+# No-op when a docs-sm target already exists (an outer aggregate build owns it)
+# or when no tool registered.
+function(statusbar_register_sm_docs_target render_script)
+  if(TARGET docs-sm)
+    return()
+  endif()
+  get_property(_sm_entries GLOBAL PROPERTY STATUSBAR_SM_DOCS)
+  if(NOT _sm_entries)
+    return()
+  endif()
+  set(_commands "")
+  set(_tools "")
+  foreach(_entry IN LISTS _sm_entries)
+    string(REPLACE "|" ";" _pair "${_entry}")
+    list(GET _pair 0 _tool)
+    list(GET _pair 1 _docs_dir)
+    list(APPEND _commands COMMAND ${render_script} $<TARGET_FILE:${_tool}>
+         ${_docs_dir})
+    list(APPEND _tools ${_tool})
+  endforeach()
+  add_custom_target(
+    docs-sm
+    ${_commands}
+    DEPENDS ${_tools}
+    COMMENT
+      "Regenerating per-SM Markdown + SVG for every registered SM tool (needs graphviz)"
+    VERBATIM USES_TERMINAL)
+endfunction()
