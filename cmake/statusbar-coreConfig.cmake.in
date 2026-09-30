@@ -18,4 +18,17 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 include("${CMAKE_CURRENT_LIST_DIR}/statusbar-coreTargets.cmake")
+
+# statusbar-core is the single source of truth for the shared build
+# machinery: module.cmake (statusbar_add_module and the package boilerplate
+# helpers, which itself pulls in the sanitizer/coverage/fuzzing/clang-tidy
+# options) ships beside this config, both installed and in core's build
+# tree. Including it here means a dependent package gets everything from
+# its ordinary find_package(statusbar-core) with no cmake/ copies of its
+# own. Guarded: under the umbrella aggregate the top-level project already
+# included the same files at a wider scope.
+if(NOT COMMAND statusbar_add_module)
+  include("${CMAKE_CURRENT_LIST_DIR}/module.cmake")
+endif()
+
 check_required_components(statusbar-core)

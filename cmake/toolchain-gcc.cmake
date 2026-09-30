@@ -10,7 +10,7 @@
 # compilers allow; the deltas are called out inline.
 #
 # libstdc++ and libc++ objects cannot be mixed, so a GCC build must use its own
-# build directory, separate from any clang-toolchain build of this package.
+# build directory (the `gcc` CMake preset points at build-gcc/).
 
 # Guard against CMake processing this toolchain file multiple times within a
 # single configure pass (e.g. if a CMakeLists also include()s it after CMake
@@ -259,7 +259,7 @@ if(ENABLE_COVERAGE)
   )
 endif()
 
-# Warnings. ON by default, matching this package's toolchain-clang.cmake. GCC's
+# Warnings. Default ON everywhere, matching toolchain-clang.cmake. GCC's
 # diagnostic set differs from clang's, so this is the flag most likely to need
 # -DENABLE_WARNINGS_AS_ERRORS=OFF on a compiler upgrade. Statically link the C++
 # runtime into executables. One flag pair covers both toolchains: GCC links
@@ -303,17 +303,12 @@ if(_STATUSBAR_LINKER_FLAGS)
   string(APPEND CMAKE_MODULE_LINKER_FLAGS " ${_STATUSBAR_LINKER_FLAGS_STR}")
 endif()
 
-# Include optional toolchain components, matching toolchain-clang.cmake.
-# sanitizers.cmake needs no GCC-specific changes (GCC and clang spell the
-# ASan/UBSan/TSan flags identically). coverage.cmake and fuzzing.cmake are
-# LLVM-only, but both are inert here: ENABLE_COVERAGE/ENABLE_FUZZING are pinned
-# off above, and an explicit -D...=ON was already rejected with a pointer to the
-# clang toolchain. clang_tidy.cmake only defines
-# statusbar_register_clang_tidy_target(), which this package's CMakeLists calls.
-include("${CMAKE_CURRENT_LIST_DIR}/sanitizers.cmake")
-include("${CMAKE_CURRENT_LIST_DIR}/coverage.cmake")
-include("${CMAKE_CURRENT_LIST_DIR}/fuzzing.cmake")
-include("${CMAKE_CURRENT_LIST_DIR}/clang_tidy.cmake")
+# NOTE: the sanitizer / coverage / fuzzing / clang-tidy helper modules are NOT
+# included here, matching toolchain-clang.cmake — they are project build logic,
+# not compiler selection; the umbrella includes them at its top scope and
+# cmake/module.cmake includes them (guarded) for standalone package builds.
+# (sanitizers.cmake needs no GCC-specific changes: GCC and clang spell the
+# ASan/UBSan/TSan flags identically.)
 
 if(_STATUSBAR_EXE_LINKER_FLAGS)
   list(JOIN _STATUSBAR_EXE_LINKER_FLAGS " " _STATUSBAR_EXE_LINKER_FLAGS_STR)

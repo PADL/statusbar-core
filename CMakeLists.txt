@@ -56,119 +56,66 @@ add_subdirectory(statusbar)
 # EXPORT_NAME for each module target is set by statusbar_add_module() in
 # cmake/module.cmake — no per-module enumeration needed here.
 
-# Give every installed executable a statusbar- prefixed on-disk name, so the
-# bin/ directory is uniform (tools that set no OUTPUT_NAME, and examples, would
-# otherwise install unprefixed).
-get_property(_exe_targets GLOBAL PROPERTY STATUSBAR_INSTALL_TARGETS)
-foreach(_t ${_exe_targets})
-  if(NOT TARGET ${_t})
-    continue()
-  endif()
-  get_target_property(_t_type ${_t} TYPE)
-  if(NOT _t_type STREQUAL "EXECUTABLE")
-    continue()
-  endif()
-  get_target_property(_t_name ${_t} OUTPUT_NAME)
-  if(NOT _t_name)
-    set(_t_name "${_t}")
-  endif()
-  if(NOT _t_name MATCHES "^statusbar-")
-    string(REPLACE "_" "-" _t_name "${_t_name}")
-    set_target_properties(${_t} PROPERTIES OUTPUT_NAME "statusbar-${_t_name}")
-  endif()
-endforeach()
+# Uniform statusbar- prefixed on-disk names for installed executables
+# (statusbar_prefix_tool_names in cmake/module.cmake).
+statusbar_prefix_tool_names()
 
 # ---- install + export ----
-# Skipped under an aggregate build (STATUSBAR_AGGREGATE_BUILD), which builds but
-# doesn't install — the outer project owns the install set. Install rules are
-# split into runtime (tools / shared libs) and devel (static libs, headers,
-# CMake config) components for CPack.
+# Standalone install/export boilerplate lives in
+# statusbar_package_install_export (cmake/module.cmake); no-op under an outer
+# aggregate build.
+statusbar_package_install_export(NAME core)
+
+# statusbar-core is the single source of truth for the shared build machinery
+# (helper modules, toolchains, build-time scripts). Two homes, both beside the
+# package config so statusbar-coreConfig.cmake can include() them relative to
+# itself: - installed, for dependents building against the core-dev package; -
+# staged into this build tree, for dependents building against
+# -Dstatusbar-core_DIR=<core-build-dir> without an install step.
 if(NOT STATUSBAR_AGGREGATE_BUILD)
-  get_property(_install_targets GLOBAL PROPERTY STATUSBAR_INSTALL_TARGETS)
+  set(_statusbar_cmake_modules
+      cmake/module.cmake
+      cmake/sanitizers.cmake
+      cmake/coverage.cmake
+      cmake/fuzzing.cmake
+      cmake/clang_tidy.cmake
+      cmake/toolchain-clang.cmake
+      cmake/toolchain-gcc.cmake
+      cmake/toolchain-clang-aarch64.cmake
+      cmake/toolchain-gcc-aarch64.cmake)
+  set(_statusbar_cmake_scripts
+      cmake/coverage-collect.sh
+      cmake/coverage-html.sh
+      cmake/coverage-report.sh
+      cmake/fuzz-all.sh
+      cmake/fuzz-smoke.sh
+      cmake/run-clang-tidy-all.sh
+      cmake/run-clang-tidy.sh
+      cmake/sm-docs-render.sh)
   install(
-    TARGETS ${_install_targets}
-    EXPORT statusbar-coreTargets
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT devel
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT runtime
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT runtime)
-  install(
-    EXPORT statusbar-coreTargets
-    FILE statusbar-coreTargets.cmake
-    NAMESPACE statusbar::
+    FILES ${_statusbar_cmake_modules}
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/statusbar-core
     COMPONENT devel)
-  # Also export the build tree, so a sibling package can find this one without
-  # an install step: pass -Dstatusbar-core_DIR=<build-dir>.
-  export(
-    EXPORT statusbar-coreTargets
-    FILE statusbar-coreTargets.cmake
-    NAMESPACE statusbar::)
   install(
-    DIRECTORY statusbar/
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/statusbar
-    COMPONENT devel
-    FILES_MATCHING
-    PATTERN "*.hpp"
-    PATTERN "*.h")
-  configure_package_config_file(
-    cmake/statusbar-coreConfig.cmake.in
-    ${CMAKE_CURRENT_BINARY_DIR}/statusbar-coreConfig.cmake
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/statusbar-core)
-  write_basic_package_version_file(
-    ${CMAKE_CURRENT_BINARY_DIR}/statusbar-coreConfigVersion.cmake
-    VERSION ${PROJECT_VERSION}
-    COMPATIBILITY AnyNewerVersion)
-  install(
-    FILES ${CMAKE_CURRENT_BINARY_DIR}/statusbar-coreConfig.cmake
-          ${CMAKE_CURRENT_BINARY_DIR}/statusbar-coreConfigVersion.cmake
+    PROGRAMS ${_statusbar_cmake_scripts}
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/statusbar-core
     COMPONENT devel)
-  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/docs)
-    install(
-      DIRECTORY docs/
-      DESTINATION ${CMAKE_INSTALL_DOCDIR}
-      COMPONENT devel
-      FILES_MATCHING
-      PATTERN "*.md"
-      PATTERN "*.svg"
-      PATTERN "*.png")
-  endif()
+  file(COPY ${_statusbar_cmake_modules} ${_statusbar_cmake_scripts}
+       DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
 endif()
 
 # ---- packaging (CPack: TGZ + ZIP, plus DEB/RPM on Linux) ----
 # Standalone builds only — run `cpack` from the build directory to produce this
-# package's archives.
+# package's archives. Common variables come from
+# statusbar_package_cpack_defaults (cmake/module.cmake); only the
+# package-specific dependency floors remain here.
 if(NOT STATUSBAR_AGGREGATE_BUILD)
-  set(CPACK_PACKAGE_NAME "statusbar-core")
-  set(CPACK_PACKAGE_VENDOR "Jeff Koftinoff")
-  set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
-  set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
-      "Foundational C++23 utilities — error handling, zero-copy buffers, IEEE and networking primitives, state machines, inter-thread communication, real-time scheduling, and terminal UI."
+  statusbar_package_cpack_defaults(
+    NAME
+    core
+    DESCRIPTION
+    "Foundational C++23 utilities — error handling, zero-copy buffers, IEEE and networking primitives, state machines, inter-thread communication, real-time scheduling, and terminal UI."
   )
-  set(CPACK_PACKAGING_INSTALL_PREFIX "${CMAKE_INSTALL_PREFIX}")
-  set(CPACK_DEBIAN_PACKAGE_MAINTAINER
-      "Jeff Koftinoff <jeff.koftinoff@statusbar.com>")
-  set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
-  set(CPACK_RPM_PACKAGE_LICENSE "MIT")
-  set(CPACK_RPM_PACKAGE_GROUP "Development/Libraries")
-  set(CPACK_RPM_PACKAGE_AUTOREQ ON)
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
-    set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
-  endif()
-  set(CPACK_DEB_COMPONENT_INSTALL ON)
-  set(CPACK_RPM_COMPONENT_INSTALL ON)
-  set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)
-  # Name DEB/RPM files the package-manager-conventional way
-  # (<name>_<version>_<arch>.deb), so dependent builds and the orchestrator
-  # locate them by package name.
-  set(CPACK_DEBIAN_FILE_NAME "DEB-DEFAULT")
-  set(CPACK_RPM_FILE_NAME "RPM-DEFAULT")
-  set(CPACK_DEBIAN_RUNTIME_PACKAGE_NAME "statusbar-core")
-  set(CPACK_RPM_RUNTIME_PACKAGE_NAME "statusbar-core")
-  set(CPACK_COMPONENT_RUNTIME_DESCRIPTION "Command-line tools and executables")
-  set(CPACK_COMPONENTS_ALL runtime devel)
-  set(CPACK_DEBIAN_DEVEL_PACKAGE_NAME "statusbar-core-dev")
-  set(CPACK_RPM_DEVEL_PACKAGE_NAME "statusbar-core-devel")
   # -dev's cmake config exports IMPORTED targets pointing at runtime binaries
   # (statusbar-net-tcp-echo-example etc.), so installing -dev without the
   # runtime breaks find_package() on the consumer side. >= (not =) so an
@@ -177,16 +124,6 @@ if(NOT STATUSBAR_AGGREGATE_BUILD)
   set(CPACK_DEBIAN_DEVEL_PACKAGE_DEPENDS
       "statusbar-core (>= ${PROJECT_VERSION})")
   set(CPACK_RPM_DEVEL_PACKAGE_REQUIRES "statusbar-core >= ${PROJECT_VERSION}")
-  set(CPACK_COMPONENT_DEVEL_DESCRIPTION
-      "C++ headers, static libraries and CMake package config")
-  set(CPACK_GENERATOR "TGZ;ZIP")
-  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    list(APPEND CPACK_GENERATOR "DEB")
-    find_program(_rpmbuild rpmbuild)
-    if(_rpmbuild)
-      list(APPEND CPACK_GENERATOR "RPM")
-    endif()
-  endif()
   include(CPack)
 endif()
 

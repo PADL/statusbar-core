@@ -1,37 +1,8 @@
 include(${PROJECT_SOURCE_DIR}/cmake/module.cmake)
 
-# Package INTERFACE library — re-exports every module target in this package's
-# build. Module tool executables link `statusbar`. Under an outer aggregate
-# build (STATUSBAR_AGGREGATE_BUILD), an outer project provides a single shared
-# `statusbar` target covering all aggregated packages.
-if(NOT STATUSBAR_AGGREGATE_BUILD)
-  add_library(statusbar INTERFACE)
-endif()
-
-# Add this package's source root to the package INTERFACE library's include path
-# so tool and example sources can #include headers ("statusbar/<dir>/...") that
-# live inside this package. Under an outer aggregate build the same target
-# accumulates the include path from every package.
-target_include_directories(statusbar
-                           INTERFACE $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>)
-
-define_property(
-  GLOBAL
-  PROPERTY STATUSBAR_TEST_FILES
-  BRIEF_DOCS "test sources"
-  FULL_DOCS "accumulated test sources")
-define_property(
-  GLOBAL
-  PROPERTY STATUSBAR_INSTALL_TARGETS
-  BRIEF_DOCS "install targets"
-  FULL_DOCS "accumulated install targets")
-# A standalone build resets these per package. Under an outer aggregate build,
-# the outer project initialises them once and lets them accumulate across every
-# aggregated package.
-if(NOT STATUSBAR_AGGREGATE_BUILD)
-  set_property(GLOBAL PROPERTY STATUSBAR_TEST_FILES "")
-  set_property(GLOBAL PROPERTY STATUSBAR_INSTALL_TARGETS "")
-endif()
+# Package INTERFACE library, include path and the global accumulation properties
+# (statusbar_package_module_init in cmake/module.cmake).
+statusbar_package_module_init()
 
 # Module subdirectories — dependency order.
 add_subdirectory(status)
@@ -100,39 +71,7 @@ if(NOT STATUSBAR_AGGREGATE_BUILD)
   endif()
 endif()
 
-# Aggregate test binary built from every module's test sources. Skipped under an
-# outer aggregate build, where the outer project builds one combined
-# statusbar_test from every aggregated package.
-if(NOT STATUSBAR_AGGREGATE_BUILD)
-  get_property(STATUSBAR_TEST_FILES_ABS GLOBAL PROPERTY STATUSBAR_TEST_FILES)
-  set(STATUSBAR_TEST_FILES "")
-  foreach(TEST_FILE_ABS ${STATUSBAR_TEST_FILES_ABS})
-    file(RELATIVE_PATH TEST_FILE_REL "${PROJECT_SOURCE_DIR}" "${TEST_FILE_ABS}")
-    list(APPEND STATUSBAR_TEST_FILES "${TEST_FILE_REL}")
-  endforeach()
-  list(SORT STATUSBAR_TEST_FILES)
-  if(STATUSBAR_TEST_FILES)
-    create_test_sourcelist(STATUSBAR_TEST_SOURCES statusbar_test.cpp
-                           ${STATUSBAR_TEST_FILES})
-    add_executable(statusbar_test ${CMAKE_CURRENT_BINARY_DIR}/statusbar_test.cpp
-                                  ${STATUSBAR_TEST_FILES_ABS})
-    target_include_directories(statusbar_test PRIVATE ${CMAKE_CURRENT_LIST_DIR})
-    target_link_libraries(statusbar_test PRIVATE statusbar)
-    foreach(TEST_FILE ${STATUSBAR_TEST_FILES})
-      string(REPLACE ".cpp" "" TEST_NAME "${TEST_FILE}")
-      add_test(NAME ${TEST_NAME} COMMAND statusbar_test ${TEST_NAME})
-    endforeach()
-    add_test(NAME statusbar_all_test COMMAND statusbar_test -A)
-    # The -A run-all branch of CMake's create_test_sourcelist driver cannot
-    # fail: it `return 0`s unconditionally, and it only prints "not ok" when a
-    # test function returns -1 -- but TestRegister::run_section() returns 1.
-    # Judge the run by the harness's own output instead of the driver's exit
-    # code (same fix as the umbrella aggregate): no FAIL: line, and the run must
-    # reach the end (so a crash part-way through cannot pass either).
-    set_tests_properties(
-      statusbar_all_test
-      PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL: " PASS_REGULAR_EXPRESSION
-                 "All tests finished\\.")
-    statusbar_register_coverage_targets(statusbar_test)
-  endif()
-endif()
+# Standalone per-package test binary (statusbar_package_test_binary in
+# cmake/module.cmake); the outer aggregate build builds one combined
+# statusbar_test from every aggregated package instead.
+statusbar_package_test_binary()

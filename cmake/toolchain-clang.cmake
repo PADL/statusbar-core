@@ -6,8 +6,8 @@
 # Guard against CMake processing this toolchain file multiple times within a
 # single configure pass (e.g. if a CMakeLists also include()s it after CMake
 # itself already loaded it via --toolchain). Directory-scope, not CACHE — using
-# a cache variable would suppress the toolchain on every *reconfigure*, breaking
-# the include()s for sanitizers/fuzzing/etc. at the bottom of this file.
+# a cache variable would suppress the toolchain (compiler/flags) on every
+# *reconfigure*.
 if(STATUSBAR_TOOLCHAIN_LOADED)
   return()
 endif()
@@ -125,30 +125,39 @@ endif()
 # __AVX__/__FMA__, so without these flags they preprocess to nothing on x86_64
 # and every SIMD op silently falls back to scalar. Applied globally (every TU,
 # not just the dsp target): two TUs that both include the SIMD headers but
-# disagree on -mavx2 pick different inline definitions - an ODR hazard. NEON is
+# disagree on -mavx2 pick different inline definitions — an ODR hazard. NEON is
 # baseline on ARMv8, so aarch64 needs no flag.
 #
-# Gate strictly on an x86_64 TARGET. A NATIVE build leaves
-# CMAKE_SYSTEM_PROCESSOR empty here (it is not populated until project() runs
-# compiler detection), so a native aarch64 build would otherwise fall through
-# and fail to compile with "-mavx2 unsupported for aarch64". Consult
-# CMAKE_HOST_SYSTEM_PROCESSOR (set from uname at startup, before project()) for
-# the native case; CMAKE_SYSTEM_PROCESSOR for the explicit cross case.
-# ENABLE_AVX (default ON) lets a build opt out of the AVX/FMA baseline - e.g. to
+# ENABLE_AVX (default ON) lets a build opt out of the AVX/FMA baseline — e.g. to
 # target an older x86 CPU without AVX2, or to produce a portable binary. It only
 # has an effect on x86 targets; on non-x86 the flags are never added regardless.
 option(ENABLE_AVX "Enable the AVX2/FMA SIMD baseline on x86 targets" ON)
-if(ENABLE_AVX
-   AND (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64"
-        OR (NOT CMAKE_SYSTEM_PROCESSOR AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES
-                                           "x86_64|AMD64")))
+
+# Resolve the *target* processor. On a cross build the cross toolchain sets
+# CMAKE_SYSTEM_PROCESSOR before including this file; on a native build it is
+# still empty during the toolchain pass (CMake probes the system only at
+# project() time), so fall back to CMAKE_HOST_SYSTEM_PROCESSOR, which CMake
+# populates before the first toolchain inclusion. Add AVX only when the target
+# is *positively* identified as x86 — treating "anything not ARM" as x86 wrongly
+# enabled -mavx2/-mfma on a native aarch64 host (clang rejects them), and would
+# also misfire on other non-x86 arches.
+if(CMAKE_SYSTEM_PROCESSOR)
+  set(_STATUSBAR_TARGET_PROC "${CMAKE_SYSTEM_PROCESSOR}")
+else()
+  set(_STATUSBAR_TARGET_PROC "${CMAKE_HOST_SYSTEM_PROCESSOR}")
+endif()
+if(ENABLE_AVX AND _STATUSBAR_TARGET_PROC MATCHES "x86_64|AMD64|amd64|i[3-6]86")
   list(APPEND _STATUSBAR_CXX_FLAGS -mavx2 -mfma)
 endif()
 
-# Warnings Statically link the C++ runtime into executables. One flag pair
-# covers both toolchains: GCC links libstdc++ and libgcc; clang links libc++,
-# libc++abi and the libgcc unwinder. Either way the C++ runtime leaves the
-# binary's dynamic dependencies entirely.
+# Warnings. Default ON everywhere (standalone packages and the aggregate alike)
+# so a new diagnostic fails the build where it is introduced instead of
+# surfacing later in a stricter context. Consumers or IDE builds on a compiler
+# other than the pinned one opt out with -DENABLE_WARNINGS_AS_ERRORS=OFF.
+# Statically link the C++ runtime into executables. One flag pair covers both
+# toolchains: GCC links libstdc++ and libgcc; clang links libc++, libc++abi and
+# the libgcc unwinder. Either way the C++ runtime leaves the binary's dynamic
+# dependencies entirely.
 #
 # This decouples the build compiler from the runtime present on the target. A
 # C++26 GCC 16 binary needs GLIBCXX_3.4.36, which Debian trixie (libstdc++
@@ -193,11 +202,12 @@ if(_STATUSBAR_LINKER_FLAGS)
   string(APPEND CMAKE_MODULE_LINKER_FLAGS " ${_STATUSBAR_LINKER_FLAGS_STR}")
 endif()
 
-# Include optional toolchain components
-include("${CMAKE_CURRENT_LIST_DIR}/sanitizers.cmake")
-include("${CMAKE_CURRENT_LIST_DIR}/coverage.cmake")
-include("${CMAKE_CURRENT_LIST_DIR}/fuzzing.cmake")
-include("${CMAKE_CURRENT_LIST_DIR}/clang_tidy.cmake")
+# NOTE: the sanitizer / coverage / fuzzing / clang-tidy helper modules are NOT
+# included here. They are project build logic (options + statusbar_register_*
+# target helpers), not compiler selection: the umbrella includes them at its top
+# scope, and cmake/module.cmake includes them (guarded) for standalone package
+# builds — so every build configures under any CMAKE_TOOLCHAIN_FILE (or none),
+# as a single-project IDE build requires.
 
 if(_STATUSBAR_EXE_LINKER_FLAGS)
   list(JOIN _STATUSBAR_EXE_LINKER_FLAGS " " _STATUSBAR_EXE_LINKER_FLAGS_STR)
