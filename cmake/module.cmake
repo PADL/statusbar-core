@@ -17,21 +17,31 @@
 # Where the shared statusbar cmake files live — the core source tree for in-tree
 # builds, or core-dev's installed lib/cmake/statusbar-core/ (this file travels
 # with statusbar-coreConfig.cmake) for standalone dependents. Consumers use it
-# to reach the bundled scripts (sm-docs-render.sh, ...).
-set(STATUSBAR_CMAKE_DIR "${CMAKE_CURRENT_LIST_DIR}")
+# to reach the bundled scripts (sm-docs-render.sh, ...). Resolved through this
+# file's REAL path: the umbrella reaches it via a cmake/module.cmake symlink
+# into core/cmake, and the sibling includes below must follow the symlink to
+# core's directory rather than expect a symlink per sibling in the umbrella —
+# otherwise a new core module can never land (core's CI configures the umbrella,
+# whose symlink for the new file can only follow core's merge).
+get_filename_component(_statusbar_module_file "${CMAKE_CURRENT_LIST_FILE}"
+                       REALPATH)
+get_filename_component(STATUSBAR_CMAKE_DIR "${_statusbar_module_file}"
+                       DIRECTORY)
+unset(_statusbar_module_file)
 
-# Build-helper modules (sanitizer/coverage/fuzzing options and the
-# statusbar_register_* target helpers). Included here — the one file every
-# package already includes — so a package configures under ANY toolchain (or
-# none), instead of relying on a toolchain file to pull them in. The COMMAND
-# guard makes this a no-op when an outer aggregate build (or a toolchain)
-# already included them at a wider directory scope, which also keeps their flag
-# appends from running twice.
+# Build-helper modules (the whole-build switches, the sanitizer/coverage/
+# fuzzing options and the statusbar_register_* target helpers). Included here —
+# the one file every package already includes — so a package configures under
+# ANY toolchain (or none), instead of relying on a toolchain file to pull them
+# in. The COMMAND guard makes this a no-op when an outer aggregate build (or a
+# toolchain) already included them at a wider directory scope, which also keeps
+# their flag appends from running twice.
 if(NOT COMMAND statusbar_register_fuzz_targets)
-  include(${CMAKE_CURRENT_LIST_DIR}/sanitizers.cmake)
-  include(${CMAKE_CURRENT_LIST_DIR}/coverage.cmake)
-  include(${CMAKE_CURRENT_LIST_DIR}/fuzzing.cmake)
-  include(${CMAKE_CURRENT_LIST_DIR}/clang_tidy.cmake)
+  include(${STATUSBAR_CMAKE_DIR}/build_switches.cmake)
+  include(${STATUSBAR_CMAKE_DIR}/sanitizers.cmake)
+  include(${STATUSBAR_CMAKE_DIR}/coverage.cmake)
+  include(${STATUSBAR_CMAKE_DIR}/fuzzing.cmake)
+  include(${STATUSBAR_CMAKE_DIR}/clang_tidy.cmake)
 endif()
 
 function(statusbar_add_module)
@@ -207,6 +217,13 @@ function(statusbar_package_test_binary)
   endforeach()
   list(SORT STATUSBAR_TEST_FILES)
   if(NOT STATUSBAR_TEST_FILES)
+    return()
+  endif()
+  # The test harness requires exceptions (build_switches.cmake), exactly as the
+  # umbrella skips its aggregate binary.
+  if(ENABLE_NO_EXCEPTIONS)
+    message(STATUS "ENABLE_NO_EXCEPTIONS: skipping the statusbar_test binary "
+                   "(the test harness requires exceptions)")
     return()
   endif()
   create_test_sourcelist(STATUSBAR_TEST_SOURCES statusbar_test.cpp

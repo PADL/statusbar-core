@@ -27,29 +27,10 @@ if(NOT STATUSBAR_AGGREGATE_BUILD)
   add_custom_target(run-all-benches)
 endif()
 
-# Hardened build: STATUSBAR_ASSERT() traps on a violated precondition even in
-# release (defense in depth; default is [[assume]] under NDEBUG). For aggregate
-# builds the umbrella declares this option and applies the definition globally;
-# here it covers the standalone statusbar-core build.
-if(NOT STATUSBAR_AGGREGATE_BUILD)
-  option(
-    ENABLE_HARDENING
-    "Make STATUSBAR_ASSERT trap on violation in all builds (defense in depth)"
-    OFF)
-  if(ENABLE_HARDENING)
-    add_compile_definitions(STATUSBAR_HARDENED)
-  endif()
-
-  # See the umbrella CMakeLists for rationale. OFF = full local-capture
-  # visibility node (no qdisc bypass + promiscuous RawnetContext sockets).
-  option(
-    ENABLE_PACKET_QDISC_BYPASS
-    "Use PACKET_QDISC_BYPASS for opted-in TX sockets (OFF = all TX visible to local capture + promiscuous RX)"
-    ON)
-  if(NOT ENABLE_PACKET_QDISC_BYPASS)
-    add_compile_definitions(STATUSBAR_NO_QDISC_BYPASS)
-  endif()
-endif()
+# The whole-build switches (ENABLE_NO_EXCEPTIONS, ENABLE_HARDENING,
+# ENABLE_PACKET_QDISC_BYPASS) come from cmake/build_switches.cmake, declared
+# once by module.cmake at this build's widest scope — the umbrella's top level
+# under an aggregate, statusbar/ here.
 
 add_subdirectory(statusbar)
 
@@ -75,6 +56,7 @@ statusbar_package_install_export(NAME core)
 if(NOT STATUSBAR_AGGREGATE_BUILD)
   set(_statusbar_cmake_modules
       cmake/module.cmake
+      cmake/build_switches.cmake
       cmake/sanitizers.cmake
       cmake/coverage.cmake
       cmake/fuzzing.cmake
