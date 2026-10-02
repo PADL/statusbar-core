@@ -7,6 +7,7 @@ statusbar_package_module_init()
 # Module subdirectories — dependency order.
 add_subdirectory(status)
 add_subdirectory(safe_arith)
+add_subdirectory(checksum)
 add_subdirectory(secure_random)
 add_subdirectory(fmt)
 add_subdirectory(buffer)

@@ -57,6 +57,7 @@ No fuzz harnesses live in this package — see `statusbar-crypto` and `statusbar
 - `benchmark`
 - `bpf`
 - `buffer`
+- `checksum`
 - `colbin`
 - `config`
 - `container`

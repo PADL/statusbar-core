@@ -13,6 +13,7 @@ two-minute orientation, then dive into its headers under
 | benchmark    | Micro-benchmark harness with optimization barriers, two timer backends, and stats.  | [BENCHMARK_MODULE.md](BENCHMARK_MODULE.md) |
 | bpf          | Raw Ethernet frame capture with kernel-side EtherType filtering via BpfDevice.      | [BPF_MODULE.md](BPF_MODULE.md)             |
 | buffer       | Bounds-checked byte-buffer primitives, fluent (de)serializers, field descriptors.   | [BUFFER_MODULE.md](BUFFER_MODULE.md)       |
+| checksum     | Ones-complement 16-bit (Internet) checksum and constexpr reflected CRC-32 (Ethernet, AUTOSAR P4). | [CHECKSUM_MODULE.md](CHECKSUM_MODULE.md)   |
 | colbin       | Append-only mmap-backed columnar binary file format for fixed-width row streams.    | [COLBIN_MODULE.md](COLBIN_MODULE.md)       |
 | config       | Cascades TOML files with CLI overrides into typed argument bindings.                | [CONFIG_MODULE.md](CONFIG_MODULE.md)       |
 | container    | Generic bounded, zero-heap containers used across protocol state machines.          | [CONTAINER_MODULE.md](CONTAINER_MODULE.md) |
