@@ -15,19 +15,23 @@ set(STATUSBAR_TOOLCHAIN_LOADED TRUE)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Compiler selection and LLVM path detection. LLVM_PATH (env var) wins on both
-# platforms, providing a single override knob. Otherwise: - macOS: leave
-# CMAKE_LLVM_PATH empty (the project requires Homebrew's clang; callers should
-# set LLVM_PATH via the Makefile / environment). - Linux: find `clang` on PATH
-# and walk back to its prefix. CMake's find_program + REALPATH is portable and
-# handles symlinks of any depth, Homebrew on Linux, custom prefixes — unlike the
-# old `readlink -f /usr/bin/clang` which was GNU-only and hardcoded /usr/bin.
+# Compiler selection. CMAKE_LLVM_PATH is the prefix holding bin/clang and
+# bin/clang++. Precedence: 1. LLVM_PATH (environment) — the single override knob
+# on every platform. 2. `clang` located by find_program, looking first in the
+# Homebrew LLVM prefixes (/opt/homebrew/opt/llvm, /usr/local/opt/llvm — the
+# newer toolchain this project prefers on macOS) and then on PATH, which on a
+# Mac with only the Xcode Command Line Tools installed is Apple's
+# /usr/bin/clang. A fresh machine therefore configures with no environment at
+# all. The binary is resolved through symlinks (REALPATH) and walked back to its
+# prefix, which also handles Homebrew on Linux, custom prefixes and ccache shim
+# directories. 3. /usr as a last resort.
 if(DEFINED ENV{LLVM_PATH})
   set(CMAKE_LLVM_PATH "$ENV{LLVM_PATH}")
-elseif(APPLE)
-  set(CMAKE_LLVM_PATH "")
 else()
-  find_program(_clang_exe clang DOC "Clang C compiler")
+  find_program(
+    _clang_exe clang
+    HINTS /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin
+    DOC "Clang C compiler")
   if(_clang_exe)
     get_filename_component(_clang_real "${_clang_exe}" REALPATH)
     get_filename_component(_clang_bin "${_clang_real}" DIRECTORY)
@@ -36,6 +40,7 @@ else()
     set(CMAKE_LLVM_PATH "/usr") # last resort
   endif()
 endif()
+message(STATUS "Clang toolchain prefix: ${CMAKE_LLVM_PATH}")
 
 set(CMAKE_C_COMPILER "${CMAKE_LLVM_PATH}/bin/clang")
 set(CMAKE_CXX_COMPILER "${CMAKE_LLVM_PATH}/bin/clang++")
