@@ -337,6 +337,23 @@ function(statusbar_package_install_export)
   endif()
 endfunction()
 
+# Where a package's Python helper modules install. Debian's python3 scans only
+# /usr/lib/python3/dist-packages, which lies outside CMAKE_INSTALL_PREFIX
+# (typically /usr/local), so the default is that absolute path and the deb and
+# rpm packages drop their modules straight into it. A relative value is taken
+# under CMAKE_INSTALL_PREFIX: CPack's archive generators (TGZ, ZIP) cannot
+# package an absolute install destination (they write it to the live filesystem,
+# or in DESTDIR mode mis-prefix it and fail), so archive builds set e.g.
+# lib/python3/dist-packages here. STRING, not PATH: a PATH cache entry given a
+# relative value on the command line is silently made absolute against the
+# working directory.
+set(STATUSBAR_PYTHON_DIST_PACKAGES
+    "/usr/lib/python3/dist-packages"
+    CACHE
+      STRING
+      "Install directory for the statusbar Python modules (absolute, or relative to CMAKE_INSTALL_PREFIX)"
+)
+
 # The CPack variables every package sets identically. A MACRO, not a function:
 # CPack reads plain variables from the scope that runs include(CPack), so they
 # must land in the caller. The caller sets its package-specific variables
