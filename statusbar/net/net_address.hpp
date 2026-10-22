@@ -4,7 +4,8 @@
 // SPDX-License-Identifier: MIT
 
 /// Network address utilities
-/// Provides SocketAddress wrapper around sockaddr_storage
+/// Provides SocketAddress wrapper around sockaddr_storage (IPv4, IPv6, and
+/// AF_UNIX filesystem paths)
 
 #include "statusbar/buffer/buffer.hpp"
 #include "statusbar/net/net_error.hpp"
@@ -14,6 +15,7 @@
 #include <netdb.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <expected>
@@ -25,6 +27,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 
 namespace statusbar::net {
 
@@ -112,6 +115,13 @@ class SocketAddress
         return ipv6(addr, port, scope_id);
     }
 
+    /// Create an AF_LOCAL (AF_UNIX) address for an absolute filesystem path
+    /// (no abstract namespace). Fails with NetError::invalid_address when
+    /// @p path is not absolute (empty or not starting with '/'), contains a
+    /// NUL, or does not fit in sun_path with its terminating NUL.
+    /// @param path Absolute filesystem path of the socket
+    [[nodiscard]] static auto local(std::string_view path) noexcept -> StatusValue<SocketAddress>;
+
     /// Get pointer to sockaddr for system calls
     [[nodiscard]] auto sockaddr() noexcept -> struct sockaddr*
     {
@@ -161,6 +171,11 @@ class SocketAddress
         return 0;
     }
 
+    /// Get the filesystem path (AF_UNIX only; empty for an unnamed peer, a
+    /// Linux abstract/autobind name, or any other family). Views this
+    /// object's storage. to_string() renders an abstract name as "@name".
+    [[nodiscard]] auto path() const noexcept -> std::string_view;
+
     /// Get the scope ID (IPv6 only, for link-local addresses)
     [[nodiscard]] auto scope_id() const noexcept -> uint32_t
     {
@@ -203,12 +218,15 @@ class SocketAddress
     -> StatusValue<FileDescriptor>;
 
 /// Create a TCP socket optionally bound to the given address
+/// For an AF_UNIX address this is a SOCK_STREAM unix socket: SO_REUSEADDR
+/// and DSCP are not applied, and the caller owns any filesystem entry
+/// bind creates (stale-path handling and unlink).
 /// @param addr The address to use (determines address family)
 /// @param do_bind If true, bind to the address
-/// @param dscp Optional DSCP value (0-63). If >= 0, sets the DSCP on the socket.
+/// @param dscp Optional DSCP value (0-63). If >= 0, sets the DSCP on the socket (IP families only).
 [[nodiscard]] auto create_tcp_socket(SocketAddress const& addr, bool do_bind, int dscp = -1) -> StatusValue<FileDescriptor>;
 
-/// Create a TCP socket, bind, and listen
+/// Create a TCP (or AF_UNIX stream) socket, bind, and listen
 /// @param addr The address to bind to
 /// @param backlog Listen backlog size
 /// @param dscp Optional DSCP value (0-63) for accepted connections. If >= 0, the server

@@ -3,7 +3,8 @@
 // Copyright 2026 Jeff Koftinoff <jeff.koftinoff@statusbar.com>
 // SPDX-License-Identifier: MIT
 
-/// TcpConnectionPool — a fixed-capacity, readiness-driven TCP server that
+/// TcpConnectionPool — a fixed-capacity, readiness-driven stream server
+/// (TCP over IPv4/IPv6, or an AF_UNIX filesystem socket) that
 /// occupies ONE slot in the MessageReactor: the pool's fd() is an
 /// FdMultiplexer holding the listener and every connection, so any member
 /// socket wakes the outer poll (no tick-cadence latency), while connection
@@ -28,6 +29,15 @@
 /// At capacity, new connections are accepted and immediately closed
 /// (otherwise the pending connection would keep the listener readable and
 /// spin the poll); on_rejected(peer) reports it.
+///
+/// AF_UNIX: pass SocketAddress::local(path) as the bind address. A stale
+/// socket file at the path (one nobody is listening on: a probe connect is
+/// refused) is unlinked before bind; a live socket or any other kind of
+/// filesystem entry there makes the pool invalid and is left alone. (The
+/// probe shows up as a connect-then-EOF on the live listener.) If the
+/// path did not exist and bind created the socket file, the pool owns it
+/// and unlinks it when destroyed, even if listen() failed. Accepted peers
+/// are usually unnamed: peer(slot) is AF_UNIX with an empty path().
 
 #include "statusbar/net/net_address.hpp"
 #include "statusbar/net/net_fd_multiplexer.hpp"
@@ -36,7 +46,10 @@
 
 #include <cstdint>
 #include <span>
+#include <string>
 #include <vector>
+
+#include <sys/types.h>
 
 namespace statusbar::net {
 
@@ -57,12 +70,15 @@ class TcpConnectionHandler
     virtual void on_rejected(SocketAddress const& peer, int64_t now_ns) { (void)peer, (void)now_ns; }
 };
 
+/// Pool options. `dscp` and `nodelay` apply to TCP only; they are ignored
+/// for an AF_UNIX listener.
 struct TcpServerOptions
 {
     int backlog = 128;
     int dscp = -1;                ///< applied to accepted sockets when >= 0
     bool nodelay = true;          ///< TCP_NODELAY on accepted sockets
     int64_t idle_timeout_ns = 0;  ///< close slots idle this long; 0 = never
+    int unix_mode = -1;           ///< AF_UNIX: chmod the socket file to this after bind; -1 = leave the umask result
 };
 
 class TcpConnectionPool : public Pollable
@@ -74,13 +90,17 @@ class TcpConnectionPool : public Pollable
         TcpConnectionHandler& handler,
         TcpServerOptions const& options = {});
 
+    /// Unlinks the AF_UNIX socket file if this pool created it (and it is
+    /// still the same file).
+    ~TcpConnectionPool() override;
+
     TcpConnectionPool(TcpConnectionPool const&) = delete;
     auto operator=(TcpConnectionPool const&) -> TcpConnectionPool& = delete;
 
     /// False when the listener or multiplexer failed to come up.
     [[nodiscard]] auto valid() const noexcept -> bool;
 
-    /// The listener's bound address (resolves port 0).
+    /// The listener's bound address (resolves port 0; the path for AF_UNIX).
     [[nodiscard]] auto local_addr() const -> StatusValue<SocketAddress>;
 
     /// Reads into @p out. 0 => orderly EOF; NetError::would_block => no
@@ -117,6 +137,10 @@ class TcpConnectionPool : public Pollable
         bool want_write{false};
     };
 
+    [[nodiscard]] auto is_unix() const noexcept -> bool { return !unix_path_.empty(); }
+    [[nodiscard]] auto prepare_unix_path(SocketAddress const& bind_addr) const -> bool;
+    [[nodiscard]] auto open_listener(SocketAddress const& bind_addr) -> StatusValue<FileDescriptor>;
+    void claim_unix_path();
     void accept_ready(int64_t now_ns);
     void close_slot(size_t slot, int64_t now_ns);
     [[nodiscard]] auto slot_ok(size_t slot) const noexcept -> bool { return slot < slots_.size() && slots_[slot].in_use; }
@@ -129,6 +153,10 @@ class TcpConnectionPool : public Pollable
     std::vector<uint32_t> free_;  ///< free slot indices, sized at construction
     size_t active_{0};
     int64_t last_now_ns_{0};
+    std::string unix_path_;  ///< AF_UNIX bind path, set at construction; empty for TCP
+    bool owns_unix_path_{false};
+    dev_t unix_dev_{};  ///< identity of the socket file bind created
+    ino_t unix_ino_{};
 };
 
 }  // namespace statusbar::net

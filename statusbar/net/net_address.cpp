@@ -7,12 +7,17 @@
 
 #include <netdb.h>
 
+#include <algorithm>
 #include <array>
+#include <cstddef>
+#include <cstring>
+#include <iterator>
 #include <string>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 
 namespace statusbar::net {
 
@@ -28,6 +33,60 @@ auto SocketAddress::ipv6(std::span<uint8_t const, 16> addr, uint16_t port, uint3
     result.length_ = sizeof(sockaddr_in6);
     return result;
 }
+
+auto SocketAddress::local(std::string_view path) noexcept -> StatusValue<SocketAddress>
+{
+    SocketAddress result;
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    auto* sun = reinterpret_cast<sockaddr_un*>(&result.storage_);
+    // Absolute only: a relative path would be re-resolved against whatever
+    // the cwd is when the owner later unlinks it.
+    if (path.empty() || path.front() != '/' || path.size() >= sizeof(sun->sun_path) || path.find('\0') != std::string_view::npos) {
+        return failure(NetError::invalid_address);
+    }
+    sun->sun_family = AF_UNIX;
+    span_copy(make_span(sun->sun_path).first(path.size()), make_const_span(path));
+    sun->sun_path[path.size()] = '\0';
+    result.length_ = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + 1);
+    return success(result);
+}
+
+auto SocketAddress::path() const noexcept -> std::string_view
+{
+    constexpr size_t PATH_OFFSET = offsetof(sockaddr_un, sun_path);
+    if (storage_.ss_family != AF_UNIX || length_ <= PATH_OFFSET) {
+        return {};
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    auto const* sun = reinterpret_cast<sockaddr_un const*>(&storage_);
+    size_t const avail = std::min(size_t(length_) - PATH_OFFSET, sizeof(sun->sun_path));
+    // The kernel may or may not count the NUL; an abstract (leading-NUL)
+    // name reads as empty.
+    return {sun->sun_path, ::strnlen(sun->sun_path, avail)};
+}
+
+namespace {
+
+/// Render an AF_UNIX address: its path, "@name" for a Linux abstract or
+/// autobind name (as ss(8) does), or "" for an unnamed socket.
+auto local_to_string(sockaddr_storage const& storage, socklen_t length, std::string_view path) -> std::string
+{
+    constexpr size_t PATH_OFFSET = offsetof(sockaddr_un, sun_path);
+    if (!path.empty() || length <= PATH_OFFSET + 1) {
+        return std::string{path};
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    auto const* sun = reinterpret_cast<sockaddr_un const*>(&storage);
+    size_t const avail = std::min(size_t(length) - PATH_OFFSET, sizeof(sun->sun_path));
+    if (sun->sun_path[0] != '\0') {
+        return {};
+    }
+    std::string result = "@";
+    result.append(std::next(std::begin(sun->sun_path)), std::next(std::begin(sun->sun_path), std::ptrdiff_t(avail)));
+    return result;
+}
+
+}  // namespace
 
 auto SocketAddress::from_string(std::string_view host, std::string_view port, int socket_type) -> StatusValue<SocketAddress>
 {
@@ -92,6 +151,10 @@ auto SocketAddress::to_string() const -> std::string
 {
     if (!valid()) {
         return "<invalid>";
+    }
+
+    if (storage_.ss_family == AF_UNIX) {
+        return local_to_string(storage_, length_, path());
     }
 
     std::array<char, 128> host_buf{};
@@ -159,18 +222,21 @@ auto create_tcp_socket(SocketAddress const& addr, bool do_bind, int dscp) -> Sta
     }
 
     FileDescriptor result{fd};
+    bool const is_unix = addr.family() == AF_UNIX;
 
     if (do_bind) {
-        if (auto status = set_reuse_addr(fd); !status) {
-            return forward_failure(status);
+        if (!is_unix) {
+            if (auto status = set_reuse_addr(fd); !status) {
+                return forward_failure(status);
+            }
         }
         if (::bind(fd, addr.sockaddr(), addr.length()) < 0) {
             return failure(NetError::bind_failed);
         }
     }
 
-    // Set DSCP if specified
-    if (dscp >= 0) {
+    // Set DSCP if specified (IP families only)
+    if (dscp >= 0 && !is_unix) {
         if (auto status = set_dscp(fd, addr.family(), static_cast<uint8_t>(dscp)); !status) {
             return forward_failure(status);
         }

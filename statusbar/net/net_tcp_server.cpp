@@ -7,10 +7,12 @@
 
 #include <cassert>
 #include <cerrno>
+#include <cstddef>
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 
 namespace statusbar::net {
 
@@ -26,12 +28,13 @@ constexpr int SEND_FLAGS = 0;
 
 void set_accepted_options(int fd, TcpServerOptions const& options, int family)
 {
+    bool const is_unix = family == AF_UNIX;
     (void)set_nonblocking(fd);
-    if (options.nodelay) {
+    if (options.nodelay && !is_unix) {
         int const one = 1;
         (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     }
-    if (options.dscp >= 0) {
+    if (options.dscp >= 0 && !is_unix) {
         (void)set_dscp(fd, family, uint8_t(options.dscp));
     }
 #if defined(SO_NOSIGPIPE)
@@ -53,7 +56,13 @@ TcpConnectionPool::TcpConnectionPool(
     for (size_t i = max_connections; i > 0; --i) {
         free_.push_back(uint32_t(i - 1));  // pop_back hands out low slots first
     }
-    auto listener = create_tcp_listener(bind_addr, options.backlog, options.dscp);
+    if (bind_addr.family() == AF_UNIX) {
+        unix_path_ = std::string{bind_addr.path()};
+        if (unix_path_.empty() || !prepare_unix_path(bind_addr)) {
+            return;
+        }
+    }
+    auto listener = open_listener(bind_addr);
     if (!listener || !mux_.valid()) {
         return;
     }
@@ -61,6 +70,86 @@ TcpConnectionPool::TcpConnectionPool(
     (void)set_nonblocking(listener_.get());
     if (!mux_.add(listener_.get(), LISTENER_TAG, true, false)) {
         listener_.close();
+    }
+}
+
+TcpConnectionPool::~TcpConnectionPool()
+{
+    if (!owns_unix_path_) {
+        return;
+    }
+    struct stat st{};
+    if (::lstat(unix_path_.c_str(), &st) == 0 && S_ISSOCK(st.st_mode) && st.st_dev == unix_dev_ && st.st_ino == unix_ino_) {
+        (void)::unlink(unix_path_.c_str());
+    }
+}
+
+auto TcpConnectionPool::prepare_unix_path(SocketAddress const& bind_addr) const -> bool
+{
+    struct stat st{};
+    if (::lstat(unix_path_.c_str(), &st) != 0) {
+        return true;  // nothing there (or unreachable: bind reports it)
+    }
+    if (!S_ISSOCK(st.st_mode)) {
+        return false;  // never clobber a non-socket
+    }
+    // Live or stale? Only a refused connect proves nobody is listening;
+    // success or a full backlog (EAGAIN) means a running instance owns it.
+    FileDescriptor probe{::socket(AF_UNIX, SOCK_STREAM, 0)};
+    if (!probe.valid() || !set_nonblocking(probe.get())) {
+        return false;
+    }
+    if (::connect(probe.get(), bind_addr.sockaddr(), bind_addr.length()) == 0) {
+        return false;
+    }
+    if (errno == ENOENT) {
+        return true;  // vanished since lstat
+    }
+    if (errno != ECONNREFUSED) {
+        return false;  // live (EAGAIN/EINPROGRESS) or unknowable: leave it
+    }
+    // A stale socket from a previous run.
+    return ::unlink(unix_path_.c_str()) == 0 || errno == ENOENT;
+}
+
+auto TcpConnectionPool::open_listener(SocketAddress const& bind_addr) -> StatusValue<FileDescriptor>
+{
+    if (!is_unix()) {
+        return create_tcp_listener(bind_addr, options_.backlog, options_.dscp);
+    }
+    // Ownership comes from the filesystem: if the path was absent and a
+    // socket is there once bind succeeds, it is ours to unlink, whatever
+    // fails later (chmod, listen, the multiplexer). For AF_UNIX,
+    // create_tcp_socket does nothing after bind, so its failure means bind
+    // did not create the file — a socket there then belongs to someone else.
+    struct stat st{};
+    bool const existed = ::lstat(unix_path_.c_str(), &st) == 0;
+    auto listener = create_tcp_socket(bind_addr, true);
+    if (!listener) {
+        return listener;
+    }
+    if (!existed) {
+        claim_unix_path();
+    }
+    // chmod before listen: nobody can connect until the mode is final.
+    if (options_.unix_mode >= 0 && ::chmod(unix_path_.c_str(), mode_t(options_.unix_mode)) < 0) {
+        return failure(NetError::socket_option_failed);
+    }
+    if (::listen(listener->get(), options_.backlog) < 0) {
+        return failure(NetError::listen_failed);
+    }
+    return listener;
+}
+
+void TcpConnectionPool::claim_unix_path()
+{
+    // Remember which file bind created so the destructor never unlinks a
+    // socket some later process put at the same path.
+    struct stat st{};
+    if (::lstat(unix_path_.c_str(), &st) == 0 && S_ISSOCK(st.st_mode)) {
+        owns_unix_path_ = true;
+        unix_dev_ = st.st_dev;
+        unix_ino_ = st.st_ino;
     }
 }
 
@@ -207,6 +296,12 @@ void TcpConnectionPool::accept_ready(int64_t now_ns)
         int const fd = ::accept(listener_.get(), peer.sockaddr(), peer.length_ptr());
         if (fd < 0) {
             return;  // EAGAIN (or transient error): nothing more pending
+        }
+        if (is_unix() && peer.family() != AF_UNIX) {
+            // Unnamed peer reported with no address at all: normalise to
+            // AF_UNIX with an empty path so peer() stays a valid address.
+            peer.sockaddr()->sa_family = AF_UNIX;
+            peer.set_length(socklen_t(offsetof(sockaddr_un, sun_path)));
         }
         if (free_.empty()) {
             ::close(fd);

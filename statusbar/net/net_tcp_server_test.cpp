@@ -10,11 +10,15 @@
 #include <unistd.h>
 
 #include <array>
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 
 using namespace statusbar;
 using namespace statusbar::net;
@@ -99,6 +103,38 @@ class EchoHandler : public TcpConnectionHandler
 auto loopback() -> SocketAddress
 {
     return SocketAddress::ipv4_loopback(0);
+}
+
+/// A private mkdtemp directory holding one socket path; both are removed
+/// on scope exit. Under /tmp so the path stays well inside sun_path.
+struct TempSocketDir
+{
+    std::string dir;
+
+    TempSocketDir()
+    {
+        std::string tmpl = "/tmp/statusbar_unix_XXXXXX";
+        if (::mkdtemp(tmpl.data()) != nullptr) {
+            dir = tmpl;
+        }
+    }
+    ~TempSocketDir()
+    {
+        if (!dir.empty()) {
+            (void)::unlink(path().c_str());
+            (void)::rmdir(dir.c_str());
+        }
+    }
+    TempSocketDir(TempSocketDir const&) = delete;
+    auto operator=(TempSocketDir const&) -> TempSocketDir& = delete;
+
+    [[nodiscard]] auto path() const -> std::string { return dir + "/ctl.sock"; }
+};
+
+auto file_exists(std::string const& path) -> bool
+{
+    struct stat st{};
+    return ::lstat(path.c_str(), &st) == 0;
 }
 
 /// Pump the pool like the reactor would: poll its fd, then on_ready/tick.
@@ -258,6 +294,210 @@ TEST(net_tcp_server, idle_timeout_sweeps)
     EXPECT_EQ(pool.active_count(), 0U);
     EXPECT_EQ(handler.closes.size(), 1U);
     EXPECT_TRUE(c.recv_some().empty());  // server closed the socket
+}
+
+TEST(net_tcp_server, unix_accept_echo_eof_lifecycle)
+{
+    TempSocketDir tmp;
+    EXPECT_FALSE(tmp.dir.empty());
+    auto bind_addr = SocketAddress::local(tmp.path());
+    EXPECT_TRUE(bind_addr.has_value());
+
+    TcpConnectionPool* pool_ptr = nullptr;
+    EchoHandler handler{pool_ptr};
+    TcpConnectionPool pool{*bind_addr, 4, handler};
+    pool_ptr = &pool;
+    EXPECT_TRUE(pool.valid());
+    auto addr = pool.local_addr();
+    EXPECT_TRUE(addr.has_value());
+    EXPECT_EQ(addr->family(), AF_UNIX);
+    EXPECT_TRUE(addr->to_string() == tmp.path());
+    EXPECT_EQ(addr->port(), 0U);
+
+    Client c{*addr};
+    EXPECT_TRUE(c.fd >= 0);
+    pump(pool, 5);
+    EXPECT_EQ(handler.accepts.size(), 1U);
+    EXPECT_EQ(pool.active_count(), 1U);
+
+    // The client never bound: an unnamed but valid AF_UNIX peer.
+    auto const& peer = pool.peer(handler.accepts[0]);
+    EXPECT_TRUE(peer.valid());
+    EXPECT_EQ(peer.family(), AF_UNIX);
+    EXPECT_TRUE(peer.path().empty());
+    EXPECT_TRUE(peer.to_string().empty());
+
+    c.send_all("hello unix pool");
+    pump(pool, 5);
+    EXPECT_TRUE(c.recv_some() == "hello unix pool");
+
+    ::shutdown(c.fd, SHUT_WR);
+    pump(pool, 10);
+    EXPECT_EQ(handler.closes.size(), 1U);
+    EXPECT_EQ(pool.active_count(), 0U);
+    EXPECT_FALSE(pool.is_open(handler.closes[0]));
+}
+
+TEST(net_tcp_server, unix_stale_socket_replaced)
+{
+    TempSocketDir tmp;
+    auto bind_addr = SocketAddress::local(tmp.path());
+    EXPECT_TRUE(bind_addr.has_value());
+
+    // Leave a socket file behind, as a crashed previous run would.
+    int const stale = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    EXPECT_TRUE(stale >= 0);
+    EXPECT_EQ(::bind(stale, bind_addr->sockaddr(), bind_addr->length()), 0);
+    ::close(stale);
+    EXPECT_TRUE(file_exists(tmp.path()));
+
+    TcpConnectionPool* pool_ptr = nullptr;
+    EchoHandler handler{pool_ptr};
+    TcpConnectionPool pool{*bind_addr, 2, handler};
+    pool_ptr = &pool;
+    EXPECT_TRUE(pool.valid());
+
+    Client c{*bind_addr};
+    EXPECT_TRUE(c.fd >= 0);
+    c.send_all("fresh");
+    pump(pool, 5);
+    EXPECT_EQ(handler.accepts.size(), 1U);
+    EXPECT_TRUE(c.recv_some() == "fresh");
+}
+
+TEST(net_tcp_server, unix_refuses_non_socket_path)
+{
+    TempSocketDir tmp;
+    int const file = ::open(tmp.path().c_str(), O_CREAT | O_WRONLY | O_EXCL, 0600);
+    EXPECT_TRUE(file >= 0);
+    ::close(file);
+
+    auto bind_addr = SocketAddress::local(tmp.path());
+    EXPECT_TRUE(bind_addr.has_value());
+    TcpConnectionPool* pool_ptr = nullptr;
+    EchoHandler handler{pool_ptr};
+    {
+        TcpConnectionPool pool{*bind_addr, 2, handler};
+        EXPECT_FALSE(pool.valid());
+    }
+    // The regular file is untouched, before and after the pool is gone.
+    struct stat st{};
+    EXPECT_EQ(::lstat(tmp.path().c_str(), &st), 0);
+    EXPECT_TRUE(S_ISREG(st.st_mode));
+}
+
+TEST(net_tcp_server, unix_live_socket_not_hijacked)
+{
+    TempSocketDir tmp;
+    auto bind_addr = SocketAddress::local(tmp.path());
+    EXPECT_TRUE(bind_addr.has_value());
+
+    TcpConnectionPool* first_ptr = nullptr;
+    EchoHandler first_handler{first_ptr};
+    TcpConnectionPool first{*bind_addr, 4, first_handler};
+    first_ptr = &first;
+    EXPECT_TRUE(first.valid());
+
+    {
+        // The path holds a live listener: the second pool must neither
+        // unlink it on the way in nor claim it on the way out.
+        TcpConnectionPool* second_ptr = nullptr;
+        EchoHandler second_handler{second_ptr};
+        TcpConnectionPool second{*bind_addr, 4, second_handler};
+        EXPECT_FALSE(second.valid());
+    }
+    EXPECT_TRUE(file_exists(tmp.path()));
+
+    // The first pool still serves (its accept count includes the probe).
+    Client c{*bind_addr};
+    EXPECT_TRUE(c.fd >= 0);
+    c.send_all("still mine");
+    pump(first, 5);
+    EXPECT_TRUE(c.recv_some() == "still mine");
+}
+
+TEST(net_tcp_server, unix_mode_applied)
+{
+    TempSocketDir tmp;
+    auto bind_addr = SocketAddress::local(tmp.path());
+    EXPECT_TRUE(bind_addr.has_value());
+    TcpConnectionPool* pool_ptr = nullptr;
+    EchoHandler handler{pool_ptr};
+    TcpServerOptions options;
+    options.unix_mode = 0600;
+    TcpConnectionPool pool{*bind_addr, 2, handler, options};
+    EXPECT_TRUE(pool.valid());
+    struct stat st{};
+    EXPECT_EQ(::lstat(tmp.path().c_str(), &st), 0);
+    EXPECT_TRUE(S_ISSOCK(st.st_mode));
+    EXPECT_EQ(st.st_mode & 07777, mode_t{0600});
+}
+
+#if defined(__linux__)
+TEST(net_tcp_server, unix_abstract_peer_renders_with_at)
+{
+    TempSocketDir tmp;
+    auto bind_addr = SocketAddress::local(tmp.path());
+    EXPECT_TRUE(bind_addr.has_value());
+    TcpConnectionPool* pool_ptr = nullptr;
+    EchoHandler handler{pool_ptr};
+    TcpConnectionPool pool{*bind_addr, 2, handler};
+    pool_ptr = &pool;
+    EXPECT_TRUE(pool.valid());
+
+    // Autobind: binding just the family gives the client a 5-hex-digit
+    // abstract name, which the server sees as the peer address.
+    int const fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    EXPECT_TRUE(fd >= 0);
+    sockaddr_un autobind{};
+    autobind.sun_family = AF_UNIX;
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    EXPECT_EQ(::bind(fd, reinterpret_cast<sockaddr const*>(&autobind), sizeof(sa_family_t)), 0);
+    EXPECT_EQ(::connect(fd, bind_addr->sockaddr(), bind_addr->length()), 0);
+    pump(pool, 5);
+    EXPECT_EQ(handler.accepts.size(), 1U);
+    auto const& peer = pool.peer(handler.accepts[0]);
+    EXPECT_TRUE(peer.path().empty());
+    auto const text = peer.to_string();
+    EXPECT_EQ(text.size(), 6U);
+    EXPECT_TRUE(!text.empty() && text[0] == '@');
+    ::close(fd);
+}
+#endif
+
+TEST(net_tcp_server, unix_socket_file_removed_on_destroy)
+{
+    TempSocketDir tmp;
+    auto bind_addr = SocketAddress::local(tmp.path());
+    EXPECT_TRUE(bind_addr.has_value());
+    TcpConnectionPool* pool_ptr = nullptr;
+    EchoHandler handler{pool_ptr};
+    {
+        TcpConnectionPool pool{*bind_addr, 2, handler};
+        EXPECT_TRUE(pool.valid());
+        EXPECT_TRUE(file_exists(tmp.path()));
+    }
+    EXPECT_FALSE(file_exists(tmp.path()));
+}
+
+TEST(net_tcp_server, unix_address_validation)
+{
+    EXPECT_FALSE(SocketAddress::local("").has_value());
+    EXPECT_FALSE(SocketAddress::local("ctl.sock").has_value());
+    EXPECT_FALSE(SocketAddress::local("./ctl.sock").has_value());
+
+    constexpr size_t SUN_PATH_SIZE = sizeof(sockaddr_un{}.sun_path);
+    EXPECT_FALSE(SocketAddress::local("/" + std::string(SUN_PATH_SIZE - 1, 'a')).has_value());
+
+    // The longest absolute path that still fits with its NUL.
+    std::string longest(SUN_PATH_SIZE - 1, 'b');
+    longest[0] = '/';
+    auto addr = SocketAddress::local(longest);
+    EXPECT_TRUE(addr.has_value());
+    EXPECT_TRUE(addr->valid());
+    EXPECT_EQ(addr->length(), socklen_t(offsetof(sockaddr_un, sun_path) + SUN_PATH_SIZE));
+    EXPECT_TRUE(addr->to_string() == longest);
+    EXPECT_EQ(addr->port(), 0U);
 }
 
 TEST_MAIN(statusbar_net, net_tcp_server_test)
