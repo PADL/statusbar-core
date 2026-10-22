@@ -415,8 +415,13 @@ auto XdpContext::fill_replenish() -> Status
         return success();
     }
 
+    auto const count = detail::fill_reserve_count(available, xsk_prod_nb_free(&rings_.fill, static_cast<uint32_t>(available)));
+    if (count == 0) {
+        return success();
+    }
+
     uint32_t idx = 0;
-    auto reserved = xsk_ring_prod__reserve(&rings_.fill, static_cast<uint32_t>(available), &idx);
+    auto reserved = xsk_ring_prod__reserve(&rings_.fill, count, &idx);
     uint32_t filled = 0;
     for (uint32_t i = 0; i < reserved; ++i) {
         auto addr = umem_.alloc_frame();

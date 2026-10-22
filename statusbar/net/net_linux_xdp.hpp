@@ -245,6 +245,15 @@ struct CycleBudget
     size_t rx_cycle_count{0};
 };
 
+/// Number of fill ring slots to reserve. xsk_ring_prod__reserve() is
+/// all-or-nothing, so never ask for more than the ring has free.
+/// @param available Free UMEM frames
+/// @param ring_free Free fill ring entries (xsk_prod_nb_free())
+[[nodiscard]] constexpr auto fill_reserve_count(size_t available, uint32_t ring_free) noexcept -> uint32_t
+{
+    return available < ring_free ? static_cast<uint32_t>(available) : ring_free;
+}
+
 }  // namespace detail
 
 // ──────────────────────────────────────────────

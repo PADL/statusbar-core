@@ -120,6 +120,28 @@ TEST(xdp_config, compiled_rule_defaults)
 }
 
 //
+// fill_reserve_count tests
+//
+
+TEST(xdp_fill_reserve, clamps_to_ring_free)
+{
+    // Default config: 1024 UMEM frames, 512-entry fill ring. Asking
+    // xsk_ring_prod__reserve() for 1024 would reserve nothing.
+    EXPECT_EQ(detail::fill_reserve_count(1024, 512), 512u);
+}
+
+TEST(xdp_fill_reserve, clamps_to_available)
+{
+    EXPECT_EQ(detail::fill_reserve_count(64, 512), 64u);
+}
+
+TEST(xdp_fill_reserve, zero_when_ring_full_or_no_frames)
+{
+    EXPECT_EQ(detail::fill_reserve_count(1024, 0), 0u);
+    EXPECT_EQ(detail::fill_reserve_count(0, 512), 0u);
+}
+
+//
 // UmemFreeList tests
 //
 
@@ -331,6 +353,40 @@ TEST(xdp_integration, open_close_lifecycle)
 
     ctx.close();
     EXPECT_FALSE(ctx.valid());
+}
+
+TEST(xdp_integration, fill_ring_populated_when_umem_exceeds_fill_ring)
+{
+    if (getuid() != 0) {
+        return;
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        return;
+    }
+    auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
+
+    XdpConfig config{
+        .interface_name = "xdptest0",
+        .filter_rules = {},
+        .default_action = XdpAction::pass_kernel,
+        .fill_ring_size = 512,
+        .umem_frame_count = 1024,
+    };
+
+    XdpContext ctx;
+    auto status = ctx.open(config);
+    EXPECT_TRUE(status.has_value());
+
+    // open() hands fill_ring_size frames to the kernel for RX; only the
+    // remainder is left for TX. An all-or-nothing reserve of 1024 would
+    // have left the fill ring empty and all 1024 frames free.
+    size_t tx_frames = 0;
+    while (ctx.tx_start().has_value()) {
+        ++tx_frames;
+    }
+    EXPECT_EQ(tx_frames, config.umem_frame_count - config.fill_ring_size);
 }
 
 TEST(xdp_integration, tx_rx_loopback)
