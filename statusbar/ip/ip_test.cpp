@@ -49,6 +49,23 @@ TEST(ipv4_address, uint32_constructor)
     EXPECT_EQ(addr.octet(3), 1);
 }
 
+TEST(ipv4_address, parses_and_writes_dotted_quads)
+{
+    auto const address = parse_ipv4("239.69.1.2");
+    EXPECT_TRUE(address.has_value());
+    EXPECT_TRUE(*address == (IPv4Address{239, 69, 1, 2}));
+    EXPECT_EQ(to_string(*address), std::string{"239.69.1.2"});
+    EXPECT_EQ(to_string(IPv4Address{}), std::string{"0.0.0.0"});
+    EXPECT_TRUE(parse_ipv4("255.255.255.255").has_value());
+    EXPECT_FALSE(parse_ipv4("239.69.1").has_value());
+    EXPECT_FALSE(parse_ipv4("239.69.1.2.3").has_value());
+    EXPECT_FALSE(parse_ipv4("239.69.1.256").has_value());
+    EXPECT_FALSE(parse_ipv4("239.69..2").has_value());
+    EXPECT_FALSE(parse_ipv4("239.69.1.2 ").has_value());
+    EXPECT_FALSE(parse_ipv4("+1.2.3.4").has_value());
+    EXPECT_FALSE(parse_ipv4("").has_value());
+}
+
 TEST(ipv4_address, loopback)
 {
     IPv4Address addr(127, 0, 0, 1);

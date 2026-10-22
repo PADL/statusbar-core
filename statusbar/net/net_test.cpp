@@ -1810,6 +1810,25 @@ TEST(net_raw_eth_pollable, send_avtp_with_invalid_context)
 // Test Runner
 //
 
+TEST(net_socket, makes_a_nonblocking_udp_socket)
+{
+    auto fd = make_udp_socket();
+    EXPECT_TRUE(fd.has_value());
+    EXPECT_TRUE((::fcntl(fd->get(), F_GETFL, 0) & O_NONBLOCK) != 0);
+    EXPECT_TRUE((::fcntl(fd->get(), F_GETFD, 0) & FD_CLOEXEC) != 0);
+    std::array<uint8_t, 4> buffer{};
+    EXPECT_TRUE(::recv(fd->get(), buffer.data(), buffer.size(), 0) < 0);  // would block, does not
+    EXPECT_TRUE(set_multicast_send(fd->get(), 0, 16, true).has_value());
+    unsigned char ttl = 0;
+    socklen_t length = sizeof(ttl);
+    EXPECT_EQ(::getsockopt(fd->get(), IPPROTO_IP, IP_MULTICAST_TTL, &ttl, &length), 0);
+    EXPECT_EQ(ttl, static_cast<unsigned char>(16));
+    // A non-multicast address is refused, with errno kept.
+    auto const refused = join_group(fd->get(), statusbar::ip::IPv4Address{10, 0, 0, 1}, 0);
+    EXPECT_FALSE(refused.has_value());
+    EXPECT_TRUE(refused.error().category() == std::system_category());
+}
+
 int statusbar_net_net_test(int argc, char** argv)
 {
     (void)argc;

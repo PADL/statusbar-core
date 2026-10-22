@@ -7,10 +7,14 @@
 #include "statusbar/ieee/ieee.hpp"
 #include "statusbar/status/status.hpp"
 
+#include <array>
+#include <charconv>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
+#include <string_view>
 
 namespace statusbar::ip {
 
@@ -105,6 +109,27 @@ struct IPv4Address
 // Compile-time layout verification
 static_assert(sizeof(IPv4Address) == 4, "IPv4Address must be exactly 4 bytes");
 static_assert(alignof(IPv4Address) == 1, "IPv4Address must have 1-byte alignment");
+
+/// Parse a dotted-quad IPv4 address ("239.69.1.2"): exactly four decimal
+/// octets 0-255, nothing before or after. nullopt otherwise.
+/// @param text The text to parse
+[[nodiscard]] inline auto parse_ipv4(std::string_view text) noexcept -> std::optional<IPv4Address>
+{
+    std::array<uint8_t, 4> octets{};
+    for (size_t i = 0; i < octets.size(); ++i) {
+        auto const dot = text.find('.');
+        if ((dot == std::string_view::npos) != (i == octets.size() - 1)) {
+            return std::nullopt;
+        }
+        auto const part = text.substr(0, dot);
+        auto const [end, error] = std::from_chars(part.data(), part.data() + part.size(), octets[i]);
+        if (part.empty() || error != std::errc{} || end != part.data() + part.size()) {
+            return std::nullopt;
+        }
+        text = dot == std::string_view::npos ? std::string_view{} : text.substr(dot + 1);
+    }
+    return IPv4Address{octets[0], octets[1], octets[2], octets[3]};
+}
 
 }  // namespace statusbar::ip
 

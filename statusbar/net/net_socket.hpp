@@ -7,6 +7,7 @@
 /// Provides FileDescriptor RAII wrapper and socket configuration functions
 
 #include "statusbar/buffer/file_descriptor.hpp"
+#include "statusbar/ip/ip_ipv4_address.hpp"
 #include "statusbar/net/net_error.hpp"
 #include "statusbar/status/status.hpp"
 
@@ -19,6 +20,7 @@
 #include <string_view>
 #include <system_error>
 
+#include <arpa/inet.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -193,6 +195,70 @@ using FileDescriptor = ::statusbar::FileDescriptor;
         }
     }
 
+    return success();
+}
+
+/// The current errno as an error code (system category), for failures whose
+/// cause the caller wants to keep.
+[[nodiscard]] inline auto errno_code() noexcept -> std::error_code
+{
+    return {errno, std::system_category()};
+}
+
+/// A non-blocking, close-on-exec IPv4 UDP socket.
+[[nodiscard]] inline auto make_udp_socket() noexcept -> StatusValue<FileDescriptor>
+{
+    FileDescriptor fd{::socket(AF_INET, SOCK_DGRAM, 0)};
+    if (!fd.valid()) {
+        return failure(errno_code());
+    }
+    if (::fcntl(fd.get(), F_SETFD, FD_CLOEXEC) != 0 || !set_nonblocking(fd.get())) {
+        return failure(errno_code());
+    }
+    return fd;
+}
+
+/// Join IPv4 multicast `group` on the interface with index `interface_index`
+/// (0: the kernel's choice; on platforms without ip_mreqn, always that).
+[[nodiscard]] inline auto join_group(int fd, ip::IPv4Address const& group, unsigned int interface_index) noexcept -> Status
+{
+#if defined(__linux__)
+    ip_mreqn request{};
+    request.imr_ifindex = static_cast<int>(interface_index);
+#else
+    (void)interface_index;
+    ip_mreq request{};
+    request.imr_interface.s_addr = htonl(INADDR_ANY);
+#endif
+    request.imr_multiaddr.s_addr = htonl(group.to_uint32());
+    if (::setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &request, sizeof(request)) != 0) {
+        return failure(errno_code());
+    }
+    return success();
+}
+
+/// Prepare an IPv4 socket to send multicast: out of the interface with index
+/// `interface_index` (0: the routing table's choice; Linux only otherwise),
+/// with hop limit `ttl`, and looped back to local listeners when `loop`.
+[[nodiscard]] inline auto set_multicast_send(int fd, unsigned int interface_index, uint8_t ttl, bool loop) noexcept -> Status
+{
+#if defined(__linux__)
+    if (interface_index != 0) {
+        ip_mreqn request{};
+        request.imr_ifindex = static_cast<int>(interface_index);
+        if (::setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &request, sizeof(request)) != 0) {
+            return failure(errno_code());
+        }
+    }
+#else
+    (void)interface_index;
+#endif
+    unsigned char const hops = ttl;
+    unsigned char const looped = loop ? 1 : 0;
+    if (::setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &hops, sizeof(hops)) != 0 ||
+        ::setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &looped, sizeof(looped)) != 0) {
+        return failure(errno_code());
+    }
     return success();
 }
 
