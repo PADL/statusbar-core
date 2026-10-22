@@ -802,4 +802,19 @@ void RawnetContext::close() noexcept
 
 #endif  // __APPLE__
 
+auto RawnetContext::set_priority(int const priority) noexcept -> Status
+{
+    if (fd_ < 0) {
+        return failure(std::make_error_code(std::errc::bad_file_descriptor));
+    }
+#if defined(__linux__)
+    if (::setsockopt(fd_, SOL_SOCKET, SO_PRIORITY, &priority, sizeof(priority)) < 0) {
+        return failure(std::error_code{errno, std::system_category()});
+    }
+#else
+    (void)priority;  // no per-socket TX queue steering on BPF
+#endif
+    return success();
+}
+
 }  // namespace statusbar::net

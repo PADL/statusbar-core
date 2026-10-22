@@ -8,12 +8,14 @@ statusbar_add_module(
   net_address.cpp
   net_bpf_port.cpp
   net_error.cpp
+  net_interface_info.cpp
   net_linux_mmap.cpp
   net_linux_xdp.cpp
   net_message_reactor.cpp
   net_rawnet.cpp
   net_ring_buffer_base.cpp
   net_tap_bridge.cpp
+  net_tc_qdisc.cpp
   net_tcp_server.cpp
   net_util.cpp
   net_test_port.cpp
@@ -33,6 +35,7 @@ statusbar_add_module(
   net_ethernet_port_test.cpp
   net_link_monitor_test.cpp
   net_linux_xdp_test.cpp
+  net_tc_qdisc_test.cpp
   net_tcam_classifier_test.cpp
   net_tcp_server_test.cpp
   net_test.cpp

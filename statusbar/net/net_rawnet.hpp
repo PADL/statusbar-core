@@ -175,6 +175,19 @@ class RawnetContext
     /// @return Status indicating success or failure
     [[nodiscard]] auto leave_multicast(Eui48 const& multicast_mac) const noexcept -> Status;
 
+    /// Set the socket's priority (SO_PRIORITY), the skb->priority of every
+    /// frame it sends.
+    ///
+    /// This is what steers a PACKET_QDISC_BYPASS socket onto a hardware TX
+    /// queue: bypass frames skip every software qdisc, and the kernel picks
+    /// their queue from skb->priority through the netdev's priority-to-traffic-
+    /// class map (which an mqprio root installs, even in software mode) and that
+    /// class's queue range. With priority 0 they land on a best-effort queue,
+    /// whatever PCP their VLAN tag carries. Priorities 0-6 need no privilege;
+    /// 7 and above need CAP_NET_ADMIN. Linux only: elsewhere a no-op success.
+    /// @return the setsockopt errno on failure; bad_file_descriptor when not open
+    [[nodiscard]] auto set_priority(int priority) noexcept -> Status;
+
     /// Check if the socket is valid
     [[nodiscard]] auto valid() const noexcept -> bool { return fd_ >= 0; }
 
