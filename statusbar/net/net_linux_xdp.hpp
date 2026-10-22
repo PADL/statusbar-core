@@ -37,6 +37,10 @@ extern unsigned int const xdp_filter_bpf_o_len;
 
 #endif  // __linux__ && HAVE_XDP
 
+#if defined(__linux__)
+#    include <linux/if_xdp.h>
+#endif
+
 #include "statusbar/buffer/buffer.hpp"
 #include "statusbar/ieee/ieee.hpp"
 #include "statusbar/net/net_compiled_rule.hpp"
@@ -123,6 +127,16 @@ enum class XdpAction : uint8_t
     redirect_tap,
 };
 
+/// How the XSK socket binds to the queue. auto_ lets the kernel choose
+/// (zero-copy when the driver offers it, copy otherwise); zero_copy fails the
+/// bind if the driver cannot do zero-copy; copy forces copy mode.
+enum class XdpBindMode : uint8_t
+{
+    auto_,
+    zero_copy,
+    copy,
+};
+
 struct XdpConfig
 {
     std::string_view interface_name;
@@ -140,6 +154,7 @@ struct XdpConfig
     size_t rx_drain_max{32};
     size_t completion_drain_max{64};
     int rx_clock_id{CLOCK_MONOTONIC_RAW};
+    XdpBindMode bind_mode{XdpBindMode::auto_};
 };
 
 }  // namespace statusbar::net
@@ -253,6 +268,23 @@ struct CycleBudget
 {
     return available < ring_free ? static_cast<uint32_t>(available) : ring_free;
 }
+
+#if defined(__linux__)
+/// The sxdp_flags for a bind mode: 0, XDP_ZEROCOPY or XDP_COPY.
+/// @param mode Requested bind mode
+[[nodiscard]] constexpr auto xdp_bind_flags(XdpBindMode mode) noexcept -> uint16_t
+{
+    switch (mode) {
+        case XdpBindMode::zero_copy:
+            return XDP_ZEROCOPY;
+        case XdpBindMode::copy:
+            return XDP_COPY;
+        case XdpBindMode::auto_:
+            break;
+    }
+    return 0;
+}
+#endif
 
 }  // namespace detail
 
@@ -626,6 +658,12 @@ class XdpContext
     [[nodiscard]] auto hardware_address() const noexcept -> ieee::Eui48 const& { return interface_.hardware_address; }
     [[nodiscard]] auto interface_index() const noexcept -> unsigned int { return interface_.index; }
 
+    /// True when the bound socket runs in zero-copy mode (XDP_OPTIONS_ZEROCOPY
+    /// read back after the bind); false in copy mode or when not open.
+    [[nodiscard]] auto zero_copy() const noexcept -> bool { return zero_copy_; }
+    /// The bind mode requested at open().
+    [[nodiscard]] auto bind_mode() const noexcept -> XdpBindMode { return bind_mode_; }
+
     void begin_cycle() noexcept { budget_.rx_cycle_count = 0; }
 
     [[nodiscard]] auto end_cycle() -> Status
@@ -706,6 +744,8 @@ class XdpContext
         std::swap(interface_, other.interface_);
         std::swap(budget_, other.budget_);
         std::swap(stats_, other.stats_);
+        std::swap(bind_mode_, other.bind_mode_);
+        std::swap(zero_copy_, other.zero_copy_);
     }
 
     struct xsk_socket* xsk_{nullptr};
@@ -716,6 +756,8 @@ class XdpContext
     detail::InterfaceId interface_;
     detail::CycleBudget budget_;
     Stats stats_{};
+    XdpBindMode bind_mode_{XdpBindMode::auto_};
+    bool zero_copy_{false};
 };
 
 #else  // !(__linux__ && HAVE_XDP)
@@ -765,6 +807,8 @@ class XdpContext
         return empty;
     }
     [[nodiscard]] auto interface_index() const noexcept -> unsigned int { return 0; }
+    [[nodiscard]] auto zero_copy() const noexcept -> bool { return false; }
+    [[nodiscard]] auto bind_mode() const noexcept -> XdpBindMode { return XdpBindMode::auto_; }
 
     void begin_cycle() noexcept {}
 

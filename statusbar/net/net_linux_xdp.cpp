@@ -289,13 +289,22 @@ auto XdpContext::open(XdpConfig const& config) -> Status
     xsk_cfg.tx_size = static_cast<__u32>(config.tx_ring_size);
     xsk_cfg.libxdp_flags = XSK_LIBXDP_FLAGS__INHIBIT_PROG_LOAD;
     xsk_cfg.xdp_flags = 0;
-    xsk_cfg.bind_flags = 0;
+    xsk_cfg.bind_flags = detail::xdp_bind_flags(config.bind_mode);
 
     std::string const ifname_str(config.interface_name);
     int const ret = xsk_socket__create(&xsk_, ifname_str.c_str(), config.queue_id, *umem_result, &rings_.rx, &rings_.tx, &xsk_cfg);
     if (ret != 0) {
         close();
         return failure(XdpError::xsk_creation_failed);
+    }
+    bind_mode_ = config.bind_mode;
+
+    // Report the mode the bind obtained: with auto_ the kernel picks zero-copy
+    // only when the driver offers it.
+    struct xdp_options opts{};
+    socklen_t opts_len = sizeof(opts);
+    if (::getsockopt(xsk_socket__fd(xsk_), SOL_XDP, XDP_OPTIONS, &opts, &opts_len) == 0) {
+        zero_copy_ = (opts.flags & XDP_OPTIONS_ZEROCOPY) != 0;
     }
 
     // Step 5: Attach BPF + register socket
@@ -340,6 +349,8 @@ void XdpContext::close() noexcept
     rings_ = {};
     budget_ = {};
     stats_ = {};
+    bind_mode_ = XdpBindMode::auto_;
+    zero_copy_ = false;
 }
 
 auto XdpContext::tx_commit(uint64_t handle, size_t frame_length) -> Status

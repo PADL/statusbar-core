@@ -103,6 +103,15 @@ TEST(xdp_config, default_values)
     EXPECT_EQ(config.umem_headroom, 0u);
     EXPECT_EQ(config.tap_ifindex, 0u);
     EXPECT_EQ(config.rx_drain_max, 32u);
+    EXPECT_EQ(config.bind_mode, XdpBindMode::auto_);
+}
+
+TEST(xdp_config, bind_mode_flags)
+{
+    // auto_ keeps the historical bind_flags = 0: the kernel chooses.
+    EXPECT_EQ(detail::xdp_bind_flags(XdpBindMode::auto_), 0u);
+    EXPECT_EQ(detail::xdp_bind_flags(XdpBindMode::zero_copy), static_cast<uint16_t>(XDP_ZEROCOPY));
+    EXPECT_EQ(detail::xdp_bind_flags(XdpBindMode::copy), static_cast<uint16_t>(XDP_COPY));
 }
 
 TEST(xdp_config, compiled_rule_defaults)
@@ -278,6 +287,8 @@ TEST(xdp_stub, not_valid_by_default)
     EXPECT_EQ(ctx.xsk_fd(), -1);
     EXPECT_EQ(ctx.fd(), -1);
     EXPECT_EQ(ctx.interface_index(), 0u);
+    EXPECT_FALSE(ctx.zero_copy());
+    EXPECT_EQ(ctx.bind_mode(), XdpBindMode::auto_);
 }
 
 TEST(xdp_stub, stats_zero_by_default)
