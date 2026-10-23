@@ -252,7 +252,8 @@ endfunction()
 
 # Give every installed executable a statusbar- prefixed on-disk name, so the
 # bin/ directory is uniform (tools that set no OUTPUT_NAME, and examples, would
-# otherwise install unprefixed).
+# otherwise install unprefixed). A tool whose name is part of its interface
+# opts out with the STATUSBAR_UNPREFIXED target property set true.
 function(statusbar_prefix_tool_names)
   get_property(_exe_targets GLOBAL PROPERTY STATUSBAR_INSTALL_TARGETS)
   foreach(_t ${_exe_targets})
@@ -261,6 +262,10 @@ function(statusbar_prefix_tool_names)
     endif()
     get_target_property(_t_type ${_t} TYPE)
     if(NOT _t_type STREQUAL "EXECUTABLE")
+      continue()
+    endif()
+    get_target_property(_t_unprefixed ${_t} STATUSBAR_UNPREFIXED)
+    if(_t_unprefixed)
       continue()
     endif()
     get_target_property(_t_name ${_t} OUTPUT_NAME)
