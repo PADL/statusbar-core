@@ -10,9 +10,10 @@
 ///
 /// Two layers:
 ///   - pure message builders (build_*), which write one complete
-///     RTM_NEWQDISC / RTM_DELQDISC request (nlmsghdr + tcmsg + TCA_KIND +
-///     TCA_OPTIONS) into a caller buffer: socket-free, unit-tested against
-///     hand-checked bytes. Netlink is host byte order; the layouts are
+///     RTM_NEWQDISC / RTM_DELQDISC / RTM_GETQDISC request (nlmsghdr + tcmsg +
+///     TCA_KIND + TCA_OPTIONS) into a caller buffer, and parse_qdisc, which
+///     reads the kernel's RTM_NEWQDISC answer to a get: socket-free,
+///     unit-tested against hand-checked bytes. Netlink is host byte order; the layouts are
 ///     linux/rtnetlink.h's struct tcmsg and linux/pkt_sched.h's
 ///     struct tc_mqprio_qopt / struct tc_cbs_qopt, written field by field
 ///     (the .cpp static_asserts the kernel's sizes and offsets), with the
@@ -21,9 +22,10 @@
 ///     TCA_CBS_PARMS.
 ///   - TcClient, a NETLINK_ROUTE socket that sends one request with
 ///     NLM_F_ACK and returns the kernel's answer as a Status (its errno),
-///     keeping the kernel's extended-ack text for logs.
+///     keeping the kernel's extended-ack text for logs. It implements
+///     TcControl, the interface a caller takes so tests can record requests.
 ///
-/// Changing qdiscs needs CAP_NET_ADMIN. Linux only.
+/// Changing qdiscs needs CAP_NET_ADMIN; reading one does not. Linux only.
 
 #if defined(__linux__)
 
@@ -33,6 +35,7 @@
 #    include <array>
 #    include <cstddef>
 #    include <cstdint>
+#    include <optional>
 #    include <span>
 #    include <string>
 #    include <string_view>
@@ -63,6 +66,8 @@ struct MqprioQdisc
     std::array<uint16_t, MAX_TRAFFIC_CLASSES> count{};   ///< TX queues of each traffic class
     std::array<uint16_t, MAX_TRAFFIC_CLASSES> offset{};  ///< first TX queue of each traffic class
     bool hw{false};                                      ///< ask the driver to offload the TC map (TC_MQPRIO_HW_OFFLOAD_TCS)
+
+    auto operator==(MqprioQdisc const&) const noexcept -> bool = default;
 };
 
 /// A credit-based shaper on one mqprio queue: `tc qdisc replace dev <if>
@@ -77,6 +82,19 @@ struct CbsQdisc
     int32_t locredit{0};
     int32_t idleslope_kbps{0};
     int32_t sendslope_kbps{0};
+
+    auto operator==(CbsQdisc const&) const noexcept -> bool = default;
+};
+
+/// One qdisc as the kernel reports it (`tc qdisc show`): its handle, parent
+/// and kind, with the options of the kinds this client writes.
+struct QdiscInfo
+{
+    uint32_t handle{0};  ///< 0 for a default qdisc the kernel attached
+    uint32_t parent{0};
+    std::string kind{};
+    std::optional<MqprioQdisc> mqprio{};  ///< kind "mqprio": its layout (major from the handle)
+    std::optional<CbsQdisc> cbs{};        ///< kind "cbs": its parameters (parent as above)
 };
 
 /// Room for any request the builders write (the largest, mqprio, is 136 bytes).
@@ -110,11 +128,45 @@ using RequestBuffer = std::array<uint8_t, MAX_REQUEST_SIZE>;
 [[nodiscard]] auto build_delete(std::span<uint8_t> out, int ifindex, uint32_t handle, uint32_t parent, uint32_t seq)
     -> StatusValue<size_t>;
 
+/// Build `tc qdisc show dev <if> parent <parent>` for one qdisc (RTM_GETQDISC,
+/// NLM_F_REQUEST | NLM_F_ACK | NLM_F_ECHO, tcm_handle 0, no attributes) into @p out: the
+/// root for @p parent ROOT, else the child on that class (major:minor of an
+/// mqprio queue). Returns the message length.
+[[nodiscard]] auto build_get(std::span<uint8_t> out, int ifindex, uint32_t parent, uint32_t seq) -> StatusValue<size_t>;
+
+/// Parse one RTM_NEWQDISC message (nlmsghdr + tcmsg + attributes), the
+/// kernel's answer to build_get. mqprio's TCA_OPTIONS is the flat
+/// tc_mqprio_qopt followed by optional attributes (ignored); cbs's nests
+/// TCA_CBS_PARMS. Errors: bad_message for a truncated or malformed message,
+/// another type, or a known kind whose options are short.
+[[nodiscard]] auto parse_qdisc(std::span<uint8_t const> message) -> StatusValue<QdiscInfo>;
+
+/// The qdisc requests a caller makes (TcClient in a host; a recorder in tests).
+class TcControl
+{
+  public:
+    virtual ~TcControl() = default;
+
+    [[nodiscard]] virtual auto replace_mqprio(int ifindex, MqprioQdisc const& qdisc) -> Status = 0;
+    [[nodiscard]] virtual auto replace_cbs(int ifindex, CbsQdisc const& qdisc) -> Status = 0;
+    [[nodiscard]] virtual auto replace_kind(int ifindex, uint32_t parent, std::string_view kind) -> Status = 0;
+    [[nodiscard]] virtual auto remove(int ifindex, uint32_t handle, uint32_t parent) -> Status = 0;
+    /// The qdisc on @p parent (ROOT: the root). Errors: ENOENT when @p
+    /// parent's qdisc does not exist, or the request's.
+    [[nodiscard]] virtual auto get(int ifindex, uint32_t parent) -> StatusValue<QdiscInfo> = 0;
+    /// The kernel's extended-ack message for the last failed request (empty:
+    /// none was given, or the request succeeded).
+    [[nodiscard]] virtual auto last_message() const noexcept -> std::string const& = 0;
+
+  protected:
+    TcControl() noexcept = default;
+};
+
 /// A blocking NETLINK_ROUTE socket for qdisc requests. Each call sends one
 /// request and waits (at most about a second) for its acknowledgement. Not
 /// thread-safe; meant for the reactor thread, where a request is rare
 /// (install, an admission change, shutdown).
-class TcClient
+class TcClient final : public TcControl
 {
   public:
     TcClient() noexcept = default;
@@ -123,20 +175,19 @@ class TcClient
     [[nodiscard]] auto open() noexcept -> Status;
     [[nodiscard]] auto is_open() const noexcept -> bool { return fd_.valid(); }
 
-    [[nodiscard]] auto replace_mqprio(int ifindex, MqprioQdisc const& qdisc) -> Status;
-    [[nodiscard]] auto replace_cbs(int ifindex, CbsQdisc const& qdisc) -> Status;
-    [[nodiscard]] auto replace_kind(int ifindex, uint32_t parent, std::string_view kind) -> Status;
-    [[nodiscard]] auto remove(int ifindex, uint32_t handle, uint32_t parent) -> Status;
+    [[nodiscard]] auto replace_mqprio(int ifindex, MqprioQdisc const& qdisc) -> Status override;
+    [[nodiscard]] auto replace_cbs(int ifindex, CbsQdisc const& qdisc) -> Status override;
+    [[nodiscard]] auto replace_kind(int ifindex, uint32_t parent, std::string_view kind) -> Status override;
+    [[nodiscard]] auto remove(int ifindex, uint32_t handle, uint32_t parent) -> Status override;
+    [[nodiscard]] auto get(int ifindex, uint32_t parent) -> StatusValue<QdiscInfo> override;
 
-    /// The kernel's extended-ack message for the last failed request (empty:
-    /// none was given, or the request succeeded).
-    [[nodiscard]] auto last_message() const noexcept -> std::string const& { return last_message_; }
+    [[nodiscard]] auto last_message() const noexcept -> std::string const& override { return last_message_; }
 
   private:
     /// Build one request with @p build (out, seq) -> StatusValue<size_t> under
     /// the next sequence number and transact it.
     template <typename Build>
-    [[nodiscard]] auto send(Build const& build) -> Status
+    [[nodiscard]] auto send(Build const& build, QdiscInfo* answer = nullptr) -> Status
     {
         RequestBuffer request{};
         uint32_t const seq = ++seq_;
@@ -144,11 +195,13 @@ class TcClient
         if (!length) {
             return failure(length.error());
         }
-        return transact(std::span<uint8_t const>{request.data(), *length}, seq);
+        return transact(std::span<uint8_t const>{request.data(), *length}, seq, answer);
     }
 
     /// Send @p request (sequence number @p seq) and wait for its NLMSG_ERROR.
-    [[nodiscard]] auto transact(std::span<uint8_t const> request, uint32_t seq) -> Status;
+    /// With @p answer, an RTM_NEWQDISC under @p seq before it is parsed into
+    /// it (bad_message if none came, or it does not parse).
+    [[nodiscard]] auto transact(std::span<uint8_t const> request, uint32_t seq, QdiscInfo* answer) -> Status;
 
     FileDescriptor fd_{};
     uint32_t seq_{0};

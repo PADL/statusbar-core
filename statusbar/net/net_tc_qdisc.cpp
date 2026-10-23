@@ -42,6 +42,9 @@ constexpr size_t TCMSG_SIZE = sizeof(tcmsg);
 constexpr size_t RTA_HEADER = sizeof(rtattr);
 constexpr uint16_t REPLACE_FLAGS = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE;
 constexpr uint16_t DELETE_FLAGS = NLM_F_REQUEST | NLM_F_ACK;
+/// tc_get_qdisc answers through rtnetlink_send, which unicasts to the asker
+/// only with NLM_F_ECHO (without it, only the RTNLGRP_TC group hears it).
+constexpr uint16_t GET_FLAGS = NLM_F_REQUEST | NLM_F_ACK | NLM_F_ECHO;
 /// IFNAMSIZ-style bound on a qdisc kind (TCA_KIND is a string of at most 15 bytes + NUL in practice).
 constexpr size_t MAX_KIND = 15;
 
@@ -196,6 +199,140 @@ auto build_delete(std::span<uint8_t> const out, int const ifindex, uint32_t cons
     return finish(b, length);
 }
 
+auto build_get(std::span<uint8_t> const out, int const ifindex, uint32_t const parent, uint32_t const seq) -> StatusValue<size_t>
+{
+    constexpr size_t length = NLMSG_HEADER + TCMSG_SIZE;
+    MutableBuffer buffer{out};
+    BufferSerializerBuilder b{buffer};
+    put_nlmsghdr(b, length, RTM_GETQDISC, GET_FLAGS, seq);
+    put_tcmsg(b, ifindex, 0, parent);
+    return finish(b, length);
+}
+
+namespace {
+
+template <typename T>
+[[nodiscard]] auto read_at(std::span<uint8_t const> const bytes, size_t const at) noexcept -> T
+{
+    T value{};
+    std::memcpy(&value, bytes.data() + at, sizeof(T));
+    return value;
+}
+
+[[nodiscard]] auto bad_message() noexcept -> std::error_code
+{
+    return std::make_error_code(std::errc::bad_message);
+}
+
+/// The flat tc_mqprio_qopt at the head of mqprio's TCA_OPTIONS.
+[[nodiscard]] auto parse_mqprio(std::span<uint8_t const> const options, uint32_t const handle) -> StatusValue<MqprioQdisc>
+{
+    if (options.size() < sizeof(tc_mqprio_qopt)) {
+        return failure(bad_message());
+    }
+    MqprioQdisc q{};
+    q.major = static_cast<uint16_t>(handle >> 16U);
+    q.num_tc = options[offsetof(tc_mqprio_qopt, num_tc)];
+    for (size_t i = 0; i < PRIORITY_COUNT; ++i) {
+        q.prio_tc_map[i] = options[offsetof(tc_mqprio_qopt, prio_tc_map) + i];
+    }
+    q.hw = options[offsetof(tc_mqprio_qopt, hw)] != TC_MQPRIO_HW_OFFLOAD_NONE;
+    for (size_t i = 0; i < MAX_TRAFFIC_CLASSES; ++i) {
+        q.count[i] = read_at<uint16_t>(options, offsetof(tc_mqprio_qopt, count) + (i * sizeof(uint16_t)));
+        q.offset[i] = read_at<uint16_t>(options, offsetof(tc_mqprio_qopt, offset) + (i * sizeof(uint16_t)));
+    }
+    return q;
+}
+
+/// TCA_CBS_PARMS inside cbs's nested TCA_OPTIONS.
+[[nodiscard]] auto parse_cbs(std::span<uint8_t const> const options, uint32_t const parent) -> StatusValue<CbsQdisc>
+{
+    size_t at = 0;
+    while (at + RTA_HEADER <= options.size()) {
+        auto const len = read_at<uint16_t>(options, at);
+        auto const type = read_at<uint16_t>(options, at + 2);
+        if (len < RTA_HEADER || at + len > options.size()) {
+            return failure(bad_message());
+        }
+        if ((type & NLA_TYPE_MASK) == TCA_CBS_PARMS) {
+            if (len < RTA_HEADER + sizeof(tc_cbs_qopt)) {
+                return failure(bad_message());
+            }
+            auto const parms = options.subspan(at + RTA_HEADER, sizeof(tc_cbs_qopt));
+            return CbsQdisc{
+                .parent = parent,
+                .offload = parms[offsetof(tc_cbs_qopt, offload)] != 0,
+                .hicredit = read_at<int32_t>(parms, offsetof(tc_cbs_qopt, hicredit)),
+                .locredit = read_at<int32_t>(parms, offsetof(tc_cbs_qopt, locredit)),
+                .idleslope_kbps = read_at<int32_t>(parms, offsetof(tc_cbs_qopt, idleslope)),
+                .sendslope_kbps = read_at<int32_t>(parms, offsetof(tc_cbs_qopt, sendslope)),
+            };
+        }
+        at += align4(len);
+    }
+    return failure(bad_message());
+}
+
+}  // namespace
+
+auto parse_qdisc(std::span<uint8_t const> const message) -> StatusValue<QdiscInfo>
+{
+    if (message.size() < NLMSG_HEADER + TCMSG_SIZE) {
+        return failure(bad_message());
+    }
+    auto const length = read_at<uint32_t>(message, offsetof(nlmsghdr, nlmsg_len));
+    if (length < NLMSG_HEADER + TCMSG_SIZE || length > message.size() ||
+        read_at<uint16_t>(message, offsetof(nlmsghdr, nlmsg_type)) != RTM_NEWQDISC) {
+        return failure(bad_message());
+    }
+    auto const body = message.first(length);
+    QdiscInfo info{};
+    info.handle = read_at<uint32_t>(body, NLMSG_HEADER + offsetof(tcmsg, tcm_handle));
+    info.parent = read_at<uint32_t>(body, NLMSG_HEADER + offsetof(tcmsg, tcm_parent));
+    std::span<uint8_t const> options{};
+    bool have_options = false;
+    size_t at = NLMSG_HEADER + TCMSG_SIZE;
+    while (at + RTA_HEADER <= body.size()) {
+        auto const len = read_at<uint16_t>(body, at);
+        auto const type = read_at<uint16_t>(body, at + 2);
+        if (len < RTA_HEADER || at + len > body.size()) {
+            return failure(bad_message());
+        }
+        auto const payload = body.subspan(at + RTA_HEADER, len - RTA_HEADER);
+        if (type == TCA_KIND) {
+            size_t n = payload.size();
+            while (n > 0 && payload[n - 1] == 0) {
+                --n;
+            }
+            info.kind.assign(payload.begin(), payload.begin() + static_cast<std::ptrdiff_t>(n));
+        } else if ((type & NLA_TYPE_MASK) == TCA_OPTIONS) {
+            options = payload;
+            have_options = true;
+        }
+        at += align4(len);
+    }
+    if (info.kind == "mqprio") {
+        if (!have_options) {
+            return failure(bad_message());
+        }
+        auto mqprio = parse_mqprio(options, info.handle);
+        if (!mqprio) {
+            return failure(mqprio.error());
+        }
+        info.mqprio = *mqprio;
+    } else if (info.kind == "cbs") {
+        if (!have_options) {
+            return failure(bad_message());
+        }
+        auto cbs = parse_cbs(options, info.parent);
+        if (!cbs) {
+            return failure(cbs.error());
+        }
+        info.cbs = *cbs;
+    }
+    return info;
+}
+
 //
 // TcClient
 //
@@ -245,8 +382,19 @@ auto TcClient::remove(int const ifindex, uint32_t const handle, uint32_t const p
     return send([&](std::span<uint8_t> out, uint32_t seq) { return build_delete(out, ifindex, handle, parent, seq); });
 }
 
-auto TcClient::transact(std::span<uint8_t const> const request, uint32_t const seq) -> Status
+auto TcClient::get(int const ifindex, uint32_t const parent) -> StatusValue<QdiscInfo>
 {
+    QdiscInfo info{};
+    if (auto status = send([&](std::span<uint8_t> out, uint32_t seq) { return build_get(out, ifindex, parent, seq); }, &info);
+        !status) {
+        return failure(status.error());
+    }
+    return info;
+}
+
+auto TcClient::transact(std::span<uint8_t const> const request, uint32_t const seq, QdiscInfo* const answer) -> Status
+{
+    bool answered = false;
     last_message_.clear();
     if (!fd_.valid()) {
         return failure(std::make_error_code(std::errc::bad_file_descriptor));
@@ -284,6 +432,9 @@ auto TcClient::transact(std::span<uint8_t const> const request, uint32_t const s
                 int error = 0;
                 std::memcpy(&error, reply.data() + offset + NLMSG_HEADER, sizeof(error));
                 if (error == 0) {
+                    if (answer != nullptr && !answered) {
+                        return failure(std::make_error_code(std::errc::bad_message));
+                    }
                     return success();
                 }
                 // Extended-ack TLVs after the (capped) nlmsgerr.
@@ -313,6 +464,14 @@ auto TcClient::transact(std::span<uint8_t const> const request, uint32_t const s
                     }
                 }
                 return failure(std::error_code{-error, std::system_category()});
+            }
+            if (answer != nullptr && header.nlmsg_seq == seq && header.nlmsg_type == RTM_NEWQDISC) {
+                auto parsed = parse_qdisc(std::span<uint8_t const>{reply.data() + offset, header.nlmsg_len});
+                if (!parsed) {
+                    return failure(parsed.error());
+                }
+                *answer = std::move(*parsed);
+                answered = true;
             }
             size_t const step = align4(header.nlmsg_len);
             if (step >= remaining) {

@@ -4,9 +4,11 @@
 // The rtnetlink qdisc request builders, against bytes checked by hand from
 // linux/rtnetlink.h (nlmsghdr, tcmsg, rtattr) and linux/pkt_sched.h
 // (tc_mqprio_qopt, tc_cbs_qopt, TCA_CBS_PARMS), framed as iproute2's
-// q_mqprio.c and q_cbs.c frame them. Netlink is host byte order: the
-// expected bytes are little-endian. No socket is opened (changing qdiscs needs
-// CAP_NET_ADMIN); the interface helpers are exercised on loopback only.
+// q_mqprio.c and q_cbs.c frame them, and the parser against replies framed as
+// the kernel's tc_fill_qdisc writes them. Netlink is host byte order: the
+// expected bytes are little-endian. Nothing is changed (that needs
+// CAP_NET_ADMIN); the interface helpers and a qdisc read are exercised on
+// loopback only.
 
 #include "statusbar/test/test.hpp"
 
@@ -222,6 +224,160 @@ TEST(tc_qdisc, replace_option_less_kind)
     EXPECT_FALSE(build_replace_kind(out, 3, make_handle(0x9000, 1), "a_kind_far_too_long", 10).has_value());
 }
 
+// `tc qdisc show dev <if3> parent 9000:1`: RTM_GETQDISC for one qdisc.
+TEST(tc_qdisc, get_one_qdisc)
+{
+    if (!LITTLE) {
+        return;
+    }
+    // clang-format off
+    std::array<uint8_t, 36> const want{
+        // nlmsghdr: len 36, RTM_GETQDISC (38), REQUEST|ACK|ECHO (0x000d), seq 11, pid 0
+        0x24, 0x00, 0x00, 0x00,  0x26, 0x00,  0x0d, 0x00,  0x0b, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+        // tcmsg: family 0, pad, ifindex 3, handle 0, parent 9000:1, info 0
+        0x00, 0x00, 0x00, 0x00,  0x03, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,  0x01, 0x00, 0x00, 0x90,  0x00, 0x00, 0x00, 0x00,
+    };
+    // clang-format on
+    RequestBuffer out{};
+    auto const length = build_get(out, 3, make_handle(0x9000, 1), 11);
+    EXPECT_TRUE(length.has_value());
+    EXPECT_TRUE(same_bytes(std::span{out}.first(*length), want));
+}
+
+// The kernel's answer for the igb AVB root above: mqprio_dump puts the flat
+// tc_mqprio_qopt (82 bytes, padded to 84) and then nested attributes (here
+// TCA_MQPRIO_MODE) inside one TCA_OPTIONS; tc_fill_qdisc adds TCA_HW_OFFLOAD.
+TEST(tc_qdisc, parse_mqprio_reply)
+{
+    if (!LITTLE) {
+        return;
+    }
+    // clang-format off
+    std::array<uint8_t, 152> const reply{
+        // nlmsghdr: len 152, RTM_NEWQDISC (36), flags 0, seq 11, pid 0
+        0x98, 0x00, 0x00, 0x00,  0x24, 0x00,  0x00, 0x00,  0x0b, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+        // tcmsg: ifindex 3, handle 9000:0, parent ROOT, info (refcnt) 1
+        0x00, 0x00, 0x00, 0x00,  0x03, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x90,  0xff, 0xff, 0xff, 0xff,  0x01, 0x00, 0x00, 0x00,
+        // TCA_KIND, len 11: "mqprio\0", pad 1
+        0x0b, 0x00, 0x01, 0x00,  'm', 'q', 'p', 'r', 'i', 'o', 0x00,  0x00,
+        // TCA_OPTIONS, len 96: num_tc 3, map 0 0 1 2 0..., hw 0
+        0x60, 0x00, 0x02, 0x00,
+        0x03,  0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  0x00,
+        //   count: 2 1 1, 0...
+        0x02, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        //   offset: 2 1 0, 0...; then the struct's pad to 84
+        0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  0x00, 0x00,
+        //   TCA_MQPRIO_MODE (1), len 6: u16 0 (dcb), pad 2
+        0x06, 0x00, 0x01, 0x00,  0x00, 0x00,  0x00, 0x00,
+        // TCA_HW_OFFLOAD (12), len 5: 0, pad 3
+        0x05, 0x00, 0x0c, 0x00,  0x00,  0x00, 0x00, 0x00,
+    };
+    // clang-format on
+    auto const info = parse_qdisc(reply);
+    EXPECT_TRUE(info.has_value());
+    if (!info) {
+        return;
+    }
+    EXPECT_EQ(info->handle, make_handle(0x9000, 0));
+    EXPECT_EQ(info->parent, ROOT);
+    EXPECT_TRUE(info->kind == "mqprio");
+    EXPECT_FALSE(info->cbs.has_value());
+    MqprioQdisc want{};
+    want.major = 0x9000;
+    want.num_tc = 3;
+    want.prio_tc_map[2] = 1;
+    want.prio_tc_map[3] = 2;
+    want.count[0] = 2;
+    want.offset[0] = 2;
+    want.count[1] = 1;
+    want.offset[1] = 1;
+    want.count[2] = 1;
+    want.offset[2] = 0;
+    EXPECT_TRUE(info->mqprio.has_value() && *info->mqprio == want);
+
+    // A truncated message, a short struct, another message type.
+    EXPECT_FALSE(parse_qdisc(std::span{reply}.first(100)).has_value());
+    auto short_options = reply;
+    short_options[48] = 0x40;  // TCA_OPTIONS len 64: under sizeof(tc_mqprio_qopt)
+    EXPECT_FALSE(parse_qdisc(short_options).has_value());
+    auto other_type = reply;
+    other_type[4] = 0x2c;  // RTM_NEWTCLASS
+    EXPECT_FALSE(parse_qdisc(other_type).has_value());
+}
+
+// A cbs child as `tc qdisc show` prints it: "qdisc cbs 8008: parent 9000:1
+// hicredit 25 locredit -254 sendslope -983424 idleslope 16576 offload 1";
+// cbs_dump nests TCA_CBS_PARMS in TCA_OPTIONS.
+TEST(tc_qdisc, parse_cbs_reply)
+{
+    if (!LITTLE) {
+        return;
+    }
+    // clang-format off
+    std::array<uint8_t, 80> const reply{
+        0x50, 0x00, 0x00, 0x00,  0x24, 0x00,  0x00, 0x00,  0x0b, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+        // tcmsg: handle 8008:0, parent 9000:1
+        0x00, 0x00, 0x00, 0x00,  0x03, 0x00, 0x00, 0x00,  0x00, 0x00, 0x08, 0x80,  0x01, 0x00, 0x00, 0x90,  0x01, 0x00, 0x00, 0x00,
+        0x08, 0x00, 0x01, 0x00,  'c', 'b', 's', 0x00,
+        // TCA_OPTIONS, len 28 > TCA_CBS_PARMS (1), len 24: offload 1, pad 3,
+        // hicredit 25, locredit -254, idleslope 16576, sendslope -983424
+        0x1c, 0x00, 0x02, 0x00,  0x18, 0x00, 0x01, 0x00,
+        0x01, 0x00, 0x00, 0x00,  0x19, 0x00, 0x00, 0x00,  0x02, 0xff, 0xff, 0xff,  0xc0, 0x40, 0x00, 0x00,  0x80, 0xfe, 0xf0, 0xff,
+        0x05, 0x00, 0x0c, 0x00,  0x01,  0x00, 0x00, 0x00,
+    };
+    // clang-format on
+    auto const info = parse_qdisc(reply);
+    EXPECT_TRUE(info.has_value());
+    if (!info) {
+        return;
+    }
+    EXPECT_EQ(info->handle, make_handle(0x8008, 0));
+    EXPECT_TRUE(info->kind == "cbs");
+    EXPECT_FALSE(info->mqprio.has_value());
+    CbsQdisc const want{
+        .parent = make_handle(0x9000, 1),
+        .offload = true,
+        .hicredit = 25,
+        .locredit = -254,
+        .idleslope_kbps = 16576,
+        .sendslope_kbps = -983424,
+    };
+    EXPECT_TRUE(info->cbs.has_value() && *info->cbs == want);
+
+    auto no_parms = reply;
+    no_parms[50] = 0x02;  // the nested attribute is TCA_CBS_MAXSDU, not TCA_CBS_PARMS
+    EXPECT_FALSE(parse_qdisc(no_parms).has_value());
+}
+
+// Any other kind (the default fq_codel on a legacy queue) parses to its kind,
+// handle 0 and parent, its options skipped.
+TEST(tc_qdisc, parse_other_kind_reply)
+{
+    if (!LITTLE) {
+        return;
+    }
+    // clang-format off
+    std::array<uint8_t, 64> const reply{
+        0x40, 0x00, 0x00, 0x00,  0x24, 0x00,  0x00, 0x00,  0x0b, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,  0x03, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,  0x03, 0x00, 0x00, 0x90,  0x01, 0x00, 0x00, 0x00,
+        0x0d, 0x00, 0x01, 0x00,  'f', 'q', '_', 'c', 'o', 'd', 'e', 'l', 0x00,  0x00, 0x00, 0x00,
+        // TCA_OPTIONS, len 12 > a u32 attribute
+        0x0c, 0x00, 0x02, 0x00,  0x08, 0x00, 0x02, 0x00,  0x00, 0x28, 0x00, 0x00,
+    };
+    // clang-format on
+    auto const info = parse_qdisc(reply);
+    EXPECT_TRUE(info.has_value());
+    if (!info) {
+        return;
+    }
+    EXPECT_EQ(info->handle, uint32_t{0});
+    EXPECT_EQ(info->parent, make_handle(0x9000, 3));
+    EXPECT_TRUE(info->kind == "fq_codel");
+    EXPECT_FALSE(info->mqprio.has_value() || info->cbs.has_value());
+}
+
 TEST(tc_qdisc, interface_info_on_loopback)
 {
     auto const index = interface_index("lo");
@@ -240,6 +396,26 @@ TEST(tc_qdisc, interface_info_on_loopback)
     EXPECT_TRUE(!missing.has_value() && missing.error() == std::errc::no_such_file_or_directory);
     EXPECT_FALSE(interface_mtu("no-such-if0").has_value());
     EXPECT_FALSE(tx_queue_count("../etc").has_value());  // not a path
+}
+
+// Reading a qdisc needs no privilege: loopback's root is the default noqueue
+// (the kernel's answer carries TCA_KIND, TCA_HW_OFFLOAD and the stats).
+TEST(tc_qdisc, get_loopback_root)
+{
+    auto const index = interface_index("lo");
+    TcClient client{};
+    if (!index || !client.open()) {
+        std::println("  no NETLINK_ROUTE socket here: skipped");
+        return;
+    }
+    auto const root = client.get(*index, ROOT);
+    EXPECT_TRUE(root.has_value());
+    if (root) {
+        EXPECT_TRUE(root->kind == "noqueue");
+        EXPECT_FALSE(root->mqprio.has_value() || root->cbs.has_value());
+    }
+    // Nothing under a class of a qdisc that does not exist.
+    EXPECT_FALSE(client.get(*index, make_handle(0x9123, 1)).has_value());
 }
 
 }  // namespace
