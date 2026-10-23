@@ -11,7 +11,9 @@
 
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -602,6 +604,62 @@ TEST(net_tcp_server_local, the_requested_mode_is_on_the_socket_file)
     pool_ptr = &pool;
     EXPECT_TRUE(pool.valid());
     EXPECT_EQ(path.mode_bits(), 0600U);
+}
+
+TEST(net_tcp_server_local, the_socket_is_staged_privately_and_linked_into_place)
+{
+    std::string dir = "/tmp/sb_pool_stage_XXXXXX";
+    EXPECT_TRUE(::mkdtemp(dir.data()) != nullptr);
+    std::string const path = dir + "/s.sock";
+    auto const addr = SocketAddress::local(path);
+    EXPECT_TRUE(addr.has_value());
+    {
+        TcpConnectionPool* pool_ptr = nullptr;
+        EchoHandler handler{pool_ptr};
+        TcpServerOptions options;
+        options.unix_mode = 0600;
+        TcpConnectionPool pool{*addr, 2, handler, options};
+        pool_ptr = &pool;
+        EXPECT_TRUE(pool.valid());
+        // Only the socket is left beside it: the private directory is gone.
+        size_t entries = 0;
+        for (auto const& entry : std::filesystem::directory_iterator{dir}) {
+            EXPECT_EQ(entry.path().string(), path);
+            ++entries;
+        }
+        EXPECT_EQ(entries, size_t{1});
+        auto const bound = pool.local_addr();
+        EXPECT_TRUE(bound.has_value());
+        Client c{*bound};
+        EXPECT_TRUE(c.fd >= 0);
+    }
+    (void)::rmdir(dir.c_str());
+}
+
+// A path that fits sun_path when its staged name beside it would not (a short
+// basename near the limit) is bound in place, with its mode.
+TEST(net_tcp_server_local, a_path_too_long_to_stage_beside_is_bound_in_place)
+{
+    std::string top = "/tmp/sb_pool_long_XXXXXX";
+    EXPECT_TRUE(::mkdtemp(top.data()) != nullptr);
+    std::string const dir = top + "/" + std::string(100 - top.size() - 1, 'd');  // 100 octets
+    EXPECT_EQ(::mkdir(dir.c_str(), 0700), 0);
+    std::string const path = dir + "/s";
+    auto const addr = SocketAddress::local(path);
+    EXPECT_TRUE(addr.has_value());
+    {
+        TcpConnectionPool* pool_ptr = nullptr;
+        EchoHandler handler{pool_ptr};
+        TcpServerOptions options;
+        options.unix_mode = 0600;
+        TcpConnectionPool pool{*addr, 2, handler, options};
+        pool_ptr = &pool;
+        EXPECT_TRUE(pool.valid());
+        struct stat st{};
+        EXPECT_TRUE(::lstat(path.c_str(), &st) == 0 && S_ISSOCK(st.st_mode) && (st.st_mode & 0777U) == 0600U);
+    }
+    (void)::rmdir(dir.c_str());
+    (void)::rmdir(top.c_str());
 }
 
 TEST(net_tcp_server_local, without_a_mode_the_umask_result_stands)
