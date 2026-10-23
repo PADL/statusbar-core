@@ -125,8 +125,9 @@ auto TcpConnectionPool::open_listener(SocketAddress const& bind_addr) -> StatusV
     // live socket that appeared since prepare_unix_path is refused). Nobody
     // can connect until the socket is at the path, with its final mode.
     // A socket there afterwards is ours to unlink (claim_unix_path).
+    // "<dir>/.XXXXXX/s": short, as it must fit sun_path like the path itself.
     auto const slash = unix_path_.rfind('/');
-    std::string private_dir = unix_path_.substr(0, slash) + "/.sock-XXXXXX";
+    std::string private_dir = (slash == std::string::npos ? std::string{"."} : unix_path_.substr(0, slash)) + "/.XXXXXX";
     if (::mkdtemp(private_dir.data()) == nullptr) {
         return failure(NetError::bind_failed);
     }

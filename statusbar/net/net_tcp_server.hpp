@@ -37,9 +37,9 @@
 /// probe shows up as a connect-then-EOF on the live listener.) The socket
 /// is bound, given unix_mode and set listening in a private directory
 /// beside the path, then hard-linked into place, so the mode never reaches
-/// anything a symlink at the path points to; the path needs room for that
-/// directory (about 10 more characters within sun_path), and its directory
-/// must not be writable by others. The pool owns the socket file at the
+/// anything a symlink at the path points to. The staged name,
+/// "<dir>/.XXXXXX/s", must fit sun_path too, and the directory must not be
+/// writable by others. The pool owns the socket file at the
 /// path and unlinks it when destroyed. Accepted peers are usually unnamed:
 /// peer(slot) is AF_UNIX with an empty path().
 
