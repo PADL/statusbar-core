@@ -34,10 +34,14 @@
 /// socket file at the path (one nobody is listening on: a probe connect is
 /// refused) is unlinked before bind; a live socket or any other kind of
 /// filesystem entry there makes the pool invalid and is left alone. (The
-/// probe shows up as a connect-then-EOF on the live listener.) If the
-/// path did not exist and bind created the socket file, the pool owns it
-/// and unlinks it when destroyed, even if listen() failed. Accepted peers
-/// are usually unnamed: peer(slot) is AF_UNIX with an empty path().
+/// probe shows up as a connect-then-EOF on the live listener.) The socket
+/// is bound, given unix_mode and set listening in a private directory
+/// beside the path, then hard-linked into place, so the mode never reaches
+/// anything a symlink at the path points to; the path needs room for that
+/// directory (about 10 more characters within sun_path), and its directory
+/// must not be writable by others. The pool owns the socket file at the
+/// path and unlinks it when destroyed. Accepted peers are usually unnamed:
+/// peer(slot) is AF_UNIX with an empty path().
 
 #include "statusbar/net/net_address.hpp"
 #include "statusbar/net/net_fd_multiplexer.hpp"
@@ -78,7 +82,7 @@ struct TcpServerOptions
     int dscp = -1;                ///< applied to accepted sockets when >= 0
     bool nodelay = true;          ///< TCP_NODELAY on accepted sockets
     int64_t idle_timeout_ns = 0;  ///< close slots idle this long; 0 = never
-    int unix_mode = -1;           ///< AF_UNIX: chmod the socket file to this after bind; -1 = leave the umask result
+    int unix_mode = -1;  ///< AF_UNIX: the socket file's mode, set before it appears at the path; -1 = leave the umask result
 };
 
 class TcpConnectionPool : public Pollable

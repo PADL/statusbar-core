@@ -8,6 +8,7 @@
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
+#include <cstdlib>
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -117,27 +118,47 @@ auto TcpConnectionPool::open_listener(SocketAddress const& bind_addr) -> StatusV
     if (!is_unix()) {
         return create_tcp_listener(bind_addr, options_.backlog, options_.dscp);
     }
-    // Ownership comes from the filesystem: if the path was absent and a
-    // socket is there once bind succeeds, it is ours to unlink, whatever
-    // fails later (chmod, listen, the multiplexer). For AF_UNIX,
-    // create_tcp_socket does nothing after bind, so its failure means bind
-    // did not create the file — a socket there then belongs to someone else.
-    struct stat st{};
-    bool const existed = ::lstat(unix_path_.c_str(), &st) == 0;
-    auto listener = create_tcp_socket(bind_addr, true);
+    // Bound, given its mode and listening inside a private (0700) directory
+    // beside the path, then linked into place: the mode never reaches
+    // anything but our own socket file, whatever is swapped in at the path,
+    // and link(), like bind(), never follows or replaces what is there (a
+    // live socket that appeared since prepare_unix_path is refused). Nobody
+    // can connect until the socket is at the path, with its final mode.
+    // A socket there afterwards is ours to unlink (claim_unix_path).
+    auto const slash = unix_path_.rfind('/');
+    std::string private_dir = unix_path_.substr(0, slash) + "/.sock-XXXXXX";
+    if (::mkdtemp(private_dir.data()) == nullptr) {
+        return failure(NetError::bind_failed);
+    }
+    std::string const private_path = private_dir + "/s";
+    auto const discard = [&private_dir, &private_path] {
+        (void)::unlink(private_path.c_str());
+        (void)::rmdir(private_dir.c_str());
+    };
+    auto private_addr = SocketAddress::local(private_path);
+    if (!private_addr) {
+        discard();
+        return failure(NetError::bind_failed);  // the path leaves no room for the private directory
+    }
+    auto listener = create_tcp_socket(*private_addr, true);
     if (!listener) {
+        discard();
         return listener;
     }
-    if (!existed) {
-        claim_unix_path();
-    }
-    // chmod before listen: nobody can connect until the mode is final.
-    if (options_.unix_mode >= 0 && ::chmod(unix_path_.c_str(), mode_t(options_.unix_mode)) < 0) {
+    if (options_.unix_mode >= 0 && ::chmod(private_path.c_str(), mode_t(options_.unix_mode)) < 0) {
+        discard();
         return failure(NetError::socket_option_failed);
     }
     if (::listen(listener->get(), options_.backlog) < 0) {
+        discard();
         return failure(NetError::listen_failed);
     }
+    if (::link(private_path.c_str(), unix_path_.c_str()) < 0) {
+        discard();
+        return failure(NetError::bind_failed);
+    }
+    discard();
+    claim_unix_path();
     return listener;
 }
 
@@ -162,6 +183,11 @@ auto TcpConnectionPool::local_addr() const -> StatusValue<SocketAddress>
 {
     if (!listener_.valid()) {
         return failure(NetError::not_connected);
+    }
+    if (is_unix()) {
+        // Not getsockname(): the socket was bound in a private directory and
+        // linked to the path (open_listener).
+        return SocketAddress::local(unix_path_);
     }
     SocketAddress addr;
     addr.reset_length();

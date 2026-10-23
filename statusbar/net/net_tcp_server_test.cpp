@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -431,6 +432,18 @@ TEST(net_tcp_server, unix_mode_applied)
     EXPECT_EQ(::lstat(tmp.path().c_str(), &st), 0);
     EXPECT_TRUE(S_ISSOCK(st.st_mode));
     EXPECT_EQ(st.st_mode & 07777, mode_t{0600});
+    // Staged in a private directory beside it, which is gone again.
+    size_t entries = 0;
+    for (auto const& entry : std::filesystem::directory_iterator{tmp.dir}) {
+        (void)entry;
+        ++entries;
+    }
+    EXPECT_EQ(entries, size_t{1});
+    // Connecting by the path reaches it.
+    auto addr = pool.local_addr();
+    EXPECT_TRUE(addr.has_value());
+    Client c{*addr};
+    EXPECT_TRUE(c.fd >= 0);
 }
 
 #if defined(__linux__)
