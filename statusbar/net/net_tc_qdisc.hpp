@@ -12,7 +12,7 @@
 ///   - pure message builders (build_*), which write one complete
 ///     RTM_NEWQDISC / RTM_DELQDISC / RTM_GETQDISC request (nlmsghdr + tcmsg +
 ///     TCA_KIND + TCA_OPTIONS) into a caller buffer, and parse_qdisc, which
-///     reads the kernel's RTM_NEWQDISC answer to a get: socket-free,
+///     reads one RTM_NEWQDISC of the kernel's qdisc dump: socket-free,
 ///     unit-tested against hand-checked bytes. Netlink is host byte order; the layouts are
 ///     linux/rtnetlink.h's struct tcmsg and linux/pkt_sched.h's
 ///     struct tc_mqprio_qopt / struct tc_cbs_qopt, written field by field
@@ -39,6 +39,7 @@
 #    include <span>
 #    include <string>
 #    include <string_view>
+#    include <vector>
 
 namespace statusbar::net::tc {
 
@@ -90,7 +91,13 @@ struct CbsQdisc
 /// and kind, with the options of the kinds this client writes.
 struct QdiscInfo
 {
-    uint32_t handle{0};  ///< 0 for a default qdisc the kernel attached
+    int ifindex{0};
+    /// The qdisc's own handle, major:0 ("8008:" for a cbs the kernel
+    /// numbered); 0 for a default qdisc the kernel attached (the mq root, an
+    /// mqprio queue's fq_codel).
+    uint32_t handle{0};
+    /// ROOT for the root; an mqprio child's is the class it hangs on,
+    /// mqprio_major:(queue + 1).
     uint32_t parent{0};
     std::string kind{};
     std::optional<MqprioQdisc> mqprio{};  ///< kind "mqprio": its layout (major from the handle)
@@ -128,14 +135,17 @@ using RequestBuffer = std::array<uint8_t, MAX_REQUEST_SIZE>;
 [[nodiscard]] auto build_delete(std::span<uint8_t> out, int ifindex, uint32_t handle, uint32_t parent, uint32_t seq)
     -> StatusValue<size_t>;
 
-/// Build `tc qdisc show dev <if> parent <parent>` for one qdisc (RTM_GETQDISC,
-/// NLM_F_REQUEST | NLM_F_ACK | NLM_F_ECHO, tcm_handle 0, no attributes) into @p out: the
-/// root for @p parent ROOT, else the child on that class (major:minor of an
-/// mqprio queue). Returns the message length.
-[[nodiscard]] auto build_get(std::span<uint8_t> out, int ifindex, uint32_t parent, uint32_t seq) -> StatusValue<size_t>;
+/// Build `tc qdisc show` (RTM_GETQDISC, NLM_F_REQUEST | NLM_F_DUMP, no
+/// attributes) into @p out. The kernel dumps every qdisc of every device in
+/// the namespace (tc_dump_qdisc ignores tcm_ifindex, which is set to @p
+/// ifindex for the record); the caller filters. A dump rather than a single
+/// get: tc_get_qdisc answers through rtnetlink_send, which with NLM_F_ECHO
+/// also tells every RTNLGRP_TC listener (`tc monitor`) of a "new" qdisc.
+/// Returns the message length.
+[[nodiscard]] auto build_dump(std::span<uint8_t> out, int ifindex, uint32_t seq) -> StatusValue<size_t>;
 
-/// Parse one RTM_NEWQDISC message (nlmsghdr + tcmsg + attributes), the
-/// kernel's answer to build_get. mqprio's TCA_OPTIONS is the flat
+/// Parse one RTM_NEWQDISC message (nlmsghdr + tcmsg + attributes), one part
+/// of the kernel's answer to build_dump. mqprio's TCA_OPTIONS is the flat
 /// tc_mqprio_qopt followed by optional attributes (ignored); cbs's nests
 /// TCA_CBS_PARMS. Errors: bad_message for a truncated or malformed message,
 /// another type, or a known kind whose options are short.
@@ -151,8 +161,8 @@ class TcControl
     [[nodiscard]] virtual auto replace_cbs(int ifindex, CbsQdisc const& qdisc) -> Status = 0;
     [[nodiscard]] virtual auto replace_kind(int ifindex, uint32_t parent, std::string_view kind) -> Status = 0;
     [[nodiscard]] virtual auto remove(int ifindex, uint32_t handle, uint32_t parent) -> Status = 0;
-    /// The qdisc on @p parent (ROOT: the root). Errors: ENOENT when @p
-    /// parent's qdisc does not exist, or the request's.
+    /// The qdisc on @p parent (ROOT: the root) of @p ifindex. Errors: ENOENT
+    /// when there is none, or the request's.
     [[nodiscard]] virtual auto get(int ifindex, uint32_t parent) -> StatusValue<QdiscInfo> = 0;
     /// The kernel's extended-ack message for the last failed request (empty:
     /// none was given, or the request succeeded).
@@ -186,8 +196,17 @@ class TcClient final : public TcControl
   private:
     /// Build one request with @p build (out, seq) -> StatusValue<size_t> under
     /// the next sequence number and transact it.
+    /// What a dump looks for: the qdisc of @p ifindex on @p parent.
+    struct Wanted
+    {
+        int ifindex{0};
+        uint32_t parent{0};
+        QdiscInfo* found{nullptr};  ///< set when it came (parsed into it)
+        bool came{false};
+    };
+
     template <typename Build>
-    [[nodiscard]] auto send(Build const& build, QdiscInfo* answer = nullptr) -> Status
+    [[nodiscard]] auto send(Build const& build, Wanted* wanted = nullptr) -> Status
     {
         RequestBuffer request{};
         uint32_t const seq = ++seq_;
@@ -195,17 +214,20 @@ class TcClient final : public TcControl
         if (!length) {
             return failure(length.error());
         }
-        return transact(std::span<uint8_t const>{request.data(), *length}, seq, answer);
+        return transact(std::span<uint8_t const>{request.data(), *length}, seq, wanted);
     }
 
-    /// Send @p request (sequence number @p seq) and wait for its NLMSG_ERROR.
-    /// With @p answer, an RTM_NEWQDISC under @p seq before it is parsed into
-    /// it (bad_message if none came, or it does not parse).
-    [[nodiscard]] auto transact(std::span<uint8_t const> request, uint32_t seq, QdiscInfo* answer) -> Status;
+    /// Send @p request (sequence number @p seq) and wait for its NLMSG_ERROR;
+    /// with @p wanted, @p request is a dump: read its parts up to NLMSG_DONE,
+    /// parsing the wanted qdisc. Only messages addressed to this socket
+    /// (nlmsg_pid, our port id) under @p seq count.
+    [[nodiscard]] auto transact(std::span<uint8_t const> request, uint32_t seq, Wanted* wanted) -> Status;
 
     FileDescriptor fd_{};
+    uint32_t portid_{0};
     uint32_t seq_{0};
     std::string last_message_{};
+    std::vector<uint8_t> reply_{};  ///< receive buffer, sized in open()
 };
 
 }  // namespace statusbar::net::tc

@@ -224,27 +224,27 @@ TEST(tc_qdisc, replace_option_less_kind)
     EXPECT_FALSE(build_replace_kind(out, 3, make_handle(0x9000, 1), "a_kind_far_too_long", 10).has_value());
 }
 
-// `tc qdisc show dev <if3> parent 9000:1`: RTM_GETQDISC for one qdisc.
-TEST(tc_qdisc, get_one_qdisc)
+// `tc qdisc show`: RTM_GETQDISC dump (the kernel dumps every device's qdiscs).
+TEST(tc_qdisc, dump_qdiscs)
 {
     if (!LITTLE) {
         return;
     }
     // clang-format off
     std::array<uint8_t, 36> const want{
-        // nlmsghdr: len 36, RTM_GETQDISC (38), REQUEST|ACK|ECHO (0x000d), seq 11, pid 0
-        0x24, 0x00, 0x00, 0x00,  0x26, 0x00,  0x0d, 0x00,  0x0b, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
-        // tcmsg: family 0, pad, ifindex 3, handle 0, parent 9000:1, info 0
-        0x00, 0x00, 0x00, 0x00,  0x03, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,  0x01, 0x00, 0x00, 0x90,  0x00, 0x00, 0x00, 0x00,
+        // nlmsghdr: len 36, RTM_GETQDISC (38), REQUEST|DUMP (0x0301), seq 11, pid 0
+        0x24, 0x00, 0x00, 0x00,  0x26, 0x00,  0x01, 0x03,  0x0b, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+        // tcmsg: family 0, pad, ifindex 3 (for the record), handle 0, parent 0, info 0
+        0x00, 0x00, 0x00, 0x00,  0x03, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
     };
     // clang-format on
     RequestBuffer out{};
-    auto const length = build_get(out, 3, make_handle(0x9000, 1), 11);
+    auto const length = build_dump(out, 3, 11);
     EXPECT_TRUE(length.has_value());
     EXPECT_TRUE(same_bytes(std::span{out}.first(*length), want));
 }
 
-// The kernel's answer for the igb AVB root above: mqprio_dump puts the flat
+// The igb AVB root above in the kernel's dump: mqprio_dump puts the flat
 // tc_mqprio_qopt (82 bytes, padded to 84) and then nested attributes (here
 // TCA_MQPRIO_MODE) inside one TCA_OPTIONS; tc_fill_qdisc adds TCA_HW_OFFLOAD.
 TEST(tc_qdisc, parse_mqprio_reply)
@@ -254,7 +254,7 @@ TEST(tc_qdisc, parse_mqprio_reply)
     }
     // clang-format off
     std::array<uint8_t, 152> const reply{
-        // nlmsghdr: len 152, RTM_NEWQDISC (36), flags 0, seq 11, pid 0
+        // nlmsghdr: len 152, RTM_NEWQDISC (36), flags 0, seq 11, pid 0 (as parse_qdisc sees it)
         0x98, 0x00, 0x00, 0x00,  0x24, 0x00,  0x00, 0x00,  0x0b, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
         // tcmsg: ifindex 3, handle 9000:0, parent ROOT, info (refcnt) 1
         0x00, 0x00, 0x00, 0x00,  0x03, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x90,  0xff, 0xff, 0xff, 0xff,  0x01, 0x00, 0x00, 0x00,
@@ -280,6 +280,7 @@ TEST(tc_qdisc, parse_mqprio_reply)
     if (!info) {
         return;
     }
+    EXPECT_EQ(info->ifindex, 3);
     EXPECT_EQ(info->handle, make_handle(0x9000, 0));
     EXPECT_EQ(info->parent, ROOT);
     EXPECT_TRUE(info->kind == "mqprio");
@@ -308,8 +309,9 @@ TEST(tc_qdisc, parse_mqprio_reply)
 }
 
 // A cbs child as `tc qdisc show` prints it: "qdisc cbs 8008: parent 9000:1
-// hicredit 25 locredit -254 sendslope -983424 idleslope 16576 offload 1";
-// cbs_dump nests TCA_CBS_PARMS in TCA_OPTIONS.
+// hicredit 25 locredit -254 sendslope -983424 idleslope 16576 offload 1":
+// its own handle 8008:0 (the kernel numbered it), its parent the mqprio class
+// of queue 0, 9000:(0 + 1); cbs_dump nests TCA_CBS_PARMS in TCA_OPTIONS.
 TEST(tc_qdisc, parse_cbs_reply)
 {
     if (!LITTLE) {
@@ -351,8 +353,8 @@ TEST(tc_qdisc, parse_cbs_reply)
     EXPECT_FALSE(parse_qdisc(no_parms).has_value());
 }
 
-// Any other kind (the default fq_codel on a legacy queue) parses to its kind,
-// handle 0 and parent, its options skipped.
+// Any other kind (the default fq_codel the kernel put on legacy queue 2,
+// class 9000:3) parses to its kind, handle 0 and parent, its options skipped.
 TEST(tc_qdisc, parse_other_kind_reply)
 {
     if (!LITTLE) {
@@ -398,8 +400,8 @@ TEST(tc_qdisc, interface_info_on_loopback)
     EXPECT_FALSE(tx_queue_count("../etc").has_value());  // not a path
 }
 
-// Reading a qdisc needs no privilege: loopback's root is the default noqueue
-// (the kernel's answer carries TCA_KIND, TCA_HW_OFFLOAD and the stats).
+// Reading qdiscs needs no privilege: loopback's root, found in the dump of
+// every device's, is the default noqueue.
 TEST(tc_qdisc, get_loopback_root)
 {
     auto const index = interface_index("lo");

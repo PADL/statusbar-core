@@ -42,9 +42,11 @@ constexpr size_t TCMSG_SIZE = sizeof(tcmsg);
 constexpr size_t RTA_HEADER = sizeof(rtattr);
 constexpr uint16_t REPLACE_FLAGS = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE;
 constexpr uint16_t DELETE_FLAGS = NLM_F_REQUEST | NLM_F_ACK;
-/// tc_get_qdisc answers through rtnetlink_send, which unicasts to the asker
-/// only with NLM_F_ECHO (without it, only the RTNLGRP_TC group hears it).
-constexpr uint16_t GET_FLAGS = NLM_F_REQUEST | NLM_F_ACK | NLM_F_ECHO;
+/// A dump ends with NLMSG_DONE; NLM_F_ACK would add nothing.
+constexpr uint16_t DUMP_FLAGS = NLM_F_REQUEST | NLM_F_DUMP;
+/// The receive buffer: a dump part is at most the larger of a page and the
+/// buffer we read with (netlink_dump's alloc_min_size).
+constexpr size_t REPLY_SIZE = 32768;
 /// IFNAMSIZ-style bound on a qdisc kind (TCA_KIND is a string of at most 15 bytes + NUL in practice).
 constexpr size_t MAX_KIND = 15;
 
@@ -199,13 +201,13 @@ auto build_delete(std::span<uint8_t> const out, int const ifindex, uint32_t cons
     return finish(b, length);
 }
 
-auto build_get(std::span<uint8_t> const out, int const ifindex, uint32_t const parent, uint32_t const seq) -> StatusValue<size_t>
+auto build_dump(std::span<uint8_t> const out, int const ifindex, uint32_t const seq) -> StatusValue<size_t>
 {
     constexpr size_t length = NLMSG_HEADER + TCMSG_SIZE;
     MutableBuffer buffer{out};
     BufferSerializerBuilder b{buffer};
-    put_nlmsghdr(b, length, RTM_GETQDISC, GET_FLAGS, seq);
-    put_tcmsg(b, ifindex, 0, parent);
+    put_nlmsghdr(b, length, RTM_GETQDISC, DUMP_FLAGS, seq);
+    put_tcmsg(b, ifindex, 0, 0);
     return finish(b, length);
 }
 
@@ -287,6 +289,7 @@ auto parse_qdisc(std::span<uint8_t const> const message) -> StatusValue<QdiscInf
     }
     auto const body = message.first(length);
     QdiscInfo info{};
+    info.ifindex = read_at<int32_t>(body, NLMSG_HEADER + offsetof(tcmsg, tcm_ifindex));
     info.handle = read_at<uint32_t>(body, NLMSG_HEADER + offsetof(tcmsg, tcm_handle));
     info.parent = read_at<uint32_t>(body, NLMSG_HEADER + offsetof(tcmsg, tcm_parent));
     std::span<uint8_t const> options{};
@@ -358,6 +361,13 @@ auto TcClient::open() noexcept -> Status
     if (::bind(fd.get(), sockaddr_cast(local), sizeof(local)) < 0) {
         return failure(std::error_code{errno, std::system_category()});
     }
+    sockaddr_nl bound{};
+    socklen_t bound_size = sizeof(bound);
+    if (::getsockname(fd.get(), sockaddr_cast(bound), &bound_size) < 0) {
+        return failure(std::error_code{errno, std::system_category()});
+    }
+    portid_ = bound.nl_pid;
+    reply_.assign(REPLY_SIZE, 0);
     fd_ = std::move(fd);
     return success();
 }
@@ -385,16 +395,18 @@ auto TcClient::remove(int const ifindex, uint32_t const handle, uint32_t const p
 auto TcClient::get(int const ifindex, uint32_t const parent) -> StatusValue<QdiscInfo>
 {
     QdiscInfo info{};
-    if (auto status = send([&](std::span<uint8_t> out, uint32_t seq) { return build_get(out, ifindex, parent, seq); }, &info);
-        !status) {
+    Wanted wanted{.ifindex = ifindex, .parent = parent, .found = &info};
+    if (auto status = send([&](std::span<uint8_t> out, uint32_t seq) { return build_dump(out, ifindex, seq); }, &wanted); !status) {
         return failure(status.error());
+    }
+    if (!wanted.came) {
+        return failure(std::make_error_code(std::errc::no_such_file_or_directory));
     }
     return info;
 }
 
-auto TcClient::transact(std::span<uint8_t const> const request, uint32_t const seq, QdiscInfo* const answer) -> Status
+auto TcClient::transact(std::span<uint8_t const> const request, uint32_t const seq, Wanted* const wanted) -> Status
 {
-    bool answered = false;
     last_message_.clear();
     if (!fd_.valid()) {
         return failure(std::make_error_code(std::errc::bad_file_descriptor));
@@ -404,9 +416,9 @@ auto TcClient::transact(std::span<uint8_t const> const request, uint32_t const s
     if (::sendto(fd_.get(), request.data(), request.size(), 0, sockaddr_cast(kernel), sizeof(kernel)) < 0) {
         return failure(std::error_code{errno, std::system_category()});
     }
-    alignas(nlmsghdr) std::array<uint8_t, 8192> reply{};
     for (;;) {
-        ssize_t const received = ::recv(fd_.get(), reply.data(), reply.size(), 0);
+        // MSG_TRUNC: the length of the datagram even when it did not fit.
+        ssize_t const received = ::recv(fd_.get(), reply_.data(), reply_.size(), MSG_TRUNC);
         if (received < 0) {
             if (errno == EINTR) {
                 continue;
@@ -416,25 +428,49 @@ auto TcClient::transact(std::span<uint8_t const> const request, uint32_t const s
             }
             return failure(std::error_code{errno, std::system_category()});
         }
+        if (static_cast<size_t>(received) > reply_.size()) {
+            return failure(std::make_error_code(std::errc::message_size));
+        }
         size_t remaining = static_cast<size_t>(received);
         size_t offset = 0;
         while (remaining >= NLMSG_HEADER) {
             nlmsghdr header{};
-            std::memcpy(&header, reply.data() + offset, NLMSG_HEADER);
+            std::memcpy(&header, reply_.data() + offset, NLMSG_HEADER);
             if (header.nlmsg_len < NLMSG_HEADER || header.nlmsg_len > remaining) {
                 return failure(std::make_error_code(std::errc::bad_message));
             }
-            if (header.nlmsg_seq == seq && header.nlmsg_type == NLMSG_ERROR) {
+            bool const ours = header.nlmsg_seq == seq && header.nlmsg_pid == portid_;
+            if (ours && header.nlmsg_type == NLMSG_DONE && wanted != nullptr) {
+                // The dump's end; its payload is the dump's error (0 when complete).
+                int error = 0;
+                if (header.nlmsg_len >= NLMSG_HEADER + sizeof(error)) {
+                    std::memcpy(&error, reply_.data() + offset + NLMSG_HEADER, sizeof(error));
+                }
+                return error == 0 ? success() : failure(std::error_code{-error, std::system_category()});
+            }
+            if (ours && header.nlmsg_type == RTM_NEWQDISC && wanted != nullptr && !wanted->came &&
+                header.nlmsg_len >= NLMSG_HEADER + TCMSG_SIZE) {
+                int32_t ifindex = 0;
+                uint32_t parent = 0;
+                std::memcpy(&ifindex, reply_.data() + offset + NLMSG_HEADER + offsetof(tcmsg, tcm_ifindex), sizeof(ifindex));
+                std::memcpy(&parent, reply_.data() + offset + NLMSG_HEADER + offsetof(tcmsg, tcm_parent), sizeof(parent));
+                if (ifindex == wanted->ifindex && parent == wanted->parent) {
+                    auto parsed = parse_qdisc(std::span<uint8_t const>{reply_.data() + offset, header.nlmsg_len});
+                    if (!parsed) {
+                        return failure(parsed.error());
+                    }
+                    *wanted->found = std::move(*parsed);
+                    wanted->came = true;
+                }
+            }
+            if (ours && header.nlmsg_type == NLMSG_ERROR) {
                 // struct nlmsgerr: int error, then the request's header (capped).
                 if (header.nlmsg_len < NLMSG_HEADER + sizeof(nlmsgerr)) {
                     return failure(std::make_error_code(std::errc::bad_message));
                 }
                 int error = 0;
-                std::memcpy(&error, reply.data() + offset + NLMSG_HEADER, sizeof(error));
+                std::memcpy(&error, reply_.data() + offset + NLMSG_HEADER, sizeof(error));
                 if (error == 0) {
-                    if (answer != nullptr && !answered) {
-                        return failure(std::make_error_code(std::errc::bad_message));
-                    }
                     return success();
                 }
                 // Extended-ack TLVs after the (capped) nlmsgerr.
@@ -446,13 +482,13 @@ auto TcClient::transact(std::span<uint8_t const> const request, uint32_t const s
                     while (at + RTA_HEADER <= end) {
                         uint16_t len = 0;
                         uint16_t type = 0;
-                        std::memcpy(&len, reply.data() + at, sizeof(len));
-                        std::memcpy(&type, reply.data() + at + 2, sizeof(type));
+                        std::memcpy(&len, reply_.data() + at, sizeof(len));
+                        std::memcpy(&type, reply_.data() + at + 2, sizeof(type));
                         if (len < RTA_HEADER || at + len > end) {
                             break;
                         }
                         if ((type & NLA_TYPE_MASK) == NLMSGERR_ATTR_MSG) {
-                            auto const* text = reply.data() + at + RTA_HEADER;
+                            auto const* text = reply_.data() + at + RTA_HEADER;
                             size_t n = len - RTA_HEADER;
                             while (n > 0 && text[n - 1] == 0) {
                                 --n;
@@ -464,14 +500,6 @@ auto TcClient::transact(std::span<uint8_t const> const request, uint32_t const s
                     }
                 }
                 return failure(std::error_code{-error, std::system_category()});
-            }
-            if (answer != nullptr && header.nlmsg_seq == seq && header.nlmsg_type == RTM_NEWQDISC) {
-                auto parsed = parse_qdisc(std::span<uint8_t const>{reply.data() + offset, header.nlmsg_len});
-                if (!parsed) {
-                    return failure(parsed.error());
-                }
-                *answer = std::move(*parsed);
-                answered = true;
             }
             size_t const step = align4(header.nlmsg_len);
             if (step >= remaining) {
