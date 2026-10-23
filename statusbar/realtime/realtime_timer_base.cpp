@@ -125,6 +125,7 @@ auto TimerBase::start(statusbar::itc::StopToken* shutdown_token) -> void
     }
     shutdown_token_ = shutdown_token;
     timer_thread_ = std::thread([this]() -> void {
+        set_current_thread_name("rt-timer");
 #if __cpp_exceptions
         try {
 #endif
@@ -256,11 +257,7 @@ auto TimerBase::wait_until_busy(int64_t deadline_ns, int64_t threshold_ns) noexc
 
     // Busy-wait for remaining time (or all time if period < threshold)
     while ((now_ns = read_monotonic_ns()) < deadline_ns) {
-#if defined(__x86_64__) || defined(__i386__)
-        __builtin_ia32_pause();
-#elif defined(__aarch64__) || defined(__arm__)
-        __asm__ __volatile__("yield");
-#endif
+        cpu_relax();
     }
 
     return now_ns - deadline_ns;

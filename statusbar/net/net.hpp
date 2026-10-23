@@ -21,6 +21,7 @@
 #include "statusbar/net/net_posix_util.hpp"
 #include "statusbar/net/net_raw_ethernet_pollable.hpp"
 #include "statusbar/net/net_rawnet.hpp"
+#include "statusbar/net/net_rawnet_filter.hpp"
 #include "statusbar/net/net_ring_buffer_base.hpp"
 #include "statusbar/net/net_ring_queue_base.hpp"
 #include "statusbar/net/net_server_config.hpp"

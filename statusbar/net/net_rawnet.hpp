@@ -95,6 +95,7 @@ class RawnetContext
         , interface_index_{other.interface_index_}
         , my_mac_{other.my_mac_}
         , default_dest_mac_{other.default_dest_mac_}
+        , transmit_only_{other.transmit_only_}
         , tx_tap_{std::move(other.tx_tap_)}
 #if defined(__APPLE__)
         , bpf_buffer_size_{other.bpf_buffer_size_}
@@ -116,12 +117,35 @@ class RawnetContext
     ///        wire — but it skips the egress tap, so bypass frames are invisible
     ///        to tcpdump/AF_PACKET on the *sending* host. Default-off keeps local
     ///        capture working; enable only for latency-critical TX.
+    /// @param transmit_only Open a socket that only sends and never receives
+    ///        (Linux: an AF_PACKET socket of protocol 0, never bound). A
+    ///        multicast_mac is then only the default destination, not joined.
+    ///        Use it for every socket nobody reads (a stream talker): an
+    ///        unread receiving socket is handed, and drops, a copy of every
+    ///        frame of its ethertype. join_multicast, leave_multicast and
+    ///        set_subtype_filter then refuse (invalid_argument): joining binds
+    ///        the socket, which would hook it, unfiltered, into delivery.
     /// @return Status indicating success or failure
     [[nodiscard]] auto open(
         std::string_view interface_name,
         uint16_t ethertype,
         Eui48 const* multicast_mac = nullptr,
-        bool qdisc_bypass = false) noexcept -> Status;
+        bool qdisc_bypass = false,
+        bool transmit_only = false) noexcept -> Status;
+
+    /// Narrow reception to frames of this socket's ethertype whose first
+    /// payload byte (the AVTP subtype, for 0x22F0) is in @p subtypes,
+    /// untagged or under one 802.1Q tag. Replaces the ethertype-only kernel
+    /// filter open() attached; an empty set restores it. On a shared
+    /// ethertype it keeps, for example, an ATDECC socket from being woken by
+    /// every AVB stream frame on the segment. Linux only: elsewhere a no-op
+    /// success (receivers still check the subtype themselves).
+    /// Frames already queued when it is attached stay queued (the kernel does
+    /// not refilter them), so a receiver still checks the subtype.
+    /// @return invalid_argument for more than rawnet_filter::MAX_SUBTYPES
+    ///         (8) subtypes or on a transmit_only socket; the setsockopt errno
+    ///         on failure
+    [[nodiscard]] auto set_subtype_filter(std::span<uint8_t const> subtypes) const noexcept -> Status;
 
     /// Close the socket
     void close() noexcept;
@@ -231,6 +255,7 @@ class RawnetContext
     int interface_index_{-1};
     Eui48 my_mac_{};
     Eui48 default_dest_mac_{};
+    bool transmit_only_{false};  ///< opened transmit_only: never joins, binds or filters
     TxTap tx_tap_{};
 
 #if defined(__APPLE__)

@@ -494,6 +494,20 @@ TEST(stats_atomic_wake, tracks_error_duration_and_skips)
     EXPECT_EQ(stats.skipped_counts(), 0);
 }
 
+TEST(stats_atomic_wake, duration_recorded_after_the_error)
+{
+    AtomicWakeStats stats;
+    stats.update(300);
+    stats.update_duration(7'000, 4);
+
+    auto const snap = stats.snapshot();
+    EXPECT_EQ(snap.error.count, 1);
+    EXPECT_EQ(snap.error.max_ns, 300);
+    EXPECT_EQ(snap.duration.count, 1);
+    EXPECT_EQ(snap.duration.max_ns, 7'000);
+    EXPECT_EQ(snap.skipped_counts, 4);
+}
+
 //
 // Test Runner
 //

@@ -4,6 +4,12 @@
 #include "statusbar/net/net_rawnet.hpp"
 
 #include "statusbar/net/net_posix_util.hpp"
+#include "statusbar/net/net_rawnet_filter.hpp"
+
+#include <array>
+#include <cstddef>
+#include <cstring>
+#include <tuple>
 
 #if defined(__linux__)
 #    include <arpa/inet.h>
@@ -32,6 +38,7 @@ auto RawnetContext::operator=(RawnetContext&& other) noexcept -> RawnetContext&
         interface_index_ = other.interface_index_;
         my_mac_ = other.my_mac_;
         default_dest_mac_ = other.default_dest_mac_;
+        transmit_only_ = other.transmit_only_;
         tx_tap_ = std::move(other.tx_tap_);
 #if defined(__APPLE__)
         bpf_buffer_size_ = other.bpf_buffer_size_;
@@ -49,10 +56,37 @@ auto RawnetContext::operator=(RawnetContext&& other) noexcept -> RawnetContext&
 
 #if defined(__linux__)
 
-[[nodiscard]] auto RawnetContext::open(
-    std::string_view interface_name, uint16_t ethertype, Eui48 const* multicast_mac, bool qdisc_bypass) noexcept -> Status
+namespace {
+
+/// Attach @p program to @p sock_fd (SO_ATTACH_FILTER replaces any filter
+/// already attached). @return 0, or the setsockopt errno.
+auto attach_filter(int const sock_fd, rawnet_filter::Program const& program) noexcept -> int
 {
-    // Create with ETH_P_ALL (not htons(ethertype)) so the socket sits in the
+    static_assert(sizeof(sock_filter) == sizeof(cbpf::Instruction));
+    static_assert(offsetof(sock_filter, k) == offsetof(cbpf::Instruction, k));
+    std::array<sock_filter, std::tuple_size_v<decltype(program.code)>> code{};
+    std::memcpy(code.data(), program.code.data(), program.length * sizeof(sock_filter));
+    sock_fprog const prog{.len = static_cast<unsigned short>(program.length), .filter = code.data()};
+    return ::setsockopt(sock_fd, SOL_SOCKET, SO_ATTACH_FILTER, &prog, sizeof(prog)) == 0 ? 0 : errno;
+}
+
+}  // namespace
+
+[[nodiscard]] auto RawnetContext::open(
+    std::string_view interface_name,
+    uint16_t ethertype,
+    Eui48 const* multicast_mac,
+    bool qdisc_bypass,
+    bool transmit_only) noexcept -> Status
+{
+    // A transmit-only socket is created with protocol 0: it is never hooked
+    // into packet delivery (ptype_all or a protocol hash) at all, so it
+    // receives nothing. sendto still names the frame's protocol in
+    // sll_protocol. Opened with ETH_P_ALL and never read, it would instead be
+    // handed a clone of every frame of `ethertype` on every interface, then
+    // drop each one with its receive buffer full.
+    //
+    // Otherwise create with ETH_P_ALL (not htons(ethertype)) so the socket sits in the
     // kernel's ptype_all list and therefore receives BOTH wire frames AND
     // locally-transmitted (PACKET_OUTGOING) frames via the egress tap. The egress
     // tap (dev_queue_xmit_nit) only feeds ETH_P_ALL sockets, never protocol-bound
@@ -62,26 +96,17 @@ auto RawnetContext::operator=(RawnetContext&& other) noexcept -> RawnetContext&
     // ATDECC controller hearing a co-located entity). A cBPF filter below narrows
     // delivery back down to `ethertype` in the kernel so we don't drown in
     // unrelated traffic. TX is unaffected (sendto carries its own sll_protocol).
-    int const sock_fd = ::socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    int const sock_fd = ::socket(AF_PACKET, SOCK_RAW, transmit_only ? 0 : htons(ETH_P_ALL));
     if (sock_fd < 0) {
         return failure(NetError::socket_creation_failed);
     }
 
     // Attach a classic-BPF program: accept only frames whose ethertype is
     // `ethertype`, whether untagged (ethertype at L2 offset 12) or carrying one
-    // 802.1Q tag (0x8100 at 12, inner ethertype at 16).
-    {
-        sock_filter code[] = {
-            {BPF_LD | BPF_H | BPF_ABS, 0, 0, 12},            // 0: A = ethertype @12
-            {BPF_JMP | BPF_JEQ | BPF_K, 4, 0, ethertype},    // 1: A==type -> accept (6)
-            {BPF_JMP | BPF_JEQ | BPF_K, 0, 2, ETH_P_8021Q},  // 2: A==0x8100 -> inner (3) else drop (5)
-            {BPF_LD | BPF_H | BPF_ABS, 0, 0, 16},            // 3: A = inner ethertype @16
-            {BPF_JMP | BPF_JEQ | BPF_K, 1, 0, ethertype},    // 4: inner==type -> accept (6) else drop (5)
-            {BPF_RET | BPF_K, 0, 0, 0},                      // 5: drop
-            {BPF_RET | BPF_K, 0, 0, 0xFFFFFFFFU},            // 6: accept
-        };
-        sock_fprog const prog{.len = static_cast<unsigned short>(sizeof(code) / sizeof(code[0])), .filter = code};
-        (void)::setsockopt(sock_fd, SOL_SOCKET, SO_ATTACH_FILTER, &prog, sizeof(prog));  // non-fatal
+    // 802.1Q tag (0x8100 at 12, inner ethertype at 16). set_subtype_filter
+    // narrows it further.
+    if (!transmit_only) {
+        (void)attach_filter(sock_fd, rawnet_filter::ethertype_filter(ethertype));  // non-fatal
     }
 
     // Get interface index
@@ -126,7 +151,7 @@ auto RawnetContext::operator=(RawnetContext&& other) noexcept -> RawnetContext&
     // Also open the socket promiscuous so it receives every frame of its
     // ethertype regardless of multicast-group membership.
     (void)qdisc_bypass;
-    {
+    if (!transmit_only) {
         struct packet_mreq promisc{};
         promisc.mr_ifindex = interface_index_;
         promisc.mr_type = PACKET_MR_PROMISC;
@@ -143,11 +168,13 @@ auto RawnetContext::operator=(RawnetContext&& other) noexcept -> RawnetContext&
 
     fd_ = sock_fd;
     ethertype_ = ethertype;
+    transmit_only_ = transmit_only;
 
-    // Set default destination MAC if provided
+    // Set default destination MAC if provided. A transmit-only socket only
+    // sends to it: joining would bind it, and so hook it into delivery.
     if (multicast_mac != nullptr) {
         default_dest_mac_ = *multicast_mac;
-        if (auto status = join_multicast(*multicast_mac); !status) {
+        if (auto status = transmit_only ? success() : join_multicast(*multicast_mac); !status) {
             close();
             return status;
         }
@@ -159,6 +186,20 @@ auto RawnetContext::operator=(RawnetContext&& other) noexcept -> RawnetContext&
         return status;
     }
 
+    return success();
+}
+
+[[nodiscard]] auto RawnetContext::set_subtype_filter(std::span<uint8_t const> const subtypes) const noexcept -> Status
+{
+    if (fd_ < 0) {
+        return failure(NetError::not_connected);
+    }
+    if (transmit_only_ || subtypes.size() > rawnet_filter::MAX_SUBTYPES) {
+        return failure(std::make_error_code(std::errc::invalid_argument));
+    }
+    if (int const err = attach_filter(fd_, rawnet_filter::subtype_filter(ethertype_, subtypes)); err != 0) {
+        return failure(std::error_code(err, std::system_category()));
+    }
     return success();
 }
 
@@ -380,6 +421,9 @@ void RawnetContext::close() noexcept
     if (fd_ < 0) {
         return failure(NetError::not_connected);
     }
+    if (transmit_only_) {
+        return failure(std::make_error_code(std::errc::invalid_argument));
+    }
 
     // Bind to interface. CRITICAL: bind with sll_protocol = ETH_P_ALL, NOT
     // htons(ethertype_). Binding to a specific protocol re-registers the socket
@@ -420,6 +464,9 @@ void RawnetContext::close() noexcept
     if (fd_ < 0) {
         return failure(NetError::not_connected);
     }
+    if (transmit_only_) {
+        return failure(std::make_error_code(std::errc::invalid_argument));
+    }
 
     // Symmetric to join_multicast: drop the NIC multicast filter entry. No
     // re-bind needed — leaving membership does not touch the socket's protocol
@@ -446,7 +493,11 @@ void RawnetContext::close() noexcept
 #if defined(__APPLE__)
 
 [[nodiscard]] auto RawnetContext::open(
-    std::string_view interface_name, uint16_t ethertype, Eui48 const* multicast_mac, bool qdisc_bypass) noexcept -> Status
+    std::string_view interface_name,
+    uint16_t ethertype,
+    Eui48 const* multicast_mac,
+    bool qdisc_bypass,
+    bool transmit_only) noexcept -> Status
 {
     (void)qdisc_bypass;  // qdisc bypass is a Linux AF_PACKET concept; no-op on macOS BPF
     // Find and open an available BPF device
@@ -557,6 +608,13 @@ void RawnetContext::close() noexcept
     struct bpf_program prog{};
     prog.bf_len = sizeof(filter) / sizeof(filter[0]);
     prog.bf_insns = filter;
+    // Transmit-only: accept nothing, or the device copies every matching
+    // frame into its store buffer, unread, until it overflows.
+    struct bpf_insn drop_all[] = {BPF_STMT(BPF_RET + BPF_K, 0)};
+    if (transmit_only) {
+        prog.bf_len = 1;
+        prog.bf_insns = drop_all;
+    }
 
     if (::ioctl(bpf_fd, BIOCSETF, &prog) < 0) {
         ::close(bpf_fd);
@@ -565,6 +623,7 @@ void RawnetContext::close() noexcept
 
     fd_ = bpf_fd;
     ethertype_ = ethertype;
+    transmit_only_ = transmit_only;
 
     // Set default destination MAC if provided
     if (multicast_mac != nullptr) {
@@ -816,5 +875,16 @@ auto RawnetContext::set_priority(int const priority) noexcept -> Status
 #endif
     return success();
 }
+
+#if !defined(__linux__)
+[[nodiscard]] auto RawnetContext::set_subtype_filter(std::span<uint8_t const> const subtypes) const noexcept -> Status
+{
+    if (fd_ < 0) {
+        return failure(NetError::not_connected);
+    }
+    (void)subtypes;  // the BPF device keeps its ethertype filter; receivers check the subtype anyway
+    return success();
+}
+#endif
 
 }  // namespace statusbar::net

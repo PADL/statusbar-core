@@ -28,8 +28,10 @@
 
 #include "statusbar/itc/itc_stop_token.hpp"
 
+#include <array>
 #include <atomic>
 #include <cctype>
+#include <cstddef>
 #include <csignal>
 #include <print>
 #include <string>
@@ -84,6 +86,48 @@ inline auto now_monotonic_raw_ns() noexcept -> int64_t
 }
 
 }  // namespace detail
+
+/// One iteration of a busy-wait: a CPU spin hint (`pause` on x86, `yield` on
+/// ARM) and no syscall. Lowers the power of the spin, frees execution
+/// resources for a hyperthread sibling and avoids the memory-order mis-
+/// speculation penalty on loop exit. Unlike sched_yield it never enters the
+/// kernel, so a spin made of these lands within tens of nanoseconds of its
+/// deadline rather than within a syscall round trip.
+inline void cpu_relax() noexcept
+{
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield" ::: "memory");
+#else
+    __asm__ __volatile__("" ::: "memory");
+#endif
+}
+
+/// Name the calling thread, for `top -H`, `ps -L`, perf and gdb. Linux keeps
+/// at most 15 characters; a longer name is truncated. Do not call it on a
+/// process's main thread: there the name is the process name (`pgrep`,
+/// `killall`, systemd's comm). A no-op where threads cannot be named.
+inline void set_current_thread_name(std::string_view const name) noexcept
+{
+#if defined(__linux__) || defined(__APPLE__)
+#    if defined(__linux__)
+    constexpr std::size_t max_len = 15;
+#    else
+    constexpr std::size_t max_len = 63;
+#    endif
+    std::array<char, max_len + 1> buf{};
+    std::size_t const n = name.size() < max_len ? name.size() : max_len;
+    std::memcpy(buf.data(), name.data(), n);
+#    if defined(__linux__)
+    (void)::pthread_setname_np(::pthread_self(), buf.data());
+#    else
+    (void)::pthread_setname_np(buf.data());
+#    endif
+#else
+    (void)name;
+#endif
+}
 
 //
 // Result Types for Realtime Operations

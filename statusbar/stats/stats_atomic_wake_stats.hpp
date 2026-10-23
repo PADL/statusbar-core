@@ -82,6 +82,15 @@ class AtomicWakeStats : public AtomicWakeStatsBase
         add_skipped(skipped_counts);
     }
 
+    /// Record a duration (and skipped counts) for a wake whose error update()
+    /// already recorded: for a duration only known after the wake's work.
+    void update_duration(int64_t duration_ns, int64_t skipped_counts = 0) noexcept
+    {
+        duration_.update(duration_ns);
+        duration_histogram_.update(duration_ns);
+        add_skipped(skipped_counts);
+    }
+
     void update_with_duration(int64_t error_ns, int64_t duration_ns, int64_t skipped_counts = 0) noexcept
     {
         error_.update(error_ns);
