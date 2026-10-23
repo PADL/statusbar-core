@@ -193,6 +193,16 @@ class TcClient final : public TcControl
 
     [[nodiscard]] auto last_message() const noexcept -> std::string const& override { return last_message_; }
 
+    /// Send one other rtnetlink request that the kernel acknowledges (e.g.
+    /// net_vlan_link's RTM_NEWLINK / RTM_DELLINK), built by @p build (out,
+    /// seq) -> StatusValue<size_t> into a RequestBuffer under the next
+    /// sequence number. Errors: the builder's, or the kernel's errno.
+    template <typename Build>
+    [[nodiscard]] auto request(Build const& build) -> Status
+    {
+        return send(build);
+    }
+
   private:
     /// Build one request with @p build (out, seq) -> StatusValue<size_t> under
     /// the next sequence number and transact it.
