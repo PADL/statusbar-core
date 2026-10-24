@@ -38,6 +38,7 @@ extern unsigned int const xdp_filter_bpf_o_len;
 #endif  // __linux__ && HAVE_XDP
 
 #if defined(__linux__)
+#    include <linux/if_link.h>
 #    include <linux/if_xdp.h>
 #endif
 
@@ -50,6 +51,7 @@ extern unsigned int const xdp_filter_bpf_o_len;
 #include "statusbar/status/throw_or_abort.hpp"
 
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -93,6 +95,11 @@ enum class XdpError
     not_supported_on_platform,
     invalid_bpf_program,
     too_many_filter_rules,
+    leave_multicast_failed,
+    bpf_query_failed,
+    bpf_pin_failed,
+    bpf_detach_failed,
+    zero_copy_needs_native_attach,
 };
 
 class XdpErrorCategory : public std::error_category
@@ -127,14 +134,23 @@ enum class XdpAction : uint8_t
     redirect_tap,
 };
 
-/// How the XSK socket binds to the queue. auto_ lets the kernel choose
-/// (zero-copy when the driver offers it, copy otherwise); zero_copy fails the
-/// bind if the driver cannot do zero-copy; copy forces copy mode.
+/// How the XSK socket binds. auto_: zero-copy under a native program when the
+/// driver offers it, else copy (never zero-copy under a generic program);
+/// zero_copy: native and zero-copy or fail; copy: copy mode.
 enum class XdpBindMode : uint8_t
 {
     auto_,
     zero_copy,
     copy,
+};
+
+/// How the XDP program is attached. native (driver mode) is what zero-copy
+/// needs, but attaching or detaching it on a running igb link resets the
+/// adapter; generic (SKB mode): no reset, copy mode only.
+enum class XdpAttachMode : uint8_t
+{
+    native,
+    generic,
 };
 
 struct XdpConfig
@@ -153,9 +169,85 @@ struct XdpConfig
     unsigned int tap_ifindex{0};
     size_t rx_drain_max{32};
     size_t completion_drain_max{64};
+    /// The clock rx_start() stamps frames with; -1: none (timestamp_ns 0, no
+    /// clock_gettime per frame).
     int rx_clock_id{CLOCK_MONOTONIC_RAW};
     XdpBindMode bind_mode{XdpBindMode::auto_};
+    /// The mode a fresh attach asks for (a refused native attach falls back to
+    /// generic unless bind_mode is zero_copy). An attached native program
+    /// stays native whatever this says; a generic one gives way to native.
+    XdpAttachMode attach_mode{XdpAttachMode::native};
+    /// A bpffs directory (XdpProgram::pin_path_for()) where a fresh program is
+    /// pinned and, with `adopt`, from which the same program still attached is
+    /// adopted instead of attaching another. Empty: no pinning.
+    std::string_view pin_path{};
+    bool adopt{true};
+    /// Detach the program at close. Default: a generic program this context
+    /// attached; a native one stays (a native detach resets igb).
+    std::optional<bool> detach_on_close{};
+    /// Bind with XDP_USE_NEED_WAKEUP: tx_flush() kicks only when the kernel
+    /// asks for it, fill_replenish() wakes RX only when the fill ring ran dry.
+    bool need_wakeup{true};
 };
+
+/// The XDP program attached to an interface, as bpf_xdp_query() reports it.
+struct XdpAttachedProgram
+{
+    uint32_t prog_id{0};
+    XdpAttachMode mode{XdpAttachMode::native};
+};
+
+/// Counters of one XDP socket (XdpContext::stats()).
+struct XdpSocketStats
+{
+    uint64_t rx_count{0};
+    uint64_t tx_count{0};
+    uint64_t tx_ring_full_count{0};
+    uint64_t umem_exhausted_count{0};
+    uint64_t rx_budget_hit_count{0};
+    uint64_t tx_flush_count{0};      ///< kicks made (sendto)
+    uint64_t tx_flush_skipped{0};    ///< kicks not needed (ring drained, or no wakeup asked for)
+    uint64_t tx_flush_failed{0};     ///< kicks the kernel refused
+    uint64_t tx_flush_transient{0};  ///< kicks that dropped a frame or found the link down (EBUSY, ENOBUFS, ENETDOWN)
+    int tx_flush_errno{0};           ///< the last refused kick's errno
+    uint64_t rx_wakeup_count{0};     ///< fill-ring wakeups (recvfrom)
+};
+
+namespace detail {
+
+/// What an attach tries: `first`, then `fallback` if the driver refuses it.
+struct AttachPlan
+{
+    XdpAttachMode first{XdpAttachMode::native};
+    std::optional<XdpAttachMode> fallback;
+};
+
+/// A fresh attach's plan: zero-copy is native or nothing; native falls back to generic.
+/// @param requested XdpConfig::attach_mode
+/// @param bind XdpConfig::bind_mode
+[[nodiscard]] constexpr auto attach_plan(XdpAttachMode requested, XdpBindMode bind) noexcept -> std::expected<AttachPlan, XdpError>
+{
+    if (bind == XdpBindMode::zero_copy) {
+        if (requested != XdpAttachMode::native) {
+            return std::unexpected(XdpError::zero_copy_needs_native_attach);
+        }
+        return AttachPlan{.first = XdpAttachMode::native, .fallback = std::nullopt};
+    }
+    if (requested == XdpAttachMode::native) {
+        return AttachPlan{.first = XdpAttachMode::native, .fallback = XdpAttachMode::generic};
+    }
+    return AttachPlan{.first = XdpAttachMode::generic, .fallback = std::nullopt};
+}
+
+/// The mode beside an attached program: native stays native, generic gives way to native.
+/// @param attached The attached program's mode
+/// @param requested XdpConfig::attach_mode
+[[nodiscard]] constexpr auto effective_attach_mode(XdpAttachMode attached, XdpAttachMode requested) noexcept -> XdpAttachMode
+{
+    return attached == XdpAttachMode::native ? XdpAttachMode::native : requested;
+}
+
+}  // namespace detail
 
 }  // namespace statusbar::net
 
@@ -270,19 +362,39 @@ struct CycleBudget
 }
 
 #if defined(__linux__)
-/// The sxdp_flags for a bind mode: 0, XDP_ZEROCOPY or XDP_COPY.
-/// @param mode Requested bind mode
-[[nodiscard]] constexpr auto xdp_bind_flags(XdpBindMode mode) noexcept -> uint16_t
+/// The sxdp_flags for `mode` under a program attached in `attached` mode:
+/// auto_ is 0 (the kernel picks) under native, XDP_COPY under generic;
+/// zero_copy under generic is refused. Plus XDP_USE_NEED_WAKEUP if asked.
+[[nodiscard]] constexpr auto xdp_bind_flags(XdpBindMode mode, XdpAttachMode attached, bool need_wakeup) noexcept
+    -> std::expected<uint16_t, XdpError>
 {
+    auto const wakeup = static_cast<uint16_t>(need_wakeup ? XDP_USE_NEED_WAKEUP : 0);
     switch (mode) {
         case XdpBindMode::zero_copy:
-            return XDP_ZEROCOPY;
+            if (attached != XdpAttachMode::native) {
+                return std::unexpected(XdpError::zero_copy_needs_native_attach);
+            }
+            return static_cast<uint16_t>(XDP_ZEROCOPY | wakeup);
         case XdpBindMode::copy:
-            return XDP_COPY;
+            return static_cast<uint16_t>(XDP_COPY | wakeup);
         case XdpBindMode::auto_:
             break;
     }
-    return 0;
+    return static_cast<uint16_t>((attached == XdpAttachMode::native ? 0 : XDP_COPY) | wakeup);
+}
+
+/// Errors a kick may meet in passing: EAGAIN (the rest next kick), EBUSY (a
+/// frame dropped), ENOBUFS, ENETDOWN (a link flap).
+[[nodiscard]] constexpr auto is_transient_kick_error(int error) noexcept -> bool
+{
+    return error == EAGAIN || error == EWOULDBLOCK || error == EBUSY || error == ENOBUFS || error == ENETDOWN;
+}
+
+/// The XDP_FLAGS_* mode bit for an attach mode.
+/// @param mode Attach mode
+[[nodiscard]] constexpr auto xdp_attach_flags(XdpAttachMode mode) noexcept -> uint32_t
+{
+    return mode == XdpAttachMode::native ? XDP_FLAGS_DRV_MODE : XDP_FLAGS_SKB_MODE;
 }
 #endif
 
@@ -444,129 +556,125 @@ class BpfObject
     struct bpf_object* obj_{nullptr};
 };
 
-/// RAII wrapper for an XDP program attached to a network interface.
-/// Owns a BpfObject — destructor detaches the program first, then
-/// the BpfObject destructor closes the BPF object.
-class BpfAttachment
+/// An owned file descriptor (a pinned BPF object from bpf_obj_get()).
+class OwnedFd
 {
   public:
-    BpfAttachment() = default;
-
-    ~BpfAttachment() noexcept { detach(); }
-
-    BpfAttachment(BpfAttachment&& other) noexcept { swap(other); }
-
-    auto operator=(BpfAttachment&& other) noexcept -> BpfAttachment&
+    OwnedFd() = default;
+    /// @param fd Descriptor to own (negative: none)
+    explicit OwnedFd(int fd) noexcept
+        : fd_{fd}
+    {}
+    ~OwnedFd() noexcept { reset(); }
+    OwnedFd(OwnedFd&& other) noexcept
+        : fd_{std::exchange(other.fd_, -1)}
+    {}
+    auto operator=(OwnedFd&& other) noexcept -> OwnedFd&
     {
         if (this != &other) {
-            detach();
-            swap(other);
+            reset();
+            fd_ = std::exchange(other.fd_, -1);
         }
         return *this;
     }
+    OwnedFd(OwnedFd const&) = delete;
+    auto operator=(OwnedFd const&) -> OwnedFd& = delete;
 
-    BpfAttachment(BpfAttachment const&) = delete;
-    auto operator=(BpfAttachment const&) -> BpfAttachment& = delete;
-
-    /// Attach an XDP program to an interface. Takes ownership of the BpfObject.
-    /// @param obj BPF object (ownership transferred)
-    /// @param prog_fd File descriptor of the XDP program
-    /// @param if_index Network interface index to attach to
-    [[nodiscard]] auto attach(BpfObject&& obj, int prog_fd, unsigned int if_index) -> Status
+    void reset() noexcept
     {
-        detach();
-        int const ret = bpf_xdp_attach(static_cast<int>(if_index), prog_fd, XDP_FLAGS_SKB_MODE, nullptr);
-        if (ret != 0) {
-            return failure(XdpError::bpf_attach_failed);
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
         }
-        obj_ = std::move(obj);
-        if_index_ = if_index;
-        attached_ = true;
-        return success();
     }
-
-    void detach() noexcept
-    {
-        if (attached_) {
-            (void)bpf_xdp_detach(static_cast<int>(if_index_), XDP_FLAGS_SKB_MODE, nullptr);
-            attached_ = false;
-            if_index_ = 0;
-        }
-        obj_.reset();
-    }
-
-    [[nodiscard]] auto is_attached() const noexcept -> bool { return attached_; }
+    [[nodiscard]] auto get() const noexcept -> int { return fd_; }
 
   private:
-    void swap(BpfAttachment& other) noexcept
-    {
-        std::swap(obj_, other.obj_);
-        std::swap(if_index_, other.if_index_);
-        std::swap(attached_, other.attached_);
-    }
-
-    BpfObject obj_;
-    unsigned int if_index_{0};
-    bool attached_{false};
+    int fd_{-1};
 };
 
-/// High-level BPF lifecycle: load, attach, manage filter maps.
-/// Owns a BpfAttachment (which owns the BpfObject). Destruction order:
-/// detach program -> close BPF object -> invalidate cached fds.
-class BpfState
+}  // namespace detail
+
+/// The XDP filter program (xdp_filter.bpf.c) on one interface: adopted from
+/// its pins when still attached, else loaded, attached (replacing in place
+/// what is attached in that mode) and pinned. Detached at close only if asked.
+class XdpProgram
 {
   public:
-    BpfState() = default;
-    ~BpfState() { close(); }
+    struct Options
+    {
+        std::span<CompiledRule<32> const> filter_rules{};
+        XdpAction default_action{XdpAction::pass_kernel};
+        XdpAttachMode attach_mode{XdpAttachMode::native};
+        /// A refused native attach falls back to generic.
+        bool allow_generic_fallback{true};
+        std::string_view pin_path{};
+        bool adopt{true};
+        std::optional<bool> detach_on_close{};
+    };
 
-    BpfState(BpfState&& other) noexcept { swap(other); }
+    /// Where pin_path_for() puts an interface's pins.
+    static constexpr std::string_view PIN_ROOT = "/sys/fs/bpf/statusbar";
+    /// The names of the pins under a pin path.
+    static constexpr std::string_view PIN_PROG = "prog";
+    static constexpr std::string_view PIN_RULES_MAP = "rules_map";
+    static constexpr std::string_view PIN_XSK_MAP = "xsk_map";
+    static constexpr std::string_view PIN_DEVMAP = "devmap";
 
-    auto operator=(BpfState&& other) noexcept -> BpfState&
+    /// PIN_ROOT/<ifname>.
+    /// @param interface_name Interface name
+    [[nodiscard]] static auto pin_path_for(std::string_view interface_name) -> std::string
+    {
+        return std::string{PIN_ROOT} + "/" + std::string{interface_name};
+    }
+
+    /// The program attached to `if_index`, or nullopt when none is.
+    /// @param if_index Interface index
+    [[nodiscard]] static auto query(unsigned int if_index) -> StatusValue<std::optional<XdpAttachedProgram>>;
+
+    /// Detach any XDP program on `if_index` and remove the pins under
+    /// `pin_path` (empty: none). A native detach on a running link resets igb.
+    [[nodiscard]] static auto detach(unsigned int if_index, std::string_view pin_path) -> Status;
+
+    XdpProgram() = default;
+    ~XdpProgram() { close(); }
+    XdpProgram(XdpProgram&& other) noexcept { std::swap(state_, other.state_); }
+    auto operator=(XdpProgram&& other) noexcept -> XdpProgram&
     {
         if (this != &other) {
             close();
-            swap(other);
+            std::swap(state_, other.state_);
         }
         return *this;
     }
+    XdpProgram(XdpProgram const&) = delete;
+    auto operator=(XdpProgram const&) -> XdpProgram& = delete;
 
-    BpfState(BpfState const&) = delete;
-    auto operator=(BpfState const&) -> BpfState& = delete;
+    /// Adopt, or load, attach and pin, the program on `if_index`, with
+    /// `options.filter_rules` installed either way.
+    [[nodiscard]] auto open(unsigned int if_index, Options const& options) -> Status;
+    /// Release the program, detaching it (and removing its pins) when
+    /// will_detach_on_close().
+    void close() noexcept;
 
-    /// Load BPF object from embedded bytes, find maps, install rules, find program.
-    /// @param rules Compiled TCAM rules to install into the BPF array map
-    /// @param default_action Action applied to frames that match no user rule
-    [[nodiscard]] auto load(std::span<CompiledRule<32> const> rules, XdpAction default_action) -> Status;
+    [[nodiscard]] auto valid() const noexcept -> bool { return state_.prog_fd >= 0; }
+    /// The mode the program runs in.
+    [[nodiscard]] auto attach_mode() const noexcept -> XdpAttachMode { return state_.mode; }
+    /// True when open() adopted a pinned program rather than attaching one.
+    [[nodiscard]] auto adopted() const noexcept -> bool { return state_.adopted; }
+    /// True when the program is pinned (by this open() or adopted from the pins).
+    [[nodiscard]] auto pinned() const noexcept -> bool { return !state_.pin_path.empty(); }
+    [[nodiscard]] auto prog_id() const noexcept -> uint32_t { return state_.prog_id; }
+    [[nodiscard]] auto will_detach_on_close() const noexcept -> bool { return state_.detach_on_close; }
+    [[nodiscard]] auto rules_map_fd() const noexcept -> int { return state_.rules_map_fd; }
 
-    /// Attach XDP program to interface, register XSK fd in xsk_map.
-    /// @param if_index Network interface index to attach to
-    /// @param queue_id Hardware queue ID for the XSK socket
-    /// @param xsk_fd File descriptor of the XSK socket
-    [[nodiscard]] auto attach(unsigned int if_index, uint32_t queue_id, int xsk_fd) -> Status
-    {
-        if (auto status = attachment_.attach(std::move(obj_), prog_fd_, if_index); !status) {
-            return status;
-        }
-
-        int const ret = bpf_map_update_elem(xsk_map_fd_, &queue_id, &xsk_fd, BPF_ANY);
-        if (ret != 0) {
-            return failure(XdpError::bpf_map_update_failed);
-        }
-
-        return success();
-    }
+    /// Redirect `queue_id`'s matching frames to `xsk_fd` (the kernel drops the
+    /// entry when the socket closes).
+    [[nodiscard]] auto register_socket(uint32_t queue_id, int xsk_fd) -> Status;
 
     /// Register TAP interface in devmap
     /// @param tap_ifindex Interface index of the TAP device
-    [[nodiscard]] auto register_tap(unsigned int tap_ifindex) -> Status
-    {
-        uint32_t zero_key = 0;
-        int const ret = bpf_map_update_elem(devmap_fd_, &zero_key, &tap_ifindex, BPF_ANY);
-        if (ret != 0) {
-            return failure(XdpError::bpf_map_update_failed);
-        }
-        return success();
-    }
+    [[nodiscard]] auto register_tap(unsigned int tap_ifindex) -> Status;
 
     /// Replace the rule set in-place. Stale slots are zeroed so old
     /// rules cannot match after the call returns.
@@ -574,68 +682,52 @@ class BpfState
     ///              rules.size() > TCAM_MAX_RULES - (default_action != pass_kernel ? 1 : 0)
     [[nodiscard]] auto set_rules(std::span<CompiledRule<32> const> rules) -> Status
     {
-        if (rules_map_fd_ < 0) {
+        if (state_.rules_map_fd < 0) {
             return failure(XdpError::not_open);
         }
         return install_tcam_rules(rules);
     }
 
-    void close() noexcept
-    {
-        attachment_.detach();
-        obj_.reset();
-        prog_fd_ = -1;
-        xsk_map_fd_ = -1;
-        rules_map_fd_ = -1;
-        devmap_fd_ = -1;
-        default_action_ = XdpAction::pass_kernel;
-    }
-
-    [[nodiscard]] auto rules_map_fd() const noexcept -> int { return rules_map_fd_; }
-
   private:
-    [[nodiscard]] auto install_tcam_rules(std::span<CompiledRule<32> const> rules) -> Status;
-
-    void swap(BpfState& other) noexcept
+    struct State
     {
-        std::swap(obj_, other.obj_);
-        std::swap(attachment_, other.attachment_);
-        std::swap(prog_fd_, other.prog_fd_);
-        std::swap(default_action_, other.default_action_);
-        std::swap(xsk_map_fd_, other.xsk_map_fd_);
-        std::swap(rules_map_fd_, other.rules_map_fd_);
-        std::swap(devmap_fd_, other.devmap_fd_);
-    }
-
-    BpfObject obj_;
-    BpfAttachment attachment_;
-    int prog_fd_{-1};
-    XdpAction default_action_{XdpAction::pass_kernel};
-    int xsk_map_fd_{-1};
-    int rules_map_fd_{-1};
-    int devmap_fd_{-1};
-};
-
-}  // namespace detail
-
-class XdpContext
-{
-  public:
-    struct Stats
-    {
-        uint64_t rx_count{0};
-        uint64_t tx_count{0};
-        uint64_t tx_ring_full_count{0};
-        uint64_t umem_exhausted_count{0};
-        uint64_t rx_budget_hit_count{0};
+        detail::BpfObject obj;  ///< the program this open() loaded
+        detail::OwnedFd adopted_prog;
+        detail::OwnedFd adopted_rules_map;
+        detail::OwnedFd adopted_xsk_map;
+        detail::OwnedFd adopted_devmap;
+        int prog_fd{-1};
+        int rules_map_fd{-1};
+        int xsk_map_fd{-1};
+        int devmap_fd{-1};
+        unsigned int if_index{0};
+        uint32_t prog_id{0};
+        XdpAttachMode mode{XdpAttachMode::native};
+        XdpAction default_action{XdpAction::pass_kernel};
+        bool attached{false};  ///< attached by this open() (not adopted)
+        bool adopted{false};
+        bool detach_on_close{false};
+        std::string pin_path;  ///< pinned by this open(), or adopted from
     };
 
-    XdpContext() = default;
-    ~XdpContext() { close(); }
+    [[nodiscard]] auto install_tcam_rules(std::span<CompiledRule<32> const> rules) -> Status;
+    [[nodiscard]] auto try_adopt(XdpAttachedProgram const& attached, Options const& options) -> bool;
+    [[nodiscard]] auto pin(std::string_view pin_path) -> Status;
 
-    XdpContext(XdpContext&& other) noexcept { swap(other); }
+    State state_;
+};
 
-    auto operator=(XdpContext&& other) noexcept -> XdpContext&
+/// One AF_XDP socket (UMEM and rings) bound to one interface queue, with the
+/// EthernetPort operations: real-time safe, single-threaded.
+class XdpSocket
+{
+  public:
+    using Stats = XdpSocketStats;
+
+    XdpSocket() = default;
+    ~XdpSocket() { close(); }
+    XdpSocket(XdpSocket&& other) noexcept { swap(other); }
+    auto operator=(XdpSocket&& other) noexcept -> XdpSocket&
     {
         if (this != &other) {
             close();
@@ -643,35 +735,22 @@ class XdpContext
         }
         return *this;
     }
+    XdpSocket(XdpSocket const&) = delete;
+    auto operator=(XdpSocket const&) -> XdpSocket& = delete;
 
-    XdpContext(XdpContext const&) = delete;
-    auto operator=(XdpContext const&) -> XdpContext& = delete;
-
-    /// @param config Configuration specifying interface, filters, ring sizes, and UMEM layout
-    [[nodiscard]] auto open(XdpConfig const& config) -> Status;
+    /// Allocate the UMEM and bind to `config.queue_id`, with xdp_bind_flags()
+    /// for a program attached in `attached` mode. Leaves the fill ring empty.
+    [[nodiscard]] auto open(XdpConfig const& config, XdpAttachMode attached) -> Status;
     void close() noexcept;
+
     [[nodiscard]] auto valid() const noexcept -> bool { return xsk_ != nullptr; }
-
-    [[nodiscard]] auto xsk_fd() const noexcept -> int { return xsk_ != nullptr ? xsk_socket__fd(xsk_) : -1; }
-    [[nodiscard]] auto fd() const noexcept -> int { return xsk_fd(); }
-
-    [[nodiscard]] auto hardware_address() const noexcept -> ieee::Eui48 const& { return interface_.hardware_address; }
-    [[nodiscard]] auto interface_index() const noexcept -> unsigned int { return interface_.index; }
-
-    /// True when the bound socket runs in zero-copy mode (XDP_OPTIONS_ZEROCOPY
-    /// read back after the bind); false in copy mode or when not open.
+    [[nodiscard]] auto fd() const noexcept -> int { return xsk_ != nullptr ? xsk_socket__fd(xsk_) : -1; }
+    /// True when the socket runs zero-copy: the program is native and the
+    /// bind read back XDP_OPTIONS_ZEROCOPY.
     [[nodiscard]] auto zero_copy() const noexcept -> bool { return zero_copy_; }
-    /// The bind mode requested at open().
     [[nodiscard]] auto bind_mode() const noexcept -> XdpBindMode { return bind_mode_; }
 
     void begin_cycle() noexcept { budget_.rx_cycle_count = 0; }
-
-    [[nodiscard]] auto end_cycle() -> Status
-    {
-        auto fill_status = fill_replenish();
-        auto comp_status = tx_complete();
-        return fill_status ? comp_status : fill_status;
-    }
 
     /// @param launch_time_ns TSN/AVB launch time in nanoseconds (currently unused, reserved)
     [[nodiscard]] auto tx_start(int64_t launch_time_ns = 0) -> StatusValue<EthernetTxSlot>
@@ -699,19 +778,10 @@ class XdpContext
         return success();
     }
 
-    [[nodiscard]] static auto is_transient_send_error(ssize_t ret) -> bool
-    {
-        return ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
-    }
-
-    [[nodiscard]] auto tx_flush() -> Status
-    {
-        auto ret = ::sendto(xsk_socket__fd(xsk_), nullptr, 0, MSG_DONTWAIT, nullptr, 0);
-        if (ret < 0 && !is_transient_send_error(ret)) {
-            return failure(XdpError::tx_flush_failed);
-        }
-        return success();
-    }
+    /// One sendto() kick, skipped when the ring is drained or no wakeup is
+    /// asked for. Transient errors are counted, not failures; the rest fail
+    /// (tx_flush_failed, tx_flush_errno).
+    [[nodiscard]] auto tx_flush() -> Status;
 
     [[nodiscard]] auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>>;
 
@@ -722,61 +792,200 @@ class XdpContext
         return success();
     }
 
+    /// Offer the kernel free UMEM frames for RX; with need_wakeup, wake the
+    /// driver (one recvfrom()) when the fill ring's flag says it ran dry.
     [[nodiscard]] auto fill_replenish() -> Status;
 
     [[nodiscard]] auto tx_complete() -> Status;
 
-    /// @param rules New filter rules to replace existing entries
-    [[nodiscard]] auto set_rules(std::span<CompiledRule<32> const> rules) -> Status { return bpf_.set_rules(rules); }
-
-    /// @param addr Multicast MAC address to join
-    [[nodiscard]] auto join_multicast(ieee::Eui48 const& addr) -> Status;
-
     [[nodiscard]] auto stats() const noexcept -> Stats const& { return stats_; }
 
   private:
-    void swap(XdpContext& other) noexcept
+    void swap(XdpSocket& other) noexcept
     {
         std::swap(xsk_, other.xsk_);
         std::swap(umem_, other.umem_);
-        std::swap(bpf_, other.bpf_);
         std::swap(rings_, other.rings_);
-        std::swap(interface_, other.interface_);
         std::swap(budget_, other.budget_);
         std::swap(stats_, other.stats_);
         std::swap(bind_mode_, other.bind_mode_);
         std::swap(zero_copy_, other.zero_copy_);
+        std::swap(need_wakeup_, other.need_wakeup_);
     }
 
     struct xsk_socket* xsk_{nullptr};
-
     detail::UmemRegion umem_;
-    detail::BpfState bpf_;
     detail::RingSet rings_;
-    detail::InterfaceId interface_;
     detail::CycleBudget budget_;
     Stats stats_{};
     XdpBindMode bind_mode_{XdpBindMode::auto_};
     bool zero_copy_{false};
+    bool need_wakeup_{false};
+};
+
+/// One XdpProgram and one XdpSocket on one interface queue: the EthernetPort
+/// the users open with one XdpConfig.
+class XdpContext
+{
+  public:
+    using Stats = XdpSocketStats;
+
+    XdpContext() = default;
+    ~XdpContext() { close(); }
+
+    XdpContext(XdpContext&& other) noexcept { swap(other); }
+
+    auto operator=(XdpContext&& other) noexcept -> XdpContext&
+    {
+        if (this != &other) {
+            close();
+            swap(other);
+        }
+        return *this;
+    }
+
+    XdpContext(XdpContext const&) = delete;
+    auto operator=(XdpContext const&) -> XdpContext& = delete;
+
+    /// @param config Configuration specifying interface, filters, ring sizes, and UMEM layout
+    [[nodiscard]] auto open(XdpConfig const& config) -> Status;
+    void close() noexcept;
+    [[nodiscard]] auto valid() const noexcept -> bool { return socket_.valid(); }
+
+    [[nodiscard]] auto xsk_fd() const noexcept -> int { return socket_.fd(); }
+    [[nodiscard]] auto fd() const noexcept -> int { return socket_.fd(); }
+
+    [[nodiscard]] auto hardware_address() const noexcept -> ieee::Eui48 const& { return interface_.hardware_address; }
+    [[nodiscard]] auto interface_index() const noexcept -> unsigned int { return interface_.index; }
+
+    /// True when the socket runs zero-copy: the program is attached in native
+    /// mode and the bind read back XDP_OPTIONS_ZEROCOPY. False in copy mode
+    /// or when not open.
+    [[nodiscard]] auto zero_copy() const noexcept -> bool { return socket_.zero_copy(); }
+    /// The bind mode requested at open().
+    [[nodiscard]] auto bind_mode() const noexcept -> XdpBindMode { return socket_.bind_mode(); }
+    /// The mode the program runs in (native when not open).
+    [[nodiscard]] auto attach_mode() const noexcept -> XdpAttachMode { return program_.attach_mode(); }
+    /// True when open() adopted a pinned program.
+    [[nodiscard]] auto adopted() const noexcept -> bool { return program_.adopted(); }
+
+    [[nodiscard]] auto program() noexcept -> XdpProgram& { return program_; }
+    [[nodiscard]] auto program() const noexcept -> XdpProgram const& { return program_; }
+    [[nodiscard]] auto socket() noexcept -> XdpSocket& { return socket_; }
+
+    void begin_cycle() noexcept { socket_.begin_cycle(); }
+
+    [[nodiscard]] auto end_cycle() -> Status
+    {
+        auto fill_status = fill_replenish();
+        auto comp_status = tx_complete();
+        return fill_status ? comp_status : fill_status;
+    }
+
+    /// @param launch_time_ns TSN/AVB launch time in nanoseconds (currently unused, reserved)
+    [[nodiscard]] auto tx_start(int64_t launch_time_ns = 0) -> StatusValue<EthernetTxSlot>
+    {
+        return socket_.tx_start(launch_time_ns);
+    }
+
+    /// @param handle UMEM frame address from tx_start()
+    /// @param frame_length Total frame size including Ethernet header
+    [[nodiscard]] auto tx_commit(uint64_t handle, size_t frame_length) -> Status { return socket_.tx_commit(handle, frame_length); }
+
+    /// @param handle UMEM frame address from tx_start()
+    [[nodiscard]] auto tx_cancel(uint64_t handle) -> Status { return socket_.tx_cancel(handle); }
+
+    [[nodiscard]] static auto is_transient_send_error(ssize_t ret) -> bool
+    {
+        return ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+    }
+
+    /// XdpSocket::tx_flush().
+    [[nodiscard]] auto tx_flush() -> Status { return socket_.tx_flush(); }
+
+    [[nodiscard]] auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>> { return socket_.rx_start(); }
+
+    /// @param handle UMEM frame address from rx_start()
+    [[nodiscard]] auto rx_release(uint64_t handle) -> Status { return socket_.rx_release(handle); }
+
+    [[nodiscard]] auto fill_replenish() -> Status { return socket_.fill_replenish(); }
+
+    [[nodiscard]] auto tx_complete() -> Status { return socket_.tx_complete(); }
+
+    /// @param rules New filter rules to replace existing entries
+    [[nodiscard]] auto set_rules(std::span<CompiledRule<32> const> rules) -> Status { return program_.set_rules(rules); }
+
+    /// Add `addr` to the interface's multicast filter (SIOCADDMULTI).
+    /// @param addr Multicast MAC address to join
+    [[nodiscard]] auto join_multicast(ieee::Eui48 const& addr) -> Status;
+
+    /// Remove `addr` from the interface's multicast filter (SIOCDELMULTI).
+    /// @param addr Multicast MAC address to leave
+    [[nodiscard]] auto leave_multicast(ieee::Eui48 const& addr) -> Status;
+
+    [[nodiscard]] auto stats() const noexcept -> Stats const& { return socket_.stats(); }
+
+  private:
+    void swap(XdpContext& other) noexcept
+    {
+        std::swap(program_, other.program_);
+        std::swap(socket_, other.socket_);
+        std::swap(interface_, other.interface_);
+    }
+
+    [[nodiscard]] auto multicast_ioctl(unsigned long request, ieee::Eui48 const& addr, XdpError error) -> Status;
+
+    XdpProgram program_;
+    XdpSocket socket_;
+    detail::InterfaceId interface_;
 };
 
 #else  // !(__linux__ && HAVE_XDP)
 
 // ──────────────────────────────────────────────
-// XdpContext — stub for non-Linux or without libbpf/libxdp
+// XdpProgram, XdpContext — stubs for non-Linux or without libbpf/libxdp
 // ──────────────────────────────────────────────
+
+class XdpProgram
+{
+  public:
+    struct Options
+    {
+        std::span<CompiledRule<32> const> filter_rules{};
+        XdpAction default_action{XdpAction::pass_kernel};
+        XdpAttachMode attach_mode{XdpAttachMode::native};
+        bool allow_generic_fallback{true};
+        std::string_view pin_path{};
+        bool adopt{true};
+        std::optional<bool> detach_on_close{};
+    };
+    static constexpr std::string_view PIN_ROOT = "/sys/fs/bpf/statusbar";
+    [[nodiscard]] static auto pin_path_for(std::string_view interface_name) -> std::string
+    {
+        return std::string{PIN_ROOT} + "/" + std::string{interface_name};
+    }
+    [[nodiscard]] static auto query(unsigned int) -> StatusValue<std::optional<XdpAttachedProgram>>
+    {
+        return failure(XdpError::not_supported_on_platform);
+    }
+    [[nodiscard]] static auto detach(unsigned int, std::string_view) -> Status
+    {
+        return failure(XdpError::not_supported_on_platform);
+    }
+    [[nodiscard]] auto open(unsigned int, Options const&) -> Status { return failure(XdpError::not_supported_on_platform); }
+    void close() noexcept {}
+    [[nodiscard]] auto valid() const noexcept -> bool { return false; }
+    [[nodiscard]] auto attach_mode() const noexcept -> XdpAttachMode { return XdpAttachMode::native; }
+    [[nodiscard]] auto adopted() const noexcept -> bool { return false; }
+    [[nodiscard]] auto pinned() const noexcept -> bool { return false; }
+    [[nodiscard]] auto prog_id() const noexcept -> uint32_t { return 0; }
+    [[nodiscard]] auto will_detach_on_close() const noexcept -> bool { return false; }
+};
 
 class XdpContext
 {
   public:
-    struct Stats
-    {
-        uint64_t rx_count{0};
-        uint64_t tx_count{0};
-        uint64_t tx_ring_full_count{0};
-        uint64_t umem_exhausted_count{0};
-        uint64_t rx_budget_hit_count{0};
-    };
+    using Stats = XdpSocketStats;
 
     XdpContext() = default;
     ~XdpContext() { close(); }
@@ -809,6 +1018,13 @@ class XdpContext
     [[nodiscard]] auto interface_index() const noexcept -> unsigned int { return 0; }
     [[nodiscard]] auto zero_copy() const noexcept -> bool { return false; }
     [[nodiscard]] auto bind_mode() const noexcept -> XdpBindMode { return XdpBindMode::auto_; }
+    [[nodiscard]] auto attach_mode() const noexcept -> XdpAttachMode { return XdpAttachMode::native; }
+    [[nodiscard]] auto adopted() const noexcept -> bool { return false; }
+    [[nodiscard]] auto program() const noexcept -> XdpProgram const&
+    {
+        static XdpProgram const none{};
+        return none;
+    }
 
     void begin_cycle() noexcept {}
 
@@ -838,6 +1054,7 @@ class XdpContext
     }
 
     [[nodiscard]] auto join_multicast(ieee::Eui48 const&) -> Status { return failure(XdpError::not_supported_on_platform); }
+    [[nodiscard]] auto leave_multicast(ieee::Eui48 const&) -> Status { return failure(XdpError::not_supported_on_platform); }
 
     [[nodiscard]] auto stats() const noexcept -> Stats const& { return stats_; }
 

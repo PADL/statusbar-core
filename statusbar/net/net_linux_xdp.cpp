@@ -5,6 +5,11 @@
 
 #include "statusbar/net/net_posix_util.hpp"
 
+#if defined(__linux__) && defined(HAVE_XDP)
+#    include <filesystem>
+#    include <system_error>
+#endif
+
 namespace statusbar::net {
 
 auto XdpErrorCategory::message(int ev) const -> std::string
@@ -54,6 +59,16 @@ auto XdpErrorCategory::message(int ev) const -> std::string
             return "Embedded BPF program is empty or invalid";
         case XdpError::too_many_filter_rules:
             return "Filter rule count exceeds TCAM_MAX_RULES";
+        case XdpError::leave_multicast_failed:
+            return "Failed to leave multicast group";
+        case XdpError::bpf_query_failed:
+            return "Querying the interface's XDP program failed";
+        case XdpError::bpf_pin_failed:
+            return "Pinning the XDP program or its maps failed";
+        case XdpError::bpf_detach_failed:
+            return "Detaching the XDP program failed";
+        case XdpError::zero_copy_needs_native_attach:
+            return "Zero-copy needs the XDP program attached in native (driver) mode";
         default:
             return "Unknown XDP error";
     }
@@ -124,54 +139,6 @@ void detail::UmemRegion::close() noexcept
     free_list_ = {};
 }
 
-auto detail::BpfState::load(std::span<CompiledRule<32> const> rules, XdpAction default_action) -> Status
-{
-    close();
-    default_action_ = default_action;
-
-    if (xdp_filter_bpf_o_len == 0) {
-        return failure(XdpError::invalid_bpf_program);
-    }
-
-    BpfObject obj;
-    if (auto status = obj.open_and_load(xdp_filter_bpf_o, xdp_filter_bpf_o_len); !status) {
-        return status;
-    }
-
-    struct bpf_map* rules_map = bpf_object__find_map_by_name(obj.get(), "rules_map");
-    struct bpf_map* xsk_map = bpf_object__find_map_by_name(obj.get(), "xsk_map");
-    struct bpf_map* devmap = bpf_object__find_map_by_name(obj.get(), "devmap");
-
-    auto are_xdp_maps_valid = [](bpf_map* rm, bpf_map* xsk, bpf_map* dev) -> bool {
-        return rm != nullptr && xsk != nullptr && dev != nullptr;
-    };
-    if (!are_xdp_maps_valid(rules_map, xsk_map, devmap)) {
-        return failure(XdpError::bpf_load_failed);
-    }
-
-    rules_map_fd_ = bpf_map__fd(rules_map);
-    xsk_map_fd_ = bpf_map__fd(xsk_map);
-    devmap_fd_ = bpf_map__fd(devmap);
-
-    // The loaded BPF object starts with all rule slots zero-initialized
-    // (array map default), so any pre-existing stale entries from the
-    // previous loader run are already cleared. install_tcam_rules() fills
-    // slots 0..rules.size()-1 and re-zeroes the tail to keep that
-    // guarantee on subsequent set_rules() calls.
-    if (auto status = install_tcam_rules(rules); !status) {
-        return status;
-    }
-
-    struct bpf_program* prog = bpf_object__find_program_by_name(obj.get(), "xdp_filter_prog");
-    if (prog == nullptr) {
-        return failure(XdpError::bpf_load_failed);
-    }
-    prog_fd_ = bpf_program__fd(prog);
-
-    obj_ = std::move(obj);
-    return success();
-}
-
 namespace {
 
 /// Derive the catch-all rule the BPF program needs when the user wants a
@@ -196,18 +163,281 @@ namespace {
     return std::nullopt;
 }
 
+/// A program's kernel id and tag (the tag hashes its instructions, map
+/// references excluded: the same program loaded twice has the same tag).
+struct ProgIdentity
+{
+    uint32_t id{0};
+    std::array<uint8_t, BPF_TAG_SIZE> tag{};
+};
+
+[[nodiscard]] auto prog_identity(int prog_fd) -> std::optional<ProgIdentity>
+{
+    struct bpf_prog_info info{};
+    __u32 length = sizeof(info);
+    if (bpf_prog_get_info_by_fd(prog_fd, &info, &length) != 0) {
+        return std::nullopt;
+    }
+    ProgIdentity identity{.id = info.id};
+    std::memcpy(identity.tag.data(), info.tag, BPF_TAG_SIZE);
+    return identity;
+}
+
+[[nodiscard]] auto pin_file(std::string_view dir, std::string_view name) -> std::string
+{
+    std::string path{dir};
+    path += '/';
+    path += name;
+    return path;
+}
+
+constexpr std::array<std::string_view, 4> PIN_NAMES = {
+    XdpProgram::PIN_PROG, XdpProgram::PIN_RULES_MAP, XdpProgram::PIN_XSK_MAP, XdpProgram::PIN_DEVMAP};
+
+/// Remove the pins under `dir` and the directory itself (ignoring what is not there).
+void remove_pins(std::string_view dir) noexcept
+{
+    if (dir.empty()) {
+        return;
+    }
+    for (auto const name : PIN_NAMES) {
+        (void)::unlink(pin_file(dir, name).c_str());
+    }
+    (void)::rmdir(std::string{dir}.c_str());
+}
+
 }  // namespace
 
-auto detail::BpfState::install_tcam_rules(std::span<CompiledRule<32> const> rules) -> Status
+auto XdpProgram::query(unsigned int const if_index) -> StatusValue<std::optional<XdpAttachedProgram>>
 {
-    auto catch_all = catch_all_rule_for(default_action_);
+    LIBBPF_OPTS(bpf_xdp_query_opts, opts);
+    if (bpf_xdp_query(static_cast<int>(if_index), 0, &opts) != 0) {
+        return failure(XdpError::bpf_query_failed);
+    }
+    switch (opts.attach_mode) {
+        case XDP_ATTACHED_DRV:
+            return std::optional{XdpAttachedProgram{.prog_id = opts.prog_id, .mode = XdpAttachMode::native}};
+        case XDP_ATTACHED_SKB:
+            return std::optional{XdpAttachedProgram{.prog_id = opts.prog_id, .mode = XdpAttachMode::generic}};
+        case XDP_ATTACHED_MULTI:
+            if (opts.drv_prog_id != 0) {
+                return std::optional{XdpAttachedProgram{.prog_id = opts.drv_prog_id, .mode = XdpAttachMode::native}};
+            }
+            if (opts.skb_prog_id != 0) {
+                return std::optional{XdpAttachedProgram{.prog_id = opts.skb_prog_id, .mode = XdpAttachMode::generic}};
+            }
+            break;
+        default:
+            break;
+    }
+    return std::optional<XdpAttachedProgram>{};
+}
+
+auto XdpProgram::detach(unsigned int const if_index, std::string_view const pin_path) -> Status
+{
+    Status status = success();
+    LIBBPF_OPTS(bpf_xdp_query_opts, opts);
+    if (bpf_xdp_query(static_cast<int>(if_index), 0, &opts) != 0) {
+        status = failure(XdpError::bpf_query_failed);
+    } else {
+        if (opts.drv_prog_id != 0 && bpf_xdp_detach(static_cast<int>(if_index), XDP_FLAGS_DRV_MODE, nullptr) != 0) {
+            status = failure(XdpError::bpf_detach_failed);
+        }
+        if (opts.skb_prog_id != 0 && bpf_xdp_detach(static_cast<int>(if_index), XDP_FLAGS_SKB_MODE, nullptr) != 0) {
+            status = failure(XdpError::bpf_detach_failed);
+        }
+    }
+    remove_pins(pin_path);
+    return status;
+}
+
+auto XdpProgram::try_adopt(XdpAttachedProgram const& attached, Options const& options) -> bool
+{
+    if (detail::effective_attach_mode(attached.mode, options.attach_mode) != attached.mode) {
+        return false;  // a generic program, native wanted: replaced
+    }
+    detail::OwnedFd prog{bpf_obj_get(pin_file(options.pin_path, PIN_PROG).c_str())};
+    if (prog.get() < 0) {
+        return false;
+    }
+    auto const pinned = prog_identity(prog.get());
+    auto const built_in = prog_identity(state_.prog_fd);
+    if (!pinned || !built_in || pinned->id != attached.prog_id || pinned->tag != built_in->tag) {
+        return false;  // a stale pin, or another program (an older build's): replaced
+    }
+    detail::OwnedFd rules{bpf_obj_get(pin_file(options.pin_path, PIN_RULES_MAP).c_str())};
+    detail::OwnedFd xsk{bpf_obj_get(pin_file(options.pin_path, PIN_XSK_MAP).c_str())};
+    detail::OwnedFd dev{bpf_obj_get(pin_file(options.pin_path, PIN_DEVMAP).c_str())};
+    if (rules.get() < 0 || xsk.get() < 0 || dev.get() < 0) {
+        return false;
+    }
+    state_.obj.reset();  // the freshly loaded copy is not needed
+    state_.prog_fd = prog.get();
+    state_.rules_map_fd = rules.get();
+    state_.xsk_map_fd = xsk.get();
+    state_.devmap_fd = dev.get();
+    state_.adopted_prog = std::move(prog);
+    state_.adopted_rules_map = std::move(rules);
+    state_.adopted_xsk_map = std::move(xsk);
+    state_.adopted_devmap = std::move(dev);
+    state_.prog_id = attached.prog_id;
+    state_.mode = attached.mode;
+    state_.adopted = true;
+    state_.pin_path = std::string{options.pin_path};
+    return true;
+}
+
+auto XdpProgram::pin(std::string_view const pin_path) -> Status
+{
+    remove_pins(pin_path);  // a stale program's pins
+    std::error_code error;
+    std::filesystem::create_directories(std::string{pin_path}, error);
+    if (error) {
+        return failure(XdpError::bpf_pin_failed);
+    }
+    std::array<int, 4> const fds = {state_.prog_fd, state_.rules_map_fd, state_.xsk_map_fd, state_.devmap_fd};
+    for (size_t i = 0; i < fds.size(); ++i) {
+        if (bpf_obj_pin(fds[i], pin_file(pin_path, PIN_NAMES[i]).c_str()) != 0) {
+            remove_pins(pin_path);
+            return failure(XdpError::bpf_pin_failed);
+        }
+    }
+    state_.pin_path = std::string{pin_path};
+    return success();
+}
+
+auto XdpProgram::open(unsigned int const if_index, Options const& options) -> Status
+{
+    close();
+    state_.default_action = options.default_action;
+    state_.if_index = if_index;
+
+    auto const attached = query(if_index);
+    if (!attached) {
+        close();
+        return failure(attached.error());
+    }
+
+    // Load the built-in program either way: its tag tells an adoptable pin
+    // from an older build's.
+    if (xdp_filter_bpf_o_len == 0) {
+        close();
+        return failure(XdpError::invalid_bpf_program);
+    }
+    if (auto status = state_.obj.open_and_load(xdp_filter_bpf_o, xdp_filter_bpf_o_len); !status) {
+        close();
+        return status;
+    }
+    struct bpf_map* rules_map = bpf_object__find_map_by_name(state_.obj.get(), "rules_map");
+    struct bpf_map* xsk_map = bpf_object__find_map_by_name(state_.obj.get(), "xsk_map");
+    struct bpf_map* devmap = bpf_object__find_map_by_name(state_.obj.get(), "devmap");
+    struct bpf_program* prog = bpf_object__find_program_by_name(state_.obj.get(), "xdp_filter_prog");
+    if (rules_map == nullptr || xsk_map == nullptr || devmap == nullptr || prog == nullptr) {
+        close();
+        return failure(XdpError::bpf_load_failed);
+    }
+    state_.rules_map_fd = bpf_map__fd(rules_map);
+    state_.xsk_map_fd = bpf_map__fd(xsk_map);
+    state_.devmap_fd = bpf_map__fd(devmap);
+    state_.prog_fd = bpf_program__fd(prog);
+
+    if (*attached && options.adopt && !options.pin_path.empty() && try_adopt(**attached, options)) {
+        state_.detach_on_close = options.detach_on_close.value_or(false);
+        if (auto status = install_tcam_rules(options.filter_rules); !status) {
+            close();
+            return status;
+        }
+        return success();
+    }
+
+    // Rules before the attach, so the program filters from its first frame.
+    if (auto status = install_tcam_rules(options.filter_rules); !status) {
+        close();
+        return status;
+    }
+
+    // What to attach in: a native program in place stays native (replaced
+    // in place, no adapter reset); a generic one gives way to native.
+    detail::AttachPlan plan{.first = options.attach_mode, .fallback = std::nullopt};
+    if (options.attach_mode == XdpAttachMode::native && options.allow_generic_fallback) {
+        plan.fallback = XdpAttachMode::generic;
+    }
+    detail::OwnedFd displaced;  // a generic program detached for native, restored if all fails
+    if (*attached) {
+        auto const mode = detail::effective_attach_mode((*attached)->mode, options.attach_mode);
+        if (mode != (*attached)->mode) {
+            // Generic in place, native wanted: the two cannot coexist.
+            displaced = detail::OwnedFd{bpf_prog_get_fd_by_id((*attached)->prog_id)};
+            (void)bpf_xdp_detach(static_cast<int>(if_index), XDP_FLAGS_SKB_MODE, nullptr);
+        } else {
+            plan = {.first = mode, .fallback = std::nullopt};
+        }
+    }
+    auto attach = [&](XdpAttachMode const mode) {
+        return bpf_xdp_attach(static_cast<int>(if_index), state_.prog_fd, detail::xdp_attach_flags(mode), nullptr) == 0;
+    };
+    if (attach(plan.first)) {
+        state_.mode = plan.first;
+    } else if (plan.fallback && attach(*plan.fallback)) {
+        state_.mode = *plan.fallback;
+    } else {
+        if (displaced.get() >= 0) {
+            (void)bpf_xdp_attach(static_cast<int>(if_index), displaced.get(), XDP_FLAGS_SKB_MODE, nullptr);
+        }
+        close();
+        return failure(XdpError::bpf_attach_failed);
+    }
+    state_.attached = true;
+    if (auto const identity = prog_identity(state_.prog_fd)) {
+        state_.prog_id = identity->id;
+    }
+
+    // A pin failure (no bpffs) is not fatal: the next open replaces the program in place.
+    if (!options.pin_path.empty()) {
+        (void)pin(options.pin_path);
+    }
+    state_.detach_on_close = options.detach_on_close.value_or(state_.mode == XdpAttachMode::generic);
+    return success();
+}
+
+void XdpProgram::close() noexcept
+{
+    if (state_.detach_on_close && (state_.attached || state_.adopted) && state_.prog_fd >= 0) {
+        // Only if it is still ours: XDP_FLAGS_REPLACE against our program.
+        LIBBPF_OPTS(bpf_xdp_attach_opts, opts, .old_prog_fd = state_.prog_fd);
+        (void)bpf_xdp_detach(static_cast<int>(state_.if_index), detail::xdp_attach_flags(state_.mode), &opts);
+        remove_pins(state_.pin_path);
+    }
+    state_ = State{};
+}
+
+auto XdpProgram::register_socket(uint32_t queue_id, int const xsk_fd) -> Status
+{
+    if (bpf_map_update_elem(state_.xsk_map_fd, &queue_id, &xsk_fd, BPF_ANY) != 0) {
+        return failure(XdpError::bpf_map_update_failed);
+    }
+    return success();
+}
+
+auto XdpProgram::register_tap(unsigned int tap_ifindex) -> Status
+{
+    uint32_t zero_key = 0;
+    if (bpf_map_update_elem(state_.devmap_fd, &zero_key, &tap_ifindex, BPF_ANY) != 0) {
+        return failure(XdpError::bpf_map_update_failed);
+    }
+    return success();
+}
+
+auto XdpProgram::install_tcam_rules(std::span<CompiledRule<32> const> rules) -> Status
+{
+    auto catch_all = catch_all_rule_for(state_.default_action);
     std::size_t const extra = catch_all.has_value() ? 1U : 0U;
     if (rules.size() + extra > TCAM_MAX_RULES) {
         return failure(XdpError::too_many_filter_rules);
     }
 
     auto write_slot = [this](std::uint32_t index, CompiledRule<32> const& rule) -> Status {
-        if (bpf_map_update_elem(rules_map_fd_, &index, &rule, BPF_ANY) != 0) {
+        if (bpf_map_update_elem(state_.rules_map_fd, &index, &rule, BPF_ANY) != 0) {
             return failure(XdpError::bpf_map_update_failed);
         }
         return success();
@@ -234,6 +464,196 @@ auto detail::BpfState::install_tcam_rules(std::span<CompiledRule<32> const> rule
         }
     }
 
+    return success();
+}
+
+auto XdpSocket::open(XdpConfig const& config, XdpAttachMode const attached) -> Status
+{
+    close();
+
+    auto const bind_flags = detail::xdp_bind_flags(config.bind_mode, attached, config.need_wakeup);
+    if (!bind_flags) {
+        return failure(bind_flags.error());
+    }
+
+    auto umem_result = umem_.allocate(
+        config.umem_frame_count,
+        config.umem_frame_size,
+        config.umem_headroom,
+        config.fill_ring_size,
+        config.completion_ring_size,
+        rings_);
+    if (!umem_result) {
+        close();
+        return failure(umem_result.error());
+    }
+
+    struct xsk_socket_config xsk_cfg{};
+    xsk_cfg.rx_size = static_cast<__u32>(config.rx_ring_size);
+    xsk_cfg.tx_size = static_cast<__u32>(config.tx_ring_size);
+    xsk_cfg.libxdp_flags = XSK_LIBXDP_FLAGS__INHIBIT_PROG_LOAD;
+    xsk_cfg.xdp_flags = 0;
+    xsk_cfg.bind_flags = *bind_flags;
+
+    std::string const ifname_str(config.interface_name);
+    int const ret = xsk_socket__create(&xsk_, ifname_str.c_str(), config.queue_id, *umem_result, &rings_.rx, &rings_.tx, &xsk_cfg);
+    if (ret != 0) {
+        xsk_ = nullptr;
+        close();
+        return failure(XdpError::xsk_creation_failed);
+    }
+    bind_mode_ = config.bind_mode;
+    need_wakeup_ = config.need_wakeup;
+
+    // Report the mode the bind obtained, truthfully: zero-copy only under a
+    // native program (a generic one never gets the driver's rings).
+    struct xdp_options opts{};
+    socklen_t opts_len = sizeof(opts);
+    if (::getsockopt(xsk_socket__fd(xsk_), SOL_XDP, XDP_OPTIONS, &opts, &opts_len) == 0) {
+        zero_copy_ = attached == XdpAttachMode::native && (opts.flags & XDP_OPTIONS_ZEROCOPY) != 0;
+    }
+
+    budget_.rx_drain_max = config.rx_drain_max;
+    budget_.completion_drain_max = config.completion_drain_max;
+    budget_.rx_clock_id = config.rx_clock_id;
+    return success();
+}
+
+void XdpSocket::close() noexcept
+{
+    if (xsk_ != nullptr) {
+        xsk_socket__delete(xsk_);
+        xsk_ = nullptr;
+    }
+    umem_.close();
+    rings_ = {};
+    budget_ = {};
+    stats_ = {};
+    bind_mode_ = XdpBindMode::auto_;
+    zero_copy_ = false;
+    need_wakeup_ = false;
+}
+
+auto XdpSocket::tx_commit(uint64_t handle, size_t frame_length) -> Status
+{
+    uint32_t idx = 0;
+    if (xsk_ring_prod__reserve(&rings_.tx, 1, &idx) == 0) {
+        // The TX ring is full. Return the caller's UMEM frame to the free
+        // list so we do not leak it — without this, every tx_ring_full
+        // event consumed one UMEM frame permanently until umem_exhausted
+        // saturated.
+        umem_.free_frame(handle);
+        ++stats_.tx_ring_full_count;
+        return failure(XdpError::tx_ring_full);
+    }
+    struct xdp_desc* desc = xsk_ring_prod__tx_desc(&rings_.tx, idx);
+    desc->addr = handle + umem_.headroom();
+    desc->len = static_cast<uint32_t>(frame_length);
+    xsk_ring_prod__submit(&rings_.tx, 1);
+    ++stats_.tx_count;
+    return success();
+}
+
+auto XdpSocket::tx_flush() -> Status
+{
+    if (xsk_ == nullptr) {
+        return failure(XdpError::not_open);
+    }
+    // Descriptors the kernel has not consumed yet (copy mode sends at most a
+    // batch per kick, so some may be left from the last one).
+    uint32_t const outstanding = *rings_.tx.producer - __atomic_load_n(rings_.tx.consumer, __ATOMIC_ACQUIRE);
+    if (outstanding == 0 || (need_wakeup_ && !xsk_ring_prod__needs_wakeup(&rings_.tx))) {
+        ++stats_.tx_flush_skipped;
+        return success();
+    }
+    ++stats_.tx_flush_count;
+    auto const ret = ::sendto(xsk_socket__fd(xsk_), nullptr, 0, MSG_DONTWAIT, nullptr, 0);
+    if (ret < 0 && detail::is_transient_kick_error(errno)) {
+        ++stats_.tx_flush_transient;
+    } else if (ret < 0) {
+        ++stats_.tx_flush_failed;
+        stats_.tx_flush_errno = errno;
+        return failure(XdpError::tx_flush_failed);
+    }
+    return success();
+}
+
+auto XdpSocket::tx_complete() -> Status
+{
+    uint32_t idx = 0;
+    auto completed = xsk_ring_cons__peek(&rings_.comp, static_cast<uint32_t>(budget_.completion_drain_max), &idx);
+    for (uint32_t i = 0; i < completed; ++i) {
+        auto addr = *xsk_ring_cons__comp_addr(&rings_.comp, idx + i);
+        umem_.free_frame(addr);
+    }
+    if (completed > 0) {
+        xsk_ring_cons__release(&rings_.comp, completed);
+    }
+    return success();
+}
+
+auto XdpSocket::rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
+{
+    if (budget_.rx_drain_max > 0 && budget_.rx_cycle_count >= budget_.rx_drain_max) {
+        ++stats_.rx_budget_hit_count;
+        return std::optional<EthernetRxSlot>{};
+    }
+
+    uint32_t idx = 0;
+    if (xsk_ring_cons__peek(&rings_.rx, 1, &idx) == 0) {
+        return std::optional<EthernetRxSlot>{};
+    }
+
+    auto const* desc = xsk_ring_cons__rx_desc(&rings_.rx, idx);
+
+    int64_t timestamp_ns = 0;
+    if (budget_.rx_clock_id >= 0) {
+        struct timespec ts{};
+        (void)::clock_gettime(budget_.rx_clock_id, &ts);
+        timestamp_ns = (static_cast<int64_t>(ts.tv_sec) * 1'000'000'000) + ts.tv_nsec;
+    }
+
+    EthernetRxSlot slot{
+        .handle = desc->addr,
+        .buffer = umem_.readable_span(desc->addr, desc->len),
+        .timestamp_ns = timestamp_ns,
+    };
+
+    // Release ring slot — UMEM frame remains valid until rx_release(handle)
+    xsk_ring_cons__release(&rings_.rx, 1);
+    ++budget_.rx_cycle_count;
+    ++stats_.rx_count;
+
+    return std::optional<EthernetRxSlot>{slot};
+}
+
+auto XdpSocket::fill_replenish() -> Status
+{
+    auto available = umem_.available_frames();
+    if (available != 0) {
+        auto const count = detail::fill_reserve_count(available, xsk_prod_nb_free(&rings_.fill, static_cast<uint32_t>(available)));
+        if (count != 0) {
+            uint32_t idx = 0;
+            auto reserved = xsk_ring_prod__reserve(&rings_.fill, count, &idx);
+            uint32_t filled = 0;
+            for (uint32_t i = 0; i < reserved; ++i) {
+                auto addr = umem_.alloc_frame();
+                if (!addr) {
+                    break;
+                }
+                *xsk_ring_prod__fill_addr(&rings_.fill, idx + i) = *addr;
+                ++filled;
+            }
+            if (filled > 0) {
+                xsk_ring_prod__submit(&rings_.fill, filled);
+            }
+        }
+    }
+    // The driver ran out of fill entries and stopped: wake it.
+    if (need_wakeup_ && xsk_ != nullptr && xsk_ring_prod__needs_wakeup(&rings_.fill)) {
+        ++stats_.rx_wakeup_count;
+        (void)::recvfrom(xsk_socket__fd(xsk_), nullptr, 0, MSG_DONTWAIT, nullptr, nullptr);
+    }
     return success();
 }
 
@@ -264,70 +684,48 @@ auto XdpContext::open(XdpConfig const& config) -> Status
     }
     span_copy(interface_.hardware_address.value, hwaddr_bytes(ifr));
 
-    // Step 2: Allocate UMEM
-    auto umem_result = umem_.allocate(
-        config.umem_frame_count,
-        config.umem_frame_size,
-        config.umem_headroom,
-        config.fill_ring_size,
-        config.completion_ring_size,
-        rings_);
-    if (!umem_result) {
+    // Step 2: The program: zero-copy needs it native, with no fallback.
+    auto const plan = detail::attach_plan(config.attach_mode, config.bind_mode);
+    if (!plan) {
         close();
-        return failure(umem_result.error());
+        return failure(plan.error());
     }
-
-    // Step 3: Load BPF
-    if (auto status = bpf_.load(config.filter_rules, config.default_action); !status) {
-        close();
-        return status;
-    }
-
-    // Step 4: Create XSK socket
-    struct xsk_socket_config xsk_cfg{};
-    xsk_cfg.rx_size = static_cast<__u32>(config.rx_ring_size);
-    xsk_cfg.tx_size = static_cast<__u32>(config.tx_ring_size);
-    xsk_cfg.libxdp_flags = XSK_LIBXDP_FLAGS__INHIBIT_PROG_LOAD;
-    xsk_cfg.xdp_flags = 0;
-    xsk_cfg.bind_flags = detail::xdp_bind_flags(config.bind_mode);
-
-    std::string const ifname_str(config.interface_name);
-    int const ret = xsk_socket__create(&xsk_, ifname_str.c_str(), config.queue_id, *umem_result, &rings_.rx, &rings_.tx, &xsk_cfg);
-    if (ret != 0) {
-        close();
-        return failure(XdpError::xsk_creation_failed);
-    }
-    bind_mode_ = config.bind_mode;
-
-    // Report the mode the bind obtained: with auto_ the kernel picks zero-copy
-    // only when the driver offers it.
-    struct xdp_options opts{};
-    socklen_t opts_len = sizeof(opts);
-    if (::getsockopt(xsk_socket__fd(xsk_), SOL_XDP, XDP_OPTIONS, &opts, &opts_len) == 0) {
-        zero_copy_ = (opts.flags & XDP_OPTIONS_ZEROCOPY) != 0;
-    }
-
-    // Step 5: Attach BPF + register socket
-    if (auto status = bpf_.attach(interface_.index, config.queue_id, xsk_socket__fd(xsk_)); !status) {
+    if (auto status = program_.open(
+            interface_.index,
+            {
+                .filter_rules = config.filter_rules,
+                .default_action = config.default_action,
+                .attach_mode = plan->first,
+                .allow_generic_fallback = plan->fallback.has_value(),
+                .pin_path = config.pin_path,
+                .adopt = config.adopt,
+                .detach_on_close = config.detach_on_close,
+            });
+        !status) {
         close();
         return status;
     }
 
-    // Step 6: Register TAP device if requested
+    // Step 3: The socket, its bind decided by the mode the program got.
+    if (auto status = socket_.open(config, program_.attach_mode()); !status) {
+        close();
+        return status;
+    }
+
+    // Step 4: Register the socket (and the TAP device if requested)
+    if (auto status = program_.register_socket(config.queue_id, socket_.fd()); !status) {
+        close();
+        return status;
+    }
     if (config.tap_ifindex != 0) {
-        if (auto status = bpf_.register_tap(config.tap_ifindex); !status) {
+        if (auto status = program_.register_tap(config.tap_ifindex); !status) {
             close();
             return status;
         }
     }
 
-    // Step 7: Store budget config + initial fill
-    budget_.rx_drain_max = config.rx_drain_max;
-    budget_.completion_drain_max = config.completion_drain_max;
-    budget_.rx_clock_id = config.rx_clock_id;
-
-    auto fill_status = fill_replenish();
-    if (!fill_status) {
+    // Step 5: Initial fill
+    if (auto fill_status = socket_.fill_replenish(); !fill_status) {
         close();
         return fill_status;
     }
@@ -337,120 +735,14 @@ auto XdpContext::open(XdpConfig const& config) -> Status
 
 void XdpContext::close() noexcept
 {
-    if (xsk_ != nullptr) {
-        xsk_socket__delete(xsk_);
-        xsk_ = nullptr;
-    }
-
-    bpf_.close();
-    umem_.close();
-
+    socket_.close();
+    program_.close();
     interface_ = {};
-    rings_ = {};
-    budget_ = {};
-    stats_ = {};
-    bind_mode_ = XdpBindMode::auto_;
-    zero_copy_ = false;
 }
 
-auto XdpContext::tx_commit(uint64_t handle, size_t frame_length) -> Status
+auto XdpContext::multicast_ioctl(unsigned long const request, ieee::Eui48 const& addr, XdpError const error) -> Status
 {
-    uint32_t idx = 0;
-    if (xsk_ring_prod__reserve(&rings_.tx, 1, &idx) == 0) {
-        // The TX ring is full. Return the caller's UMEM frame to the free
-        // list so we do not leak it — without this, every tx_ring_full
-        // event consumed one UMEM frame permanently until umem_exhausted
-        // saturated.
-        umem_.free_frame(handle);
-        ++stats_.tx_ring_full_count;
-        return failure(XdpError::tx_ring_full);
-    }
-    struct xdp_desc* desc = xsk_ring_prod__tx_desc(&rings_.tx, idx);
-    desc->addr = handle + umem_.headroom();
-    desc->len = static_cast<uint32_t>(frame_length);
-    xsk_ring_prod__submit(&rings_.tx, 1);
-    ++stats_.tx_count;
-    return success();
-}
-
-auto XdpContext::tx_complete() -> Status
-{
-    uint32_t idx = 0;
-    auto completed = xsk_ring_cons__peek(&rings_.comp, static_cast<uint32_t>(budget_.completion_drain_max), &idx);
-    for (uint32_t i = 0; i < completed; ++i) {
-        auto addr = *xsk_ring_cons__comp_addr(&rings_.comp, idx + i);
-        umem_.free_frame(addr);
-    }
-    if (completed > 0) {
-        xsk_ring_cons__release(&rings_.comp, completed);
-    }
-    return success();
-}
-
-auto XdpContext::rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
-{
-    if (budget_.rx_drain_max > 0 && budget_.rx_cycle_count >= budget_.rx_drain_max) {
-        ++stats_.rx_budget_hit_count;
-        return std::optional<EthernetRxSlot>{};
-    }
-
-    uint32_t idx = 0;
-    if (xsk_ring_cons__peek(&rings_.rx, 1, &idx) == 0) {
-        return std::optional<EthernetRxSlot>{};
-    }
-
-    auto const* desc = xsk_ring_cons__rx_desc(&rings_.rx, idx);
-
-    struct timespec ts{};
-    (void)::clock_gettime(budget_.rx_clock_id, &ts);
-    int64_t const timestamp_ns = (static_cast<int64_t>(ts.tv_sec) * 1'000'000'000) + ts.tv_nsec;
-
-    EthernetRxSlot slot{
-        .handle = desc->addr,
-        .buffer = umem_.readable_span(desc->addr, desc->len),
-        .timestamp_ns = timestamp_ns,
-    };
-
-    // Release ring slot — UMEM frame remains valid until rx_release(handle)
-    xsk_ring_cons__release(&rings_.rx, 1);
-    ++budget_.rx_cycle_count;
-    ++stats_.rx_count;
-
-    return std::optional<EthernetRxSlot>{slot};
-}
-
-auto XdpContext::fill_replenish() -> Status
-{
-    auto available = umem_.available_frames();
-    if (available == 0) {
-        return success();
-    }
-
-    auto const count = detail::fill_reserve_count(available, xsk_prod_nb_free(&rings_.fill, static_cast<uint32_t>(available)));
-    if (count == 0) {
-        return success();
-    }
-
-    uint32_t idx = 0;
-    auto reserved = xsk_ring_prod__reserve(&rings_.fill, count, &idx);
-    uint32_t filled = 0;
-    for (uint32_t i = 0; i < reserved; ++i) {
-        auto addr = umem_.alloc_frame();
-        if (!addr) {
-            break;
-        }
-        *xsk_ring_prod__fill_addr(&rings_.fill, idx + i) = *addr;
-        ++filled;
-    }
-    if (filled > 0) {
-        xsk_ring_prod__submit(&rings_.fill, filled);
-    }
-    return success();
-}
-
-auto XdpContext::join_multicast(ieee::Eui48 const& addr) -> Status
-{
-    if (xsk_ == nullptr) {
+    if (!socket_.valid()) {
         return failure(XdpError::not_open);
     }
 
@@ -467,11 +759,21 @@ auto XdpContext::join_multicast(ieee::Eui48 const& addr) -> Status
     }
     auto close_sock = detail::scopeguard([&]() noexcept { ::close(sock_fd); });
 
-    if (::ioctl(sock_fd, SIOCADDMULTI, &ifr) < 0) {
-        return failure(XdpError::join_multicast_failed);
+    if (::ioctl(sock_fd, request, &ifr) < 0) {
+        return failure(error);
     }
 
     return success();
+}
+
+auto XdpContext::join_multicast(ieee::Eui48 const& addr) -> Status
+{
+    return multicast_ioctl(SIOCADDMULTI, addr, XdpError::join_multicast_failed);
+}
+
+auto XdpContext::leave_multicast(ieee::Eui48 const& addr) -> Status
+{
+    return multicast_ioctl(SIOCDELMULTI, addr, XdpError::leave_multicast_failed);
 }
 
 #endif  // __linux__ && HAVE_XDP
