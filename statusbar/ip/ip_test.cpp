@@ -60,6 +60,9 @@ TEST(ipv4_address, parses_and_writes_dotted_quads)
     EXPECT_FALSE(parse_ipv4("239.69.1").has_value());
     EXPECT_FALSE(parse_ipv4("239.69.1.2.3").has_value());
     EXPECT_FALSE(parse_ipv4("239.69.1.256").has_value());
+    EXPECT_FALSE(parse_ipv4("10.10.032.5").has_value());  // octal or decimal? refused
+    EXPECT_TRUE(parse_ipv4("0.0.0.0").has_value());
+    EXPECT_TRUE(parse_ipv4("10.0.0.1").has_value());
     EXPECT_FALSE(parse_ipv4("239.69..2").has_value());
     EXPECT_FALSE(parse_ipv4("239.69.1.2 ").has_value());
     EXPECT_FALSE(parse_ipv4("+1.2.3.4").has_value());

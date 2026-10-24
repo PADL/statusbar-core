@@ -123,7 +123,8 @@ static_assert(alignof(IPv4Address) == 1, "IPv4Address must have 1-byte alignment
         }
         auto const part = text.substr(0, dot);
         auto const [end, error] = std::from_chars(part.data(), part.data() + part.size(), octets[i]);
-        if (part.empty() || error != std::errc{} || end != part.data() + part.size()) {
+        // A leading zero is refused: inet_aton reads "032" as octal, from_chars as decimal.
+        if (part.empty() || error != std::errc{} || end != part.data() + part.size() || (part.size() > 1 && part[0] == '0')) {
             return std::nullopt;
         }
         text = dot == std::string_view::npos ? std::string_view{} : text.substr(dot + 1);
