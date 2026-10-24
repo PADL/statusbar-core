@@ -39,6 +39,7 @@ emits cBPF for kernel-side filtering.
 - `NotificationPipe` — pipe-based reactor wakeup; `notify(code)` is safe from any thread.
 - `RawnetContext` — Layer-2 socket; `open(iface, ethertype, multicast_mac)` configures `AF_PACKET` (Linux) or BPF (macOS); `MAX_ETHERNET_FRAME_SIZE` / `MAX_ETHERNET_PAYLOAD` / `VLAN_TAG_SIZE` live in this header.
 - `EthernetPort` (concept) — zero-copy TX/RX contract satisfied by `TestPortContext`, `LoopbackPortContext`, `BpfPortContext`, `MmapContext`, `XdpContext`; `EthernetTxGuard` / `EthernetRxGuard` provide scoped slot acquisition.
+- `RssIndirection` — a NIC's RSS indirection table; `rss_indirection(iface)` reads it (`ethtool -x`), `set_rss_indirection(iface, table)` writes it (an empty table restores the driver default), and `set_rss_indirection_all(iface, queue)` steers every bucket to one queue and returns the previous table to put back (`ethtool -X iface weight 1 0 0 0`). `rss_indirection_all` / `rss_steered_to` build and test tables.
 - `TrafficClassifier` / `TcamClassifier` — rule-based steering; `ClassifierRule` for the linear matcher, `CompiledRule<32>` / `CompiledRule<64>` for the TCAM matcher (built via `ClassifierRuleBuilder`).
 
 ## Quick example
@@ -81,6 +82,7 @@ int main() {
 - `statusbar/net/net_rawnet.hpp`, `net_ethernet_port.hpp` — `RawnetContext` and the `EthernetPort` concept + slot/guard types.
 - `statusbar/net/net_traffic_classifier.hpp`, `net_tcam_classifier.hpp`, `net_compiled_rule.hpp`, `net_cbpf_emit.hpp` — classification and cBPF emission.
 - `statusbar/net/net_test_port.hpp`, `net_loopback_port.hpp`, `net_bpf_port.hpp`, `net_tap_bridge.hpp` — `EthernetPort` backends.
+- `statusbar/net/net_rss.hpp` — `RssIndirection` and the `ETHTOOL_GRXFHINDIR` / `ETHTOOL_SRXFHINDIR` helpers (the ioctls Linux-only).
 - `statusbar/net/net_linux_mmap.hpp`, `net_linux_xdp.hpp` — Linux `PACKET_MMAP` and AF_XDP contexts (Linux-only).
 
 ## Dependencies
@@ -99,6 +101,7 @@ int main() {
 - `Pollable::fd()` may return `-1` for tick-only ports — `tick(now_ns)` still fires each cycle. `poll_events()` defaults to `POLLIN`; override for `POLLOUT` / `on_writable`.
 - `set_dscp` writes IPv4 TOS or IPv6 traffic-class based on `family`; `is_valid_dscp` accepts `-1` (unset) or `0..63`.
 - `RawnetContext` needs `CAP_NET_RAW` on Linux; root or BPF device access on macOS. AF_XDP needs kernel ≥ 5.4, libbpf, libxdp, and an XDP-capable driver — otherwise `XdpContext` compiles as a stub.
+- An AF_XDP socket binds one RX queue, and RSS spreads received IP flows (multicast UDP included) over all of them: steer every bucket to the socket's queue with `set_rss_indirection_all` (needs `CAP_NET_ADMIN`; NICs without RSS, such as `lo` and `veth`, report `operation_not_supported`). Non-IP frames such as AVTP are not hashed and land on queue 0 on most NICs (igb, igc).
 - `SocketAddress::from_string` takes host *and* port plus a socket type (`SocketStream` / `SocketDatagram`) — the type drives `getaddrinfo` hints.
 - `NetError::would_block` is the expected end-of-drain on nonblocking `recv` / `send` — treat as success, not failure.
 

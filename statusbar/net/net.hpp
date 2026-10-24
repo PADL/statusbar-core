@@ -24,6 +24,7 @@
 #include "statusbar/net/net_rawnet_filter.hpp"
 #include "statusbar/net/net_ring_buffer_base.hpp"
 #include "statusbar/net/net_ring_queue_base.hpp"
+#include "statusbar/net/net_rss.hpp"
 #include "statusbar/net/net_server_config.hpp"
 #include "statusbar/net/net_socket.hpp"
 #include "statusbar/net/net_tap_bridge.hpp"
