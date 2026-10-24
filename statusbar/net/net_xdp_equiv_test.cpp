@@ -15,6 +15,7 @@
 #    include "statusbar/net/net_compiled_rule.hpp"
 #    include "statusbar/net/net_tcam_bpf_abi.h"
 #    include "statusbar/net/net_tcam_classifier.hpp"
+#    include "statusbar/net/net_xdp_avtp_rules.hpp"
 
 #    include <unistd.h>
 
@@ -212,6 +213,45 @@ TEST(xdp_equiv, bpf_matches_tcam_classifier)
         EXPECT_EQ(classifier_matched, c.expect_match);
         EXPECT_EQ(bpf_dropped, c.expect_match);
         EXPECT_EQ(classifier_matched, bpf_dropped);
+    }
+}
+
+TEST(xdp_equiv, avtp_stream_rules_match_in_bpf_as_in_the_classifier)
+{
+    struct rlimit const rlim = {.rlim_cur = RLIM_INFINITY, .rlim_max = RLIM_INFINITY};
+    (void)::setrlimit(RLIMIT_MEMLOCK, &rlim);
+
+    auto loaded = try_load_program();
+    if (loaded.prog_fd < 0) {
+        return;
+    }
+    // The six stream rules, with drop for a clean verdict (as above).
+    auto const rules = statusbar::net::avtp_subtype_rules(statusbar::net::AVTP_STREAM_SUBTYPES, true, flag::drop);
+    EXPECT_TRUE(rules.has_value());
+    std::span<CompiledRule<32> const> const view{rules->data(), rules->size()};
+    EXPECT_TRUE(install_rules(loaded.rules_map_fd, view));
+    TcamClassifier<32> classifier;
+    classifier.set_rules(view);
+
+    for (bool const tagged : {false, true}) {
+        for (std::uint16_t subtype = 0; subtype < 0x100; ++subtype) {
+            auto frame = make_frame(tagged ? 0x8100 : 0x22F0);
+            std::size_t at = 14;
+            if (tagged) {
+                frame[14] = 0x60;
+                frame[15] = 0x02;
+                frame[16] = 0x22;
+                frame[17] = 0xF0;
+                at = 18;
+            }
+            frame[at] = static_cast<std::uint8_t>(subtype);
+            auto const span = std::span<std::uint8_t const>{frame};
+            bool const stream = subtype == 0x00 || subtype == 0x02 || subtype == 0x04;
+            bool const classifier_matched = (classifier.classify_first(span) & flag::drop) != 0U;
+            bool const bpf_dropped = run_prog(loaded.prog_fd, span) == XDP_DROP;
+            EXPECT_EQ(classifier_matched, stream);
+            EXPECT_EQ(bpf_dropped, stream);
+        }
     }
 }
 

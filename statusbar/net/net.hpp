@@ -31,6 +31,7 @@
 #include "statusbar/net/net_test_port.hpp"
 #include "statusbar/net/net_traffic_classifier.hpp"
 #include "statusbar/net/net_util.hpp"
+#include "statusbar/net/net_xdp_avtp_rules.hpp"
 
 #ifdef __linux__
 #    include "statusbar/net/net_linux_mmap.hpp"
