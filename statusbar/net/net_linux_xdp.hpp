@@ -161,9 +161,12 @@ struct XdpConfig
     uint32_t queue_id{0};
     size_t rx_ring_size{256};
     size_t tx_ring_size{256};
+    /// fill_replenish() keeps up to this many free frames in the fill ring for RX.
     size_t fill_ring_size{512};
     size_t completion_ring_size{512};
     size_t umem_frame_size{2048};
+    /// tx_start() draws from what the fill ring leaves: umem_frame_count -
+    /// fill_ring_size after open() (none if not larger), less frames held in RX.
     size_t umem_frame_count{1024};
     size_t umem_headroom{0};
     unsigned int tap_ifindex{0};
@@ -738,6 +741,11 @@ class XdpSocket
     XdpSocket(XdpSocket const&) = delete;
     auto operator=(XdpSocket const&) -> XdpSocket& = delete;
 
+    /// open() retries a bind refused with EBUSY this often, BIND_BUSY_PAUSE_NS
+    /// apart: a socket just closed on the queue is released by the kernel later.
+    static constexpr size_t BIND_BUSY_RETRIES = 50;
+    static constexpr long BIND_BUSY_PAUSE_NS = 10'000'000;
+
     /// Allocate the UMEM and bind to `config.queue_id`, with xdp_bind_flags()
     /// for a program attached in `attached` mode. Leaves the fill ring empty.
     [[nodiscard]] auto open(XdpConfig const& config, XdpAttachMode attached) -> Status;
@@ -752,6 +760,8 @@ class XdpSocket
 
     void begin_cycle() noexcept { budget_.rx_cycle_count = 0; }
 
+    /// A free UMEM frame to fill and tx_commit(); free_list_empty when the fill
+    /// ring and RX hold the rest (XdpConfig::umem_frame_count).
     /// @param launch_time_ns TSN/AVB launch time in nanoseconds (currently unused, reserved)
     [[nodiscard]] auto tx_start(int64_t launch_time_ns = 0) -> StatusValue<EthernetTxSlot>
     {

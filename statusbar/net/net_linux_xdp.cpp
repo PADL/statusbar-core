@@ -476,31 +476,41 @@ auto XdpSocket::open(XdpConfig const& config, XdpAttachMode const attached) -> S
         return failure(bind_flags.error());
     }
 
-    auto umem_result = umem_.allocate(
-        config.umem_frame_count,
-        config.umem_frame_size,
-        config.umem_headroom,
-        config.fill_ring_size,
-        config.completion_ring_size,
-        rings_);
-    if (!umem_result) {
-        close();
-        return failure(umem_result.error());
-    }
-
     struct xsk_socket_config xsk_cfg{};
     xsk_cfg.rx_size = static_cast<__u32>(config.rx_ring_size);
     xsk_cfg.tx_size = static_cast<__u32>(config.tx_ring_size);
     xsk_cfg.libxdp_flags = XSK_LIBXDP_FLAGS__INHIBIT_PROG_LOAD;
     xsk_cfg.xdp_flags = 0;
     xsk_cfg.bind_flags = *bind_flags;
-
     std::string const ifname_str(config.interface_name);
-    int const ret = xsk_socket__create(&xsk_, ifname_str.c_str(), config.queue_id, *umem_result, &rings_.rx, &rings_.tx, &xsk_cfg);
-    if (ret != 0) {
+
+    // The kernel frees a closed socket's hold on its queue later (an RCU grace
+    // period and a work item), so a bind right after a close can see EBUSY.
+    // A failed create leaves its UMEM's rings configured: start again from a fresh UMEM.
+    for (size_t attempt = 0;; ++attempt) {
+        auto umem_result = umem_.allocate(
+            config.umem_frame_count,
+            config.umem_frame_size,
+            config.umem_headroom,
+            config.fill_ring_size,
+            config.completion_ring_size,
+            rings_);
+        if (!umem_result) {
+            close();
+            return failure(umem_result.error());
+        }
+        int const ret =
+            xsk_socket__create(&xsk_, ifname_str.c_str(), config.queue_id, *umem_result, &rings_.rx, &rings_.tx, &xsk_cfg);
+        if (ret == 0) {
+            break;
+        }
         xsk_ = nullptr;
         close();
-        return failure(XdpError::xsk_creation_failed);
+        if (ret != -EBUSY || attempt == BIND_BUSY_RETRIES) {
+            return failure(XdpError::xsk_creation_failed);
+        }
+        struct timespec const pause{.tv_sec = 0, .tv_nsec = BIND_BUSY_PAUSE_NS};
+        (void)::nanosleep(&pause, nullptr);
     }
     bind_mode_ = config.bind_mode;
     need_wakeup_ = config.need_wakeup;
