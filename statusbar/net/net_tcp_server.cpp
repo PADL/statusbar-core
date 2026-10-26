@@ -44,6 +44,19 @@ void set_accepted_options(int fd, TcpServerOptions const& options, int family)
 #endif
 }
 
+/// An AF_UNIX SOCK_SEQPACKET socket bound to `addr`.
+auto create_seqpacket_socket(SocketAddress const& addr) -> StatusValue<FileDescriptor>
+{
+    FileDescriptor fd{::socket(AF_UNIX, SOCK_SEQPACKET, 0)};
+    if (!fd.valid()) {
+        return failure(NetError::socket_creation_failed);
+    }
+    if (::bind(fd.get(), addr.sockaddr(), addr.length()) < 0) {
+        return failure(NetError::bind_failed);
+    }
+    return fd;
+}
+
 }  // namespace
 
 TcpConnectionPool::TcpConnectionPool(
@@ -96,7 +109,7 @@ auto TcpConnectionPool::prepare_unix_path(SocketAddress const& bind_addr) const 
     }
     // Live or stale? Only a refused connect proves nobody is listening;
     // success or a full backlog (EAGAIN) means a running instance owns it.
-    FileDescriptor probe{::socket(AF_UNIX, SOCK_STREAM, 0)};
+    FileDescriptor const probe{::socket(AF_UNIX, options_.unix_seqpacket ? SOCK_SEQPACKET : SOCK_STREAM, 0)};
     if (!probe.valid() || !set_nonblocking(probe.get())) {
         return false;
     }
@@ -141,7 +154,7 @@ auto TcpConnectionPool::open_listener(SocketAddress const& bind_addr) -> StatusV
         discard();
         return failure(NetError::bind_failed);  // the path leaves no room for the private directory
     }
-    auto listener = create_tcp_socket(*private_addr, true);
+    auto listener = options_.unix_seqpacket ? create_seqpacket_socket(*private_addr) : create_tcp_socket(*private_addr, true);
     if (!listener) {
         discard();
         return listener;

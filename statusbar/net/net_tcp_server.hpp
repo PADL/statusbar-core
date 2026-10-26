@@ -42,6 +42,9 @@
 /// writable by others. The pool owns the socket file at the
 /// path and unlinks it when destroyed. Accepted peers are usually unnamed:
 /// peer(slot) is AF_UNIX with an empty path().
+///
+/// With unix_seqpacket the listener is SOCK_SEQPACKET: write() sends one
+/// whole message or, when the peer's queue is full, nothing (0).
 
 #include "statusbar/net/net_address.hpp"
 #include "statusbar/net/net_fd_multiplexer.hpp"
@@ -83,6 +86,7 @@ struct TcpServerOptions
     bool nodelay = true;          ///< TCP_NODELAY on accepted sockets
     int64_t idle_timeout_ns = 0;  ///< close slots idle this long; 0 = never
     int unix_mode = -1;  ///< AF_UNIX: the socket file's mode, set before it appears at the path; -1 = leave the umask result
+    bool unix_seqpacket = false;  ///< AF_UNIX: SOCK_SEQPACKET (each write() one message) instead of SOCK_STREAM
 };
 
 class TcpConnectionPool : public Pollable

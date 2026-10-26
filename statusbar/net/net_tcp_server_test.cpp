@@ -339,6 +339,33 @@ TEST(net_tcp_server, unix_accept_echo_eof_lifecycle)
     EXPECT_FALSE(pool.is_open(handler.closes[0]));
 }
 
+TEST(net_tcp_server, unix_seqpacket_keeps_message_boundaries)
+{
+    TempSocketDir tmp;
+    auto bind_addr = SocketAddress::local(tmp.path());
+    TcpConnectionPool* pool_ptr = nullptr;
+    EchoHandler handler{pool_ptr};
+    TcpServerOptions options;
+    options.unix_seqpacket = true;
+    TcpConnectionPool pool{*bind_addr, 4, handler, options};
+    pool_ptr = &pool;
+    EXPECT_TRUE(pool.valid());
+
+    int const fd = ::socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    EXPECT_TRUE(fd >= 0);
+    EXPECT_EQ(::connect(fd, bind_addr->sockaddr(), bind_addr->length()), 0);
+    pump(pool, 5);
+    EXPECT_EQ(handler.accepts.size(), 1U);
+    std::array<uint8_t, 3> const first{1, 2, 3};
+    std::array<uint8_t, 2> const second{4, 5};
+    EXPECT_EQ(pool.write(handler.accepts[0], first).value_or(0), first.size());
+    EXPECT_EQ(pool.write(handler.accepts[0], second).value_or(0), second.size());
+    std::array<uint8_t, 16> in{};
+    EXPECT_EQ(::recv(fd, in.data(), in.size(), 0), ssize_t{3});  // one message per write
+    EXPECT_EQ(::recv(fd, in.data(), in.size(), 0), ssize_t{2});
+    ::close(fd);
+}
+
 TEST(net_tcp_server, unix_stale_socket_replaced)
 {
     TempSocketDir tmp;
