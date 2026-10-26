@@ -76,19 +76,19 @@ TEST(rawnet_filter, ethertype_filter_bytecode)
 TEST(rawnet_filter, subtype_filter_bytecode)
 {
     std::array<cbpf::Instruction, 13> const expected{{
-        {0x28, 0, 0, 12},          // 0: ldh [12]
-        {0x15, 5, 0, AVTP},        // 1: untagged -> 7
-        {0x15, 0, 8, 0x8100},      // 2: tagged -> 3, else drop (11)
-        {0x28, 0, 0, 16},          // 3: ldh [16]
-        {0x15, 0, 6, AVTP},        // 4: else drop (11)
-        {0x30, 0, 0, 18},          // 5: ldb [18]
-        {0x05, 0, 0, 1},           // 6: ja 8
-        {0x30, 0, 0, 14},          // 7: ldb [14]
-        {0x15, 3, 0, 0xFA},        // 8: -> accept (12)
-        {0x15, 2, 0, 0xFB},        // 9: -> accept (12)
-        {0x15, 1, 0, 0xFC},        // 10: -> accept (12), else drop (11)
-        {0x06, 0, 0, 0},           // 11: drop
-        {0x06, 0, 0, 0xFFFFFFFFU}, // 12: accept
+        {0x28, 0, 0, 12},           // 0: ldh [12]
+        {0x15, 5, 0, AVTP},         // 1: untagged -> 7
+        {0x15, 0, 8, 0x8100},       // 2: tagged -> 3, else drop (11)
+        {0x28, 0, 0, 16},           // 3: ldh [16]
+        {0x15, 0, 6, AVTP},         // 4: else drop (11)
+        {0x30, 0, 0, 18},           // 5: ldb [18]
+        {0x05, 0, 0, 1},            // 6: ja 8
+        {0x30, 0, 0, 14},           // 7: ldb [14]
+        {0x15, 3, 0, 0xFA},         // 8: -> accept (12)
+        {0x15, 2, 0, 0xFB},         // 9: -> accept (12)
+        {0x15, 1, 0, 0xFC},         // 10: -> accept (12), else drop (11)
+        {0x06, 0, 0, 0},            // 11: drop
+        {0x06, 0, 0, 0xFFFFFFFFU},  // 12: accept
     }};
     auto const p = rawnet_filter::subtype_filter(AVTP, ATDECC_SUBTYPES);
     EXPECT_EQ(p.length, expected.size());

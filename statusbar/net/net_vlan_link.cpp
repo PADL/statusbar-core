@@ -139,8 +139,7 @@ auto build_delete_link(std::span<uint8_t> const out, std::string_view const name
 
 auto VlanLinkClient::add_vlan(int const parent_ifindex, std::string_view const name, uint16_t const vid) -> Status
 {
-    return rtnl_.request(
-        [&](std::span<uint8_t> out, uint32_t seq) { return build_new_vlan(out, parent_ifindex, name, vid, seq); });
+    return rtnl_.request([&](std::span<uint8_t> out, uint32_t seq) { return build_new_vlan(out, parent_ifindex, name, vid, seq); });
 }
 
 auto VlanLinkClient::remove_link(std::string_view const name) -> Status

@@ -47,13 +47,13 @@ inline constexpr std::uint16_t TPID_8021Q = 0x8100U;
 {
     Program p{};
     p.code = {{
-        {cbpf::op::LD_H_ABS, 0, 0, 12},          // 0: A = ethertype @12
-        {cbpf::op::JMP_JEQ_K, 4, 0, ethertype},  // 1: == type -> accept (6)
-        {cbpf::op::JMP_JEQ_K, 0, 2, TPID_8021Q}, // 2: == 0x8100 -> 3, else drop (5)
-        {cbpf::op::LD_H_ABS, 0, 0, 16},          // 3: A = inner ethertype @16
-        {cbpf::op::JMP_JEQ_K, 1, 0, ethertype},  // 4: == type -> accept (6), else drop (5)
-        {cbpf::op::RET_K, 0, 0, DROP},           // 5
-        {cbpf::op::RET_K, 0, 0, ACCEPT},         // 6
+        {cbpf::op::LD_H_ABS, 0, 0, 12},           // 0: A = ethertype @12
+        {cbpf::op::JMP_JEQ_K, 4, 0, ethertype},   // 1: == type -> accept (6)
+        {cbpf::op::JMP_JEQ_K, 0, 2, TPID_8021Q},  // 2: == 0x8100 -> 3, else drop (5)
+        {cbpf::op::LD_H_ABS, 0, 0, 16},           // 3: A = inner ethertype @16
+        {cbpf::op::JMP_JEQ_K, 1, 0, ethertype},   // 4: == type -> accept (6), else drop (5)
+        {cbpf::op::RET_K, 0, 0, DROP},            // 5
+        {cbpf::op::RET_K, 0, 0, ACCEPT},          // 6
     }};
     p.length = 7;
     return p;

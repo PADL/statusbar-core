@@ -73,11 +73,8 @@ auto attach_filter(int const sock_fd, rawnet_filter::Program const& program) noe
 }  // namespace
 
 [[nodiscard]] auto RawnetContext::open(
-    std::string_view interface_name,
-    uint16_t ethertype,
-    Eui48 const* multicast_mac,
-    bool qdisc_bypass,
-    bool transmit_only) noexcept -> Status
+    std::string_view interface_name, uint16_t ethertype, Eui48 const* multicast_mac, bool qdisc_bypass, bool transmit_only) noexcept
+    -> Status
 {
     // A transmit-only socket is created with protocol 0: it is never hooked
     // into packet delivery (ptype_all or a protocol hash) at all, so it
@@ -493,11 +490,8 @@ void RawnetContext::close() noexcept
 #if defined(__APPLE__)
 
 [[nodiscard]] auto RawnetContext::open(
-    std::string_view interface_name,
-    uint16_t ethertype,
-    Eui48 const* multicast_mac,
-    bool qdisc_bypass,
-    bool transmit_only) noexcept -> Status
+    std::string_view interface_name, uint16_t ethertype, Eui48 const* multicast_mac, bool qdisc_bypass, bool transmit_only) noexcept
+    -> Status
 {
     (void)qdisc_bypass;  // qdisc bypass is a Linux AF_PACKET concept; no-op on macOS BPF
     // Find and open an available BPF device

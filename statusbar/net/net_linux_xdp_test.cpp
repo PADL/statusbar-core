@@ -1081,14 +1081,12 @@ TEST(xdp_integration, tx_flush_kicks_only_when_there_is_something_to_send)
         return;
     }
     XdpContext ctx;
-    EXPECT_TRUE(
-        ctx.open(
-               {.interface_name = "xdptest0",
-                .fill_ring_size = 32,  // half the UMEM left for TX
-                .umem_frame_count = 64,
-                .rx_clock_id = -1,
-                .attach_mode = XdpAttachMode::generic})
-            .has_value());
+    EXPECT_TRUE(ctx.open({.interface_name = "xdptest0",
+                          .fill_ring_size = 32,  // half the UMEM left for TX
+                          .umem_frame_count = 64,
+                          .rx_clock_id = -1,
+                          .attach_mode = XdpAttachMode::generic})
+                    .has_value());
     EXPECT_TRUE(ctx.tx_flush().has_value());
     EXPECT_EQ(ctx.stats().tx_flush_skipped, uint64_t{1});
     EXPECT_EQ(ctx.stats().tx_flush_count, uint64_t{0});
