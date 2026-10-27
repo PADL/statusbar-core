@@ -11,21 +11,25 @@
 //   - set_ifr_data       - Linux smuggles ethtool/hwtstamp via ifreq.ifr_data (char*)
 //   - ifname_bytes       - ifreq.ifr_name is char[IFNAMSIZ] for interface-name copies
 //   - hwaddr_bytes       - ifreq.ifr_hwaddr.sa_data holds 6 MAC bytes
+//   - ifreq_ioctl        - the socket-plus-name dance every SIOC* ioctl needs
 //
 // All of these are POSIX/Linux boundary crossings. They're isolated here
 // so the reinterpret_cast is confined to one typed helper per pattern and
 // call sites read cleanly.
 
 #include "statusbar/ieee/ieee_ethernet.hpp"
+#include "statusbar/status/status.hpp"
 
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <optional>
 #include <span>
 #include <string_view>
+#include <system_error>
 
 #include <net/if.h>
 #include <sys/ioctl.h>
@@ -85,6 +89,40 @@ inline void set_ifr_data(ifreq& ifr, T* data) noexcept
     return std::span<uint8_t, IFNAMSIZ>(reinterpret_cast<uint8_t*>(ifr.ifr_name), IFNAMSIZ);
 }
 
+/// Run an interface ioctl: open a transient AF_INET datagram socket purely as
+/// the carrier, fill ifr.ifr_name from `iface`, run `request`, and close the
+/// socket. Every SIOC* call needs this dance and nothing else, so it lives
+/// here once. Any ifr_* payload the caller has already set is left alone.
+///
+/// errno is saved across the close() so the failure reported is the ioctl's
+/// and not the close's.
+/// @param iface Interface name, 1 to IFNAMSIZ-1 bytes
+/// @param request The ioctl request (SIOCETHTOOL, SIOCGIFHWADDR, ...)
+/// @param ifr The ifreq to pass, with its payload fields already set
+[[nodiscard]] inline auto ifreq_ioctl(std::string_view const iface, unsigned long const request, ifreq& ifr) noexcept -> Status
+{
+    if (iface.empty() || iface.size() >= IFNAMSIZ) {
+        return failure(std::make_error_code(std::errc::no_such_device));
+    }
+#if defined(SOCK_CLOEXEC)
+    int const sock = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+#else
+    int const sock = ::socket(AF_INET, SOCK_DGRAM, 0);
+#endif
+    if (sock < 0) {
+        return failure(std::error_code{errno, std::system_category()});
+    }
+    std::memset(ifr.ifr_name, 0, sizeof(ifr.ifr_name));
+    std::memcpy(ifr.ifr_name, iface.data(), iface.size());
+    int const rc = ::ioctl(sock, request, &ifr);
+    int const failed_with = errno;
+    ::close(sock);
+    if (rc < 0) {
+        return failure(std::error_code{failed_with, std::system_category()});
+    }
+    return success();
+}
+
 #if defined(__linux__)
 
 /// View the ifreq.ifr_hwaddr.sa_data as a fixed 6-byte span. This is the
@@ -111,19 +149,8 @@ inline void set_ifr_data(ifreq& ifr, T* data) noexcept
 /// use this with Ethernet (`ARPHRD_ETHER`) interfaces.
 [[nodiscard]] inline auto read_interface_mac(std::string_view iface) noexcept -> std::optional<ieee::Eui48>
 {
-    if (iface.empty() || iface.size() >= IFNAMSIZ) {
-        return std::nullopt;
-    }
-    int const sock = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-    if (sock < 0) {
-        return std::nullopt;
-    }
     ifreq ifr{};
-    std::memcpy(ifr.ifr_name, iface.data(), iface.size());
-    ifr.ifr_name[iface.size()] = '\0';
-    int const rc = ::ioctl(sock, SIOCGIFHWADDR, &ifr);
-    ::close(sock);
-    if (rc < 0) {
+    if (auto const status = ifreq_ioctl(iface, SIOCGIFHWADDR, ifr); !status) {
         return std::nullopt;
     }
     ieee::Eui48 mac{};
