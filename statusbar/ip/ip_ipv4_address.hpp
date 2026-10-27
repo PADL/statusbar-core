@@ -7,10 +7,13 @@
 #include "statusbar/ieee/ieee.hpp"
 #include "statusbar/status/status.hpp"
 
+#include <array>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
+#include <string_view>
 
 namespace statusbar::ip {
 
@@ -105,6 +108,71 @@ struct IPv4Address
 // Compile-time layout verification
 static_assert(sizeof(IPv4Address) == 4, "IPv4Address must be exactly 4 bytes");
 static_assert(alignof(IPv4Address) == 1, "IPv4Address must have 1-byte alignment");
+
+namespace detail {
+
+/// One decimal octet of a dotted quad: one to three digits with a value of
+/// 0-255, and no leading zero unless the octet is exactly "0". nullopt for
+/// anything else, an empty part and a sign included.
+///
+/// The leading zero is refused rather than interpreted. inet_aton(3) reads
+/// "032" as octal 26 and a decimal parser reads it as 32, so the text has two
+/// readings and no way to choose between them; a peer that disagrees with us
+/// about what an address means is how an address check passes while the
+/// traffic goes elsewhere (CVE-2021-29418 and its relatives). Refusing is the
+/// one answer that cannot disagree.
+/// @param part The text of a single octet, without the dots
+[[nodiscard]] constexpr auto parse_ipv4_octet(std::string_view const part) noexcept -> std::optional<uint8_t>
+{
+    if (part.empty() || part.size() > 3 || (part.size() > 1 && part.front() == '0')) {
+        return std::nullopt;
+    }
+    unsigned value = 0;
+    for (char const c : part) {
+        if (c < '0' || c > '9') {
+            return std::nullopt;
+        }
+        value = (value * 10) + static_cast<unsigned>(c - '0');
+    }
+    if (value > 255) {
+        return std::nullopt;
+    }
+    return static_cast<uint8_t>(value);
+}
+
+}  // namespace detail
+
+/// Parse a dotted-quad IPv4 address ("239.69.1.2"): exactly four decimal
+/// octets of 0-255 separated by three dots, with nothing before, between or
+/// after them. nullopt otherwise - no inet_aton(3) shorthand ("10.1",
+/// "0x0a000001"), no leading zeros, no surrounding whitespace.
+///
+/// Strict because the text arrives from the network: SDP session descriptions
+/// carried over SAP are written by whoever is announcing, and an address we
+/// accept from one must have a single unambiguous reading. See
+/// detail::parse_ipv4_octet for why a leading zero is a refusal.
+/// @param text The text to parse
+[[nodiscard]] constexpr auto parse_ipv4(std::string_view text) noexcept -> std::optional<IPv4Address>
+{
+    std::array<uint8_t, IPv4Address::LENGTH> octets{};
+    for (size_t i = 0; i < octets.size(); ++i) {
+        bool const last = (i + 1) == octets.size();
+        auto const dot = text.find('.');
+        // Three dots, and the fourth octet runs to the end of the text.
+        if ((dot == std::string_view::npos) != last) {
+            return std::nullopt;
+        }
+        auto const octet = detail::parse_ipv4_octet(text.substr(0, dot));
+        if (!octet.has_value()) {
+            return std::nullopt;
+        }
+        octets[i] = *octet;
+        if (!last) {
+            text.remove_prefix(dot + 1);
+        }
+    }
+    return IPv4Address{octets[0], octets[1], octets[2], octets[3]};
+}
 
 }  // namespace statusbar::ip
 
