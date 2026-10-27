@@ -235,10 +235,13 @@ class TcClient final : public TcControl
     /// The messages in reply_'s first @p received bytes: the transaction's result
     /// once one ends it, else nullopt (read on).
     [[nodiscard]] auto read_replies(size_t received, size_t request_size, uint32_t seq, Wanted* wanted) -> std::optional<Status>;
-    /// One message addressed to this transaction: its result if it ends it, else nullopt.
-    [[nodiscard]] auto read_reply(std::span<uint8_t const> message, size_t request_size, Wanted* wanted) -> std::optional<Status>;
-    /// Parse a dump's RTM_NEWQDISC into @p wanted when it is the qdisc wanted: nullopt, or the parse's failure.
-    [[nodiscard]] static auto take_qdisc(std::span<uint8_t const> message, Wanted& wanted) -> std::optional<Status>;
+    /// One message addressed to this transaction, of nlmsg_type @p type and
+    /// nlmsg_flags @p flags: its result if it ends the transaction, else nullopt.
+    [[nodiscard]] auto read_reply(
+        std::span<uint8_t const> message, uint16_t type, uint16_t flags, size_t request_size, Wanted* wanted)
+        -> std::optional<Status>;
+    /// Parse a dump's RTM_NEWQDISC into @p wanted when it is the qdisc wanted (else ignore it).
+    [[nodiscard]] static auto take_qdisc(std::span<uint8_t const> message, Wanted& wanted) -> Status;
 
     FileDescriptor fd_{};
     uint32_t portid_{0};

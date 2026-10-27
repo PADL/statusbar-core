@@ -295,7 +295,7 @@ template <typename T>
 }
 
 /// The tcmsg fields of a qdisc message at least NLMSG_HEADER + TCMSG_SIZE long.
-[[nodiscard]] auto read_tcmsg(std::span<uint8_t const> const message) -> QdiscInfo
+[[nodiscard]] auto read_tcmsg(std::span<uint8_t const> const message) noexcept -> QdiscInfo
 {
     QdiscInfo info{};
     info.ifindex = read_at<int32_t>(message, NLMSG_HEADER + offsetof(tcmsg, tcm_ifindex));
@@ -355,7 +355,7 @@ template <typename T>
 }
 
 /// A dump's NLMSG_DONE: its payload is the dump's error (0 when complete).
-[[nodiscard]] auto dump_status(std::span<uint8_t const> const message) -> Status
+[[nodiscard]] auto dump_status(std::span<uint8_t const> const message) noexcept -> Status
 {
     int error = 0;
     if (message.size() >= NLMSG_HEADER + sizeof(error)) {
@@ -404,7 +404,7 @@ void read_ext_ack_message(
 }
 
 /// Bind netlink socket @p fd to a port id the kernel assigns: that id.
-[[nodiscard]] auto bind_port_id(int const fd) -> StatusValue<uint32_t>
+[[nodiscard]] auto bind_port_id(int const fd) noexcept -> StatusValue<uint32_t>
 {
     sockaddr_nl const local{.nl_family = AF_NETLINK, .nl_pad = 0, .nl_pid = 0, .nl_groups = 0};
     if (::bind(fd, sockaddr_cast(local), sizeof(local)) < 0) {
@@ -419,7 +419,7 @@ void read_ext_ack_message(
 }
 
 /// Set up route socket @p fd (acks, a 1 s receive timeout) and bind it: its port id.
-[[nodiscard]] auto configure_route_socket(int const fd) -> StatusValue<uint32_t>
+[[nodiscard]] auto configure_route_socket(int const fd) noexcept -> StatusValue<uint32_t>
 {
     // Extended acks carry the kernel's reason ("Change operation not
     // supported", "Specified device does not support offload"); capped acks
@@ -545,7 +545,8 @@ auto TcClient::read_replies(size_t const received, size_t const request_size, ui
             return failure(std::make_error_code(std::errc::bad_message));
         }
         if (header.nlmsg_seq == seq && header.nlmsg_pid == portid_) {
-            if (auto done = read_reply(reply.subspan(offset, header.nlmsg_len), request_size, wanted)) {
+            auto const message = reply.subspan(offset, header.nlmsg_len);
+            if (auto done = read_reply(message, header.nlmsg_type, header.nlmsg_flags, request_size, wanted)) {
                 return done;
             }
         }
@@ -554,23 +555,29 @@ auto TcClient::read_replies(size_t const received, size_t const request_size, ui
     return std::nullopt;
 }
 
-auto TcClient::read_reply(std::span<uint8_t const> const message, size_t const request_size, Wanted* const wanted)
-    -> std::optional<Status>
+auto TcClient::read_reply(
+    std::span<uint8_t const> const message,
+    uint16_t const type,
+    uint16_t const flags,
+    size_t const request_size,
+    Wanted* const wanted) -> std::optional<Status>
 {
-    auto const header = read_at<nlmsghdr>(message, 0);
-    if (header.nlmsg_type == NLMSG_DONE && wanted != nullptr) {
+    if (type == NLMSG_DONE && wanted != nullptr) {
         return dump_status(message);
     }
-    if (header.nlmsg_type == RTM_NEWQDISC && wanted != nullptr && !wanted->came && message.size() >= NLMSG_HEADER + TCMSG_SIZE) {
-        return take_qdisc(message, *wanted);
+    if (type == RTM_NEWQDISC && wanted != nullptr && !wanted->came && message.size() >= NLMSG_HEADER + TCMSG_SIZE) {
+        if (auto status = take_qdisc(message, *wanted); !status) {
+            return status;
+        }
+        return std::nullopt;
     }
-    if (header.nlmsg_type == NLMSG_ERROR) {
-        return ack_status(message, header.nlmsg_flags, request_size, last_message_);
+    if (type == NLMSG_ERROR) {
+        return ack_status(message, flags, request_size, last_message_);
     }
     return std::nullopt;
 }
 
-auto TcClient::take_qdisc(std::span<uint8_t const> const message, Wanted& wanted) -> std::optional<Status>
+auto TcClient::take_qdisc(std::span<uint8_t const> const message, Wanted& wanted) -> Status
 {
     auto const ifindex = read_at<int32_t>(message, NLMSG_HEADER + offsetof(tcmsg, tcm_ifindex));
     auto const parent = read_at<uint32_t>(message, NLMSG_HEADER + offsetof(tcmsg, tcm_parent));
@@ -582,7 +589,7 @@ auto TcClient::take_qdisc(std::span<uint8_t const> const message, Wanted& wanted
         *wanted.found = std::move(*parsed);
         wanted.came = true;
     }
-    return std::nullopt;
+    return success();
 }
 
 }  // namespace statusbar::net::tc
