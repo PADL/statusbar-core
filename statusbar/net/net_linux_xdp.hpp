@@ -91,6 +91,9 @@ enum class XdpError
     too_many_filter_rules,
     zero_copy_needs_native_attach,
     zero_copy_unavailable,
+    bpffs_not_mounted,
+    invalid_pin_path,
+    pin_failed,
 };
 
 class XdpErrorCategory : public std::error_category
@@ -158,6 +161,18 @@ enum class XdpAttachMode : uint8_t
 static_assert(XdpBindMode{} == XdpBindMode::auto_);
 static_assert(XdpAttachMode{} == XdpAttachMode::native);
 
+/// What is attached to an interface right now, as the kernel reports it.
+struct XdpAttachedProgram
+{
+    /// The attached program's id. Zero when programs are attached in more
+    /// than one mode at once, the one case where the kernel will not name a
+    /// single program - and the one case where adopting would be a guess.
+    uint32_t program_id{0};
+    /// Where it runs. `native` when programs are attached in both modes,
+    /// that being the one a frame meets first.
+    XdpAttachMode mode{XdpAttachMode::native};
+};
+
 struct XdpConfig
 {
     std::string_view interface_name;
@@ -177,6 +192,18 @@ struct XdpConfig
     int rx_clock_id{CLOCK_MONOTONIC_RAW};
     XdpBindMode bind_mode{XdpBindMode::auto_};
     XdpAttachMode attach_mode{XdpAttachMode::native};
+    /// Where to pin the program and its maps, from XdpProgram::pin_path_for().
+    /// Empty - the default - means do not pin, which is the behaviour from
+    /// before pinning existed: attach at open(), detach at close().
+    /// A view, like interface_name: whatever it points at must outlive the
+    /// open() call. XdpContext::program().pin_path() keeps a copy.
+    std::string_view pin_path{};
+    /// Reuse a program already pinned at `pin_path` instead of attaching a
+    /// fresh one, when it is recognisably ours and matches this config.
+    /// Ignored when `pin_path` is empty. True by default: a caller that named
+    /// a pin path wants the pin used. False forces a fresh attach and pins
+    /// the result, which is what an upgrade with a changed program wants.
+    bool adopt{true};
 };
 
 }  // namespace statusbar::net
@@ -327,7 +354,149 @@ struct AttachPlan
     return AttachPlan{.first = XdpAttachMode::native, .fallback = XdpAttachMode::generic};
 }
 
+/// Whether `name` is a name the kernel would accept for an interface - which
+/// is also exactly what makes it safe to paste into a pin path: no '/', so it
+/// cannot climb out of the pin directory, and neither "." nor "..".
+/// Mirrors the kernel's dev_valid_name(). The length limit is spelled out
+/// rather than taken from IFNAMSIZ so this stays usable off Linux.
+/// @param name The candidate interface name
+[[nodiscard]] constexpr auto valid_interface_name(std::string_view const name) noexcept -> bool
+{
+    constexpr size_t MaxNameLength = 15;  // IFNAMSIZ - 1
+    if (name.empty() || name.size() > MaxNameLength) {
+        return false;
+    }
+    if (name == "." || name == "..") {
+        return false;
+    }
+    for (char const c : name) {
+        if (c == '/' || c == ':' || c == '\0' || c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r') {
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace detail
+
+// ──────────────────────────────────────────────
+// XdpProgram — the program on the interface, and its pins
+// ──────────────────────────────────────────────
+
+class XdpContext;
+
+/// The XDP program an XdpContext is using: where it is pinned, whether open()
+/// adopted it rather than attaching one, and the operations on a pin path that
+/// need no instance at all.
+///
+/// The loaded object and the map descriptors live inside XdpContext. What is
+/// here is the part a caller can see and - the point of pinning - the part
+/// that outlives the process.
+///
+/// ### Why pin
+///
+/// An unpinned program's lifetime is our process's. Restart the daemon and the
+/// program comes off the interface and goes back on, and for that gap every
+/// frame it was steering reaches the kernel instead: audio drops out on a
+/// config reload, not just on a crash. Pinned into bpffs, the program stays
+/// attached when we exit and the next start **adopts** it, so a reload does
+/// not interrupt the data path and a crash leaves a working one. It also makes
+/// the state inspectable - `bpftool map dump pinned <path>/rules_map` against
+/// a known name, instead of hunting for a program id.
+///
+/// ### Close policy
+///
+/// A pinned program is deliberately **left attached** when the context closes;
+/// that is what makes the next start seamless, and it is the whole difference
+/// from the unpinned path. Nothing in the process removes it. detach() is the
+/// only way, and a caller that wants the old lifetime leaves
+/// XdpConfig::pin_path empty.
+class XdpProgram
+{
+  public:
+    /// The bpf filesystem every pin lives under. It must be mounted; a pin
+    /// path anywhere else is refused rather than quietly creating ordinary
+    /// directories that bpf_obj_pin() would then reject.
+    static constexpr std::string_view BPFFS_ROOT = "/sys/fs/bpf";
+    /// Our directory within it, one subdirectory per interface below that.
+    static constexpr std::string_view PIN_NAMESPACE = "statusbar";
+
+    /// Entry names inside a pin directory. Fixed and documented so an
+    /// external tool knows what to look for.
+    static constexpr std::string_view PIN_PROG = "prog";
+    static constexpr std::string_view PIN_RULES_MAP = "rules_map";
+    static constexpr std::string_view PIN_XSK_MAP = "xsk_map";
+    static constexpr std::string_view PIN_DEVMAP = "devmap";
+
+    /// The pin directory for an interface: BPFFS_ROOT/PIN_NAMESPACE/<name>,
+    /// so two interfaces never collide. Pure - no filesystem is touched and
+    /// nothing is created.
+    /// @param interface_name The interface the program will steer
+    /// @return The directory, or an empty string when the name is not one the
+    ///         kernel would accept. Empty means "do not pin", so a bad name
+    ///         degrades to the unpinned behaviour rather than yielding a path
+    ///         that could point outside the pin directory.
+    [[nodiscard]] static auto pin_path_for(std::string_view interface_name) -> std::string;
+
+    /// One entry within a pin directory, e.g. pin_entry(dir, PIN_PROG).
+    /// @param pin_path A pin directory, from pin_path_for()
+    /// @param entry One of PIN_PROG, PIN_RULES_MAP, PIN_XSK_MAP, PIN_DEVMAP
+    /// @return The full path, or empty if either argument is empty
+    [[nodiscard]] static auto pin_entry(std::string_view pin_path, std::string_view entry) -> std::string;
+
+    /// Whether anything can be pinned at `pin_path`: it is a path under
+    /// BPFFS_ROOT with something below it, and a bpf filesystem is mounted
+    /// there. Creates nothing and needs no privilege.
+    ///
+    /// open() asks this before it allocates anything, so a config pointing
+    /// outside bpffs, or a host with no bpffs mounted, is reported as itself
+    /// rather than as the ENOENT or EINVAL that the pin would produce much
+    /// later. A daemon can ask the same question of its own config at
+    /// startup.
+    /// @param pin_path A pin directory, from pin_path_for()
+    [[nodiscard]] static auto pinnable(std::string_view pin_path) -> Status;
+
+    /// What is attached to an interface now, if anything - so open(), or a
+    /// caller, can tell whether a pinned program is the one in force.
+    /// @param if_index The interface index
+    /// @return The attached program, or nullopt when nothing is attached
+    [[nodiscard]] static auto query(unsigned int if_index) -> StatusValue<std::optional<XdpAttachedProgram>>;
+
+    /// Unpin and detach: the counterpart to leaving a program running on
+    /// purpose. Goes by path and interface index and holds no handle from the
+    /// process that created the pin, so it works on a stale pin whose creator
+    /// is long gone - which, once a crash leaves the program attached, is a
+    /// normal state and not an exceptional one. Succeeds when there is
+    /// nothing left to remove.
+    /// A non-empty `pin_path` must be one pinnable() accepts - this call
+    /// unlinks within it and then removes it, so a path built by hand rather
+    /// than by pin_path_for() is refused instead of followed.
+    /// @param if_index The interface to detach from
+    /// @param pin_path The pin directory to empty; empty to only detach
+    [[nodiscard]] static auto detach(unsigned int if_index, std::string_view pin_path) -> Status;
+
+    /// Whether the program and its maps are pinned, and so outlive us.
+    [[nodiscard]] auto pinned() const noexcept -> bool { return pinned_; }
+
+    /// Whether open() reused a program already pinned instead of attaching
+    /// one. False after a fresh attach, pinned or not.
+    [[nodiscard]] auto adopted() const noexcept -> bool { return adopted_; }
+
+    /// Where it is pinned; empty when it is not.
+    [[nodiscard]] auto pin_path() const noexcept -> std::string_view { return pin_path_; }
+
+    /// The kernel's id for the program, 0 when nothing is loaded.
+    [[nodiscard]] auto id() const noexcept -> uint32_t { return id_; }
+
+  private:
+    // XdpContext is what opens, adopts and pins; these record what it did.
+    friend class XdpContext;
+
+    std::string pin_path_;
+    uint32_t id_{0};
+    bool pinned_{false};
+    bool adopted_{false};
+};
 
 // ──────────────────────────────────────────────
 // XdpContext — Linux implementation with libbpf/libxdp
@@ -592,6 +761,14 @@ class BpfAttachment
         obj_.reset();
     }
 
+    /// Leave the program on the interface when this object goes away, keeping
+    /// the object open so the borrowed program and map descriptors stay valid
+    /// for as long as we are running. Used once the program is pinned: the
+    /// attachment is then outliving us on purpose, and detaching it at close
+    /// would defeat the pin. The mode is kept so attach_mode() still answers
+    /// truthfully.
+    void disown() noexcept { attached_ = false; }
+
     [[nodiscard]] auto is_attached() const noexcept -> bool { return attached_; }
 
     /// The mode the program is attached in, which after a fallback is not
@@ -651,14 +828,50 @@ class BpfState
         if (auto status = attachment_.attach(std::move(obj_), prog_fd_, if_index, plan); !status) {
             return status;
         }
+        return register_xsk(queue_id, xsk_fd);
+    }
 
-        int const ret = bpf_map_update_elem(xsk_map_fd_, &queue_id, &xsk_fd, BPF_ANY);
-        if (ret != 0) {
+    /// Put the XSK socket in xsk_map for its queue. Split out of attach()
+    /// because an adopted program needs this and nothing else: the program on
+    /// the interface is already the right one, but the socket behind the map
+    /// entry belongs to the process that died.
+    /// @param queue_id Hardware queue ID for the XSK socket
+    /// @param xsk_fd File descriptor of the XSK socket
+    [[nodiscard]] auto register_xsk(uint32_t queue_id, int xsk_fd) -> Status
+    {
+        if (xsk_map_fd_ < 0) {
+            return failure(XdpError::not_open);
+        }
+        if (bpf_map_update_elem(xsk_map_fd_, &queue_id, &xsk_fd, BPF_ANY) != 0) {
             return failure(XdpError::bpf_map_update_failed);
         }
-
         return success();
     }
+
+    /// Take over the program and maps pinned under `pin_path`, in place of
+    /// load(): same post-conditions, no new program. Succeeds only when the
+    /// pin is recognisably ours *and* is the program attached to `if_index`;
+    /// anything else - a stale pin, an older build, someone else's program -
+    /// is a plain failure and the caller loads fresh instead.
+    ///
+    /// `rules` are installed into the adopted map exactly as load() would
+    /// install them. The rules in force are the ones this process asked for,
+    /// not whatever the last one left behind: a map whose contents depend on
+    /// history cannot be reasoned about, and a caller that wants its rules to
+    /// survive the restart passes them to open().
+    /// @param pin_path The pin directory to adopt from
+    /// @param if_index The interface the program must already be attached to
+    /// @param rules Compiled TCAM rules to install into the adopted map
+    /// @param default_action Action applied to frames that match no user rule
+    [[nodiscard]] auto adopt(
+        std::string_view pin_path, unsigned int if_index, std::span<CompiledRule<32> const> rules, XdpAction default_action)
+        -> Status;
+
+    /// Pin the loaded program and its maps under `pin_path`, creating the
+    /// directory. On success the attachment is disowned, so the program stays
+    /// on the interface after we exit - which is the point of pinning.
+    /// @param pin_path The pin directory to create and fill
+    [[nodiscard]] auto pin(std::string_view pin_path) -> Status;
 
     /// Register TAP interface in devmap
     /// @param tap_ifindex Interface index of the TAP device
@@ -687,18 +900,36 @@ class BpfState
     void close() noexcept
     {
         attachment_.detach();
+        // After load() the descriptors are borrowed from obj_ and go with it.
+        // After adopt() they came from bpf_obj_get() and are ours to close.
+        if (owns_fds_) {
+            for (int* fd : {&prog_fd_, &xsk_map_fd_, &rules_map_fd_, &devmap_fd_}) {
+                if (*fd >= 0) {
+                    ::close(*fd);
+                }
+            }
+            owns_fds_ = false;
+        }
         obj_.reset();
         prog_fd_ = -1;
         xsk_map_fd_ = -1;
         rules_map_fd_ = -1;
         devmap_fd_ = -1;
         default_action_ = XdpAction::pass_kernel;
+        program_id_ = 0;
+        adopted_ = false;
     }
 
     [[nodiscard]] auto rules_map_fd() const noexcept -> int { return rules_map_fd_; }
 
     /// The mode the program is attached in, native unless nothing is attached.
     [[nodiscard]] auto attach_mode() const noexcept -> XdpAttachMode { return attachment_.attach_mode(); }
+
+    /// Whether the program came from a pin rather than from a fresh load.
+    [[nodiscard]] auto adopted() const noexcept -> bool { return adopted_; }
+
+    /// The kernel's id for the loaded or adopted program, 0 when none.
+    [[nodiscard]] auto program_id() const noexcept -> uint32_t { return program_id_; }
 
   private:
     [[nodiscard]] auto install_tcam_rules(std::span<CompiledRule<32> const> rules) -> Status;
@@ -712,6 +943,9 @@ class BpfState
         std::swap(xsk_map_fd_, other.xsk_map_fd_);
         std::swap(rules_map_fd_, other.rules_map_fd_);
         std::swap(devmap_fd_, other.devmap_fd_);
+        std::swap(owns_fds_, other.owns_fds_);
+        std::swap(program_id_, other.program_id_);
+        std::swap(adopted_, other.adopted_);
     }
 
     BpfObject obj_;
@@ -721,6 +955,9 @@ class BpfState
     int xsk_map_fd_{-1};
     int rules_map_fd_{-1};
     int devmap_fd_{-1};
+    uint32_t program_id_{0};
+    bool owns_fds_{false};
+    bool adopted_{false};
 };
 
 }  // namespace detail
@@ -778,6 +1015,17 @@ class XdpContext
     /// The mode the program is attached in, which after a native-to-generic
     /// fallback is not the mode that was asked for.
     [[nodiscard]] auto attach_mode() const noexcept -> XdpAttachMode { return bpf_.attach_mode(); }
+
+    /// The program in force, and its pins.
+    [[nodiscard]] auto program() const noexcept -> XdpProgram const& { return program_; }
+
+    /// Whether the program and its maps are pinned, and so stay attached
+    /// after this context closes.
+    [[nodiscard]] auto pinned() const noexcept -> bool { return program_.pinned(); }
+
+    /// Whether open() adopted a program already pinned rather than attaching
+    /// one - the restart that did not interrupt anything.
+    [[nodiscard]] auto adopted() const noexcept -> bool { return program_.adopted(); }
 
     void begin_cycle() noexcept { budget_.rx_cycle_count = 0; }
 
@@ -859,6 +1107,7 @@ class XdpContext
         std::swap(interface_, other.interface_);
         std::swap(budget_, other.budget_);
         std::swap(stats_, other.stats_);
+        std::swap(program_, other.program_);
         std::swap(zero_copy_, other.zero_copy_);
     }
 
@@ -870,6 +1119,7 @@ class XdpContext
     detail::InterfaceId interface_;
     detail::CycleBudget budget_;
     Stats stats_{};
+    XdpProgram program_;
     bool zero_copy_{false};
 };
 
@@ -925,6 +1175,10 @@ class XdpContext
     [[nodiscard]] auto bind_mode() const noexcept -> XdpBindMode { return XdpBindMode::copy; }
     [[nodiscard]] auto attach_mode() const noexcept -> XdpAttachMode { return XdpAttachMode::native; }
 
+    [[nodiscard]] auto program() const noexcept -> XdpProgram const& { return program_; }
+    [[nodiscard]] auto pinned() const noexcept -> bool { return false; }
+    [[nodiscard]] auto adopted() const noexcept -> bool { return false; }
+
     void begin_cycle() noexcept {}
 
     [[nodiscard]] auto end_cycle() -> Status { return success(); }
@@ -957,8 +1211,13 @@ class XdpContext
     [[nodiscard]] auto stats() const noexcept -> Stats const& { return stats_; }
 
   private:
-    void swap(XdpContext& other) noexcept { std::swap(stats_, other.stats_); }
+    void swap(XdpContext& other) noexcept
+    {
+        std::swap(stats_, other.stats_);
+        std::swap(program_, other.program_);
+    }
     Stats stats_{};
+    XdpProgram program_;
 };
 
 #endif  // __linux__ && HAVE_XDP

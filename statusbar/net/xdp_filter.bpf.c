@@ -35,7 +35,7 @@ struct
 struct
 {
     __uint(type, BPF_MAP_TYPE_XSKMAP);
-    __uint(max_entries, 64);
+    __uint(max_entries, TCAM_XSK_MAP_ENTRIES);
     __type(key, __u32);
     __type(value, __u32);
 } xsk_map SEC(".maps");
@@ -44,7 +44,7 @@ struct
 struct
 {
     __uint(type, BPF_MAP_TYPE_DEVMAP);
-    __uint(max_entries, 1);
+    __uint(max_entries, TCAM_DEVMAP_ENTRIES);
     __type(key, __u32);
     __type(value, __u32);
 } devmap SEC(".maps");

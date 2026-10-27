@@ -45,7 +45,15 @@ enum
 
     /* Maximum number of rules the BPF program evaluates per frame.
      * Matches statusbar::net::tcam_default_capacity. */
-    TCAM_MAX_RULES = 16
+    TCAM_MAX_RULES = 16,
+
+    /* xsk_map's capacity: one slot per NIC receive queue, keyed by
+     * rx_queue_index. Part of the ABI because a pinned map is adopted
+     * only when its declared capacity still matches. */
+    TCAM_XSK_MAP_ENTRIES = 64,
+
+    /* devmap's capacity. One entry, at key 0. */
+    TCAM_DEVMAP_ENTRIES = 1
 };
 
 /* One slot in the BPF rules_map. Byte-for-byte identical to

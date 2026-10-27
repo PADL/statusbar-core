@@ -78,6 +78,9 @@ TEST(xdp_error, all_errors_have_messages)
     check(XdpError::too_many_filter_rules);
     check(XdpError::zero_copy_needs_native_attach);
     check(XdpError::zero_copy_unavailable);
+    check(XdpError::bpffs_not_mounted);
+    check(XdpError::invalid_pin_path);
+    check(XdpError::pin_failed);
 }
 
 TEST(xdp_error, category_name)
@@ -107,6 +110,10 @@ TEST(xdp_config, default_values)
     EXPECT_EQ(config.rx_drain_max, 32u);
     EXPECT_TRUE(config.bind_mode == XdpBindMode::auto_);
     EXPECT_TRUE(config.attach_mode == XdpAttachMode::native);
+    // Empty pin path: no pinning, which is the behaviour from before pinning
+    // existed. `adopt` only has a say once a pin path is given.
+    EXPECT_TRUE(config.pin_path.empty());
+    EXPECT_TRUE(config.adopt);
 }
 
 //
@@ -178,6 +185,64 @@ TEST(xdp_attach_plan, the_defaults_mean_try_native_fall_back_to_generic)
     static_assert(plan->first == XdpAttachMode::native);
     static_assert(plan->fallback == XdpAttachMode::generic);
     EXPECT_TRUE(plan.has_value());
+}
+
+//
+// Program pinning: the pure parts
+//
+// pin_path_for() touches no filesystem, so the convention itself - one
+// directory per interface, under a mounted bpffs, with fixed entry names - is
+// checked here. What needs a kernel is further down.
+//
+
+TEST(xdp_pin_path, each_interface_gets_its_own_directory)
+{
+    EXPECT_TRUE(XdpProgram::pin_path_for("eth0") == "/sys/fs/bpf/statusbar/eth0");
+    EXPECT_TRUE(XdpProgram::pin_path_for("eth1") == "/sys/fs/bpf/statusbar/eth1");
+    EXPECT_TRUE(XdpProgram::pin_path_for("eth0") != XdpProgram::pin_path_for("eth1"));
+    // Under the bpffs mount, which is the only place a pin can live.
+    EXPECT_TRUE(XdpProgram::pin_path_for("eno1").starts_with(XdpProgram::BPFFS_ROOT));
+}
+
+TEST(xdp_pin_path, a_name_the_kernel_would_refuse_yields_no_path)
+{
+    // An empty result means "do not pin". Returning a path built from a name
+    // with a '/' in it would be the dangerous answer: pin() creates that
+    // directory and detach() unlinks inside it, so a name that can climb out
+    // of the pin directory must never reach either.
+    for (auto const* const name : {"", "/", "..", ".", "eth0/../../etc", "a b", "eth:0", "with\tTab", "sixteen-chars-xx"}) {
+        EXPECT_TRUE(XdpProgram::pin_path_for(name).empty());
+    }
+    // Fifteen characters is the longest an interface name can be.
+    EXPECT_FALSE(XdpProgram::pin_path_for("fifteen-chars-x").empty());
+}
+
+TEST(xdp_pin_path, interface_name_validity_is_constexpr)
+{
+    static_assert(detail::valid_interface_name("eth0"));
+    static_assert(detail::valid_interface_name("fifteen-chars-x"));
+    static_assert(!detail::valid_interface_name("sixteen-chars-xx"));
+    static_assert(!detail::valid_interface_name(""));
+    static_assert(!detail::valid_interface_name("."));
+    static_assert(!detail::valid_interface_name(".."));
+    static_assert(!detail::valid_interface_name("a/b"));
+    static_assert(!detail::valid_interface_name("a:b"));
+    static_assert(!detail::valid_interface_name("a b"));
+    EXPECT_TRUE(detail::valid_interface_name("lo"));
+}
+
+TEST(xdp_pin_path, the_entry_names_are_fixed)
+{
+    auto const dir = XdpProgram::pin_path_for("eth0");
+    EXPECT_TRUE(XdpProgram::pin_entry(dir, XdpProgram::PIN_PROG) == "/sys/fs/bpf/statusbar/eth0/prog");
+    EXPECT_TRUE(XdpProgram::pin_entry(dir, XdpProgram::PIN_RULES_MAP) == "/sys/fs/bpf/statusbar/eth0/rules_map");
+    EXPECT_TRUE(XdpProgram::pin_entry(dir, XdpProgram::PIN_XSK_MAP) == "/sys/fs/bpf/statusbar/eth0/xsk_map");
+    EXPECT_TRUE(XdpProgram::pin_entry(dir, XdpProgram::PIN_DEVMAP) == "/sys/fs/bpf/statusbar/eth0/devmap");
+    // A trailing slash on the directory does not double up.
+    EXPECT_TRUE(XdpProgram::pin_entry("/sys/fs/bpf/statusbar/eth0/", XdpProgram::PIN_PROG) == "/sys/fs/bpf/statusbar/eth0/prog");
+    // No directory, no entry: the "do not pin" answer propagates.
+    EXPECT_TRUE(XdpProgram::pin_entry("", XdpProgram::PIN_PROG).empty());
+    EXPECT_TRUE(XdpProgram::pin_entry(XdpProgram::pin_path_for("bad/name"), XdpProgram::PIN_PROG).empty());
 }
 
 TEST(xdp_config, compiled_rule_defaults)
@@ -353,6 +418,17 @@ TEST(xdp_stub, modes_before_open)
     EXPECT_TRUE(ctx.attach_mode() == XdpAttachMode::native);
 }
 
+TEST(xdp_stub, no_program_before_open)
+{
+    XdpContext ctx;
+    EXPECT_FALSE(ctx.pinned());
+    EXPECT_FALSE(ctx.adopted());
+    EXPECT_FALSE(ctx.program().pinned());
+    EXPECT_FALSE(ctx.program().adopted());
+    EXPECT_TRUE(ctx.program().pin_path().empty());
+    EXPECT_EQ(ctx.program().id(), 0u);
+}
+
 // Needs no privilege and no NIC: the combination is refused before open()
 // looks up the interface, so the failure arrives the same way everywhere.
 TEST(xdp_open, zero_copy_with_generic_attach_is_refused_before_any_syscall)
@@ -385,13 +461,194 @@ TEST(xdp_open, zero_copy_with_generic_attach_is_refused_before_any_syscall)
     }
 }
 
+#    if defined(__linux__) && defined(HAVE_XDP)
+
+//
+// Pinning against the real kernel, without privilege
+//
+// Querying what is attached to an interface goes over netlink and needs no
+// capability, so these run everywhere. Pinning itself needs CAP_BPF and a
+// writable /sys/fs/bpf, so what is checked here is that each way of being
+// unable to pin reports itself as itself.
+//
+
+#        include <unistd.h>
+
+#        include <net/if.h>
+
+TEST(xdp_query, nothing_is_attached_to_loopback)
+{
+    auto const index = ::if_nametoindex("lo");
+    EXPECT_TRUE(index != 0);
+    auto const attached = XdpProgram::query(index);
+    EXPECT_TRUE(attached.has_value());
+    if (attached) {
+        // An answer, and the answer is "nothing" - told apart from the query
+        // having failed, which is the distinction a caller deciding whether
+        // to adopt depends on.
+        EXPECT_FALSE(attached->has_value());
+    }
+}
+
+TEST(xdp_query, an_unknown_interface_is_reported_as_one)
+{
+    constexpr unsigned int NoSuchInterface = 0x7FFFFFFF;
+    auto const attached = XdpProgram::query(NoSuchInterface);
+    EXPECT_FALSE(attached.has_value());
+    if (!attached) {
+        EXPECT_TRUE(attached.error() == std::errc::no_such_device);
+    }
+}
+
+TEST(xdp_detach, succeeds_when_there_is_nothing_to_detach)
+{
+    // An empty pin path means "detach only", so this reaches nothing but the
+    // interface - and loopback has no program on it. Nothing attached is not
+    // an error: detach() is idempotent, so a daemon can call it on the way in
+    // without first working out what the last run left behind.
+    auto const index = ::if_nametoindex("lo");
+    EXPECT_TRUE(index != 0);
+    EXPECT_TRUE(XdpProgram::detach(index, "").has_value());
+    EXPECT_TRUE(XdpProgram::detach(index, "").has_value());
+}
+
+TEST(xdp_detach, an_unreadable_pin_directory_is_reported_rather_than_assumed_empty)
+{
+    // /sys/fs/bpf is mode 700, so without privilege we cannot tell "the pin
+    // is not there" from "we cannot look". Reporting the permission error is
+    // the honest answer; silently treating it as "nothing to remove" would
+    // tell a daemon it had cleaned up when it had not.
+    auto const index = ::if_nametoindex("lo");
+    auto const absent = XdpProgram::pin_path_for("statusbar-no-if");
+    auto const status = XdpProgram::detach(index, absent);
+    if (getuid() == 0) {
+        EXPECT_TRUE(status.has_value());  // root can look, and there is nothing there
+    } else {
+        EXPECT_FALSE(status.has_value());
+        if (!status) {
+            EXPECT_TRUE(status.error() == std::errc::permission_denied);
+        }
+    }
+}
+
+//
+// pinnable(): the three ways pinning can be unavailable, told apart
+//
+
+TEST(xdp_pinnable, a_path_outside_the_bpf_filesystem_is_refused)
+{
+    // "" is what pin_path_for() returns for a name it refused; BPFFS_ROOT
+    // itself names no interface; and a path that merely starts with the same
+    // letters is not the mount point.
+    for (auto const* const path :
+         {"/tmp/statusbar-not-bpffs/lo", "/var/lib/statusbar/lo", "", "/sys/fs/bpf", "/sys/fs/bpfs-elsewhere/lo"}) {
+        auto const status = XdpProgram::pinnable(path);
+        EXPECT_FALSE(status.has_value());
+        if (!status) {
+            EXPECT_TRUE(status.error() == XdpError::invalid_pin_path);
+        }
+    }
+}
+
+TEST(xdp_pinnable, a_path_in_a_mounted_bpffs_is_accepted_without_privilege)
+{
+    // Needs no capability and creates nothing: it is the question a daemon
+    // asks of its own config at startup.
+    auto const path = XdpProgram::pin_path_for("lo");
+    auto const status = XdpProgram::pinnable(path);
+    if (status) {
+        EXPECT_TRUE(status.has_value());
+    } else {
+        // A host with no bpffs mounted says so, and says it distinctly from
+        // the bad-path answer above.
+        EXPECT_TRUE(status.error() == XdpError::bpffs_not_mounted);
+    }
+    // Nothing was created on the way through.
+    EXPECT_TRUE(::access(path.c_str(), F_OK) != 0 || getuid() == 0);
+}
+
+TEST(xdp_detach, a_pin_path_it_could_not_have_made_is_refused)
+{
+    // detach() unlinks inside the directory and then removes it, so a path
+    // that is not somewhere a pin could be must not be followed. Nothing
+    // outside bpffs is touched, and the interface is left alone too.
+    auto const index = ::if_nametoindex("lo");
+    for (auto const* const path : {"/tmp/statusbar-elsewhere/lo", "/sys/fs/bpf", "/etc"}) {
+        auto const status = XdpProgram::detach(index, path);
+        EXPECT_FALSE(status.has_value());
+        if (!status) {
+            EXPECT_TRUE(status.error() == XdpError::invalid_pin_path);
+        }
+    }
+}
+
+TEST(xdp_detach, an_unknown_interface_is_reported_as_one)
+{
+    constexpr unsigned int NoSuchInterface = 0x7FFFFFFF;
+    auto const status = XdpProgram::detach(NoSuchInterface, "");
+    EXPECT_FALSE(status.has_value());
+    if (!status) {
+        EXPECT_TRUE(status.error() == std::errc::no_such_device);
+    }
+}
+
+TEST(xdp_open, a_pin_path_outside_bpffs_is_refused_before_any_syscall)
+{
+    // Pinning only works inside a bpf filesystem. A path somewhere else is a
+    // configuration mistake, and open() says so before it looks the
+    // interface up or allocates anything - which is also why this test needs
+    // no privilege and no NIC.
+    XdpContext ctx;
+    XdpConfig const config{
+        .interface_name = "lo",
+        .umem_frame_count = 16,
+        .pin_path = "/tmp/statusbar-not-bpffs/lo",
+    };
+    auto const status = ctx.open(config);
+    EXPECT_FALSE(status.has_value());
+    if (!status) {
+        EXPECT_TRUE(status.error() == XdpError::invalid_pin_path);
+    }
+    EXPECT_FALSE(ctx.valid());
+    EXPECT_FALSE(ctx.pinned());
+
+    // Not created on the way past, either.
+    EXPECT_TRUE(::access("/tmp/statusbar-not-bpffs", F_OK) != 0);
+
+    // The name is never looked up, so a nonexistent interface gives the same
+    // answer rather than interface_not_found.
+    XdpContext other;
+    XdpConfig elsewhere = config;
+    elsewhere.interface_name = "statusbar-no-such-if";
+    auto const same = other.open(elsewhere);
+    EXPECT_FALSE(same.has_value());
+    if (!same) {
+        EXPECT_TRUE(same.error() == XdpError::invalid_pin_path);
+    }
+}
+
+TEST(xdp_open, an_empty_pin_path_changes_nothing)
+{
+    // The opt-in has to be exactly that: with no pin path, open() takes the
+    // path it took before pinning existed. Here that means it gets as far as
+    // the UMEM and fails there for want of privilege - never on anything to
+    // do with pinning.
+    XdpContext ctx;
+    XdpConfig const config{.interface_name = "lo", .umem_frame_count = 16};
+    EXPECT_TRUE(config.pin_path.empty());
+    auto const status = ctx.open(config);
+    if (!status) {
+        EXPECT_TRUE(status.error() != XdpError::invalid_pin_path);
+        EXPECT_TRUE(status.error() != XdpError::bpffs_not_mounted);
+        EXPECT_TRUE(status.error() != XdpError::pin_failed);
+    }
+    EXPECT_FALSE(ctx.pinned());
+    EXPECT_FALSE(ctx.adopted());
+}
+
 //
 // Integration tests (require root, veth pairs, Linux with XDP)
 //
-
-#    if defined(__linux__) && defined(HAVE_XDP)
-
-#        include <unistd.h>
 
 #        include <cstdlib>
 
@@ -501,6 +758,199 @@ TEST(xdp_integration, veth_falls_back_to_generic_attach)
         EXPECT_TRUE(refused.error() == XdpError::zero_copy_unavailable);
     }
     EXPECT_FALSE(ctx.valid());
+}
+
+// The feature in one test: a pinned program outlives the context that made
+// it, the next open adopts it instead of attaching another, and detach() is
+// the only thing that takes it away.
+//
+// Root-only, and so does not run on a developer host. Run it with
+//   sudo ./statusbar_test statusbar/net/net_linux_xdp_test
+TEST(xdp_integration, a_pinned_program_outlives_the_context_and_is_adopted)
+{
+    if (getuid() != 0) {
+        return;
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        return;
+    }
+    auto const pin_path = XdpProgram::pin_path_for("xdptest0");
+    EXPECT_FALSE(pin_path.empty());
+    auto cleanup = detail::scopeguard([&] {
+        (void)XdpProgram::detach(::if_nametoindex("xdptest0"), pin_path);
+        destroy_veth_pair("xdptest0");
+    });
+
+    XdpConfig config{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .umem_frame_count = 64,
+        .pin_path = pin_path,
+    };
+
+    unsigned int if_index = 0;
+    uint32_t first_id = 0;
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        EXPECT_TRUE(status.has_value());
+        if (!status) {
+            return;
+        }
+        EXPECT_TRUE(ctx.pinned());
+        EXPECT_FALSE(ctx.adopted());  // nothing was there to adopt
+        EXPECT_TRUE(ctx.program().pin_path() == pin_path);
+        EXPECT_TRUE(ctx.program().id() != 0);
+        if_index = ctx.interface_index();
+        first_id = ctx.program().id();
+    }
+
+    // The context is gone and the program is still steering. This is the
+    // whole point: an unpinned context would have detached here.
+    auto const after = XdpProgram::query(if_index);
+    EXPECT_TRUE(after.has_value());
+    if (after) {
+        EXPECT_TRUE(after->has_value());
+        if (*after) {
+            EXPECT_EQ((*after)->program_id, first_id);
+        }
+    }
+    for (auto const entry : {XdpProgram::PIN_PROG, XdpProgram::PIN_RULES_MAP, XdpProgram::PIN_XSK_MAP, XdpProgram::PIN_DEVMAP}) {
+        EXPECT_EQ(::access(XdpProgram::pin_entry(pin_path, entry).c_str(), F_OK), 0);
+    }
+
+    // Second open: the same program, adopted, not attached again.
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            EXPECT_TRUE(ctx.adopted());
+            EXPECT_TRUE(ctx.pinned());
+            EXPECT_EQ(ctx.program().id(), first_id);
+            auto const during = XdpProgram::query(if_index);
+            EXPECT_TRUE(during.has_value());
+            if (during && *during) {
+                // Not a second attach, and not a replacement: the program on
+                // the interface never changed.
+                EXPECT_EQ((*during)->program_id, first_id);
+            }
+        }
+    }
+
+    // A pin whose program is no longer attached is stale, not adoptable. The
+    // usual way to get here is a crash that took the attachment with it.
+    EXPECT_TRUE(XdpProgram::detach(if_index, "").has_value());  // detach only; pins stay
+    EXPECT_EQ(::access(XdpProgram::pin_entry(pin_path, XdpProgram::PIN_PROG).c_str(), F_OK), 0);
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            EXPECT_FALSE(ctx.adopted());
+            EXPECT_TRUE(ctx.pinned());
+            EXPECT_TRUE(ctx.program().id() != first_id);  // a fresh program, freshly pinned
+        }
+    }
+
+    // adopt = false forces a fresh attach even when the pin is good.
+    uint32_t replaced_id = 0;
+    {
+        XdpConfig fresh = config;
+        fresh.adopt = false;
+        XdpContext ctx;
+        auto const status = ctx.open(fresh);
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            EXPECT_FALSE(ctx.adopted());
+            EXPECT_TRUE(ctx.pinned());
+            replaced_id = ctx.program().id();
+        }
+    }
+
+    // detach() removes both the attachment and the pins, and the process
+    // that made them is already gone by now.
+    EXPECT_TRUE(XdpProgram::detach(if_index, pin_path).has_value());
+    auto const gone = XdpProgram::query(if_index);
+    EXPECT_TRUE(gone.has_value());
+    if (gone) {
+        EXPECT_FALSE(gone->has_value());
+    }
+    for (auto const entry : {XdpProgram::PIN_PROG, XdpProgram::PIN_RULES_MAP, XdpProgram::PIN_XSK_MAP, XdpProgram::PIN_DEVMAP}) {
+        EXPECT_TRUE(::access(XdpProgram::pin_entry(pin_path, entry).c_str(), F_OK) != 0);
+    }
+    EXPECT_TRUE(replaced_id != 0);
+
+    // And calling it a second time, with nothing left, still succeeds.
+    EXPECT_TRUE(XdpProgram::detach(if_index, pin_path).has_value());
+}
+
+// Adopting a map that is not the one this build declares would mean writing
+// rules into someone else's memory. A pin with a wrong-shaped rules_map must
+// be replaced, and must come out of it untouched.
+TEST(xdp_integration, a_foreign_pinned_map_is_replaced_and_never_written_to)
+{
+    if (getuid() != 0) {
+        return;
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        return;
+    }
+    auto const pin_path = XdpProgram::pin_path_for("xdptest0");
+    auto cleanup = detail::scopeguard([&] {
+        (void)XdpProgram::detach(::if_nametoindex("xdptest0"), pin_path);
+        destroy_veth_pair("xdptest0");
+    });
+
+    XdpConfig const config{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .umem_frame_count = 64,
+        .pin_path = pin_path,
+    };
+
+    unsigned int if_index = 0;
+    {
+        XdpContext ctx;
+        if (!ctx.open(config)) {
+            return;
+        }
+        if_index = ctx.interface_index();
+    }
+
+    // Swap the pinned rules_map for one with a different capacity - the shape
+    // an older build of the program would have left behind.
+    auto const rules_pin = XdpProgram::pin_entry(pin_path, XdpProgram::PIN_RULES_MAP);
+    EXPECT_EQ(::unlink(rules_pin.c_str()), 0);
+    int const foreign = bpf_map_create(BPF_MAP_TYPE_ARRAY, "rules_map", sizeof(uint32_t), sizeof(uint32_t), 4, nullptr);
+    EXPECT_TRUE(foreign >= 0);
+    if (foreign < 0) {
+        return;
+    }
+    EXPECT_EQ(bpf_obj_pin(foreign, rules_pin.c_str()), 0);
+
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            // Not adopted - and so the foreign map was never written into.
+            EXPECT_FALSE(ctx.adopted());
+            EXPECT_TRUE(ctx.pinned());
+        }
+    }
+
+    // Every slot of the map we did not recognise is still zero.
+    for (uint32_t key = 0; key < 4; ++key) {
+        uint32_t value = 0xFFFFFFFF;
+        EXPECT_EQ(bpf_map_lookup_elem(foreign, &key, &value), 0);
+        EXPECT_EQ(value, 0u);
+    }
+    ::close(foreign);
 }
 
 TEST(xdp_integration, tx_rx_loopback)
