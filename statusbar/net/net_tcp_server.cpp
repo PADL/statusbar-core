@@ -61,7 +61,7 @@ auto create_seqpacket_socket(SocketAddress const& addr) -> StatusValue<FileDescr
 /// Connect @p probe (non-blocking) to the socket at @p path, unlinking it when
 /// stale: only a refused connect proves nobody is listening; success or a
 /// full backlog (EAGAIN) means a running instance owns it. True: @p path is free.
-[[nodiscard]] auto unlink_if_stale(int const probe, SocketAddress const& addr, std::string const& path) -> bool
+[[nodiscard]] auto unlink_if_stale(int const probe, SocketAddress const& addr, std::string const& path) noexcept -> bool
 {
     if (::connect(probe, addr.sockaddr(), addr.length()) == 0) {
         return false;
@@ -100,7 +100,7 @@ auto create_seqpacket_socket(SocketAddress const& addr) -> StatusValue<FileDescr
 
 /// Give the socket @p fd bound at @p private_path its mode, listen and link it to @p path.
 [[nodiscard]] auto listen_and_link(
-    int const fd, std::string const& private_path, std::string const& path, TcpServerOptions const& options) -> Status
+    int const fd, std::string const& private_path, std::string const& path, TcpServerOptions const& options) noexcept -> Status
 {
     if (options.unix_mode >= 0 && ::chmod(private_path.c_str(), mode_t(options.unix_mode)) < 0) {
         return failure(NetError::socket_option_failed);
@@ -115,7 +115,7 @@ auto create_seqpacket_socket(SocketAddress const& addr) -> StatusValue<FileDescr
 }
 
 /// Remove the private socket name and its directory, whatever became of them.
-void remove_private(std::string const& private_path, std::string const& private_dir)
+void remove_private(std::string const& private_path, std::string const& private_dir) noexcept
 {
     (void)::unlink(private_path.c_str());
     (void)::rmdir(private_dir.c_str());

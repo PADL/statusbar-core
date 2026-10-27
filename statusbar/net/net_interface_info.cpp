@@ -60,7 +60,7 @@ namespace {
 
 /// Read the sysfs speed attribute at @p path into @p text, leaving a byte for
 /// a NUL: the length read, unknown_link_speed when there is none, or the errno.
-[[nodiscard]] auto read_speed(std::filesystem::path const& path, std::span<char> const text) -> StatusValue<size_t>
+[[nodiscard]] auto read_speed(std::filesystem::path const& path, std::span<char> const text) noexcept -> StatusValue<size_t>
 {
     FileDescriptor const fd{::open(path.c_str(), O_RDONLY | O_CLOEXEC)};
     if (!fd.valid()) {
@@ -79,7 +79,7 @@ namespace {
 
 /// A sysfs speed in Mb/s: bad_message when not a number, unknown_link_speed
 /// for SPEED_UNKNOWN (-1) or out of range.
-[[nodiscard]] auto parse_link_speed(std::string_view const text) -> StatusValue<uint32_t>
+[[nodiscard]] auto parse_link_speed(std::string_view const text) noexcept -> StatusValue<uint32_t>
 {
     long long speed = 0;
     auto const parsed = std::from_chars(text.data(), text.data() + text.size(), speed);

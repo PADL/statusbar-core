@@ -16,6 +16,7 @@
 // so the reinterpret_cast is confined to one typed helper per pattern and
 // call sites read cleanly.
 
+#include "statusbar/buffer/file_descriptor.hpp"
 #include "statusbar/ieee/ieee_ethernet.hpp"
 #include "statusbar/status/status.hpp"
 
@@ -91,25 +92,20 @@ inline void set_ifr_data(ifreq& ifr, T* data) noexcept
 namespace detail {
 
 /// The transient AF_INET datagram socket an interface ioctl is carried on.
-[[nodiscard]] inline auto ioctl_carrier_socket() noexcept -> int
+[[nodiscard]] inline auto ioctl_carrier_socket() noexcept -> FileDescriptor
 {
 #if defined(SOCK_CLOEXEC)
-    return ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    return FileDescriptor{::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
 #else
-    return ::socket(AF_INET, SOCK_DGRAM, 0);
+    return FileDescriptor{::socket(AF_INET, SOCK_DGRAM, 0)};
 #endif
 }
 
-/// Run @p request on @p ifr over @p sock, then close @p sock: the ioctl's errno on failure.
-[[nodiscard]] inline auto ioctl_and_close(int const sock, unsigned long const request, ifreq& ifr) noexcept -> Status
+/// Write @p iface (shorter than IFNAMSIZ) into ifr.ifr_name, NUL-padded.
+inline void set_ifr_name(ifreq& ifr, std::string_view const iface) noexcept
 {
-    int const rc = ::ioctl(sock, request, &ifr);
-    int const saved = errno;
-    ::close(sock);
-    if (rc < 0) {
-        return failure(std::error_code{saved, std::system_category()});
-    }
-    return success();
+    std::memset(ifr.ifr_name, 0, sizeof(ifr.ifr_name));
+    std::memcpy(ifr.ifr_name, iface.data(), iface.size());
 }
 
 }  // namespace detail
@@ -124,13 +120,15 @@ namespace detail {
     if (iface.empty() || iface.size() >= IFNAMSIZ) {
         return failure(std::make_error_code(std::errc::no_such_device));
     }
-    int const sock = detail::ioctl_carrier_socket();
-    if (sock < 0) {
+    FileDescriptor const sock = detail::ioctl_carrier_socket();
+    if (!sock.valid()) {
         return failure(std::error_code{errno, std::system_category()});
     }
-    std::memset(ifr.ifr_name, 0, sizeof(ifr.ifr_name));
-    std::memcpy(ifr.ifr_name, iface.data(), iface.size());
-    return detail::ioctl_and_close(sock, request, ifr);
+    detail::set_ifr_name(ifr, iface);
+    if (::ioctl(sock.get(), request, &ifr) < 0) {
+        return failure(std::error_code{errno, std::system_category()});
+    }
+    return success();
 }
 
 #if defined(__linux__)

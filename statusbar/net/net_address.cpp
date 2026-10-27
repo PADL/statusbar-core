@@ -37,7 +37,7 @@ auto SocketAddress::ipv6(std::span<uint8_t const, 16> addr, uint16_t port, uint3
 namespace {
 
 /// Write AF_UNIX and the NUL-terminated @p path (which fits) into @p sun: the address length.
-auto write_local_path(sockaddr_un& sun, std::string_view const path) noexcept -> socklen_t
+[[nodiscard]] auto write_local_path(sockaddr_un& sun, std::string_view const path) noexcept -> socklen_t
 {
     sun.sun_family = AF_UNIX;
     span_copy(make_span(sun.sun_path).first(path.size()), make_const_span(path));
