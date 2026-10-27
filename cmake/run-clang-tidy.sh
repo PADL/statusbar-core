@@ -21,6 +21,14 @@ SOURCE_FILE="$4"
 
 outfile="$OUTPUT_DIR/$(echo "$SOURCE_FILE" | tr '/' '_').txt"
 
-"$CLANG_TIDY" -p "$BUILD_DIR" "$SOURCE_FILE" 2>&1 \
+# The house-style plugin, when built (clang_tidy.cmake): its check reports, never fails, here;
+# check-block-statements.sh holds changed code to it.
+set --
+if [ -n "${STATUSBAR_TIDY_PLUGIN:-}" ] && [ -f "$STATUSBAR_TIDY_PLUGIN" ]; then
+    set -- "--load=$STATUSBAR_TIDY_PLUGIN" "--checks=statusbar-block-statements" \
+        "--warnings-as-errors=-statusbar-block-statements"
+fi
+
+"$CLANG_TIDY" -p "$BUILD_DIR" "$@" "$SOURCE_FILE" 2>&1 \
     | grep -v 'warnings generated\|errors generated\|Error while processing' \
     > "$outfile" || true

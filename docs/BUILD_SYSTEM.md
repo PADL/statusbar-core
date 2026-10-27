@@ -245,6 +245,25 @@ through the linker.
 compatible with `-stdlib=libc++`, so no separate libFuzzer detection
 is needed.
 
+## `clang_tidy.cmake` — the `clang-tidy` target and block size
+
+`statusbar_register_clang_tidy_target()` adds a `clang-tidy` target that runs the toolchain's
+clang-tidy over every non-test `.cpp` in `compile_commands.json` (`run-clang-tidy-all.sh`).
+
+With clang-tidy's development headers installed (`libclang-dev` for the toolchain's LLVM), it also
+builds `libstatusbar-tidy.so` from `tidy/statusbar_tidy_block_statements.cpp`, against the
+clang-tidy binary's own LLVM and C++ library, and loads it. The plugin's check,
+`statusbar-block-statements`, counts the statements directly inside each `{...}` block (a nested
+block counts once) and flags a block with more than `MaxStatements` (default 4). The `clang-tidy`
+target reports these as warnings only.
+
+`check-block-statements.sh <build-dir> [--staged | <base-ref>]` holds changed code to it as an
+error. It checks the files a change touches and fails on any flagged block whose lines the change
+touches, at `STATUSBAR_BLOCK_STATEMENTS_MAX` statements (default 6, so the target of 4 has a little
+slack). The pre-commit hook that `install-hooks.sh` installs runs it on staged changes when the
+umbrella build has the plugin. A deliberate exception is marked on the opening brace's line:
+`// NOLINT(statusbar-block-statements): <reason>`.
+
 ## `statusbar-coreConfig.cmake.in`
 
 This package's `find_package` template.

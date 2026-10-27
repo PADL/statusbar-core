@@ -73,6 +73,7 @@ if(NOT STATUSBAR_AGGREGATE_BUILD)
       cmake/fuzz-smoke.sh
       cmake/run-clang-tidy-all.sh
       cmake/run-clang-tidy.sh
+      cmake/check-block-statements.sh
       cmake/sm-docs-render.sh)
   install(
     FILES ${_statusbar_cmake_modules}
@@ -82,8 +83,14 @@ if(NOT STATUSBAR_AGGREGATE_BUILD)
     PROGRAMS ${_statusbar_cmake_scripts}
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/statusbar-core
     COMPONENT devel)
+  install(
+    FILES cmake/tidy/statusbar_tidy_block_statements.cpp
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/statusbar-core/tidy
+    COMPONENT devel)
   file(COPY ${_statusbar_cmake_modules} ${_statusbar_cmake_scripts}
        DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+  file(COPY cmake/tidy/statusbar_tidy_block_statements.cpp
+       DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/tidy)
 endif()
 
 # ---- packaging (CPack: TGZ + ZIP, plus DEB/RPM on Linux) ----
