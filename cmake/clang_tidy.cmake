@@ -102,7 +102,9 @@ function(statusbar_tidy_plugin out)
     DEPENDS "${_source}"
     COMMENT "clang-tidy plugin statusbar-block-statements"
     VERBATIM)
-  add_custom_target(statusbar-tidy-plugin DEPENDS "${_plugin}")
+  # In the default build, so the pre-commit block-size gate finds it in a fresh
+  # tree.
+  add_custom_target(statusbar-tidy-plugin ALL DEPENDS "${_plugin}")
   set(${out}
       "${_plugin}"
       PARENT_SCOPE)
