@@ -538,6 +538,23 @@ template <typename Attempt, typename Pause>
     return result;
 }
 
+/// How many fill-ring slots to ask xsk_ring_prod__reserve() for.
+///
+/// xsk_ring_prod__reserve() is all-or-nothing: asked for more slots than the
+/// ring has free, it reserves none and returns 0. So asking for every free
+/// UMEM frame hands the kernel nothing at all whenever the UMEM has more
+/// frames free than the ring has room for — the fill ring drains, the NIC runs
+/// out of buffers and receive stops, with no error anywhere. It is a function
+/// of ring sizing and load, so it presents as an intermittent deaf receiver.
+///
+/// @param available Free UMEM frames
+/// @param ring_free Slots the fill ring reports free (xsk_prod_nb_free)
+/// @return The lesser of the two
+[[nodiscard]] constexpr auto fill_reserve_count(size_t const available, uint32_t const ring_free) noexcept -> uint32_t
+{
+    return available < ring_free ? static_cast<uint32_t>(available) : ring_free;
+}
+
 }  // namespace detail
 
 /// The magic in a pin directory's identity entry: the bytes "STATUSBR".

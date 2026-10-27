@@ -1060,8 +1060,15 @@ auto XdpContext::fill_replenish() -> Status
         return success();
     }
 
+    // xsk_ring_prod__reserve is all-or-nothing, so never ask for more than the
+    // ring has free: a request the ring cannot meet reserves nothing at all.
+    auto const want = detail::fill_reserve_count(available, xsk_prod_nb_free(&rings_.fill, static_cast<uint32_t>(available)));
+    if (want == 0) {
+        return success();
+    }
+
     uint32_t idx = 0;
-    auto reserved = xsk_ring_prod__reserve(&rings_.fill, static_cast<uint32_t>(available), &idx);
+    auto reserved = xsk_ring_prod__reserve(&rings_.fill, want, &idx);
     uint32_t filled = 0;
     for (uint32_t i = 0; i < reserved; ++i) {
         auto addr = umem_.alloc_frame();

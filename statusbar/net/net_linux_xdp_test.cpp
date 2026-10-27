@@ -26,6 +26,7 @@ static auto stats_through_an_incomplete_type(statusbar::net::XdpSocketStats cons
 #    include <cstddef>
 #    include <cstdint>
 #    include <expected>
+#    include <limits>
 #    include <optional>
 #    include <span>
 #    include <string>
@@ -373,6 +374,62 @@ TEST(xdp_freelist, default_constructed_is_empty)
     EXPECT_EQ(fl.available(), 0u);
     auto a = fl.pop();
     EXPECT_FALSE(a.has_value());
+}
+
+//
+// fill_reserve_count tests
+//
+// xsk_ring_prod__reserve is all-or-nothing, so the replenish path must ask for
+// no more than the ring reports free. Asking for every free UMEM frame
+// reserves nothing whenever the UMEM is the larger of the two, which stalls
+// receive silently.
+//
+
+TEST(xdp_fill_reserve, ring_is_the_limit)
+{
+    // The stalling case before the fix: 64 frames free, room for 8.
+    EXPECT_EQ(detail::fill_reserve_count(64, 8), 8u);
+}
+
+TEST(xdp_fill_reserve, umem_is_the_limit)
+{
+    EXPECT_EQ(detail::fill_reserve_count(8, 64), 8u);
+}
+
+TEST(xdp_fill_reserve, equal_takes_all)
+{
+    EXPECT_EQ(detail::fill_reserve_count(32, 32), 32u);
+}
+
+TEST(xdp_fill_reserve, no_frames_free)
+{
+    EXPECT_EQ(detail::fill_reserve_count(0, 64), 0u);
+}
+
+TEST(xdp_fill_reserve, no_ring_space)
+{
+    EXPECT_EQ(detail::fill_reserve_count(64, 0), 0u);
+}
+
+TEST(xdp_fill_reserve, both_zero)
+{
+    EXPECT_EQ(detail::fill_reserve_count(0, 0), 0u);
+}
+
+TEST(xdp_fill_reserve, available_above_uint32_clamps_to_ring)
+{
+    // available is a size_t frame count; the reserve argument is a uint32_t.
+    // The ring free count bounds the result, so the narrowing cast is only
+    // ever applied to a value the ring already admitted.
+    constexpr size_t huge = static_cast<size_t>(std::numeric_limits<uint32_t>::max()) + 1;
+    EXPECT_EQ(detail::fill_reserve_count(huge, 16), 16u);
+}
+
+TEST(xdp_fill_reserve, is_constexpr)
+{
+    static_assert(detail::fill_reserve_count(64, 8) == 8u);
+    static_assert(detail::fill_reserve_count(8, 64) == 8u);
+    static_assert(detail::fill_reserve_count(0, 0) == 0u);
 }
 
 //
