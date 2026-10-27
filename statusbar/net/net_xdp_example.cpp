@@ -336,7 +336,7 @@ auto log_packet(std::span<uint8_t const> data, int64_t timestamp_ns, int64_t& fi
     return success();
 }
 
-auto print_stats(XdpContext::Stats const& stats) -> void
+auto print_stats(XdpSocketStats const& stats) -> void
 {
     std::println(
         stderr,
@@ -346,6 +346,18 @@ auto print_stats(XdpContext::Stats const& stats) -> void
         stats.tx_ring_full_count,
         stats.umem_exhausted_count,
         stats.rx_budget_hit_count);
+    // A healthy sender skips most kicks, so a low skip ratio here is itself
+    // worth looking at. transient and failed are deliberately separate: the
+    // first passes, the second does not.
+    std::println(
+        stderr,
+        "       tx_kicks={} skipped={} transient={} failed={} last_errno={} rx_wakeups={}",
+        stats.tx_flush_count,
+        stats.tx_flush_skipped,
+        stats.tx_flush_transient,
+        stats.tx_flush_failed,
+        stats.tx_flush_errno,
+        stats.rx_wakeup_count);
 }
 
 }  // namespace

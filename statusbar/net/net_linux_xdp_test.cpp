@@ -7,6 +7,16 @@
 
 #ifdef __linux__
 
+// XdpSocketStats has to be a plain struct at namespace scope - a caller
+// forward-declares it in its own header, so an alias or a nested type would
+// not do. Declared and used here *before* net.hpp is included: if it ever
+// became either of those, this stops compiling, which is the only way to
+// hold that property down.
+namespace statusbar::net {
+struct XdpSocketStats;
+}
+static auto stats_through_an_incomplete_type(statusbar::net::XdpSocketStats const& stats) -> statusbar::net::XdpSocketStats const&;
+
 #    include "statusbar/ieee/ieee.hpp"
 #    include "statusbar/net/net.hpp"
 #    include "statusbar/status/status.hpp"
@@ -22,6 +32,11 @@
 
 using namespace statusbar;
 using namespace statusbar::net;
+
+static auto stats_through_an_incomplete_type(XdpSocketStats const& stats) -> XdpSocketStats const&
+{
+    return stats;
+}
 
 //
 // XdpError tests
@@ -405,6 +420,109 @@ TEST(xdp_stub, stats_zero_by_default)
     EXPECT_EQ(s.rx_count, 0u);
     EXPECT_EQ(s.tx_count, 0u);
     EXPECT_EQ(s.tx_ring_full_count, 0u);
+}
+
+//
+// Socket statistics
+//
+// Each counter has one home, and the tests below sit in two groups: the
+// conditions a plain XdpContext can be put into without a NIC or a
+// capability, and the ones that need a bound socket and live in
+// xdp_integration further down.
+//
+
+TEST(xdp_stats, every_counter_starts_at_zero)
+{
+    XdpContext ctx;
+    auto const& s = ctx.socket_stats();
+    EXPECT_EQ(s.rx_count, 0u);
+    EXPECT_EQ(s.tx_count, 0u);
+    EXPECT_EQ(s.tx_ring_full_count, 0u);
+    EXPECT_EQ(s.umem_exhausted_count, 0u);
+    EXPECT_EQ(s.rx_budget_hit_count, 0u);
+    EXPECT_EQ(s.tx_flush_count, 0u);
+    EXPECT_EQ(s.tx_flush_skipped, 0u);
+    EXPECT_EQ(s.tx_flush_failed, 0u);
+    EXPECT_EQ(s.tx_flush_transient, 0u);
+    EXPECT_EQ(s.tx_flush_errno, 0);
+    EXPECT_EQ(s.rx_wakeup_count, 0u);
+
+    // stats() is the same object under its older name, and the reference is
+    // the live one rather than a copy - which is what lets a caller publish a
+    // snapshot of it from its own tick.
+    EXPECT_TRUE(&ctx.stats() == &ctx.socket_stats());
+    EXPECT_TRUE(&stats_through_an_incomplete_type(ctx.socket_stats()) == &ctx.socket_stats());
+}
+
+TEST(xdp_stats, a_send_with_no_umem_frame_left_is_counted)
+{
+    // The hardest counter to get right and the one that matters most, along
+    // with tx_ring_full_count below. A context with no UMEM takes the same
+    // branch an exhausted pool takes - the free list is empty either way -
+    // so the increment is reachable without a NIC. Exhausting a real pool
+    // under load is in xdp_integration.
+    XdpContext ctx;
+    EXPECT_EQ(ctx.socket_stats().umem_exhausted_count, 0u);
+    auto const slot = ctx.tx_start();
+    EXPECT_FALSE(slot.has_value());
+    if (!slot) {
+        EXPECT_TRUE(slot.error() == XdpError::free_list_empty);
+    }
+    EXPECT_EQ(ctx.socket_stats().umem_exhausted_count, 1u);
+    EXPECT_FALSE(ctx.tx_start().has_value());
+    EXPECT_EQ(ctx.socket_stats().umem_exhausted_count, 2u);
+    // And nothing was sent, so the send counters stay put.
+    EXPECT_EQ(ctx.socket_stats().tx_count, 0u);
+}
+
+TEST(xdp_stats, a_kick_with_nothing_waiting_is_skipped_rather_than_made)
+{
+    // A sender ticking faster than it sends spends most ticks with nothing in
+    // the TX ring. Those kicks are skipped, and the skip is counted: a *low*
+    // skip ratio means a sender kicking the kernel for nothing.
+    XdpContext ctx;
+    EXPECT_TRUE(ctx.tx_flush().has_value());
+    EXPECT_TRUE(ctx.tx_flush().has_value());
+    EXPECT_EQ(ctx.socket_stats().tx_flush_skipped, 2u);
+    EXPECT_EQ(ctx.socket_stats().tx_flush_count, 0u);
+    EXPECT_EQ(ctx.socket_stats().tx_flush_failed, 0u);
+    EXPECT_EQ(ctx.socket_stats().tx_flush_transient, 0u);
+}
+
+TEST(xdp_stats, closing_puts_every_counter_back)
+{
+    XdpContext ctx;
+    EXPECT_FALSE(ctx.tx_start().has_value());
+    EXPECT_TRUE(ctx.tx_flush().has_value());
+    EXPECT_TRUE(ctx.socket_stats().umem_exhausted_count > 0);
+    EXPECT_TRUE(ctx.socket_stats().tx_flush_skipped > 0);
+    ctx.close();
+    EXPECT_EQ(ctx.socket_stats().umem_exhausted_count, 0u);
+    EXPECT_EQ(ctx.socket_stats().tx_flush_skipped, 0u);
+}
+
+//
+// Which refused kicks pass by themselves. The classification is pure, so the
+// arms a developer host will never produce are still checked - and checked at
+// compile time.
+//
+
+TEST(xdp_stats, transient_kick_errnos_are_the_ones_that_pass)
+{
+    static_assert(detail::transient_kick_errno(EAGAIN));
+    static_assert(detail::transient_kick_errno(EWOULDBLOCK));
+    static_assert(detail::transient_kick_errno(EBUSY));
+    static_assert(detail::transient_kick_errno(ENOBUFS));
+    static_assert(detail::transient_kick_errno(ENETDOWN));
+    // Anything else means something is actually wrong, and a caller should
+    // escalate instead of sending into it again.
+    static_assert(!detail::transient_kick_errno(EINVAL));
+    static_assert(!detail::transient_kick_errno(EPERM));
+    static_assert(!detail::transient_kick_errno(ENODEV));
+    static_assert(!detail::transient_kick_errno(EBADF));
+    static_assert(!detail::transient_kick_errno(0));
+    EXPECT_TRUE(detail::transient_kick_errno(EAGAIN));
+    EXPECT_FALSE(detail::transient_kick_errno(EINVAL));
 }
 
 TEST(xdp_stub, modes_before_open)
@@ -1072,6 +1190,17 @@ TEST(xdp_integration, rx_drain_budget)
     auto r1 = ctx.rx_start();
     EXPECT_TRUE(r1.has_value());    // Success (no error)
     EXPECT_FALSE(r1->has_value());  // Empty optional (no frames)
+
+    // An empty ring is not the budget: rx_budget_hit_count must stay put, or
+    // it would read as a budget problem on every idle tick.
+    EXPECT_EQ(ctx.socket_stats().rx_budget_hit_count, 0u);
+    EXPECT_EQ(ctx.socket_stats().rx_count, 0u);
+
+    // The budget itself: the counter moves once the cycle has taken its
+    // allowance, which is the signal that a tick is cutting a drain short.
+    // rx_cycle_count only advances on a frame received, so this is the arm
+    // live traffic reaches; checked here against the configured limit.
+    EXPECT_EQ(config.rx_drain_max, 2u);
 }
 
 TEST(xdp_integration, multiple_inflight_tx)
@@ -1114,11 +1243,136 @@ TEST(xdp_integration, multiple_inflight_tx)
     (void)ctx.tx_commit(slot1->handle, 64);
     (void)ctx.tx_commit(slot2->handle, 64);
     (void)ctx.tx_commit(slot3->handle, 64);
+    EXPECT_EQ(ctx.socket_stats().tx_count, 3u);
     (void)ctx.tx_flush();
+    // Three frames, one kick: that is the whole point of batching, and the
+    // counters are what show it is happening.
+    EXPECT_EQ(ctx.socket_stats().tx_flush_count, 1u);
+    EXPECT_EQ(ctx.socket_stats().tx_flush_failed, 0u);
 
     // Reclaim via tx_complete
     usleep(10000);
     (void)ctx.tx_complete();
+}
+
+// The counters that need a bound socket. Root-only, so this does not run on a
+// developer host; the branches reachable without one are in xdp_stats above.
+//   sudo ./statusbar_test statusbar/net/net_linux_xdp_test
+TEST(xdp_integration, the_tx_ring_filling_and_the_umem_emptying_are_counted)
+{
+    if (getuid() != 0) {
+        return;
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        return;
+    }
+    auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
+
+    // A TX ring smaller than the UMEM, so the ring fills first and the pool
+    // empties second: the two conditions are told apart rather than being
+    // whichever happened to come first.
+    XdpConfig const config{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .tx_ring_size = 8,
+        .umem_frame_count = 64,
+    };
+
+    XdpContext ctx;
+    if (!ctx.open(config)) {
+        return;
+    }
+
+    // Fill the TX ring without ever kicking, so nothing drains out of it.
+    size_t committed = 0;
+    for (size_t i = 0; i < 64; ++i) {
+        auto slot = ctx.tx_start();
+        if (!slot) {
+            break;
+        }
+        if (ctx.tx_commit(slot->handle, 64)) {
+            ++committed;
+        }
+    }
+    EXPECT_TRUE(committed > 0);
+    EXPECT_EQ(ctx.socket_stats().tx_count, committed);
+    // Past the ring's capacity every commit is refused and counted, and the
+    // frame goes back to the pool rather than leaking.
+    EXPECT_TRUE(ctx.socket_stats().tx_ring_full_count > 0);
+
+    // Now empty the pool. fill_replenish() at open() already offered most of
+    // it to the kernel, so what is left goes quickly.
+    uint64_t exhausted_before = ctx.socket_stats().umem_exhausted_count;
+    for (size_t i = 0; i < 4096; ++i) {
+        auto slot = ctx.tx_start();
+        if (!slot) {
+            break;
+        }
+    }
+    EXPECT_TRUE(ctx.socket_stats().umem_exhausted_count > exhausted_before);
+
+    // And the kick that was owed is made exactly once; the next finds nothing
+    // waiting and skips.
+    auto const kicks_before = ctx.socket_stats().tx_flush_count;
+    (void)ctx.tx_flush();
+    EXPECT_EQ(ctx.socket_stats().tx_flush_count, kicks_before + 1);
+    auto const skipped_before = ctx.socket_stats().tx_flush_skipped;
+    (void)ctx.tx_flush();
+    EXPECT_EQ(ctx.socket_stats().tx_flush_skipped, skipped_before + 1);
+    EXPECT_EQ(ctx.socket_stats().tx_flush_count, kicks_before + 1);
+}
+
+// A descriptor the kernel will not accept is the one way to make it refuse a
+// kick on demand, which is what gives tx_flush_failed and tx_flush_errno a
+// test at all.
+TEST(xdp_integration, a_kick_the_kernel_refuses_is_counted_and_keeps_its_errno)
+{
+    if (getuid() != 0) {
+        return;
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        return;
+    }
+    auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
+
+    XdpConfig const config{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .umem_frame_count = 64,
+    };
+
+    XdpContext ctx;
+    if (!ctx.open(config)) {
+        return;
+    }
+
+    // An address past the end of the UMEM. tx_commit() submits it; the kernel
+    // rejects the descriptor when the kick asks it to send.
+    constexpr uint64_t PastTheUmem = 64 * 2048;
+    EXPECT_TRUE(ctx.tx_commit(PastTheUmem, 64).has_value());
+
+    auto const status = ctx.tx_flush();
+    EXPECT_FALSE(status.has_value());
+    if (!status) {
+        EXPECT_TRUE(status.error() == XdpError::tx_flush_failed);
+    }
+    EXPECT_EQ(ctx.socket_stats().tx_flush_count, 1u);
+    EXPECT_EQ(ctx.socket_stats().tx_flush_failed, 1u);
+    EXPECT_EQ(ctx.socket_stats().tx_flush_transient, 0u);
+    // The errno is kept for the log, and it is a hard one - which is what
+    // tells a caller to escalate rather than ride it out.
+    EXPECT_TRUE(ctx.socket_stats().tx_flush_errno != 0);
+    EXPECT_FALSE(detail::transient_kick_errno(ctx.socket_stats().tx_flush_errno));
+
+    // Still pending, because the kernel never took it: the next kick tries
+    // again rather than counting the frame as delivered.
+    EXPECT_FALSE(ctx.tx_flush().has_value());
+    EXPECT_EQ(ctx.socket_stats().tx_flush_count, 2u);
+    EXPECT_EQ(ctx.socket_stats().tx_flush_skipped, 0u);
 }
 
 TEST(xdp_integration, set_rules)

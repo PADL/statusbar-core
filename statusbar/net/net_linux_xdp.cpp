@@ -786,6 +786,7 @@ void XdpContext::close() noexcept
     umem_.close();
 
     zero_copy_ = false;
+    tx_pending_ = false;
     interface_ = {};
     rings_ = {};
     budget_ = {};
@@ -813,6 +814,9 @@ auto XdpContext::tx_commit(uint64_t handle, size_t frame_length) -> Status
     desc->len = static_cast<uint32_t>(frame_length);
     xsk_ring_prod__submit(&rings_.tx, 1);
     ++stats_.tx_count;
+    // The kernel does not know about it until tx_flush() kicks, and that is
+    // what makes the kick needed rather than skippable.
+    tx_pending_ = true;
     return success();
 }
 
@@ -882,6 +886,17 @@ auto XdpContext::fill_replenish() -> Status
     }
     if (filled > 0) {
         xsk_ring_prod__submit(&rings_.fill, filled);
+    }
+
+    // The counterpart of the TX kick: a driver that asked to be woken for the
+    // fill ring is waiting on a recvfrom before it will pick the new frames
+    // up. The flag is only ever set on a socket bound with
+    // XDP_USE_NEED_WAKEUP, which we do not ask for yet, so today this costs
+    // nothing and the counter stays at zero - but the wakeup is here and
+    // correct for when the bind flag is added.
+    if (xsk_ring_prod__needs_wakeup(&rings_.fill) != 0) {
+        (void)::recvfrom(xsk_socket__fd(xsk_), nullptr, 0, MSG_DONTWAIT, nullptr, nullptr);
+        ++stats_.rx_wakeup_count;
     }
     return success();
 }

@@ -161,6 +161,49 @@ enum class XdpAttachMode : uint8_t
 static_assert(XdpBindMode{} == XdpBindMode::auto_);
 static_assert(XdpAttachMode{} == XdpAttachMode::native);
 
+/// Counters for the AF_XDP socket, so the hot path is diagnosable at all.
+///
+/// Every failure mode of an AF_XDP stream looks the same from outside - audio
+/// glitches - and they need completely different fixes: the TX ring filled,
+/// the UMEM ran out of frames, the RX drain hit its per-tick budget, or the
+/// kernel refused a kick. Without counters, telling them apart is guesswork.
+///
+/// ### Threading
+///
+/// Updated on the real-time thread with plain stores: no locks, no atomics,
+/// no ordering. A reader on another thread may therefore see a torn 64-bit
+/// value or one counter from before an update and the next from after. That
+/// is deliberate and accepted - these are counters, nobody acts on an exact
+/// one, and the hot path is not paying for a precision no caller needs. A
+/// reader that wants a consistent set snapshots it at a defined point; a
+/// caller publishing a copy through a seqlock is why this has to stay
+/// trivially copyable.
+///
+/// A plain struct at namespace scope, not a nested type and not an alias, so
+/// a caller can forward-declare it and hold a reference without including
+/// this header.
+struct XdpSocketStats
+{
+    uint64_t rx_count{0};              ///< frames received
+    uint64_t tx_count{0};              ///< frames sent
+    uint64_t tx_ring_full_count{0};    ///< sends refused: TX ring full
+    uint64_t umem_exhausted_count{0};  ///< sends refused: no UMEM frame
+    uint64_t rx_budget_hit_count{0};   ///< drains that hit the per-tick budget
+    uint64_t tx_flush_count{0};        ///< kicks made (sendto)
+    uint64_t tx_flush_skipped{0};      ///< kicks not needed: nothing was waiting
+    /// Kicks the kernel refused for a reason that will not pass by itself.
+    /// Disjoint from tx_flush_transient: a caller rides out the transient
+    /// ones and escalates on these.
+    uint64_t tx_flush_failed{0};
+    uint64_t tx_flush_transient{0};  ///< kicks refused with EAGAIN/EBUSY/ENOBUFS/ENETDOWN
+    int tx_flush_errno{0};           ///< the last refused kick's errno, transient or not
+    uint64_t rx_wakeup_count{0};     ///< fill-ring wakeups (recvfrom)
+};
+
+// A caller keeping a published copy in an itc::SeqlockValue needs this: a
+// seqlock is only sound for a type that can be copied bytewise.
+static_assert(std::is_trivially_copyable_v<XdpSocketStats>);
+
 /// What is attached to an interface right now, as the kernel reports it.
 struct XdpAttachedProgram
 {
@@ -352,6 +395,20 @@ struct AttachPlan
         return AttachPlan{.first = XdpAttachMode::generic, .fallback = std::nullopt};
     }
     return AttachPlan{.first = XdpAttachMode::native, .fallback = XdpAttachMode::generic};
+}
+
+/// Whether a refused TX kick will pass by itself. EAGAIN and EWOULDBLOCK are
+/// the ring being momentarily busy; EBUSY, ENOBUFS and ENETDOWN are the
+/// driver or the link being momentarily unable to take the frame. Anything
+/// else means something is actually wrong, and the caller should escalate
+/// rather than keep sending into it.
+///
+/// Pure, so the classification is testable without a socket - which is the
+/// only way to check the arms a developer host will never produce.
+/// @param err The errno from a refused sendto
+[[nodiscard]] constexpr auto transient_kick_errno(int const err) noexcept -> bool
+{
+    return err == EAGAIN || err == EWOULDBLOCK || err == EBUSY || err == ENOBUFS || err == ENETDOWN;
 }
 
 /// Whether `name` is a name the kernel would accept for an interface - which
@@ -965,14 +1022,10 @@ class BpfState
 class XdpContext
 {
   public:
-    struct Stats
-    {
-        uint64_t rx_count{0};
-        uint64_t tx_count{0};
-        uint64_t tx_ring_full_count{0};
-        uint64_t umem_exhausted_count{0};
-        uint64_t rx_budget_hit_count{0};
-    };
+    /// Kept as a name for XdpSocketStats so existing callers of
+    /// XdpContext::Stats still compile; the type itself lives at namespace
+    /// scope so it can be forward-declared.
+    using Stats = XdpSocketStats;
 
     XdpContext() = default;
     ~XdpContext() { close(); }
@@ -1062,18 +1115,49 @@ class XdpContext
         return success();
     }
 
+    /// Whether a refused sendto will pass by itself, read off the current
+    /// errno. Call it straight after the sendto, before anything else can
+    /// overwrite errno.
+    /// @param ret The sendto return value
     [[nodiscard]] static auto is_transient_send_error(ssize_t ret) -> bool
     {
-        return ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+        return ret < 0 && detail::transient_kick_errno(errno);
     }
 
+    /// Tell the kernel there are frames in the TX ring, when there are.
+    ///
+    /// The kick is skipped when nothing has been submitted since the last one
+    /// got through: without XDP_USE_NEED_WAKEUP the kernel needs a kick for
+    /// every submission, so "nothing submitted" is the only thing it is safe
+    /// to skip on - and it is the common case for a sender ticking faster
+    /// than it sends. A healthy sender therefore skips most kicks, which
+    /// makes a *low* skip ratio in the counters a signal in itself.
+    ///
+    /// A kick refused with EAGAIN and friends leaves the frames pending, so
+    /// the next call tries again rather than counting them as delivered.
     [[nodiscard]] auto tx_flush() -> Status
     {
-        auto ret = ::sendto(xsk_socket__fd(xsk_), nullptr, 0, MSG_DONTWAIT, nullptr, 0);
-        if (ret < 0 && !is_transient_send_error(ret)) {
-            return failure(XdpError::tx_flush_failed);
+        if (!tx_pending_) {
+            ++stats_.tx_flush_skipped;
+            return success();
         }
-        return success();
+        auto const ret = ::sendto(xsk_socket__fd(xsk_), nullptr, 0, MSG_DONTWAIT, nullptr, 0);
+        ++stats_.tx_flush_count;
+        if (ret >= 0) {
+            tx_pending_ = false;
+            return success();
+        }
+        int const err = errno;
+        stats_.tx_flush_errno = err;
+        if (detail::transient_kick_errno(err)) {
+            // Momentary, and the frames stay pending for the next kick. The
+            // caller hears success so it does not escalate on a hiccup; the
+            // counter is there for when the hiccups do not stop.
+            ++stats_.tx_flush_transient;
+            return success();
+        }
+        ++stats_.tx_flush_failed;
+        return failure(XdpError::tx_flush_failed);
     }
 
     [[nodiscard]] auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>>;
@@ -1095,6 +1179,9 @@ class XdpContext
     /// @param addr Multicast MAC address to join
     [[nodiscard]] auto join_multicast(ieee::Eui48 const& addr) -> Status;
 
+    /// The socket's counters, as of now. See XdpSocketStats on what a reader
+    /// on another thread may and may not expect of them.
+    [[nodiscard]] auto socket_stats() const noexcept -> XdpSocketStats const& { return stats_; }
     [[nodiscard]] auto stats() const noexcept -> Stats const& { return stats_; }
 
   private:
@@ -1108,6 +1195,7 @@ class XdpContext
         std::swap(budget_, other.budget_);
         std::swap(stats_, other.stats_);
         std::swap(program_, other.program_);
+        std::swap(tx_pending_, other.tx_pending_);
         std::swap(zero_copy_, other.zero_copy_);
     }
 
@@ -1120,6 +1208,9 @@ class XdpContext
     detail::CycleBudget budget_;
     Stats stats_{};
     XdpProgram program_;
+    /// Frames are in the TX ring that the kernel has not been kicked for.
+    /// Set by tx_commit(), cleared only by a kick the kernel accepted.
+    bool tx_pending_{false};
     bool zero_copy_{false};
 };
 
@@ -1132,14 +1223,10 @@ class XdpContext
 class XdpContext
 {
   public:
-    struct Stats
-    {
-        uint64_t rx_count{0};
-        uint64_t tx_count{0};
-        uint64_t tx_ring_full_count{0};
-        uint64_t umem_exhausted_count{0};
-        uint64_t rx_budget_hit_count{0};
-    };
+    /// Kept as a name for XdpSocketStats so existing callers of
+    /// XdpContext::Stats still compile; the type itself lives at namespace
+    /// scope so it can be forward-declared.
+    using Stats = XdpSocketStats;
 
     XdpContext() = default;
     ~XdpContext() { close(); }
@@ -1208,6 +1295,7 @@ class XdpContext
 
     [[nodiscard]] auto join_multicast(ieee::Eui48 const&) -> Status { return failure(XdpError::not_supported_on_platform); }
 
+    [[nodiscard]] auto socket_stats() const noexcept -> XdpSocketStats const& { return stats_; }
     [[nodiscard]] auto stats() const noexcept -> Stats const& { return stats_; }
 
   private:
