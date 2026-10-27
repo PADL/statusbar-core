@@ -226,19 +226,26 @@ void remove_pins(std::string_view dir) noexcept
 
 /// True when `pinned_fd` is the program attached as `prog_id` and the same
 /// build as `built_in_fd` (equal tags).
-[[nodiscard]] auto is_attached_build(int const pinned_fd, int const built_in_fd, uint32_t const prog_id) -> bool
+[[nodiscard]] auto is_attached_build(int const pinned_fd, int const built_in_fd, uint32_t const prog_id) noexcept -> bool
 {
     auto const pinned = prog_identity(pinned_fd);
     auto const built_in = prog_identity(built_in_fd);
     return pinned && built_in && pinned->id == prog_id && pinned->tag == built_in->tag;
 }
 
+/// A pinned program and its maps, opened from their pins for adoption.
+struct PinnedProgram
+{
+    detail::OwnedFd prog;
+    std::array<detail::OwnedFd, 3> maps;  ///< rules_map, xsk_map, devmap
+};
+
 /// The program and maps pinned under `pin_path`, when that program is the one
 /// attached as `prog_id` and the same build as `built_in_fd`; else nullopt.
 [[nodiscard]] auto open_adoptable_pins(std::string_view const pin_path, int const built_in_fd, uint32_t const prog_id)
-    -> std::optional<detail::PinnedProgram>
+    -> std::optional<PinnedProgram>
 {
-    detail::PinnedProgram pins{.prog = detail::OwnedFd{bpf_obj_get(pin_file(pin_path, XdpProgram::PIN_PROG).c_str())}};
+    PinnedProgram pins{.prog = detail::OwnedFd{bpf_obj_get(pin_file(pin_path, XdpProgram::PIN_PROG).c_str())}};
     if (pins.prog.get() < 0 || !is_attached_build(pins.prog.get(), built_in_fd, prog_id)) {
         return std::nullopt;  // a stale pin, or another program (an older build's): replaced
     }
@@ -251,8 +258,17 @@ void remove_pins(std::string_view dir) noexcept
     return pins;
 }
 
+/// The fds of the built-in object's maps and program.
+struct ProgramFds
+{
+    int rules_map{-1};
+    int xsk_map{-1};
+    int devmap{-1};
+    int prog{-1};
+};
+
 /// The built-in object's map and program fds, or nullopt when one is missing.
-[[nodiscard]] auto builtin_fds(struct bpf_object* const obj) -> std::optional<detail::ProgramFds>
+[[nodiscard]] auto builtin_fds(struct bpf_object* const obj) noexcept -> std::optional<ProgramFds>
 {
     struct bpf_map* rules_map = bpf_object__find_map_by_name(obj, "rules_map");
     struct bpf_map* xsk_map = bpf_object__find_map_by_name(obj, "xsk_map");
@@ -261,7 +277,7 @@ void remove_pins(std::string_view dir) noexcept
     if (rules_map == nullptr || xsk_map == nullptr || devmap == nullptr || prog == nullptr) {
         return std::nullopt;
     }
-    return detail::ProgramFds{
+    return ProgramFds{
         .rules_map = bpf_map__fd(rules_map),
         .xsk_map = bpf_map__fd(xsk_map),
         .devmap = bpf_map__fd(devmap),
@@ -270,36 +286,32 @@ void remove_pins(std::string_view dir) noexcept
 }
 
 /// What to attach in: a native program in place stays native (replaced in
-/// place, no adapter reset); a generic one gives way to native, detached into
-/// `displaced` (restored if all fails).
-[[nodiscard]] auto plan_attach(
-    unsigned int const if_index,
-    std::optional<XdpAttachedProgram> const& attached,
-    XdpProgram::Options const& options,
-    detail::OwnedFd& displaced) -> detail::AttachPlan
+/// place, no adapter reset); a generic one gives way to native.
+[[nodiscard]] auto plan_for_attached(std::optional<XdpAttachedProgram> const& attached, XdpProgram::Options const& options) noexcept
+    -> detail::AttachPlan
 {
     detail::AttachPlan plan{.first = options.attach_mode, .fallback = std::nullopt};
     if (options.attach_mode == XdpAttachMode::native && options.allow_generic_fallback) {
         plan.fallback = XdpAttachMode::generic;
     }
-    if (attached) {
-        auto const mode = detail::effective_attach_mode(attached->mode, options.attach_mode);
-        if (mode != attached->mode) {
-            // Generic in place, native wanted: the two cannot coexist.
-            displaced = detail::OwnedFd{bpf_prog_get_fd_by_id(attached->prog_id)};
-            (void)bpf_xdp_detach(static_cast<int>(if_index), XDP_FLAGS_SKB_MODE, nullptr);
-        } else {
-            plan = {.first = mode, .fallback = std::nullopt};
-        }
+    if (attached && detail::effective_attach_mode(attached->mode, options.attach_mode) == attached->mode) {
+        plan = {.first = attached->mode, .fallback = std::nullopt};
     }
     return plan;
 }
 
-/// Descriptors the kernel has not consumed yet (copy mode sends at most a
-/// batch per kick, so some may be left from the last one).
-[[nodiscard]] inline auto tx_outstanding(struct xsk_ring_prod const& tx) noexcept -> uint32_t
+/// Detach the generic program in place when native is wanted (the two cannot
+/// coexist): its fd, to restore it if all fails; else none.
+[[nodiscard]] auto displace_generic_for_native(
+    unsigned int const if_index, std::optional<XdpAttachedProgram> const& attached, XdpAttachMode const wanted) noexcept
+    -> detail::OwnedFd
 {
-    return *tx.producer - __atomic_load_n(tx.consumer, __ATOMIC_ACQUIRE);
+    if (!attached || detail::effective_attach_mode(attached->mode, wanted) == attached->mode) {
+        return detail::OwnedFd{};
+    }
+    detail::OwnedFd displaced{bpf_prog_get_fd_by_id(attached->prog_id)};
+    (void)bpf_xdp_detach(static_cast<int>(if_index), XDP_FLAGS_SKB_MODE, nullptr);
+    return displaced;
 }
 
 /// Whether the bound socket `fd` reads back XDP_OPTIONS_ZEROCOPY (false when
@@ -365,35 +377,32 @@ auto XdpProgram::try_adopt(XdpAttachedProgram const& attached, Options const& op
     if (!pins) {
         return false;
     }
-    adopt(std::move(*pins), attached, options.pin_path);
+    adopt(std::move(pins->prog), std::move(pins->maps), attached, options.pin_path);
     return true;
 }
 
-void XdpProgram::adopt(detail::PinnedProgram pins, XdpAttachedProgram const& attached, std::string_view const pin_path)
-{                        // NOLINT(statusbar-block-statements): the adopted state, field by field
-    state_.obj.reset();  // the freshly loaded copy is not needed
-    set_fds({
-        .rules_map = pins.maps[0].get(),
-        .xsk_map = pins.maps[1].get(),
-        .devmap = pins.maps[2].get(),
-        .prog = pins.prog.get(),
-    });
-    state_.adopted_prog = std::move(pins.prog);
-    state_.adopted_rules_map = std::move(pins.maps[0]);
-    state_.adopted_xsk_map = std::move(pins.maps[1]);
-    state_.adopted_devmap = std::move(pins.maps[2]);
+void XdpProgram::adopt(
+    detail::OwnedFd prog, std::array<detail::OwnedFd, 3> maps, XdpAttachedProgram const& attached, std::string_view const pin_path)
+{  // NOLINT(statusbar-block-statements): the adopted state, field by field
+    // The freshly loaded copy is not needed.
+    state_.obj.reset();
+    set_fds(prog.get(), maps[0].get(), maps[1].get(), maps[2].get());
+    state_.adopted_prog = std::move(prog);
+    state_.adopted_rules_map = std::move(maps[0]);
+    state_.adopted_xsk_map = std::move(maps[1]);
+    state_.adopted_devmap = std::move(maps[2]);
     state_.prog_id = attached.prog_id;
     state_.mode = attached.mode;
     state_.adopted = true;
     state_.pin_path = std::string{pin_path};
 }
 
-void XdpProgram::set_fds(detail::ProgramFds const& fds) noexcept
+void XdpProgram::set_fds(int const prog, int const rules_map, int const xsk_map, int const devmap) noexcept
 {
-    state_.rules_map_fd = fds.rules_map;
-    state_.xsk_map_fd = fds.xsk_map;
-    state_.devmap_fd = fds.devmap;
-    state_.prog_fd = fds.prog;
+    state_.rules_map_fd = rules_map;
+    state_.xsk_map_fd = xsk_map;
+    state_.devmap_fd = devmap;
+    state_.prog_fd = prog;
 }
 
 auto XdpProgram::pin(std::string_view const pin_path) -> Status
@@ -452,15 +461,15 @@ auto XdpProgram::load_builtin() -> Status
     if (!fds) {
         return failure(XdpError::bpf_load_failed);
     }
-    set_fds(*fds);
+    set_fds(fds->prog, fds->rules_map, fds->xsk_map, fds->devmap);
     return success();
 }
 
 auto XdpProgram::attach(unsigned int const if_index, std::optional<XdpAttachedProgram> const& attached, Options const& options)
     -> Status
 {
-    detail::OwnedFd displaced;
-    auto const plan = plan_attach(if_index, attached, options, displaced);
+    auto const plan = plan_for_attached(attached, options);
+    detail::OwnedFd const displaced = displace_generic_for_native(if_index, attached, options.attach_mode);
     if (auto status = attach_by_plan(if_index, plan, displaced.get()); !status) {
         return status;
     }
@@ -472,7 +481,7 @@ auto XdpProgram::attach(unsigned int const if_index, std::optional<XdpAttachedPr
     return success();
 }
 
-auto XdpProgram::attach_by_plan(unsigned int const if_index, detail::AttachPlan const& plan, int const displaced) -> Status
+auto XdpProgram::attach_by_plan(unsigned int const if_index, detail::AttachPlan const& plan, int const displaced) noexcept -> Status
 {
     auto attach_in = [&](XdpAttachMode const mode) {
         return bpf_xdp_attach(static_cast<int>(if_index), state_.prog_fd, detail::xdp_attach_flags(mode), nullptr) == 0;
@@ -588,14 +597,14 @@ auto XdpSocket::bind_queue(XdpConfig const& config, uint16_t const bind_flags) -
     // The kernel frees a closed socket's hold on its queue later (an RCU grace
     // period and a work item), so a bind right after a close can see EBUSY.
     for (size_t attempt = 0;; ++attempt) {
-        auto const ret = create_once(config, ifname_str, xsk_cfg);
-        if (!ret) {
-            return failure(ret.error());
+        auto const bound = create_once(config, ifname_str, xsk_cfg);
+        if (!bound) {
+            return failure(bound.error());
         }
-        if (*ret == 0) {
+        if (*bound) {
             return success();
         }
-        if (*ret != -EBUSY || attempt == BIND_BUSY_RETRIES) {
+        if (attempt == BIND_BUSY_RETRIES) {
             return failure(XdpError::xsk_creation_failed);
         }
         struct timespec const pause{.tv_sec = 0, .tv_nsec = BIND_BUSY_PAUSE_NS};
@@ -604,7 +613,7 @@ auto XdpSocket::bind_queue(XdpConfig const& config, uint16_t const bind_flags) -
 }
 
 auto XdpSocket::create_once(XdpConfig const& config, std::string const& ifname, xsk_socket_config const& xsk_cfg)
-    -> StatusValue<int>
+    -> StatusValue<bool>
 {
     // A failed create leaves its UMEM's rings configured: each attempt starts from a fresh UMEM.
     auto umem_result = umem_.allocate(
@@ -623,7 +632,10 @@ auto XdpSocket::create_once(XdpConfig const& config, std::string const& ifname, 
         xsk_ = nullptr;
         close();
     }
-    return ret;
+    if (ret != 0 && ret != -EBUSY) {
+        return failure(XdpError::xsk_creation_failed);
+    }
+    return ret == 0;
 }
 
 void XdpSocket::record_bind(XdpConfig const& config, XdpAttachMode const attached) noexcept
@@ -677,7 +689,10 @@ auto XdpSocket::tx_flush() -> Status
     if (xsk_ == nullptr) {
         return failure(XdpError::not_open);
     }
-    if (tx_outstanding(rings_.tx) == 0 || (need_wakeup_ && !xsk_ring_prod__needs_wakeup(&rings_.tx))) {
+    // Descriptors the kernel has not consumed yet (copy mode sends at most a
+    // batch per kick, so some may be left from the last one).
+    if (*rings_.tx.producer - __atomic_load_n(rings_.tx.consumer, __ATOMIC_ACQUIRE) == 0 ||
+        (need_wakeup_ && !xsk_ring_prod__needs_wakeup(&rings_.tx))) {
         ++stats_.tx_flush_skipped;
         return success();
     }

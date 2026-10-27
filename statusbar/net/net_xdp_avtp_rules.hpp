@@ -61,6 +61,8 @@ using XdpRules = sg14::inplace_vector<CompiledRule<32>, TCAM_MAX_RULES>;
     return *avtp_subtype_rules(AVTP_STREAM_SUBTYPES);
 }
 
+namespace detail {
+
 /// 14 or 18: where the payload after an AVTP ethertype starts, untagged or
 /// under one 802.1Q tag; nullopt when the frame is not AVTP.
 [[nodiscard]] constexpr auto avtp_ethertype_end(std::span<std::uint8_t const> const frame) noexcept -> std::optional<std::size_t>
@@ -80,12 +82,14 @@ using XdpRules = sg14::inplace_vector<CompiledRule<32>, TCAM_MAX_RULES>;
     return std::nullopt;
 }
 
+}  // namespace detail
+
 /// Where the AVTP PDU starts in an Ethernet frame: 14 untagged, 18 after one
 /// 802.1Q tag; nullopt if not AVTP or too short for the 12-byte AVTP header.
 [[nodiscard]] constexpr auto avtp_payload_offset(std::span<std::uint8_t const> const frame) noexcept -> std::optional<std::size_t>
 {
     constexpr std::size_t AVTP_HEADER = 12;
-    auto const offset = avtp_ethertype_end(frame);
+    auto const offset = detail::avtp_ethertype_end(frame);
     if (!offset || frame.size() < *offset + AVTP_HEADER) {
         return std::nullopt;
     }
