@@ -80,23 +80,30 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     pkg_check_modules(LIBXDP libxdp)
   endif()
   if(LIBBPF_FOUND AND LIBXDP_FOUND)
-    execute_process(
-      COMMAND dpkg-architecture -qDEB_HOST_MULTIARCH
-      OUTPUT_VARIABLE DEB_HOST_MULTIARCH
-      OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET
-      RESULT_VARIABLE DPKG_RESULT)
-    if(DPKG_RESULT EQUAL 0)
-      set(MULTIARCH_INCLUDE "-I/usr/include/${DEB_HOST_MULTIARCH}")
+    # The BPF object needs the target's multiarch <asm/types.h>: a cross
+    # toolchain names it in CMAKE_LIBRARY_ARCHITECTURE (and maybe a sysroot).
+    if(CMAKE_CROSSCOMPILING AND CMAKE_LIBRARY_ARCHITECTURE)
+      set(MULTIARCH_INCLUDE
+          "-I${CMAKE_SYSROOT}/usr/include/${CMAKE_LIBRARY_ARCHITECTURE}")
     else()
       execute_process(
-        COMMAND ${CMAKE_C_COMPILER} -dumpmachine
-        OUTPUT_VARIABLE _GCC_MACHINE
+        COMMAND dpkg-architecture -qDEB_HOST_MULTIARCH
+        OUTPUT_VARIABLE DEB_HOST_MULTIARCH
         OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET
-        RESULT_VARIABLE _GCC_RESULT)
-      if(_GCC_RESULT EQUAL 0 AND EXISTS "/usr/include/${_GCC_MACHINE}")
-        set(MULTIARCH_INCLUDE "-I/usr/include/${_GCC_MACHINE}")
+        RESULT_VARIABLE DPKG_RESULT)
+      if(DPKG_RESULT EQUAL 0)
+        set(MULTIARCH_INCLUDE "-I/usr/include/${DEB_HOST_MULTIARCH}")
       else()
-        set(MULTIARCH_INCLUDE "")
+        execute_process(
+          COMMAND ${CMAKE_C_COMPILER} -dumpmachine
+          OUTPUT_VARIABLE _GCC_MACHINE
+          OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET
+          RESULT_VARIABLE _GCC_RESULT)
+        if(_GCC_RESULT EQUAL 0 AND EXISTS "/usr/include/${_GCC_MACHINE}")
+          set(MULTIARCH_INCLUDE "-I/usr/include/${_GCC_MACHINE}")
+        else()
+          set(MULTIARCH_INCLUDE "")
+        endif()
       endif()
     endif()
 
