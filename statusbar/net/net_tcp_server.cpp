@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdlib>
+#include <string>
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -55,6 +56,84 @@ auto create_seqpacket_socket(SocketAddress const& addr) -> StatusValue<FileDescr
         return failure(NetError::bind_failed);
     }
     return fd;
+}
+
+/// Connect @p probe (non-blocking) to the socket at @p path, unlinking it when
+/// stale: only a refused connect proves nobody is listening; success or a
+/// full backlog (EAGAIN) means a running instance owns it. True: @p path is free.
+[[nodiscard]] auto unlink_if_stale(int const probe, SocketAddress const& addr, std::string const& path) -> bool
+{
+    if (::connect(probe, addr.sockaddr(), addr.length()) == 0) {
+        return false;
+    }
+    if (errno == ENOENT) {
+        return true;  // vanished since lstat
+    }
+    if (errno != ECONNREFUSED) {
+        return false;  // live (EAGAIN/EINPROGRESS) or unknowable: leave it
+    }
+    // A stale socket from a previous run.
+    return ::unlink(path.c_str()) == 0 || errno == ENOENT;
+}
+
+/// A fresh private (0700) directory "<dir>/.XXXXXX" beside @p path: short, as
+/// "<dir>/.XXXXXX/s" must fit sun_path like the path itself.
+[[nodiscard]] auto make_private_dir(std::string const& path) -> StatusValue<std::string>
+{
+    auto const slash = path.rfind('/');
+    std::string private_dir = (slash == std::string::npos ? std::string{"."} : path.substr(0, slash)) + "/.XXXXXX";
+    if (::mkdtemp(private_dir.data()) == nullptr) {
+        return failure(NetError::bind_failed);
+    }
+    return private_dir;
+}
+
+/// A socket bound at @p private_path: SOCK_SEQPACKET, or stream.
+[[nodiscard]] auto bind_private(std::string const& private_path, bool const seqpacket) -> StatusValue<FileDescriptor>
+{
+    auto private_addr = SocketAddress::local(private_path);
+    if (!private_addr) {
+        return failure(NetError::bind_failed);  // the path leaves no room for the private directory
+    }
+    return seqpacket ? create_seqpacket_socket(*private_addr) : create_tcp_socket(*private_addr, true);
+}
+
+/// Give the socket @p fd bound at @p private_path its mode, listen and link it to @p path.
+[[nodiscard]] auto listen_and_link(
+    int const fd, std::string const& private_path, std::string const& path, TcpServerOptions const& options) -> Status
+{
+    if (options.unix_mode >= 0 && ::chmod(private_path.c_str(), mode_t(options.unix_mode)) < 0) {
+        return failure(NetError::socket_option_failed);
+    }
+    if (::listen(fd, options.backlog) < 0) {
+        return failure(NetError::listen_failed);
+    }
+    if (::link(private_path.c_str(), path.c_str()) < 0) {
+        return failure(NetError::bind_failed);
+    }
+    return success();
+}
+
+/// Remove the private socket name and its directory, whatever became of them.
+void remove_private(std::string const& private_path, std::string const& private_dir)
+{
+    (void)::unlink(private_path.c_str());
+    (void)::rmdir(private_dir.c_str());
+}
+
+/// A listener made in @p private_dir and linked to @p path; the private names are removed either way.
+[[nodiscard]] auto link_private_listener(std::string const& private_dir, std::string const& path, TcpServerOptions const& options)
+    -> StatusValue<FileDescriptor>
+{
+    std::string const private_path = private_dir + "/s";
+    auto listener = bind_private(private_path, options.unix_seqpacket);
+    auto const status =
+        listener.and_then([&](FileDescriptor const& fd) { return listen_and_link(fd.get(), private_path, path, options); });
+    remove_private(private_path, private_dir);
+    if (!status) {
+        return failure(status.error());
+    }
+    return listener;
 }
 
 }  // namespace
@@ -107,23 +186,12 @@ auto TcpConnectionPool::prepare_unix_path(SocketAddress const& bind_addr) const 
     if (!S_ISSOCK(st.st_mode)) {
         return false;  // never clobber a non-socket
     }
-    // Live or stale? Only a refused connect proves nobody is listening;
-    // success or a full backlog (EAGAIN) means a running instance owns it.
+    // Live or stale?
     FileDescriptor const probe{::socket(AF_UNIX, options_.unix_seqpacket ? SOCK_SEQPACKET : SOCK_STREAM, 0)};
     if (!probe.valid() || !set_nonblocking(probe.get())) {
         return false;
     }
-    if (::connect(probe.get(), bind_addr.sockaddr(), bind_addr.length()) == 0) {
-        return false;
-    }
-    if (errno == ENOENT) {
-        return true;  // vanished since lstat
-    }
-    if (errno != ECONNREFUSED) {
-        return false;  // live (EAGAIN/EINPROGRESS) or unknowable: leave it
-    }
-    // A stale socket from a previous run.
-    return ::unlink(unix_path_.c_str()) == 0 || errno == ENOENT;
+    return unlink_if_stale(probe.get(), bind_addr, unix_path_);
 }
 
 auto TcpConnectionPool::open_listener(SocketAddress const& bind_addr) -> StatusValue<FileDescriptor>
@@ -138,41 +206,14 @@ auto TcpConnectionPool::open_listener(SocketAddress const& bind_addr) -> StatusV
     // live socket that appeared since prepare_unix_path is refused). Nobody
     // can connect until the socket is at the path, with its final mode.
     // A socket there afterwards is ours to unlink (claim_unix_path).
-    // "<dir>/.XXXXXX/s": short, as it must fit sun_path like the path itself.
-    auto const slash = unix_path_.rfind('/');
-    std::string private_dir = (slash == std::string::npos ? std::string{"."} : unix_path_.substr(0, slash)) + "/.XXXXXX";
-    if (::mkdtemp(private_dir.data()) == nullptr) {
-        return failure(NetError::bind_failed);
+    auto const private_dir = make_private_dir(unix_path_);
+    if (!private_dir) {
+        return failure(private_dir.error());
     }
-    std::string const private_path = private_dir + "/s";
-    auto const discard = [&private_dir, &private_path] {
-        (void)::unlink(private_path.c_str());
-        (void)::rmdir(private_dir.c_str());
-    };
-    auto private_addr = SocketAddress::local(private_path);
-    if (!private_addr) {
-        discard();
-        return failure(NetError::bind_failed);  // the path leaves no room for the private directory
+    auto listener = link_private_listener(*private_dir, unix_path_, options_);
+    if (listener) {
+        claim_unix_path();
     }
-    auto listener = options_.unix_seqpacket ? create_seqpacket_socket(*private_addr) : create_tcp_socket(*private_addr, true);
-    if (!listener) {
-        discard();
-        return listener;
-    }
-    if (options_.unix_mode >= 0 && ::chmod(private_path.c_str(), mode_t(options_.unix_mode)) < 0) {
-        discard();
-        return failure(NetError::socket_option_failed);
-    }
-    if (::listen(listener->get(), options_.backlog) < 0) {
-        discard();
-        return failure(NetError::listen_failed);
-    }
-    if (::link(private_path.c_str(), unix_path_.c_str()) < 0) {
-        discard();
-        return failure(NetError::bind_failed);
-    }
-    discard();
-    claim_unix_path();
     return listener;
 }
 

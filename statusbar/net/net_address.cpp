@@ -34,6 +34,19 @@ auto SocketAddress::ipv6(std::span<uint8_t const, 16> addr, uint16_t port, uint3
     return result;
 }
 
+namespace {
+
+/// Write AF_UNIX and the NUL-terminated @p path (which fits) into @p sun: the address length.
+auto write_local_path(sockaddr_un& sun, std::string_view const path) noexcept -> socklen_t
+{
+    sun.sun_family = AF_UNIX;
+    span_copy(make_span(sun.sun_path).first(path.size()), make_const_span(path));
+    sun.sun_path[path.size()] = '\0';
+    return static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + 1);
+}
+
+}  // namespace
+
 auto SocketAddress::local(std::string_view path) noexcept -> StatusValue<SocketAddress>
 {
     SocketAddress result;
@@ -44,10 +57,7 @@ auto SocketAddress::local(std::string_view path) noexcept -> StatusValue<SocketA
     if (path.empty() || path.front() != '/' || path.size() >= sizeof(sun->sun_path) || path.find('\0') != std::string_view::npos) {
         return failure(NetError::invalid_address);
     }
-    sun->sun_family = AF_UNIX;
-    span_copy(make_span(sun->sun_path).first(path.size()), make_const_span(path));
-    sun->sun_path[path.size()] = '\0';
-    result.length_ = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + 1);
+    result.length_ = write_local_path(*sun, path);
     return success(result);
 }
 
@@ -81,9 +91,7 @@ auto local_to_string(sockaddr_storage const& storage, socklen_t length, std::str
     if (sun->sun_path[0] != '\0') {
         return {};
     }
-    std::string result = "@";
-    result.append(std::next(std::begin(sun->sun_path)), std::next(std::begin(sun->sun_path), std::ptrdiff_t(avail)));
-    return result;
+    return "@" + std::string(std::next(std::begin(sun->sun_path)), std::next(std::begin(sun->sun_path), std::ptrdiff_t(avail)));
 }
 
 }  // namespace

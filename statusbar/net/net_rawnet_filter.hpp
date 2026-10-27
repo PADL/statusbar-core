@@ -76,7 +76,7 @@ inline constexpr std::uint16_t TPID_8021Q = 0x8100U;
 ///   9+n: ret #-1
 [[nodiscard]] constexpr auto subtype_filter(std::uint16_t const ethertype, std::span<std::uint8_t const> const subtypes) noexcept
     -> Program
-{
+{  // NOLINT(statusbar-block-statements): the program above, one statement per instruction
     std::size_t const n = subtypes.size();
     if (n == 0 || n > MAX_SUBTYPES) {
         return ethertype_filter(ethertype);

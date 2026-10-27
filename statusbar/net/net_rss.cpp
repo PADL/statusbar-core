@@ -42,22 +42,29 @@ constexpr size_t RXFH_HEADER_WORDS = 2;
     return ifreq_ioctl(interface_name, SIOCETHTOOL, ifr);
 }
 
-}  // namespace
-
-auto rss_indirection(std::string_view const interface_name) -> StatusValue<RssIndirection>
+/// The size of the indirection table: a zero size asks for it.
+[[nodiscard]] auto rss_table_size(std::string_view const interface_name) -> StatusValue<uint32_t>
 {
-    // A zero size asks for the table's size; then the table itself.
     std::vector<uint32_t> request{ETHTOOL_GRXFHINDIR, 0};
     if (auto status = rxfh_ioctl(interface_name, request); !status) {
         return failure(status.error());
     }
-    uint32_t const size = request[1];
-    if (size == 0) {
+    if (request[1] == 0) {
         return failure(std::make_error_code(std::errc::operation_not_supported));
     }
-    request.assign(RXFH_HEADER_WORDS + size, 0);
-    request[0] = ETHTOOL_GRXFHINDIR;
-    request[1] = size;
+    return request[1];
+}
+
+}  // namespace
+
+auto rss_indirection(std::string_view const interface_name) -> StatusValue<RssIndirection>
+{
+    auto const size = rss_table_size(interface_name);
+    if (!size) {
+        return failure(size.error());
+    }
+    std::vector<uint32_t> request{ETHTOOL_GRXFHINDIR, *size};
+    request.resize(RXFH_HEADER_WORDS + *size);
     if (auto status = rxfh_ioctl(interface_name, request); !status) {
         return failure(status.error());
     }

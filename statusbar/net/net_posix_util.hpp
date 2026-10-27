@@ -88,6 +88,32 @@ inline void set_ifr_data(ifreq& ifr, T* data) noexcept
     return std::span<uint8_t, IFNAMSIZ>(reinterpret_cast<uint8_t*>(ifr.ifr_name), IFNAMSIZ);
 }
 
+namespace detail {
+
+/// The transient AF_INET datagram socket an interface ioctl is carried on.
+[[nodiscard]] inline auto ioctl_carrier_socket() noexcept -> int
+{
+#if defined(SOCK_CLOEXEC)
+    return ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+#else
+    return ::socket(AF_INET, SOCK_DGRAM, 0);
+#endif
+}
+
+/// Run @p request on @p ifr over @p sock, then close @p sock: the ioctl's errno on failure.
+[[nodiscard]] inline auto ioctl_and_close(int const sock, unsigned long const request, ifreq& ifr) noexcept -> Status
+{
+    int const rc = ::ioctl(sock, request, &ifr);
+    int const saved = errno;
+    ::close(sock);
+    if (rc < 0) {
+        return failure(std::error_code{saved, std::system_category()});
+    }
+    return success();
+}
+
+}  // namespace detail
+
 /// Run one interface ioctl (SIOCGIFMTU, SIOCETHTOOL, SIOCGIFHWADDR...) on
 /// @p ifr, after writing @p iface into ifr.ifr_name (the rest of @p ifr, e.g.
 /// an ifr_data set with set_ifr_data, is left as the caller filled it). A
@@ -98,23 +124,13 @@ inline void set_ifr_data(ifreq& ifr, T* data) noexcept
     if (iface.empty() || iface.size() >= IFNAMSIZ) {
         return failure(std::make_error_code(std::errc::no_such_device));
     }
-#if defined(SOCK_CLOEXEC)
-    int const sock = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-#else
-    int const sock = ::socket(AF_INET, SOCK_DGRAM, 0);
-#endif
+    int const sock = detail::ioctl_carrier_socket();
     if (sock < 0) {
         return failure(std::error_code{errno, std::system_category()});
     }
     std::memset(ifr.ifr_name, 0, sizeof(ifr.ifr_name));
     std::memcpy(ifr.ifr_name, iface.data(), iface.size());
-    int const rc = ::ioctl(sock, request, &ifr);
-    int const saved = errno;
-    ::close(sock);
-    if (rc < 0) {
-        return failure(std::error_code{saved, std::system_category()});
-    }
-    return success();
+    return detail::ioctl_and_close(sock, request, ifr);
 }
 
 #if defined(__linux__)
