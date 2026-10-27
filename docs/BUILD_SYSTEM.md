@@ -102,6 +102,62 @@ includes `sanitizers.cmake`, `coverage.cmake`, `fuzzing.cmake`, and
 `clang_tidy.cmake`. Their options become available without any extra
 `include()` from the project.
 
+## `toolchain-clang-aarch64.cmake` — cross builds
+
+Wraps `toolchain-clang.cmake` for an aarch64-linux-gnu target: `--target`
+on compile and link, lld, libunwind, and find/pkg-config roots on the
+arm64 tree. The target's headers and libraries come from one of two
+places:
+
+- **Multiarch** (the default, as `Containerfile.cross` uses): the
+  `:arm64` dev packages installed on the build host.
+- **A sysroot** (`STATUSBAR_SYSROOT`, cache or environment): a directory
+  holding the target's `/usr/include`, `/usr/lib/<triple>` and
+  `/usr/lib/llvm-<N>`, for a host without `:arm64` packages. The file
+  sets `CMAKE_SYSROOT`, points pkg-config at it
+  (`PKG_CONFIG_SYSROOT_DIR`), and links against the sysroot's
+  compiler-rt (the host clang ships builtins only for its own arch), so
+  the sysroot needs `libclang-rt-<N>-dev` for the host clang's `<N>`.
+  libc++ headers are the host clang's; the libraries are the sysroot's.
+
+A sysroot is the target's root filesystem, or the same packages
+installed into a container of the target's distribution with
+`dpkg --add-architecture arm64` there (not on the host):
+
+```sh
+# inside e.g. ubuntu:26.04 (amd64), with an arm64 apt source added
+apt-get install libc6-dev:arm64 libc++-20-dev:arm64 libc++abi-20-dev:arm64 \
+    libunwind-20-dev:arm64 libclang-rt-20-dev:arm64 libbpf-dev:arm64 \
+    libxdp-dev:arm64 libelf-dev:arm64 zlib1g-dev:arm64 libasound2-dev:arm64 \
+    libsystemd-dev:arm64
+tar cf - usr/include usr/lib/aarch64-linux-gnu usr/lib/llvm-20 usr/lib/gcc \
+    | tar xf - -C "$SYSROOT"
+ln -s usr/lib "$SYSROOT/lib"
+# glibc's libc.so names /lib/ld-linux-aarch64.so.1; a multiarch container
+# keeps it only under aarch64-linux-gnu/
+ln -s aarch64-linux-gnu/ld-linux-aarch64.so.1 "$SYSROOT/usr/lib/"
+```
+
+Then, from the umbrella:
+
+```sh
+STATUSBAR_SYSROOT=$SYSROOT LLVM_PATH=/usr/lib/llvm-20 cmake -G Ninja \
+    -B build-arm64 --toolchain cmake/toolchain-clang-aarch64.cmake
+cmake --build build-arm64
+# packages: the same packaging script, cross
+STATUSBAR_TARGET_ARCH=arm64 STATUSBAR_SYSROOT=$SYSROOT ./local-build-debs.sh
+```
+
+The tests run on the target: copy `statusbar_test` with the sysroot's
+`libc++.so.1`, `libc++abi.so.1` and `libunwind.so.1` and run
+`LD_LIBRARY_PATH=. ./statusbar_test -A`. Tests that read files from the
+source tree need it at the same path there. `qemu-aarch64` with
+`QEMU_LD_PREFIX=$SYSROOT` runs most of them on the host, but not those
+using netlink or socket options qemu-user lacks. With a sysroot,
+dpkg-shlibdeps cannot resolve the target's libraries, so the packaging
+script turns it off and a `.deb` carries only the dependencies its
+package declares.
+
 ## `module.cmake` — `statusbar_add_module()`
 
 The helper every per-module `CMakeLists.txt` calls to declare its
