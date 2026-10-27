@@ -1,0 +1,43 @@
+libc++ 20 (and 21, 22): std::format_to into a back_insert_iterator overflows its
+256-code-unit stack buffer when an argument or fill of a multiple of 256 code units
+is followed by more output (llvm-project issue 154670). Upstream fix, llvm-project
+PR 226791 (Apache-2.0 WITH LLVM-exception), against <llvm>/include/c++/v1:
+  sudo patch -p1 -d /usr/lib/llvm-20/include/c++/v1 < cmake/patches/libcxx-20-format-buffer.patch
+
+diff --git a/__format/buffer.h b/__format/buffer.h
+index bf2bebf9b2a859..f53f4d60b7d4c4 100644
+--- a/__format/buffer.h
++++ b/__format/buffer.h
+@@ -250,6 +250,10 @@ class __output_buffer {
+       __first += __chunk;
+       __n -= __chunk;
+     } while (__n);
++
++    // push_back needs a free code unit, which the last chunk may have used.
++    if (__size_ == __capacity_)
++      __prepare_write(0);
+   }
+ 
+   /// A std::transform wrapper.
+@@ -276,6 +280,10 @@ class __output_buffer {
+       __first += __chunk;
+       __n -= __chunk;
+     } while (__n);
++
++    // push_back needs a free code unit, which the last chunk may have used.
++    if (__size_ == __capacity_)
++      __prepare_write(0);
+   }
+ 
+   /// A \c fill_n wrapper.
+@@ -293,6 +301,10 @@ class __output_buffer {
+       __size_ += __chunk;
+       __n -= __chunk;
+     } while (__n);
++
++    // push_back needs a free code unit, which the last chunk may have used.
++    if (__size_ == __capacity_)
++      __prepare_write(0);
+   }
+ 
+   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI size_t __capacity() const { return __capacity_; }
