@@ -596,6 +596,22 @@ class OwnedFd
     int fd_{-1};
 };
 
+/// The fds an XdpProgram works through, loaded or adopted.
+struct ProgramFds
+{
+    int rules_map{-1};
+    int xsk_map{-1};
+    int devmap{-1};
+    int prog{-1};
+};
+
+/// A pinned program and its maps, opened from their pins for adoption.
+struct PinnedProgram
+{
+    OwnedFd prog;
+    std::array<OwnedFd, 3> maps;  ///< rules_map, xsk_map, devmap
+};
+
 }  // namespace detail
 
 /// The XDP filter program (xdp_filter.bpf.c) on one interface: adopted from
@@ -714,7 +730,20 @@ class XdpProgram
     };
 
     [[nodiscard]] auto install_tcam_rules(std::span<CompiledRule<32> const> rules) -> Status;
+    /// open() after its reset: query, load, then adopt or attach; the caller closes on failure.
+    [[nodiscard]] auto adopt_or_attach(unsigned int if_index, Options const& options) -> Status;
+    /// Load the built-in program and take its fds.
+    [[nodiscard]] auto load_builtin() -> Status;
     [[nodiscard]] auto try_adopt(XdpAttachedProgram const& attached, Options const& options) -> bool;
+    /// Take over `pins` (verified by try_adopt) in place of the loaded copy.
+    void adopt(detail::PinnedProgram pins, XdpAttachedProgram const& attached, std::string_view pin_path);
+    /// Attach the loaded program (displacing a generic one for native), then pin it.
+    [[nodiscard]] auto attach(unsigned int if_index, std::optional<XdpAttachedProgram> const& attached, Options const& options)
+        -> Status;
+    /// Attach in plan.first, else plan.fallback; on failure, restore the `displaced` generic program (fd, or -1).
+    [[nodiscard]] auto attach_by_plan(unsigned int if_index, detail::AttachPlan const& plan, int displaced) -> Status;
+    /// Work through `fds`: the program's and its maps'.
+    void set_fds(detail::ProgramFds const& fds) noexcept;
     [[nodiscard]] auto pin(std::string_view pin_path) -> Status;
 
     State state_;
@@ -811,6 +840,14 @@ class XdpSocket
     [[nodiscard]] auto stats() const noexcept -> Stats const& { return stats_; }
 
   private:
+    /// Create the socket on `config.queue_id`, retrying while the queue is busy.
+    [[nodiscard]] auto bind_queue(XdpConfig const& config, uint16_t bind_flags) -> Status;
+    /// One fresh UMEM and socket create: 0, or the create's -errno (closed again); the UMEM's failure.
+    [[nodiscard]] auto create_once(XdpConfig const& config, std::string const& ifname, xsk_socket_config const& xsk_cfg)
+        -> StatusValue<int>;
+    /// Record what the bind obtained (mode, wakeup, zero-copy) and the cycle budget.
+    void record_bind(XdpConfig const& config, XdpAttachMode attached) noexcept;
+
     void swap(XdpSocket& other) noexcept
     {
         std::swap(xsk_, other.xsk_);
