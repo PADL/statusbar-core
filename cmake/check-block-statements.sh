@@ -5,7 +5,8 @@
 # Hold changed C++ to the house block size: run clang-tidy's statusbar-block-statements check
 # (the plugin clang_tidy.cmake builds) over the files a change touches, and fail on any block whose
 # lines the change touches that holds more than STATUSBAR_BLOCK_STATEMENTS_MAX statements (default 6:
-# aim for 4). A changed header is checked through its own .cpp, or else every .cpp beside it.
+# aim for 4). A changed header is checked through its own .cpp, or else every .cpp beside it;
+# tests and fuzzers are not held to it.
 #
 # Usage: check-block-statements.sh <build-dir> [--staged | <base-ref>]   (default --staged)
 # Run in the repository to check; <build-dir> holds compile_commands.json and libstatusbar-tidy.so.
@@ -40,6 +41,8 @@ changed, path = {}, None
 for line in diff.splitlines():
     if line.startswith("+++ "):
         path = None if line.endswith("/dev/null") else os.path.realpath(os.path.join(root, line[6:]))
+        if path and path.endswith(("_test.cpp", "_fuzzer.cpp")):
+            path = None  # tests and fuzzers are lists of cases
     elif line.startswith("@@") and path:
         start, _, count = re.match(r"@@ -\S+ \+(\d+)(,(\d+))?", line).groups()
         start, count = int(start), int(count if count is not None else 1)

@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 /// A clang-tidy plugin with the house check statusbar-block-statements: a block ({...}) holds at most
-/// MaxStatements statements (default 4), each counted once whatever its kind; an exception is marked
+/// MaxStatements statements (default 4), each counted once whatever its kind (a switch's body is
+/// exempt: its cases are a list); an exception is marked
 /// `// NOLINT(statusbar-block-statements): <reason>` on the opening brace's line.
 
 #include "clang-tidy/ClangTidyCheck.h"
@@ -29,7 +30,7 @@ class BlockStatementsCheck final : public clang::tidy::ClangTidyCheck
     void registerMatchers(MatchFinder* finder) override
     {
         using namespace clang::ast_matchers;
-        finder->addMatcher(compoundStmt(unless(isExpansionInSystemHeader())).bind("block"), this);
+        finder->addMatcher(compoundStmt(unless(isExpansionInSystemHeader()), unless(hasParent(switchStmt()))).bind("block"), this);
     }
 
     void check(MatchFinder::MatchResult const& result) override

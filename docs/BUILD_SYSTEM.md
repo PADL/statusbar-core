@@ -254,12 +254,13 @@ With clang-tidy's development headers installed (`libclang-dev` for the toolchai
 builds `libstatusbar-tidy.so` from `tidy/statusbar_tidy_block_statements.cpp`, against the
 clang-tidy binary's own LLVM and C++ library, and loads it. The plugin's check,
 `statusbar-block-statements`, counts the statements directly inside each `{...}` block (a nested
-block counts once) and flags a block with more than `MaxStatements` (default 4). The `clang-tidy`
+block counts once; a `switch` body is exempt) and flags a block with more than `MaxStatements`
+(default 4). The `clang-tidy`
 target reports these as warnings only.
 
 `check-block-statements.sh <build-dir> [--staged | <base-ref>]` holds changed code to it as an
 error. It checks the files a change touches and fails on any flagged block whose lines the change
-touches, at `STATUSBAR_BLOCK_STATEMENTS_MAX` statements (default 6, so the target of 4 has a little
+touches, outside tests and fuzzers, at `STATUSBAR_BLOCK_STATEMENTS_MAX` statements (default 6, so the target of 4 has a little
 slack). The pre-commit hook that `install-hooks.sh` installs runs it on staged changes when the
 umbrella build has the plugin. A deliberate exception is marked on the opening brace's line:
 `// NOLINT(statusbar-block-statements): <reason>`.
