@@ -232,6 +232,13 @@ class TcClient final : public TcControl
     /// parsing the wanted qdisc. Only messages addressed to this socket
     /// (nlmsg_pid, our port id) under @p seq count.
     [[nodiscard]] auto transact(std::span<uint8_t const> request, uint32_t seq, Wanted* wanted) -> Status;
+    /// The messages in reply_'s first @p received bytes: the transaction's result
+    /// once one ends it, else nullopt (read on).
+    [[nodiscard]] auto read_replies(size_t received, size_t request_size, uint32_t seq, Wanted* wanted) -> std::optional<Status>;
+    /// One message addressed to this transaction: its result if it ends it, else nullopt.
+    [[nodiscard]] auto read_reply(std::span<uint8_t const> message, size_t request_size, Wanted* wanted) -> std::optional<Status>;
+    /// Parse a dump's RTM_NEWQDISC into @p wanted when it is the qdisc wanted: nullopt, or the parse's failure.
+    [[nodiscard]] static auto take_qdisc(std::span<uint8_t const> message, Wanted& wanted) -> std::optional<Status>;
 
     FileDescriptor fd_{};
     uint32_t portid_{0};

@@ -112,19 +112,28 @@ void put_kind(BufferSerializerBuilder& b, std::string_view const kind)
     return expected;
 }
 
+/// Usable mqprio settings: major 0 would give the per-queue classes ids
+/// 0:1..N, which do not exist; every priority maps to one of num_tc classes.
+[[nodiscard]] auto valid_mqprio(MqprioQdisc const& qdisc) noexcept -> bool
+{
+    if (qdisc.major == 0 || qdisc.num_tc == 0 || qdisc.num_tc > MAX_TRAFFIC_CLASSES) {
+        return false;
+    }
+    for (uint8_t const tc : qdisc.prio_tc_map) {
+        if (tc >= qdisc.num_tc) {
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 auto build_replace_mqprio(std::span<uint8_t> const out, int const ifindex, MqprioQdisc const& qdisc, uint32_t const seq)
     -> StatusValue<size_t>
-{
-    // major 0 would give the per-queue classes ids 0:1..N, which do not exist.
-    if (qdisc.major == 0 || qdisc.num_tc == 0 || qdisc.num_tc > MAX_TRAFFIC_CLASSES) {
+{  // NOLINT(statusbar-block-statements): the mqprio request, field by field
+    if (!valid_mqprio(qdisc)) {
         return failure(std::make_error_code(std::errc::invalid_argument));
-    }
-    for (uint8_t const tc : qdisc.prio_tc_map) {
-        if (tc >= qdisc.num_tc) {
-            return failure(std::make_error_code(std::errc::invalid_argument));
-        }
     }
     constexpr std::string_view KIND = "mqprio";
     constexpr size_t QOPT = sizeof(tc_mqprio_qopt);
@@ -154,7 +163,7 @@ auto build_replace_mqprio(std::span<uint8_t> const out, int const ifindex, Mqpri
 
 auto build_replace_cbs(std::span<uint8_t> const out, int const ifindex, CbsQdisc const& qdisc, uint32_t const seq)
     -> StatusValue<size_t>
-{
+{  // NOLINT(statusbar-block-statements): the cbs request, field by field
     constexpr std::string_view KIND = "cbs";
     constexpr size_t QOPT = sizeof(tc_cbs_qopt);
     constexpr size_t PARMS = RTA_HEADER + QOPT;  // 24: already aligned
@@ -177,7 +186,7 @@ auto build_replace_cbs(std::span<uint8_t> const out, int const ifindex, CbsQdisc
 auto build_replace_kind(
     std::span<uint8_t> const out, int const ifindex, uint32_t const parent, std::string_view const kind, uint32_t const seq)
     -> StatusValue<size_t>
-{
+{  // NOLINT(statusbar-block-statements): the request, field by field
     if (kind.empty() || kind.size() > MAX_KIND) {
         return failure(std::make_error_code(std::errc::invalid_argument));
     }
@@ -228,7 +237,7 @@ template <typename T>
 
 /// The flat tc_mqprio_qopt at the head of mqprio's TCA_OPTIONS.
 [[nodiscard]] auto parse_mqprio(std::span<uint8_t const> const options, uint32_t const handle) -> StatusValue<MqprioQdisc>
-{
+{  // NOLINT(statusbar-block-statements): tc_mqprio_qopt, field by field
     if (options.size() < sizeof(tc_mqprio_qopt)) {
         return failure(bad_message());
     }
@@ -275,6 +284,156 @@ template <typename T>
     return failure(bad_message());
 }
 
+/// @p bytes without its trailing NULs.
+[[nodiscard]] auto without_trailing_nuls(std::span<uint8_t const> const bytes) noexcept -> std::span<uint8_t const>
+{
+    size_t n = bytes.size();
+    while (n > 0 && bytes[n - 1] == 0) {
+        --n;
+    }
+    return bytes.first(n);
+}
+
+/// The tcmsg fields of a qdisc message at least NLMSG_HEADER + TCMSG_SIZE long.
+[[nodiscard]] auto read_tcmsg(std::span<uint8_t const> const message) -> QdiscInfo
+{
+    QdiscInfo info{};
+    info.ifindex = read_at<int32_t>(message, NLMSG_HEADER + offsetof(tcmsg, tcm_ifindex));
+    info.handle = read_at<uint32_t>(message, NLMSG_HEADER + offsetof(tcmsg, tcm_handle));
+    info.parent = read_at<uint32_t>(message, NLMSG_HEADER + offsetof(tcmsg, tcm_parent));
+    return info;
+}
+
+/// Decode the TCA_OPTIONS of a kind we know (mqprio, cbs) into @p info;
+/// bad_message when that kind has none.
+[[nodiscard]] auto parse_options(QdiscInfo& info, std::optional<std::span<uint8_t const>> const options) -> Status
+{
+    if (info.kind == "mqprio") {
+        if (!options) {
+            return failure(bad_message());
+        }
+        auto mqprio = parse_mqprio(*options, info.handle);
+        if (!mqprio) {
+            return failure(mqprio.error());
+        }
+        info.mqprio = *mqprio;
+    } else if (info.kind == "cbs") {
+        if (!options) {
+            return failure(bad_message());
+        }
+        auto cbs = parse_cbs(*options, info.parent);
+        if (!cbs) {
+            return failure(cbs.error());
+        }
+        info.cbs = *cbs;
+    }
+    return success();
+}
+
+/// Walk the attributes after the tcmsg of @p body: TCA_KIND names
+/// info.kind, then the kind's TCA_OPTIONS are decoded (parse_options).
+[[nodiscard]] auto parse_attributes(std::span<uint8_t const> const body, QdiscInfo& info) -> Status
+{
+    std::optional<std::span<uint8_t const>> options;
+    size_t at = NLMSG_HEADER + TCMSG_SIZE;
+    while (at + RTA_HEADER <= body.size()) {
+        auto const len = read_at<uint16_t>(body, at);
+        auto const type = read_at<uint16_t>(body, at + 2);
+        if (len < RTA_HEADER || at + len > body.size()) {
+            return failure(bad_message());
+        }
+        auto const payload = body.subspan(at + RTA_HEADER, len - RTA_HEADER);
+        if (type == TCA_KIND) {
+            auto const kind = without_trailing_nuls(payload);
+            info.kind.assign(kind.begin(), kind.end());
+        } else if ((type & NLA_TYPE_MASK) == TCA_OPTIONS) {
+            options = payload;
+        }
+        at += align4(len);
+    }
+    return parse_options(info, options);
+}
+
+/// A dump's NLMSG_DONE: its payload is the dump's error (0 when complete).
+[[nodiscard]] auto dump_status(std::span<uint8_t const> const message) -> Status
+{
+    int error = 0;
+    if (message.size() >= NLMSG_HEADER + sizeof(error)) {
+        error = read_at<int>(message, NLMSG_HEADER);
+    }
+    return error == 0 ? success() : failure(std::error_code{-error, std::system_category()});
+}
+
+/// Copy the extended ack's NLMSGERR_ATTR_MSG, if any, into @p text.
+void read_ext_ack_message(
+    std::span<uint8_t const> const message, uint16_t const flags, size_t const request_size, std::string& text)
+{
+    size_t const skip = (flags & NLM_F_CAPPED) != 0 ? sizeof(nlmsgerr) : sizeof(nlmsgerr) + request_size - NLMSG_HEADER;
+    size_t at = NLMSG_HEADER + align4(skip);
+    while (at + RTA_HEADER <= message.size()) {
+        auto const len = read_at<uint16_t>(message, at);
+        auto const type = read_at<uint16_t>(message, at + 2);
+        if (len < RTA_HEADER || at + len > message.size()) {
+            return;
+        }
+        if ((type & NLA_TYPE_MASK) == NLMSGERR_ATTR_MSG) {
+            auto const found = without_trailing_nuls(message.subspan(at + RTA_HEADER, len - RTA_HEADER));
+            text.assign(found.begin(), found.end());
+            return;
+        }
+        at += align4(len);
+    }
+}
+
+/// An NLMSG_ERROR: struct nlmsgerr (int error, then the request's header,
+/// capped), then extended-ack TLVs, whose message goes to @p text.
+[[nodiscard]] auto ack_status(
+    std::span<uint8_t const> const message, uint16_t const flags, size_t const request_size, std::string& text) -> Status
+{
+    if (message.size() < NLMSG_HEADER + sizeof(nlmsgerr)) {
+        return failure(std::make_error_code(std::errc::bad_message));
+    }
+    auto const error = read_at<int>(message, NLMSG_HEADER);
+    if (error == 0) {
+        return success();
+    }
+    if ((flags & NLM_F_ACK_TLVS) != 0) {
+        read_ext_ack_message(message, flags, request_size, text);
+    }
+    return failure(std::error_code{-error, std::system_category()});
+}
+
+/// Bind netlink socket @p fd to a port id the kernel assigns: that id.
+[[nodiscard]] auto bind_port_id(int const fd) -> StatusValue<uint32_t>
+{
+    sockaddr_nl const local{.nl_family = AF_NETLINK, .nl_pad = 0, .nl_pid = 0, .nl_groups = 0};
+    if (::bind(fd, sockaddr_cast(local), sizeof(local)) < 0) {
+        return failure(std::error_code{errno, std::system_category()});
+    }
+    sockaddr_nl bound{};
+    socklen_t bound_size = sizeof(bound);
+    if (::getsockname(fd, sockaddr_cast(bound), &bound_size) < 0) {
+        return failure(std::error_code{errno, std::system_category()});
+    }
+    return bound.nl_pid;
+}
+
+/// Set up route socket @p fd (acks, a 1 s receive timeout) and bind it: its port id.
+[[nodiscard]] auto configure_route_socket(int const fd) -> StatusValue<uint32_t>
+{
+    // Extended acks carry the kernel's reason ("Change operation not
+    // supported", "Specified device does not support offload"); capped acks
+    // keep our request out of the reply. Both are best effort.
+    int const on = 1;
+    (void)::setsockopt(fd, SOL_NETLINK, NETLINK_EXT_ACK, &on, sizeof(on));
+    (void)::setsockopt(fd, SOL_NETLINK, NETLINK_CAP_ACK, &on, sizeof(on));
+    timeval const timeout{.tv_sec = 1, .tv_usec = 0};
+    if (::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        return failure(std::error_code{errno, std::system_category()});
+    }
+    return bind_port_id(fd);
+}
+
 }  // namespace
 
 auto parse_qdisc(std::span<uint8_t const> const message) -> StatusValue<QdiscInfo>
@@ -287,51 +446,9 @@ auto parse_qdisc(std::span<uint8_t const> const message) -> StatusValue<QdiscInf
         read_at<uint16_t>(message, offsetof(nlmsghdr, nlmsg_type)) != RTM_NEWQDISC) {
         return failure(bad_message());
     }
-    auto const body = message.first(length);
-    QdiscInfo info{};
-    info.ifindex = read_at<int32_t>(body, NLMSG_HEADER + offsetof(tcmsg, tcm_ifindex));
-    info.handle = read_at<uint32_t>(body, NLMSG_HEADER + offsetof(tcmsg, tcm_handle));
-    info.parent = read_at<uint32_t>(body, NLMSG_HEADER + offsetof(tcmsg, tcm_parent));
-    std::span<uint8_t const> options{};
-    bool have_options = false;
-    size_t at = NLMSG_HEADER + TCMSG_SIZE;
-    while (at + RTA_HEADER <= body.size()) {
-        auto const len = read_at<uint16_t>(body, at);
-        auto const type = read_at<uint16_t>(body, at + 2);
-        if (len < RTA_HEADER || at + len > body.size()) {
-            return failure(bad_message());
-        }
-        auto const payload = body.subspan(at + RTA_HEADER, len - RTA_HEADER);
-        if (type == TCA_KIND) {
-            size_t n = payload.size();
-            while (n > 0 && payload[n - 1] == 0) {
-                --n;
-            }
-            info.kind.assign(payload.begin(), payload.begin() + static_cast<std::ptrdiff_t>(n));
-        } else if ((type & NLA_TYPE_MASK) == TCA_OPTIONS) {
-            options = payload;
-            have_options = true;
-        }
-        at += align4(len);
-    }
-    if (info.kind == "mqprio") {
-        if (!have_options) {
-            return failure(bad_message());
-        }
-        auto mqprio = parse_mqprio(options, info.handle);
-        if (!mqprio) {
-            return failure(mqprio.error());
-        }
-        info.mqprio = *mqprio;
-    } else if (info.kind == "cbs") {
-        if (!have_options) {
-            return failure(bad_message());
-        }
-        auto cbs = parse_cbs(options, info.parent);
-        if (!cbs) {
-            return failure(cbs.error());
-        }
-        info.cbs = *cbs;
+    auto info = read_tcmsg(message);
+    if (auto status = parse_attributes(message.first(length), info); !status) {
+        return failure(status.error());
     }
     return info;
 }
@@ -346,30 +463,11 @@ auto TcClient::open() noexcept -> Status
     if (!fd.valid()) {
         return failure(std::error_code{errno, std::system_category()});
     }
-    // Extended acks carry the kernel's reason ("Change operation not
-    // supported", "Specified device does not support offload"); capped acks
-    // keep our request out of the reply. Both are best effort.
-    int const on = 1;
-    (void)::setsockopt(fd.get(), SOL_NETLINK, NETLINK_EXT_ACK, &on, sizeof(on));
-    (void)::setsockopt(fd.get(), SOL_NETLINK, NETLINK_CAP_ACK, &on, sizeof(on));
-    timeval const timeout{.tv_sec = 1, .tv_usec = 0};
-    if (::setsockopt(fd.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
-        return failure(std::error_code{errno, std::system_category()});
-    }
-    sockaddr_nl local{};
-    local.nl_family = AF_NETLINK;
-    if (::bind(fd.get(), sockaddr_cast(local), sizeof(local)) < 0) {
-        return failure(std::error_code{errno, std::system_category()});
-    }
-    sockaddr_nl bound{};
-    socklen_t bound_size = sizeof(bound);
-    if (::getsockname(fd.get(), sockaddr_cast(bound), &bound_size) < 0) {
-        return failure(std::error_code{errno, std::system_category()});
-    }
-    portid_ = bound.nl_pid;
-    reply_.assign(REPLY_SIZE, 0);
-    fd_ = std::move(fd);
-    return success();
+    return configure_route_socket(fd.get()).transform([&](uint32_t const portid) {
+        portid_ = portid;
+        reply_.assign(REPLY_SIZE, 0);
+        fd_ = std::move(fd);
+    });
 }
 
 auto TcClient::replace_mqprio(int const ifindex, MqprioQdisc const& qdisc) -> Status
@@ -431,84 +529,60 @@ auto TcClient::transact(std::span<uint8_t const> const request, uint32_t const s
         if (static_cast<size_t>(received) > reply_.size()) {
             return failure(std::make_error_code(std::errc::message_size));
         }
-        size_t remaining = static_cast<size_t>(received);
-        size_t offset = 0;
-        while (remaining >= NLMSG_HEADER) {
-            nlmsghdr header{};
-            std::memcpy(&header, reply_.data() + offset, NLMSG_HEADER);
-            if (header.nlmsg_len < NLMSG_HEADER || header.nlmsg_len > remaining) {
-                return failure(std::make_error_code(std::errc::bad_message));
-            }
-            bool const ours = header.nlmsg_seq == seq && header.nlmsg_pid == portid_;
-            if (ours && header.nlmsg_type == NLMSG_DONE && wanted != nullptr) {
-                // The dump's end; its payload is the dump's error (0 when complete).
-                int error = 0;
-                if (header.nlmsg_len >= NLMSG_HEADER + sizeof(error)) {
-                    std::memcpy(&error, reply_.data() + offset + NLMSG_HEADER, sizeof(error));
-                }
-                return error == 0 ? success() : failure(std::error_code{-error, std::system_category()});
-            }
-            if (ours && header.nlmsg_type == RTM_NEWQDISC && wanted != nullptr && !wanted->came &&
-                header.nlmsg_len >= NLMSG_HEADER + TCMSG_SIZE) {
-                int32_t ifindex = 0;
-                uint32_t parent = 0;
-                std::memcpy(&ifindex, reply_.data() + offset + NLMSG_HEADER + offsetof(tcmsg, tcm_ifindex), sizeof(ifindex));
-                std::memcpy(&parent, reply_.data() + offset + NLMSG_HEADER + offsetof(tcmsg, tcm_parent), sizeof(parent));
-                if (ifindex == wanted->ifindex && parent == wanted->parent) {
-                    auto parsed = parse_qdisc(std::span<uint8_t const>{reply_.data() + offset, header.nlmsg_len});
-                    if (!parsed) {
-                        return failure(parsed.error());
-                    }
-                    *wanted->found = std::move(*parsed);
-                    wanted->came = true;
-                }
-            }
-            if (ours && header.nlmsg_type == NLMSG_ERROR) {
-                // struct nlmsgerr: int error, then the request's header (capped).
-                if (header.nlmsg_len < NLMSG_HEADER + sizeof(nlmsgerr)) {
-                    return failure(std::make_error_code(std::errc::bad_message));
-                }
-                int error = 0;
-                std::memcpy(&error, reply_.data() + offset + NLMSG_HEADER, sizeof(error));
-                if (error == 0) {
-                    return success();
-                }
-                // Extended-ack TLVs after the (capped) nlmsgerr.
-                if ((header.nlmsg_flags & NLM_F_ACK_TLVS) != 0) {
-                    size_t const skip = (header.nlmsg_flags & NLM_F_CAPPED) != 0 ? sizeof(nlmsgerr)
-                                                                                 : sizeof(nlmsgerr) + request.size() - NLMSG_HEADER;
-                    size_t at = offset + NLMSG_HEADER + align4(skip);
-                    size_t const end = offset + header.nlmsg_len;
-                    while (at + RTA_HEADER <= end) {
-                        uint16_t len = 0;
-                        uint16_t type = 0;
-                        std::memcpy(&len, reply_.data() + at, sizeof(len));
-                        std::memcpy(&type, reply_.data() + at + 2, sizeof(type));
-                        if (len < RTA_HEADER || at + len > end) {
-                            break;
-                        }
-                        if ((type & NLA_TYPE_MASK) == NLMSGERR_ATTR_MSG) {
-                            auto const* text = reply_.data() + at + RTA_HEADER;
-                            size_t n = len - RTA_HEADER;
-                            while (n > 0 && text[n - 1] == 0) {
-                                --n;
-                            }
-                            last_message_.assign(text, text + n);
-                            break;
-                        }
-                        at += align4(len);
-                    }
-                }
-                return failure(std::error_code{-error, std::system_category()});
-            }
-            size_t const step = align4(header.nlmsg_len);
-            if (step >= remaining) {
-                break;
-            }
-            offset += step;
-            remaining -= step;
+        if (auto done = read_replies(static_cast<size_t>(received), request.size(), seq, wanted)) {
+            return *done;
         }
     }
+}
+
+auto TcClient::read_replies(size_t const received, size_t const request_size, uint32_t const seq, Wanted* const wanted)
+    -> std::optional<Status>
+{
+    std::span<uint8_t const> const reply{reply_.data(), received};
+    for (size_t offset = 0; offset + NLMSG_HEADER <= reply.size();) {
+        auto const header = read_at<nlmsghdr>(reply, offset);
+        if (header.nlmsg_len < NLMSG_HEADER || header.nlmsg_len > reply.size() - offset) {
+            return failure(std::make_error_code(std::errc::bad_message));
+        }
+        if (header.nlmsg_seq == seq && header.nlmsg_pid == portid_) {
+            if (auto done = read_reply(reply.subspan(offset, header.nlmsg_len), request_size, wanted)) {
+                return done;
+            }
+        }
+        offset += align4(header.nlmsg_len);
+    }
+    return std::nullopt;
+}
+
+auto TcClient::read_reply(std::span<uint8_t const> const message, size_t const request_size, Wanted* const wanted)
+    -> std::optional<Status>
+{
+    auto const header = read_at<nlmsghdr>(message, 0);
+    if (header.nlmsg_type == NLMSG_DONE && wanted != nullptr) {
+        return dump_status(message);
+    }
+    if (header.nlmsg_type == RTM_NEWQDISC && wanted != nullptr && !wanted->came && message.size() >= NLMSG_HEADER + TCMSG_SIZE) {
+        return take_qdisc(message, *wanted);
+    }
+    if (header.nlmsg_type == NLMSG_ERROR) {
+        return ack_status(message, header.nlmsg_flags, request_size, last_message_);
+    }
+    return std::nullopt;
+}
+
+auto TcClient::take_qdisc(std::span<uint8_t const> const message, Wanted& wanted) -> std::optional<Status>
+{
+    auto const ifindex = read_at<int32_t>(message, NLMSG_HEADER + offsetof(tcmsg, tcm_ifindex));
+    auto const parent = read_at<uint32_t>(message, NLMSG_HEADER + offsetof(tcmsg, tcm_parent));
+    if (ifindex == wanted.ifindex && parent == wanted.parent) {
+        auto parsed = parse_qdisc(message);
+        if (!parsed) {
+            return failure(parsed.error());
+        }
+        *wanted.found = std::move(*parsed);
+        wanted.came = true;
+    }
+    return std::nullopt;
 }
 
 }  // namespace statusbar::net::tc

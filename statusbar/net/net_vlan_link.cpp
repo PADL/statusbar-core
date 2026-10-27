@@ -98,7 +98,7 @@ auto vlan_link_name(std::string_view const interface, uint16_t const vid) -> std
 auto build_new_vlan(
     std::span<uint8_t> const out, int const parent_ifindex, std::string_view const name, uint16_t const vid, uint32_t const seq)
     -> StatusValue<size_t>
-{
+{  // NOLINT(statusbar-block-statements): the RTM_NEWLINK request, field by field
     if (parent_ifindex <= 0 || !valid_name(name) || vid == 0 || vid > MAX_VID) {
         return failure(std::make_error_code(std::errc::invalid_argument));
     }
@@ -125,7 +125,7 @@ auto build_new_vlan(
 }
 
 auto build_delete_link(std::span<uint8_t> const out, std::string_view const name, uint32_t const seq) -> StatusValue<size_t>
-{
+{  // NOLINT(statusbar-block-statements): the RTM_DELLINK request, field by field
     if (!valid_name(name)) {
         return failure(std::make_error_code(std::errc::invalid_argument));
     }
