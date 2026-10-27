@@ -76,6 +76,8 @@ TEST(xdp_error, all_errors_have_messages)
     check(XdpError::not_supported_on_platform);
     check(XdpError::invalid_bpf_program);
     check(XdpError::too_many_filter_rules);
+    check(XdpError::zero_copy_needs_native_attach);
+    check(XdpError::zero_copy_unavailable);
 }
 
 TEST(xdp_error, category_name)
@@ -103,6 +105,79 @@ TEST(xdp_config, default_values)
     EXPECT_EQ(config.umem_headroom, 0u);
     EXPECT_EQ(config.tap_ifindex, 0u);
     EXPECT_EQ(config.rx_drain_max, 32u);
+    EXPECT_TRUE(config.bind_mode == XdpBindMode::auto_);
+    EXPECT_TRUE(config.attach_mode == XdpAttachMode::native);
+}
+
+//
+// Bind / attach mode policy
+//
+// The whole table is constexpr, so the policy is checked at compile time as
+// well as run time. What cannot be checked without hardware is whether a
+// given driver actually grants zero-copy or a native attach; that is what
+// XdpContext::bind_mode() and attach_mode() report back at run time.
+//
+
+TEST(xdp_attach_plan, zero_copy_demands_native_and_does_not_fall_back)
+{
+    constexpr auto plan = detail::attach_plan(XdpAttachMode::native, XdpBindMode::zero_copy);
+    static_assert(plan.has_value());
+    static_assert(plan->first == XdpAttachMode::native);
+    // Falling back to generic here would quietly deliver copy mode, which is
+    // the one thing the caller said it did not want.
+    static_assert(!plan->fallback.has_value());
+    EXPECT_TRUE(plan.has_value());
+}
+
+TEST(xdp_attach_plan, zero_copy_with_generic_attach_is_impossible)
+{
+    constexpr auto plan = detail::attach_plan(XdpAttachMode::generic, XdpBindMode::zero_copy);
+    // Generic XDP runs in the stack, where there is no driver to hand a frame
+    // to, so there is nothing to try.
+    static_assert(!plan.has_value());
+    EXPECT_FALSE(plan.has_value());
+}
+
+TEST(xdp_attach_plan, auto_and_copy_try_native_then_generic)
+{
+    for (auto const bind : {XdpBindMode::auto_, XdpBindMode::copy}) {
+        auto const plan = detail::attach_plan(XdpAttachMode::native, bind);
+        EXPECT_TRUE(plan.has_value());
+        if (plan) {
+            EXPECT_TRUE(plan->first == XdpAttachMode::native);
+            EXPECT_TRUE(plan->fallback.has_value());
+            if (plan->fallback) {
+                EXPECT_TRUE(*plan->fallback == XdpAttachMode::generic);
+            }
+        }
+    }
+
+    static_assert(detail::attach_plan(XdpAttachMode::native, XdpBindMode::auto_)->fallback == XdpAttachMode::generic);
+    static_assert(detail::attach_plan(XdpAttachMode::native, XdpBindMode::copy)->fallback == XdpAttachMode::generic);
+}
+
+TEST(xdp_attach_plan, generic_attach_stays_generic)
+{
+    for (auto const bind : {XdpBindMode::auto_, XdpBindMode::copy}) {
+        auto const plan = detail::attach_plan(XdpAttachMode::generic, bind);
+        EXPECT_TRUE(plan.has_value());
+        if (plan) {
+            EXPECT_TRUE(plan->first == XdpAttachMode::generic);
+            // Nothing to fall back to: generic is the mode that works
+            // everywhere, so there is nowhere further down to go.
+            EXPECT_FALSE(plan->fallback.has_value());
+        }
+    }
+}
+
+TEST(xdp_attach_plan, the_defaults_mean_try_native_fall_back_to_generic)
+{
+    // A caller that leaves XdpConfig's fields alone gets the forgiving plan.
+    constexpr auto plan = detail::attach_plan(XdpAttachMode{}, XdpBindMode{});
+    static_assert(plan.has_value());
+    static_assert(plan->first == XdpAttachMode::native);
+    static_assert(plan->fallback == XdpAttachMode::generic);
+    EXPECT_TRUE(plan.has_value());
 }
 
 TEST(xdp_config, compiled_rule_defaults)
@@ -267,6 +342,49 @@ TEST(xdp_stub, stats_zero_by_default)
     EXPECT_EQ(s.tx_ring_full_count, 0u);
 }
 
+TEST(xdp_stub, modes_before_open)
+{
+    XdpContext ctx;
+    // Nothing is bound, so nothing got zero-copy. bind_mode() answers copy
+    // rather than auto_ because it reports what is in force, and auto_ is
+    // only ever a request.
+    EXPECT_FALSE(ctx.zero_copy());
+    EXPECT_TRUE(ctx.bind_mode() == XdpBindMode::copy);
+    EXPECT_TRUE(ctx.attach_mode() == XdpAttachMode::native);
+}
+
+// Needs no privilege and no NIC: the combination is refused before open()
+// looks up the interface, so the failure arrives the same way everywhere.
+TEST(xdp_open, zero_copy_with_generic_attach_is_refused_before_any_syscall)
+{
+    XdpContext ctx;
+    XdpConfig const config{
+        .interface_name = "lo",
+        .bind_mode = XdpBindMode::zero_copy,
+        .attach_mode = XdpAttachMode::generic,
+    };
+    auto const status = ctx.open(config);
+    EXPECT_FALSE(status.has_value());
+    if (!status) {
+        EXPECT_TRUE(status.error() == XdpError::zero_copy_needs_native_attach);
+    }
+    EXPECT_FALSE(ctx.valid());
+
+    // The name is never even looked at, so a nonexistent interface gives the
+    // same answer rather than interface_not_found.
+    XdpContext other;
+    XdpConfig const elsewhere{
+        .interface_name = "statusbar-no-such-if",
+        .bind_mode = XdpBindMode::zero_copy,
+        .attach_mode = XdpAttachMode::generic,
+    };
+    auto const same = other.open(elsewhere);
+    EXPECT_FALSE(same.has_value());
+    if (!same) {
+        EXPECT_TRUE(same.error() == XdpError::zero_copy_needs_native_attach);
+    }
+}
+
 //
 // Integration tests (require root, veth pairs, Linux with XDP)
 //
@@ -330,6 +448,58 @@ TEST(xdp_integration, open_close_lifecycle)
     EXPECT_TRUE(ctx.interface_index() > 0);
 
     ctx.close();
+    EXPECT_FALSE(ctx.valid());
+}
+
+// A veth has no native XDP and no zero-copy, which makes it the right place to
+// prove the fallback: the default config asks for native, has to settle for
+// generic, and must say so afterwards.
+TEST(xdp_integration, veth_falls_back_to_generic_attach)
+{
+    if (getuid() != 0) {
+        return;
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        return;
+    }
+    auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
+
+    XdpConfig config{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .umem_frame_count = 64,
+    };
+
+    XdpContext ctx;
+    auto const status = ctx.open(config);
+    EXPECT_TRUE(status.has_value());
+    if (status) {
+        EXPECT_TRUE(ctx.attach_mode() == XdpAttachMode::generic);
+        EXPECT_FALSE(ctx.zero_copy());
+        EXPECT_TRUE(ctx.bind_mode() == XdpBindMode::copy);
+    }
+    ctx.close();
+
+    // Asking for generic outright reaches the same place.
+    config.attach_mode = XdpAttachMode::generic;
+    auto const generic = ctx.open(config);
+    EXPECT_TRUE(generic.has_value());
+    if (generic) {
+        EXPECT_TRUE(ctx.attach_mode() == XdpAttachMode::generic);
+    }
+    ctx.close();
+
+    // And insisting on zero-copy fails cleanly, with the reason named and no
+    // program left behind on the interface.
+    config.attach_mode = XdpAttachMode::native;
+    config.bind_mode = XdpBindMode::zero_copy;
+    auto const refused = ctx.open(config);
+    EXPECT_FALSE(refused.has_value());
+    if (!refused) {
+        EXPECT_TRUE(refused.error() == XdpError::zero_copy_unavailable);
+    }
     EXPECT_FALSE(ctx.valid());
 }
 

@@ -89,6 +89,8 @@ enum class XdpError
     not_supported_on_platform,
     invalid_bpf_program,
     too_many_filter_rules,
+    zero_copy_needs_native_attach,
+    zero_copy_unavailable,
 };
 
 class XdpErrorCategory : public std::error_category
@@ -123,6 +125,39 @@ enum class XdpAction : uint8_t
     redirect_tap,
 };
 
+/// How the AF_XDP socket binds to the queue.
+///
+/// Zero-copy is the difference between a socket that can carry a media stream
+/// and one that cannot: in copy mode every frame is memcpy'd between UMEM and
+/// the driver. It needs driver support, so demanding it unconditionally fails
+/// on hardware that would otherwise work, and never asking for it gives up the
+/// performance on hardware that has it. Hence three answers, not two.
+enum class XdpBindMode : uint8_t
+{
+    /// Take what the driver offers: zero-copy where available, copy otherwise.
+    auto_ = 0,
+    /// Insist on zero-copy; fail rather than fall back to copying.
+    zero_copy,
+    /// Insist on copy mode, even where zero-copy is available.
+    copy,
+};
+
+/// Where the XDP program runs.
+enum class XdpAttachMode : uint8_t
+{
+    /// In the driver (XDP_FLAGS_DRV_MODE). Faster, and needs driver support.
+    native = 0,
+    /// In the stack (XDP_FLAGS_SKB_MODE). Slower, and available everywhere -
+    /// on veth pairs, which is how this gets tested at all, and on NICs whose
+    /// driver has no XDP support.
+    generic,
+};
+
+// Both zero values are the sensible default, so a caller can leave the
+// XdpConfig fields default-initialised and mean it.
+static_assert(XdpBindMode{} == XdpBindMode::auto_);
+static_assert(XdpAttachMode{} == XdpAttachMode::native);
+
 struct XdpConfig
 {
     std::string_view interface_name;
@@ -140,6 +175,8 @@ struct XdpConfig
     size_t rx_drain_max{32};
     size_t completion_drain_max{64};
     int rx_clock_id{CLOCK_MONOTONIC_RAW};
+    XdpBindMode bind_mode{XdpBindMode::auto_};
+    XdpAttachMode attach_mode{XdpAttachMode::native};
 };
 
 }  // namespace statusbar::net
@@ -245,6 +282,51 @@ struct CycleBudget
     size_t rx_cycle_count{0};
 };
 
+/// Which attach mode to try, and what to try if that fails.
+struct AttachPlan
+{
+    XdpAttachMode first{XdpAttachMode::native};
+    /// Tried only if `first` fails. nullopt means there is nothing else to
+    /// try and the failure is the answer.
+    std::optional<XdpAttachMode> fallback{};
+};
+
+/// The bind/attach fallback policy, with no syscall in it:
+///
+///   | bind              | attach  | plan                         |
+///   |-------------------|---------|------------------------------|
+///   | zero_copy         | native  | native, no fallback          |
+///   | zero_copy         | generic | impossible - nullopt         |
+///   | auto_ / copy      | native  | native, falling back to      |
+///   |                   |         | generic                      |
+///   | auto_ / copy      | generic | generic only                 |
+///
+/// Zero-copy with generic attach is refused rather than attempted: generic
+/// XDP runs in the stack, where there is no driver to hand a frame to, so the
+/// combination cannot work. The caller hears about it at open(), as a
+/// configuration mistake, instead of as a runtime surprise.
+///
+/// Zero-copy with native attach gets no fallback either: falling back to
+/// generic would silently deliver copy mode, which is the thing the caller
+/// said it did not want.
+/// @param requested The attach mode asked for
+/// @param bind The bind mode asked for
+/// @return The plan, or nullopt when the two cannot be satisfied together
+[[nodiscard]] constexpr auto attach_plan(XdpAttachMode const requested, XdpBindMode const bind) noexcept
+    -> std::optional<AttachPlan>
+{
+    if (bind == XdpBindMode::zero_copy) {
+        if (requested == XdpAttachMode::generic) {
+            return std::nullopt;
+        }
+        return AttachPlan{.first = XdpAttachMode::native, .fallback = std::nullopt};
+    }
+    if (requested == XdpAttachMode::generic) {
+        return AttachPlan{.first = XdpAttachMode::generic, .fallback = std::nullopt};
+    }
+    return AttachPlan{.first = XdpAttachMode::native, .fallback = XdpAttachMode::generic};
+}
+
 }  // namespace detail
 
 // ──────────────────────────────────────────────
@@ -254,6 +336,36 @@ struct CycleBudget
 #if defined(__linux__) && defined(HAVE_XDP)
 
 namespace detail {
+
+/// The XDP_ZEROCOPY / XDP_COPY bind flag for a bind mode. auto_ asks for
+/// nothing and lets the kernel pick zero-copy where the driver has it.
+/// @param mode The bind mode asked for
+[[nodiscard]] constexpr auto bind_flags(XdpBindMode const mode) noexcept -> uint16_t
+{
+    switch (mode) {
+        case XdpBindMode::zero_copy:
+            return XDP_ZEROCOPY;
+        case XdpBindMode::copy:
+            return XDP_COPY;
+        case XdpBindMode::auto_:
+            break;
+    }
+    return 0;
+}
+
+/// Whether the kernel bound this XSK socket zero-copy. Asked of the socket
+/// rather than inferred: with XdpBindMode::auto_ the answer is the driver's,
+/// and nothing we passed in tells us which way it went.
+/// @param xsk_fd The AF_XDP socket descriptor
+[[nodiscard]] inline auto socket_has_zero_copy(int const xsk_fd) noexcept -> bool
+{
+    struct xdp_options options{};
+    socklen_t length = sizeof(options);
+    if (::getsockopt(xsk_fd, SOL_XDP, XDP_OPTIONS, &options, &length) != 0) {
+        return false;
+    }
+    return (options.flags & XDP_OPTIONS_ZEROCOPY) != 0;
+}
 
 /// The four XSK ring buffers
 struct RingSet
@@ -427,19 +539,41 @@ class BpfAttachment
     BpfAttachment(BpfAttachment const&) = delete;
     auto operator=(BpfAttachment const&) -> BpfAttachment& = delete;
 
-    /// Attach an XDP program to an interface. Takes ownership of the BpfObject.
-    /// @param obj BPF object (ownership transferred)
+    /// The bpf_xdp_attach/detach flag for an attach mode.
+    /// @param mode Native or generic attach
+    [[nodiscard]] static constexpr auto attach_flags(XdpAttachMode const mode) noexcept -> uint32_t
+    {
+        return mode == XdpAttachMode::native ? XDP_FLAGS_DRV_MODE : XDP_FLAGS_SKB_MODE;
+    }
+
+    /// Attach an XDP program to an interface following `plan`, falling back to
+    /// the plan's second mode if the first does not take. Takes ownership of
+    /// the BpfObject, and only once an attach has succeeded - a failed attempt
+    /// must leave the program open for the next one.
+    /// @param obj BPF object (ownership transferred on success)
     /// @param prog_fd File descriptor of the XDP program
     /// @param if_index Network interface index to attach to
-    [[nodiscard]] auto attach(BpfObject&& obj, int prog_fd, unsigned int if_index) -> Status
+    /// @param plan Which mode to try, and what to try next
+    [[nodiscard]] auto attach(BpfObject&& obj, int prog_fd, unsigned int if_index, AttachPlan const& plan) -> Status
     {
         detach();
-        int const ret = bpf_xdp_attach(static_cast<int>(if_index), prog_fd, XDP_FLAGS_SKB_MODE, nullptr);
+        auto const attempt = [prog_fd, if_index](XdpAttachMode const mode) {
+            return bpf_xdp_attach(static_cast<int>(if_index), prog_fd, attach_flags(mode), nullptr);
+        };
+
+        auto mode = plan.first;
+        int ret = attempt(mode);
+        if (ret != 0 && plan.fallback.has_value()) {
+            mode = *plan.fallback;
+            ret = attempt(mode);
+        }
         if (ret != 0) {
             return failure(XdpError::bpf_attach_failed);
         }
+
         obj_ = std::move(obj);
         if_index_ = if_index;
+        mode_ = mode;
         attached_ = true;
         return success();
     }
@@ -447,25 +581,35 @@ class BpfAttachment
     void detach() noexcept
     {
         if (attached_) {
-            (void)bpf_xdp_detach(static_cast<int>(if_index_), XDP_FLAGS_SKB_MODE, nullptr);
+            // With the flags it was attached by: the kernel refuses a detach
+            // whose mode does not match, which would leave the program on the
+            // interface after we think we are gone.
+            (void)bpf_xdp_detach(static_cast<int>(if_index_), attach_flags(mode_), nullptr);
             attached_ = false;
             if_index_ = 0;
+            mode_ = XdpAttachMode::native;
         }
         obj_.reset();
     }
 
     [[nodiscard]] auto is_attached() const noexcept -> bool { return attached_; }
 
+    /// The mode the program is attached in, which after a fallback is not
+    /// always the mode that was asked for.
+    [[nodiscard]] auto attach_mode() const noexcept -> XdpAttachMode { return mode_; }
+
   private:
     void swap(BpfAttachment& other) noexcept
     {
         std::swap(obj_, other.obj_);
         std::swap(if_index_, other.if_index_);
+        std::swap(mode_, other.mode_);
         std::swap(attached_, other.attached_);
     }
 
     BpfObject obj_;
     unsigned int if_index_{0};
+    XdpAttachMode mode_{XdpAttachMode::native};
     bool attached_{false};
 };
 
@@ -501,9 +645,10 @@ class BpfState
     /// @param if_index Network interface index to attach to
     /// @param queue_id Hardware queue ID for the XSK socket
     /// @param xsk_fd File descriptor of the XSK socket
-    [[nodiscard]] auto attach(unsigned int if_index, uint32_t queue_id, int xsk_fd) -> Status
+    /// @param plan Which attach mode to try, and what to try next
+    [[nodiscard]] auto attach(unsigned int if_index, uint32_t queue_id, int xsk_fd, AttachPlan const& plan) -> Status
     {
-        if (auto status = attachment_.attach(std::move(obj_), prog_fd_, if_index); !status) {
+        if (auto status = attachment_.attach(std::move(obj_), prog_fd_, if_index, plan); !status) {
             return status;
         }
 
@@ -551,6 +696,9 @@ class BpfState
     }
 
     [[nodiscard]] auto rules_map_fd() const noexcept -> int { return rules_map_fd_; }
+
+    /// The mode the program is attached in, native unless nothing is attached.
+    [[nodiscard]] auto attach_mode() const noexcept -> XdpAttachMode { return attachment_.attach_mode(); }
 
   private:
     [[nodiscard]] auto install_tcam_rules(std::span<CompiledRule<32> const> rules) -> Status;
@@ -616,6 +764,20 @@ class XdpContext
 
     [[nodiscard]] auto hardware_address() const noexcept -> ieee::Eui48 const& { return interface_.hardware_address; }
     [[nodiscard]] auto interface_index() const noexcept -> unsigned int { return interface_.index; }
+
+    /// Whether the socket actually got zero-copy, read back from the kernel
+    /// rather than inferred from what was asked for. A caller that asked for
+    /// XdpBindMode::auto_ has no other way to find out, and it is exactly
+    /// what it needs in order to report or log what it is running on.
+    [[nodiscard]] auto zero_copy() const noexcept -> bool { return zero_copy_; }
+
+    /// The bind mode in force: zero_copy or copy, never auto_ - auto_ is a
+    /// request, and this is the answer.
+    [[nodiscard]] auto bind_mode() const noexcept -> XdpBindMode { return zero_copy_ ? XdpBindMode::zero_copy : XdpBindMode::copy; }
+
+    /// The mode the program is attached in, which after a native-to-generic
+    /// fallback is not the mode that was asked for.
+    [[nodiscard]] auto attach_mode() const noexcept -> XdpAttachMode { return bpf_.attach_mode(); }
 
     void begin_cycle() noexcept { budget_.rx_cycle_count = 0; }
 
@@ -697,6 +859,7 @@ class XdpContext
         std::swap(interface_, other.interface_);
         std::swap(budget_, other.budget_);
         std::swap(stats_, other.stats_);
+        std::swap(zero_copy_, other.zero_copy_);
     }
 
     struct xsk_socket* xsk_{nullptr};
@@ -707,6 +870,7 @@ class XdpContext
     detail::InterfaceId interface_;
     detail::CycleBudget budget_;
     Stats stats_{};
+    bool zero_copy_{false};
 };
 
 #else  // !(__linux__ && HAVE_XDP)
@@ -756,6 +920,10 @@ class XdpContext
         return empty;
     }
     [[nodiscard]] auto interface_index() const noexcept -> unsigned int { return 0; }
+
+    [[nodiscard]] auto zero_copy() const noexcept -> bool { return false; }
+    [[nodiscard]] auto bind_mode() const noexcept -> XdpBindMode { return XdpBindMode::copy; }
+    [[nodiscard]] auto attach_mode() const noexcept -> XdpAttachMode { return XdpAttachMode::native; }
 
     void begin_cycle() noexcept {}
 

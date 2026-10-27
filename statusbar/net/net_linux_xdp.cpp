@@ -54,6 +54,10 @@ auto XdpErrorCategory::message(int ev) const -> std::string
             return "Embedded BPF program is empty or invalid";
         case XdpError::too_many_filter_rules:
             return "Filter rule count exceeds TCAM_MAX_RULES";
+        case XdpError::zero_copy_needs_native_attach:
+            return "Zero-copy bind cannot be combined with generic XDP attach";
+        case XdpError::zero_copy_unavailable:
+            return "Driver does not support zero-copy AF_XDP on this queue";
         default:
             return "Unknown XDP error";
     }
@@ -241,6 +245,15 @@ auto XdpContext::open(XdpConfig const& config) -> Status
 {
     close();
 
+    // Step 0: Settle the bind/attach policy before touching anything. A
+    // zero-copy request with generic attach cannot be honoured, and the
+    // caller should hear that as a configuration mistake rather than as a
+    // half-built socket.
+    auto const plan = detail::attach_plan(config.attach_mode, config.bind_mode);
+    if (!plan.has_value()) {
+        return failure(XdpError::zero_copy_needs_native_attach);
+    }
+
     // Step 1: Look up interface index and MAC address
     int sock_fd = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (sock_fd < 0) {
@@ -289,17 +302,22 @@ auto XdpContext::open(XdpConfig const& config) -> Status
     xsk_cfg.tx_size = static_cast<__u32>(config.tx_ring_size);
     xsk_cfg.libxdp_flags = XSK_LIBXDP_FLAGS__INHIBIT_PROG_LOAD;
     xsk_cfg.xdp_flags = 0;
-    xsk_cfg.bind_flags = 0;
+    xsk_cfg.bind_flags = detail::bind_flags(config.bind_mode);
 
     std::string const ifname_str(config.interface_name);
     int const ret = xsk_socket__create(&xsk_, ifname_str.c_str(), config.queue_id, *umem_result, &rings_.rx, &rings_.tx, &xsk_cfg);
     if (ret != 0) {
+        bool const refused_zero_copy = config.bind_mode == XdpBindMode::zero_copy && (-ret == EOPNOTSUPP || -ret == EINVAL);
         close();
-        return failure(XdpError::xsk_creation_failed);
+        // Told apart from every other reason the socket would not open: a
+        // driver without zero-copy is a fact about the hardware, and the
+        // caller may well want to open again in copy mode.
+        return failure(refused_zero_copy ? XdpError::zero_copy_unavailable : XdpError::xsk_creation_failed);
     }
+    zero_copy_ = detail::socket_has_zero_copy(xsk_socket__fd(xsk_));
 
     // Step 5: Attach BPF + register socket
-    if (auto status = bpf_.attach(interface_.index, config.queue_id, xsk_socket__fd(xsk_)); !status) {
+    if (auto status = bpf_.attach(interface_.index, config.queue_id, xsk_socket__fd(xsk_), *plan); !status) {
         close();
         return status;
     }
@@ -336,6 +354,7 @@ void XdpContext::close() noexcept
     bpf_.close();
     umem_.close();
 
+    zero_copy_ = false;
     interface_ = {};
     rings_ = {};
     budget_ = {};
