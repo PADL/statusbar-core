@@ -28,6 +28,20 @@ foreach(_lflag CMAKE_EXE_LINKER_FLAGS CMAKE_SHARED_LINKER_FLAGS
     " --target=${_STATUSBAR_CROSS_TRIPLE} -fuse-ld=lld --unwindlib=libunwind")
 endforeach()
 
+# Optional sysroot (STATUSBAR_SYSROOT, cache or environment): the target's
+# /usr/include, /usr/lib/<triple> and the libc++/compiler-rt dev packages copied
+# from an arm64 Debian/Ubuntu install, for hosts without :arm64 multiarch.
+if(NOT STATUSBAR_SYSROOT AND DEFINED ENV{STATUSBAR_SYSROOT})
+  set(STATUSBAR_SYSROOT "$ENV{STATUSBAR_SYSROOT}")
+endif()
+set(STATUSBAR_SYSROOT
+    "${STATUSBAR_SYSROOT}"
+    CACHE PATH "Target root for the aarch64 cross build (empty: multiarch)")
+list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES STATUSBAR_SYSROOT)
+if(STATUSBAR_SYSROOT)
+  set(CMAKE_SYSROOT "${STATUSBAR_SYSROOT}")
+endif()
+
 # find_library / find_path / find_package must search the arm64 multiarch tree
 # (/usr/lib/aarch64-linux-gnu, /usr/include/aarch64-linux-gnu) instead of the
 # host amd64 paths.
@@ -44,7 +58,11 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
 # search path so we only see arm64 .pc files (otherwise pkg-config returns amd64
 # paths that link-fail at the very end).
 set(ENV{PKG_CONFIG_LIBDIR}
-    "/usr/lib/${_STATUSBAR_CROSS_TRIPLE}/pkgconfig:/usr/share/pkgconfig")
+    "${CMAKE_SYSROOT}/usr/lib/${_STATUSBAR_CROSS_TRIPLE}/pkgconfig:${CMAKE_SYSROOT}/usr/share/pkgconfig"
+)
+if(CMAKE_SYSROOT)
+  set(ENV{PKG_CONFIG_SYSROOT_DIR} "${CMAKE_SYSROOT}")
+endif()
 
 # Cross-built fuzzers can't run on the build host, and Debian's
 # libclang_rt.fuzzer was built against libstdc++ — which the cross-builder
@@ -58,3 +76,21 @@ set(ENABLE_FUZZING
 # warnings, sanitizers). It uses string(APPEND) on CMAKE_*_FLAGS, so our
 # cross-targeting additions above are preserved.
 include("${CMAKE_CURRENT_LIST_DIR}/toolchain-clang.cmake")
+
+# The host clang ships compiler-rt only for its own arch; with a sysroot, link
+# against the target's copy (libclang-rt-<N>-dev) under the same resource path.
+if(CMAKE_SYSROOT)
+  execute_process(
+    COMMAND "${CMAKE_CXX_COMPILER}" -print-resource-dir
+    OUTPUT_VARIABLE _STATUSBAR_RESOURCE_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  set(_STATUSBAR_RT "${CMAKE_SYSROOT}${_STATUSBAR_RESOURCE_DIR}")
+  if(NOT EXISTS "${_STATUSBAR_RT}/lib/linux/libclang_rt.builtins-aarch64.a")
+    message(FATAL_ERROR "no aarch64 compiler-rt under ${_STATUSBAR_RT}; "
+                        "install libclang-rt-<N>-dev in the sysroot")
+  endif()
+  foreach(_lflag CMAKE_EXE_LINKER_FLAGS CMAKE_SHARED_LINKER_FLAGS
+                 CMAKE_MODULE_LINKER_FLAGS)
+    string(APPEND ${_lflag} " -resource-dir=${_STATUSBAR_RT}")
+  endforeach()
+endif()
