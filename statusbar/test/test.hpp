@@ -18,6 +18,13 @@
 // Assertion macros (EXPECT_*) throw TestFailedException on failure.
 // The test runner catches exceptions to determine pass/fail status.
 //
+// A test that cannot run where it finds itself - no root, no hardware, a
+// kernel without the feature - calls SKIP("reason") instead of returning.
+// A bare return would be reported as a pass, which is a lie about work
+// that was never done: the count comes out the same whether the test ran
+// or not, so nobody can tell. SKIP reports the test and its reason, and
+// counts it apart from the passes.
+//
 // Example:
 //   TEST(mygroup, mytest) {
 //       EXPECT_TRUE(1 + 1 == 2);
@@ -71,12 +78,23 @@ class TestRegister
     static int g_test_count;
     static int g_test_passed;
     static int g_test_failed;
+    static int g_test_skipped;
 
     // Per-test failure flag, used by the EXPECT_* macros so the framework works
     // with or without exceptions (under -fno-exceptions a failed EXPECT sets
     // this and returns from the void test function instead of throwing).
     static bool g_current_test_failed;
     static void fail_current() noexcept { g_current_test_failed = true; }
+
+    // Per-test skip flag and reason, set by SKIP(). The reason is a string
+    // literal owned by the caller, so nothing here allocates or copies.
+    static bool g_current_test_skipped;
+    static char const* g_current_test_skip_reason;
+    static void skip_current(char const* reason) noexcept
+    {
+        g_current_test_skipped = true;
+        g_current_test_skip_reason = reason;
+    }
 };
 
 namespace detail {
@@ -156,6 +174,22 @@ inline void print_ne_fail(char const* ea, char const* eb, A const&, B const&, ch
             ::statusbar::test::detail::print_ne_fail(#a, #b, (a), (b), __FILE__, __LINE__);                                        \
             STATUSBAR_TEST_FAIL();                                                                                                 \
         }                                                                                                                          \
+    } while (0)
+
+/// Abandon the current test, reporting it as skipped with `reason`.
+///
+/// For a precondition the test cannot create and is not testing: running
+/// unprivileged, a missing interface, a kernel built without the feature.
+/// Use it instead of a bare `return`, which the runner cannot distinguish
+/// from a test that ran and passed.
+///
+/// Not for a precondition that *should* hold - a setup step that fails
+/// where it was expected to work is a failure, and asserting on it is how
+/// a broken environment gets noticed instead of papered over.
+#define SKIP(reason)                                                                                                               \
+    do {                                                                                                                           \
+        ::statusbar::test::TestRegister::skip_current(reason);                                                                     \
+        return;                                                                                                                    \
     } while (0)
 
 /// Test main entry point macro

@@ -1105,14 +1105,13 @@ static void destroy_veth_pair(char const* name_a)
 
 TEST(xdp_integration, open_close_lifecycle)
 {
-    // Skip if not root
     if (getuid() != 0) {
-        return;
+        SKIP("needs root");
     }
 
     destroy_veth_pair("xdptest0");
     if (!create_veth_pair("xdptest0", "xdptest1")) {
-        return;
+        SKIP("could not create a veth pair");
     }
     auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
 
@@ -1142,12 +1141,12 @@ TEST(xdp_integration, open_close_lifecycle)
 TEST(xdp_integration, veth_falls_back_to_generic_attach)
 {
     if (getuid() != 0) {
-        return;
+        SKIP("needs root");
     }
 
     destroy_veth_pair("xdptest0");
     if (!create_veth_pair("xdptest0", "xdptest1")) {
-        return;
+        SKIP("could not create a veth pair");
     }
     auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
 
@@ -1197,12 +1196,12 @@ TEST(xdp_integration, veth_falls_back_to_generic_attach)
 TEST(xdp_integration, a_pinned_program_outlives_the_context_and_is_adopted)
 {
     if (getuid() != 0) {
-        return;
+        SKIP("needs root");
     }
 
     destroy_veth_pair("xdptest0");
     if (!create_veth_pair("xdptest0", "xdptest1")) {
-        return;
+        SKIP("could not create a veth pair");
     }
     auto const pin_path = XdpProgram::pin_path_for("xdptest0");
     EXPECT_FALSE(pin_path.empty());
@@ -1321,12 +1320,12 @@ TEST(xdp_integration, a_pinned_program_outlives_the_context_and_is_adopted)
 TEST(xdp_integration, a_pinned_map_of_the_wrong_shape_is_replaced_and_never_written_to)
 {
     if (getuid() != 0) {
-        return;
+        SKIP("needs root");
     }
 
     destroy_veth_pair("xdptest0");
     if (!create_veth_pair("xdptest0", "xdptest1")) {
-        return;
+        SKIP("could not create a veth pair");
     }
     auto const pin_path = XdpProgram::pin_path_for("xdptest0");
     auto cleanup = detail::scopeguard([&] {
@@ -1386,12 +1385,12 @@ TEST(xdp_integration, a_pinned_map_of_the_wrong_shape_is_replaced_and_never_writ
 TEST(xdp_integration, tx_rx_loopback)
 {
     if (getuid() != 0) {
-        return;
+        SKIP("needs root");
     }
 
     destroy_veth_pair("xdptest0");
     if (!create_veth_pair("xdptest0", "xdptest1")) {
-        return;
+        SKIP("could not create a veth pair");
     }
     auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
 
@@ -1472,12 +1471,12 @@ TEST(xdp_integration, tx_rx_loopback)
 TEST(xdp_integration, rx_drain_budget)
 {
     if (getuid() != 0) {
-        return;
+        SKIP("needs root");
     }
 
     destroy_veth_pair("xdptest0");
     if (!create_veth_pair("xdptest0", "xdptest1")) {
-        return;
+        SKIP("could not create a veth pair");
     }
     auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
 
@@ -1518,12 +1517,12 @@ TEST(xdp_integration, rx_drain_budget)
 TEST(xdp_integration, multiple_inflight_tx)
 {
     if (getuid() != 0) {
-        return;
+        SKIP("needs root");
     }
 
     destroy_veth_pair("xdptest0");
     if (!create_veth_pair("xdptest0", "xdptest1")) {
-        return;
+        SKIP("could not create a veth pair");
     }
     auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
 
@@ -1573,12 +1572,12 @@ TEST(xdp_integration, multiple_inflight_tx)
 TEST(xdp_integration, the_tx_ring_filling_and_the_umem_emptying_are_counted)
 {
     if (getuid() != 0) {
-        return;
+        SKIP("needs root");
     }
 
     destroy_veth_pair("xdptest0");
     if (!create_veth_pair("xdptest0", "xdptest1")) {
-        return;
+        SKIP("could not create a veth pair");
     }
     auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
 
@@ -1593,7 +1592,9 @@ TEST(xdp_integration, the_tx_ring_filling_and_the_umem_emptying_are_counted)
     };
 
     XdpContext ctx;
-    if (!ctx.open(config)) {
+    auto const opened = ctx.open(config);
+    EXPECT_TRUE(opened.has_value());
+    if (!opened) {
         return;
     }
 
@@ -1642,12 +1643,12 @@ TEST(xdp_integration, the_tx_ring_filling_and_the_umem_emptying_are_counted)
 TEST(xdp_integration, a_kick_the_kernel_refuses_is_counted_and_keeps_its_errno)
 {
     if (getuid() != 0) {
-        return;
+        SKIP("needs root");
     }
 
     destroy_veth_pair("xdptest0");
     if (!create_veth_pair("xdptest0", "xdptest1")) {
-        return;
+        SKIP("could not create a veth pair");
     }
     auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
 
@@ -1658,7 +1659,9 @@ TEST(xdp_integration, a_kick_the_kernel_refuses_is_counted_and_keeps_its_errno)
     };
 
     XdpContext ctx;
-    if (!ctx.open(config)) {
+    auto const opened = ctx.open(config);
+    EXPECT_TRUE(opened.has_value());
+    if (!opened) {
         return;
     }
 
@@ -1690,12 +1693,12 @@ TEST(xdp_integration, a_kick_the_kernel_refuses_is_counted_and_keeps_its_errno)
 TEST(xdp_integration, set_rules)
 {
     if (getuid() != 0) {
-        return;
+        SKIP("needs root");
     }
 
     destroy_veth_pair("xdptest0");
     if (!create_veth_pair("xdptest0", "xdptest1")) {
-        return;
+        SKIP("could not create a veth pair");
     }
     auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
 
@@ -1746,12 +1749,12 @@ TEST(xdp_integration, a_pin_that_belongs_to_somebody_else_is_left_strictly_alone
     // either, because replacing means unlinking their pins and taking their
     // program off the interface. Open fails, and nothing moves.
     if (getuid() != 0) {
-        return;
+        SKIP("needs root");
     }
 
     destroy_veth_pair("xdptest0");
     if (!create_veth_pair("xdptest0", "xdptest1")) {
-        return;
+        SKIP("could not create a veth pair");
     }
     auto const pin_path = XdpProgram::pin_path_for("xdptest0");
     auto cleanup = detail::scopeguard([&] {
@@ -1837,12 +1840,12 @@ TEST(xdp_integration, a_pin_from_a_different_build_of_ours_is_replaced)
     // the new one is in force - and it has to be replaced rather than
     // refused, or no upgrade could ever restart.
     if (getuid() != 0) {
-        return;
+        SKIP("needs root");
     }
 
     destroy_veth_pair("xdptest0");
     if (!create_veth_pair("xdptest0", "xdptest1")) {
-        return;
+        SKIP("could not create a veth pair");
     }
     auto const pin_path = XdpProgram::pin_path_for("xdptest0");
     auto cleanup = detail::scopeguard([&] {
@@ -1909,12 +1912,12 @@ TEST(xdp_integration, a_pin_from_a_different_build_of_ours_is_replaced)
 TEST(xdp_integration, pinned_and_adopted_report_every_combination_truthfully)
 {
     if (getuid() != 0) {
-        return;
+        SKIP("needs root");
     }
 
     destroy_veth_pair("xdptest0");
     if (!create_veth_pair("xdptest0", "xdptest1")) {
-        return;
+        SKIP("could not create a veth pair");
     }
     auto const pin_path = XdpProgram::pin_path_for("xdptest0");
     auto cleanup = detail::scopeguard([&] {
@@ -2000,12 +2003,12 @@ TEST(xdp_integration, pinned_and_adopted_report_every_combination_truthfully)
 TEST(xdp_integration, a_queue_rebound_the_instant_it_is_closed_still_opens)
 {
     if (getuid() != 0) {
-        return;
+        SKIP("needs root");
     }
 
     destroy_veth_pair("xdptest0");
     if (!create_veth_pair("xdptest0", "xdptest1")) {
-        return;
+        SKIP("could not create a veth pair");
     }
     auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
 
