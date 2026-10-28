@@ -1260,10 +1260,20 @@ TEST(xdp_integration, open_close_lifecycle)
     EXPECT_FALSE(ctx.valid());
 }
 
-// A veth has no native XDP and no zero-copy, which makes it the right place to
-// prove the fallback: the default config asks for native, has to settle for
-// generic, and must say so afterwards.
-TEST(xdp_integration, veth_falls_back_to_generic_attach)
+// A veth takes a native attach - it has had ndo_bpf since Linux 4.14 - and
+// has no zero-copy. So it is the right place to prove the *bind* refusal and
+// that the mode is reported truthfully, and the wrong place to prove the
+// attach fallback: there is nothing here for native to fall back from.
+//
+// This test previously asserted the fallback and was never run, because it
+// skipped silently off root. The first root run said attach_mode() was not
+// generic, which on a successful open leaves only native.
+//
+// Proving the fallback needs an interface whose driver has no XDP at all.
+// detail::attach_plan covers the policy without one; what is missing is a
+// test that the plan is carried out, and that needs hardware this host has
+// not got.
+TEST(xdp_integration, a_veth_attaches_natively_and_still_refuses_zero_copy)
 {
     if (getuid() != 0) {
         SKIP("needs root");
@@ -1285,13 +1295,18 @@ TEST(xdp_integration, veth_falls_back_to_generic_attach)
     auto const status = ctx.open(config);
     EXPECT_TRUE(status.has_value());
     if (status) {
-        EXPECT_TRUE(ctx.attach_mode() == XdpAttachMode::generic);
+        // The default config asks for native and gets it, so the fallback is
+        // never reached. What a veth does refuse is zero-copy, and the bind
+        // mode has to come back as the copy it settled for rather than the
+        // auto_ that was asked for.
+        EXPECT_TRUE(ctx.attach_mode() == XdpAttachMode::native);
         EXPECT_FALSE(ctx.zero_copy());
         EXPECT_TRUE(ctx.bind_mode() == XdpBindMode::copy);
     }
     ctx.close();
 
-    // Asking for generic outright reaches the same place.
+    // Asking for generic outright gets generic: the mode is honoured, not
+    // upgraded to the native the driver would have allowed.
     config.attach_mode = XdpAttachMode::generic;
     auto const generic = ctx.open(config);
     EXPECT_TRUE(generic.has_value());
@@ -1790,27 +1805,52 @@ TEST(xdp_integration, a_kick_the_kernel_refuses_is_counted_and_keeps_its_errno)
         return;
     }
 
-    // An address past the end of the UMEM. tx_commit() submits it; the kernel
-    // rejects the descriptor when the kick asks it to send.
-    constexpr uint64_t PastTheUmem = 64 * 2048;
-    EXPECT_TRUE(ctx.tx_commit(PastTheUmem, 64).has_value());
+    // A real frame, from a real UMEM slot, so the only thing wrong with the
+    // kick is the state of the link.
+    auto slot = ctx.tx_start();
+    EXPECT_TRUE(slot.has_value());
+    if (!slot) {
+        return;
+    }
+    EXPECT_TRUE(ctx.tx_commit(slot->handle, 64).has_value());
+
+    // Take the link down under the socket. This is the one refusal that can
+    // be produced to order: the earlier version of this test submitted a
+    // descriptor pointing past the end of the UMEM and expected the kick to
+    // fail, but the kernel does not refuse that - xsk_generic_xmit validates
+    // the descriptor, counts it in XDP_STATISTICS tx_invalid_descs and drops
+    // the frame, and sendto still returns success. Surfacing that counter is
+    // its own piece of work; it is not reachable from here.
+    EXPECT_EQ(system("ip link set xdptest0 down"), 0);
 
     auto const status = ctx.tx_flush();
-    EXPECT_FALSE(status.has_value());
+    auto const& stats = ctx.socket_stats();
+    EXPECT_EQ(stats.tx_flush_count, 1u);
+
+    if (stats.tx_flush_errno == 0) {
+        // Some kernels take the frame anyway and drop it further down. There
+        // is then no refusal to classify, and asserting on one would be
+        // asserting on this kernel rather than on our bookkeeping.
+        SKIP("this kernel accepted a kick on a down link");
+    }
+
+    // Whichever errno it gave, the counters have to agree with the
+    // classification: that agreement is the thing under test, not the
+    // identity of the errno, which is the kernel's business and varies.
+    bool const transient = detail::transient_kick_errno(stats.tx_flush_errno);
+    EXPECT_EQ(stats.tx_flush_transient, transient ? 1u : 0u);
+    EXPECT_EQ(stats.tx_flush_failed, transient ? 0u : 1u);
+    // A transient refusal reads as success so the caller does not escalate on
+    // a hiccup; a hard one is reported.
+    EXPECT_EQ(status.has_value(), transient);
     if (!status) {
         EXPECT_TRUE(status.error() == XdpError::tx_flush_failed);
     }
-    EXPECT_EQ(ctx.socket_stats().tx_flush_count, 1u);
-    EXPECT_EQ(ctx.socket_stats().tx_flush_failed, 1u);
-    EXPECT_EQ(ctx.socket_stats().tx_flush_transient, 0u);
-    // The errno is kept for the log, and it is a hard one - which is what
-    // tells a caller to escalate rather than ride it out.
-    EXPECT_TRUE(ctx.socket_stats().tx_flush_errno != 0);
-    EXPECT_FALSE(detail::transient_kick_errno(ctx.socket_stats().tx_flush_errno));
 
-    // Still pending, because the kernel never took it: the next kick tries
-    // again rather than counting the frame as delivered.
-    EXPECT_FALSE(ctx.tx_flush().has_value());
+    // Either way the frames stayed pending, because the kernel never took
+    // them: the next kick tries again rather than counting them as delivered,
+    // and so is a kick and not a skip.
+    (void)ctx.tx_flush();
     EXPECT_EQ(ctx.socket_stats().tx_flush_count, 2u);
     EXPECT_EQ(ctx.socket_stats().tx_flush_skipped, 0u);
 }
