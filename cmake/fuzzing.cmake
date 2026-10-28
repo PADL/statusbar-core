@@ -62,6 +62,27 @@ if(ENABLE_FUZZING)
   endif()
 endif()
 
+# Build a parser's libFuzzer harness (Linux) or standalone ASan/UBSan driver
+# (macOS) from source_file, named after it and linked against statusbar. A no-op
+# unless ENABLE_FUZZING.
+function(statusbar_add_fuzzer source_file)
+  if(NOT ENABLE_FUZZING)
+    return()
+  endif()
+  get_filename_component(_name ${source_file} NAME_WE)
+  add_executable(${_name} ${source_file})
+  target_link_libraries(${_name} PRIVATE statusbar)
+  if(APPLE)
+    set(_sanitizers -fsanitize=address,undefined)
+  else()
+    set(_sanitizers -fsanitize=fuzzer,address,undefined)
+  endif()
+  target_compile_options(${_name} PRIVATE ${_sanitizers}
+                                          -fno-omit-frame-pointer)
+  target_link_options(${_name} PRIVATE ${_sanitizers}
+                      ${FUZZER_EXTRA_LINK_OPTIONS})
+endfunction()
+
 # Register the fuzz-smoke and fuzz-all custom make targets. Both auto-discover
 # every executable matching *_fuzzer under the build tree, so the targets stay
 # in sync with add_*_fuzzer() calls without a hand-maintained list. Call from

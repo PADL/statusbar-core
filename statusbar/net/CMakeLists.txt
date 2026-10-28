@@ -12,6 +12,8 @@ statusbar_add_module(
   net_linux_mmap.cpp
   net_linux_xdp.cpp
   net_message_reactor.cpp
+  net_netlink.cpp
+  net_netdev_features.cpp
   net_rawnet.cpp
   net_ring_buffer_base.cpp
   net_rss.cpp
@@ -39,6 +41,7 @@ statusbar_add_module(
   net_ethernet_port_test.cpp
   net_link_monitor_test.cpp
   net_linux_xdp_test.cpp
+  net_netdev_features_test.cpp
   net_tc_qdisc_test.cpp
   net_tcam_classifier_test.cpp
   net_tcp_server_test.cpp
@@ -46,6 +49,10 @@ statusbar_add_module(
   net_vlan_link_test.cpp
   net_xdp_abi_test.cpp
   net_xdp_equiv_test.cpp)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  statusbar_add_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_netdev_features_fuzzer.cpp)
+endif()
 
 add_executable(net_tcp_echo_example net_tcp_echo_example.cpp)
 target_link_libraries(net_tcp_echo_example PRIVATE statusbar)
@@ -74,6 +81,29 @@ set_property(
 
 # Optional: libbpf/libxdp for AF_XDP support (Linux only)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # The netdev uapi constants net_netdev_features.cpp asserts against, where the
+  # headers have them (xsk-features from 6.8, tx-launch-time-fifo from 6.15).
+  include(CheckCXXSourceCompiles)
+  include(CMakePushCheckState)
+  cmake_push_check_state(RESET)
+  set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+  check_cxx_source_compiles(
+    "#include <linux/netdev.h>
+    static_assert(NETDEV_A_DEV_XSK_FEATURES > NETDEV_A_DEV_XDP_RX_METADATA_FEATURES);"
+    STATUSBAR_HAVE_NETDEV_XSK_FEATURES)
+  check_cxx_source_compiles(
+    "#include <linux/netdev.h>
+    static_assert(NETDEV_XSK_FLAGS_TX_LAUNCH_TIME_FIFO != 0);"
+    STATUSBAR_HAVE_NETDEV_XSK_LAUNCH_TIME)
+  cmake_pop_check_state()
+  if(STATUSBAR_HAVE_NETDEV_XSK_FEATURES)
+    target_compile_definitions(statusbar-net PRIVATE HAVE_NETDEV_XSK_FEATURES=1)
+  endif()
+  if(STATUSBAR_HAVE_NETDEV_XSK_LAUNCH_TIME)
+    target_compile_definitions(statusbar-net
+                               PRIVATE HAVE_NETDEV_XSK_LAUNCH_TIME=1)
+  endif()
+
   find_package(PkgConfig)
   if(PkgConfig_FOUND)
     pkg_check_modules(LIBBPF libbpf)
@@ -135,6 +165,27 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # HAVE_XDP must be visible to consumers so the gated parts of
     # net_linux_xdp.hpp compile in their TUs too.
     target_compile_definitions(statusbar-net PUBLIC HAVE_XDP=1)
+    # AF_XDP launch time needs xsk_umem__create_opts with tx_metadata_len
+    # (libxdp >= 1.5), compiled as net_linux_xdp.cpp uses it. Public: the header
+    # uses it.
+    include(CheckCXXSourceCompiles)
+    include(CMakePushCheckState)
+    cmake_push_check_state(RESET)
+    set(CMAKE_REQUIRED_INCLUDES ${LIBXDP_INCLUDE_DIRS} ${LIBBPF_INCLUDE_DIRS})
+    set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+    check_cxx_source_compiles(
+      "#include <xdp/xsk.h>
+      auto make(void* area, xsk_ring_prod* fill, xsk_ring_cons* comp) -> xsk_umem* {
+        xsk_umem_opts opts{.sz = sizeof(xsk_umem_opts), .size = 4096, .fill_size = 1,
+          .comp_size = 1, .frame_size = 4096, .frame_headroom = 24, .flags = 4,
+          .tx_metadata_len = 24};
+        return xsk_umem__create_opts(area, fill, comp, &opts);
+      }"
+      STATUSBAR_HAVE_XSK_UMEM_OPTS_TX_METADATA)
+    cmake_pop_check_state()
+    if(STATUSBAR_HAVE_XSK_UMEM_OPTS_TX_METADATA)
+      target_compile_definitions(statusbar-net PUBLIC HAVE_XSK_TX_METADATA=1)
+    endif()
     # The --embed-dir flag is only needed when compiling
     # xdp_filter_bpf_embed.cpp, which is the only TU using #embed. Scope it to
     # that source rather than the whole library.

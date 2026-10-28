@@ -29,7 +29,7 @@
 
 #if defined(__linux__)
 
-#    include "statusbar/buffer/file_descriptor.hpp"
+#    include "statusbar/net/net_netlink.hpp"
 #    include "statusbar/status/status.hpp"
 
 #    include <array>
@@ -39,7 +39,6 @@
 #    include <span>
 #    include <string>
 #    include <string_view>
-#    include <vector>
 
 namespace statusbar::net::tc {
 
@@ -183,7 +182,7 @@ class TcClient final : public TcControl
 
     /// Open and bind the socket (extended acks requested). Errors: the socket's errno.
     [[nodiscard]] auto open() noexcept -> Status;
-    [[nodiscard]] auto is_open() const noexcept -> bool { return fd_.valid(); }
+    [[nodiscard]] auto is_open() const noexcept -> bool { return socket_.is_open(); }
 
     [[nodiscard]] auto replace_mqprio(int ifindex, MqprioQdisc const& qdisc) -> Status override;
     [[nodiscard]] auto replace_cbs(int ifindex, CbsQdisc const& qdisc) -> Status override;
@@ -232,9 +231,6 @@ class TcClient final : public TcControl
     /// parsing the wanted qdisc. Only messages addressed to this socket
     /// (nlmsg_pid, our port id) under @p seq count.
     [[nodiscard]] auto transact(std::span<uint8_t const> request, uint32_t seq, Wanted* wanted) -> Status;
-    /// The messages in reply_'s first @p received bytes: the transaction's result
-    /// once one ends it, else nullopt (read on).
-    [[nodiscard]] auto read_replies(size_t received, size_t request_size, uint32_t seq, Wanted* wanted) -> std::optional<Status>;
     /// One message addressed to this transaction, of nlmsg_type @p type and
     /// nlmsg_flags @p flags: its result if it ends the transaction, else nullopt.
     [[nodiscard]] auto read_reply(
@@ -243,11 +239,12 @@ class TcClient final : public TcControl
     /// Parse a dump's RTM_NEWQDISC into @p wanted when it is the qdisc wanted (else ignore it).
     [[nodiscard]] static auto take_qdisc(std::span<uint8_t const> message, Wanted& wanted) -> Status;
 
-    FileDescriptor fd_{};
-    uint32_t portid_{0};
+    netlink::Socket socket_{};
     uint32_t seq_{0};
     std::string last_message_{};
-    std::vector<uint8_t> reply_{};  ///< receive buffer, sized in open()
+    /// A dump part is at most the larger of a page and the buffer read with (netlink_dump's
+    /// alloc_min_size). 32 KiB in the object: hosts hold the client on the heap.
+    std::array<uint8_t, 32768> reply_{};
 };
 
 }  // namespace statusbar::net::tc

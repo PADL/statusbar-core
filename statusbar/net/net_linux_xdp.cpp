@@ -3,6 +3,7 @@
 
 #include "statusbar/net/net_linux_xdp.hpp"
 
+#include "statusbar/net/net_netdev_features.hpp"
 #include "statusbar/net/net_posix_util.hpp"
 
 #if defined(__linux__) && defined(HAVE_XDP)
@@ -70,6 +71,8 @@ auto XdpErrorCategory::message(int ev) const -> std::string
             return "Detaching the XDP program failed";
         case XdpError::zero_copy_needs_native_attach:
             return "Zero-copy needs the XDP program attached in native (driver) mode";
+        case XdpError::tx_metadata_not_supported:
+            return "AF_XDP TX metadata (launch time) is not supported by this kernel or by libxdp (needs 1.5 at build time)";
         default:
             return "Unknown XDP error";
     }
@@ -77,51 +80,148 @@ auto XdpErrorCategory::message(int ev) const -> std::string
 
 #if defined(__linux__) && defined(HAVE_XDP)
 
-auto detail::UmemRegion::allocate(
-    size_t frame_count, size_t frame_size, size_t headroom, size_t fill_ring_size, size_t comp_ring_size, RingSet& rings)
-    -> StatusValue<struct xsk_umem*>
+namespace {
+
+#    if defined(HAVE_XSK_TX_METADATA)
+#        if defined(XDP_UMEM_TX_METADATA_LEN)
+static_assert(detail::UMEM_TX_METADATA_LEN == XDP_UMEM_TX_METADATA_LEN);
+#        endif
+#        if defined(XDP_TXMD_FLAGS_LAUNCH_TIME)
+static_assert(detail::TX_METADATA_LAUNCH_TIME == XDP_TXMD_FLAGS_LAUNCH_TIME);
+static_assert(sizeof(xsk_tx_metadata) == detail::TX_METADATA_SIZE);
+static_assert(offsetof(xsk_tx_metadata, request.launch_time) == offsetof(detail::XskTxMetadata, launch_time));
+#        endif
+
+/// xsk_umem__create_opts (libxdp >= 1.5) reserving geometry.tx_metadata_len before each frame's
+/// data; fd left 0 so libxdp opens the socket. 0, or a negative errno (NULL and errno from libxdp).
+[[nodiscard]] auto make_umem_with_metadata(
+    xsk_umem** umem, uint8_t* area, size_t size, detail::RingSet& rings, detail::UmemGeometry const& geometry) noexcept -> int
+{
+    xsk_umem_opts opts{
+        .sz = sizeof(xsk_umem_opts),
+        .size = size,
+        .fill_size = static_cast<__u32>(geometry.fill_ring_size),
+        .comp_size = static_cast<__u32>(geometry.comp_ring_size),
+        .frame_size = static_cast<__u32>(geometry.frame_size),
+        .frame_headroom = static_cast<__u32>(geometry.headroom + geometry.tx_metadata_len),
+        .flags = detail::UMEM_TX_METADATA_LEN,
+        .tx_metadata_len = static_cast<__u32>(geometry.tx_metadata_len),
+    };
+    *umem = xsk_umem__create_opts(area, &rings.fill, &rings.comp, &opts);
+    return *umem != nullptr ? 0 : -(errno != 0 ? errno : EINVAL);
+}
+#    endif
+
+/// True when a registration that failed with `error` was refused for its TX metadata alone: EINVAL
+/// for an otherwise valid geometry, as a kernel before XDP_UMEM_TX_METADATA_LEN (6.11) answers.
+[[nodiscard]] auto kernel_lacks_tx_metadata(int const error, detail::UmemGeometry const& geometry) noexcept -> bool
+{
+    auto const page_size = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+    return error == -EINVAL && geometry.tx_metadata_len != 0 && detail::valid_umem_geometry(geometry, page_size);
+}
+
+/// Keep `area` out of fork() children and fault in each of its pages.
+void prepare_area(std::span<uint8_t> const area) noexcept
+{
+    (void)::madvise(area.data(), area.size(), MADV_DONTFORK);
+    auto const page_size = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+    uint8_t const volatile* const pages = area.data();
+    for (size_t i = 0; i < area.size(); i += page_size) {
+        (void)pages[i];
+    }
+}
+
+/// Register `size` octets at `area` as a UMEM of `geometry`: 0, else an errno (negative with
+/// metadata; xsk_umem__create's sign differs between libxdp 1.4 and 1.5).
+[[nodiscard]] auto make_umem(
+    xsk_umem** umem, uint8_t* area, size_t size, detail::RingSet& rings, detail::UmemGeometry const& geometry) noexcept -> int
+{
+#    if defined(HAVE_XSK_TX_METADATA)
+    if (geometry.tx_metadata_len != 0) {
+        return make_umem_with_metadata(umem, area, size, rings, geometry);
+    }
+#    endif
+    xsk_umem_config const config{
+        .fill_size = static_cast<__u32>(geometry.fill_ring_size),
+        .comp_size = static_cast<__u32>(geometry.comp_ring_size),
+        .frame_size = static_cast<__u32>(geometry.frame_size),
+        .frame_headroom = static_cast<__u32>(geometry.headroom),
+        .flags = 0,
+    };
+    return xsk_umem__create(umem, area, size, &rings.fill, &rings.comp, &config);
+}
+
+/// An ifreq naming `name`, cut to IFNAMSIZ - 1 octets.
+[[nodiscard]] auto ifreq_for(std::string_view const name) noexcept -> ifreq
+{
+    struct ifreq ifr{};
+    auto const length = std::min(name.size(), size_t{IFNAMSIZ - 1});
+    span_copy(ifname_bytes(ifr).first(length), make_const_span(name).first(length));
+    ifr.ifr_name[length] = '\0';
+    return ifr;
+}
+
+/// The index (SIOCGIFINDEX) and MAC address (SIOCGIFHWADDR) of the interface `ifr` names.
+[[nodiscard]] auto interface_id(int const sock_fd, ifreq& ifr) noexcept -> StatusValue<detail::InterfaceId>
+{
+    if (::ioctl(sock_fd, SIOCGIFINDEX, &ifr) < 0) {
+        return failure(XdpError::interface_not_found);
+    }
+    detail::InterfaceId id{.index = static_cast<unsigned int>(ifr.ifr_ifindex)};
+    if (::ioctl(sock_fd, SIOCGIFHWADDR, &ifr) < 0) {
+        return failure(XdpError::get_hwaddr_failed);
+    }
+    span_copy(id.hardware_address.value, hwaddr_bytes(ifr));
+    return id;
+}
+
+/// The index and MAC address of interface `name`.
+[[nodiscard]] auto lookup_interface(std::string_view const name) -> StatusValue<detail::InterfaceId>
+{
+    int const sock_fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock_fd < 0) {
+        return failure(XdpError::socket_creation_failed);
+    }
+    auto close_sock = detail::scopeguard([&]() noexcept { ::close(sock_fd); });
+    auto ifr = ifreq_for(name);
+    return interface_id(sock_fd, ifr);
+}
+
+}  // namespace
+
+auto detail::UmemRegion::allocate(UmemGeometry const& geometry, RingSet& rings) -> StatusValue<struct xsk_umem*>
 {
     close();
+    auto const status = map_area(geometry.frame_count * geometry.frame_size).and_then([&] { return create_umem(geometry, rings); });
+    if (!status) {
+        close();
+        return failure(status.error());
+    }
+    set_geometry(geometry);
+    return umem_;
+}
 
-    frame_size_ = frame_size;
-    headroom_ = headroom;
-
-    size_t const total_size = frame_count * frame_size;
-    area_ = static_cast<uint8_t*>(
-        ::mmap(nullptr, total_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0));
+auto detail::UmemRegion::map_area(size_t const size) -> Status
+{
+    area_ = static_cast<uint8_t*>(::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0));
     if (area_ == MAP_FAILED) {
         area_ = nullptr;
-        frame_size_ = 0;
-        headroom_ = 0;
         return failure(XdpError::umem_creation_failed);
     }
-    area_size_ = total_size;
+    area_size_ = size;
+    prepare_area({area_, size});
+    return success();
+}
 
-    (void)::madvise(area_, total_size, MADV_DONTFORK);
-    {
-        size_t const page_size = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
-        uint8_t volatile* p = area_;
-        for (size_t i = 0; i < total_size; i += page_size) {
-            (void)p[i];
-        }
+auto detail::UmemRegion::create_umem(UmemGeometry const& geometry, RingSet& rings) -> Status
+{
+    int const error = make_umem(&umem_, area_, area_size_, rings, geometry);
+    if (error != 0) {
+        umem_ = nullptr;
+        return failure(
+            kernel_lacks_tx_metadata(error, geometry) ? XdpError::tx_metadata_not_supported : XdpError::umem_creation_failed);
     }
-
-    struct xsk_umem_config umem_cfg{};
-    umem_cfg.fill_size = static_cast<__u32>(fill_ring_size);
-    umem_cfg.comp_size = static_cast<__u32>(comp_ring_size);
-    umem_cfg.frame_size = static_cast<__u32>(frame_size);
-    umem_cfg.frame_headroom = static_cast<__u32>(headroom);
-    umem_cfg.flags = 0;
-
-    int const ret = xsk_umem__create(&umem_, area_, total_size, &rings.fill, &rings.comp, &umem_cfg);
-    if (ret != 0) {
-        close();
-        return failure(XdpError::umem_creation_failed);
-    }
-
-    free_list_ = UmemFreeList(frame_count, frame_size);
-
-    return umem_;
+    return success();
 }
 
 void detail::UmemRegion::close() noexcept
@@ -137,6 +237,7 @@ void detail::UmemRegion::close() noexcept
     }
     frame_size_ = 0;
     headroom_ = 0;
+    tx_metadata_len_ = 0;
     free_list_ = {};
 }
 
@@ -570,21 +671,21 @@ auto XdpProgram::install_tcam_rules(std::span<CompiledRule<32> const> rules) -> 
     return success();
 }
 
-auto XdpSocket::open(XdpConfig const& config, XdpAttachMode const attached) -> Status
+auto XdpSocket::open(XdpConfig const& config, detail::UmemGeometry const& geometry, XdpAttachMode const attached) -> Status
 {
     close();
     auto const bind_flags = detail::xdp_bind_flags(config.bind_mode, attached, config.need_wakeup);
     if (!bind_flags) {
         return failure(bind_flags.error());
     }
-    if (auto status = bind_queue(config, *bind_flags); !status) {
+    if (auto status = bind_queue(config, geometry, *bind_flags); !status) {
         return status;
     }
     record_bind(config, attached);
     return success();
 }
 
-auto XdpSocket::bind_queue(XdpConfig const& config, uint16_t const bind_flags) -> Status
+auto XdpSocket::bind_queue(XdpConfig const& config, detail::UmemGeometry const& geometry, uint16_t const bind_flags) -> Status
 {
     struct xsk_socket_config const xsk_cfg{
         .rx_size = static_cast<__u32>(config.rx_ring_size),
@@ -597,7 +698,7 @@ auto XdpSocket::bind_queue(XdpConfig const& config, uint16_t const bind_flags) -
     // The kernel frees a closed socket's hold on its queue later (an RCU grace
     // period and a work item), so a bind right after a close can see EBUSY.
     for (size_t attempt = 0;; ++attempt) {
-        auto const bound = create_once(config, ifname_str, xsk_cfg);
+        auto const bound = create_once(config, geometry, ifname_str, xsk_cfg);
         if (!bound) {
             return failure(bound.error());
         }
@@ -612,17 +713,12 @@ auto XdpSocket::bind_queue(XdpConfig const& config, uint16_t const bind_flags) -
     }
 }
 
-auto XdpSocket::create_once(XdpConfig const& config, std::string const& ifname, xsk_socket_config const& xsk_cfg)
+auto XdpSocket::create_once(
+    XdpConfig const& config, detail::UmemGeometry const& geometry, std::string const& ifname, xsk_socket_config const& xsk_cfg)
     -> StatusValue<bool>
 {
     // A failed create leaves its UMEM's rings configured: each attempt starts from a fresh UMEM.
-    auto umem_result = umem_.allocate(
-        config.umem_frame_count,
-        config.umem_frame_size,
-        config.umem_headroom,
-        config.fill_ring_size,
-        config.completion_ring_size,
-        rings_);
+    auto umem_result = umem_.allocate(geometry, rings_);
     if (!umem_result) {
         close();
         return failure(umem_result.error());
@@ -676,9 +772,7 @@ auto XdpSocket::tx_commit(uint64_t handle, size_t frame_length) -> Status
         ++stats_.tx_ring_full_count;
         return failure(XdpError::tx_ring_full);
     }
-    struct xdp_desc* desc = xsk_ring_prod__tx_desc(&rings_.tx, idx);
-    desc->addr = handle + umem_.headroom();
-    desc->len = static_cast<uint32_t>(frame_length);
+    *xsk_ring_prod__tx_desc(&rings_.tx, idx) = umem_.tx_desc(handle, frame_length);
     xsk_ring_prod__submit(&rings_.tx, 1);
     ++stats_.tx_count;
     return success();
@@ -789,78 +883,62 @@ auto XdpSocket::fill_replenish() -> Status
 
 auto XdpContext::open(XdpConfig const& config) -> Status
 {
+    // Validated before anything is closed or attached (a native attach resets igb).
+    auto const geometry = detail::umem_geometry(config);
+    if (!geometry) {
+        return failure(geometry.error());
+    }
     close();
-
-    // Step 1: Look up interface index and MAC address
-    int sock_fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock_fd < 0) {
-        return failure(XdpError::socket_creation_failed);
-    }
-    auto close_sock = detail::scopeguard([&]() noexcept { ::close(sock_fd); });
-
-    struct ifreq ifr{};
-    auto const name_len = config.interface_name.size() < IFNAMSIZ ? config.interface_name.size() : IFNAMSIZ - 1;
-    span_copy(ifname_bytes(ifr).first(name_len), make_const_span(config.interface_name).first(name_len));
-    ifr.ifr_name[name_len] = '\0';
-
-    if (::ioctl(sock_fd, SIOCGIFINDEX, &ifr) < 0) {
-        return failure(XdpError::interface_not_found);
-    }
-    interface_.index = static_cast<unsigned int>(ifr.ifr_ifindex);
-
-    if (::ioctl(sock_fd, SIOCGIFHWADDR, &ifr) < 0) {
+    auto const status = lookup_interface(config.interface_name).and_then([&](detail::InterfaceId const& id) {
+        interface_ = id;
+        return open_program(config).and_then([&] { return open_socket(config, *geometry); });
+    });
+    if (!status) {
         close();
-        return failure(XdpError::get_hwaddr_failed);
     }
-    span_copy(interface_.hardware_address.value, hwaddr_bytes(ifr));
+    return status;
+}
 
-    // Step 2: The program: zero-copy needs it native, with no fallback.
+auto XdpContext::open_program(XdpConfig const& config) -> Status
+{
+    // Zero-copy needs the program native, with no fallback.
     auto const plan = detail::attach_plan(config.attach_mode, config.bind_mode);
     if (!plan) {
-        close();
         return failure(plan.error());
     }
-    if (auto status = program_.open(
-            interface_.index,
-            {
-                .filter_rules = config.filter_rules,
-                .default_action = config.default_action,
-                .attach_mode = plan->first,
-                .allow_generic_fallback = plan->fallback.has_value(),
-                .pin_path = config.pin_path,
-                .adopt = config.adopt,
-                .detach_on_close = config.detach_on_close,
-            });
-        !status) {
-        close();
-        return status;
-    }
+    return program_.open(
+        interface_.index,
+        {
+            .filter_rules = config.filter_rules,
+            .default_action = config.default_action,
+            .attach_mode = plan->first,
+            .allow_generic_fallback = plan->fallback.has_value(),
+            .pin_path = config.pin_path,
+            .adopt = config.adopt,
+            .detach_on_close = config.detach_on_close,
+        });
+}
 
-    // Step 3: The socket, its bind decided by the mode the program got.
-    if (auto status = socket_.open(config, program_.attach_mode()); !status) {
-        close();
-        return status;
+auto XdpContext::open_socket(XdpConfig const& config, detail::UmemGeometry const& geometry) -> Status
+{
+    // The bind follows the mode the program got; then the socket (and TAP) are registered and the fill ring primed.
+    auto status = socket_.open(config, geometry, program_.attach_mode()).and_then([&] {
+        return program_.register_socket(config.queue_id, socket_.fd());
+    });
+    if (status && config.tap_ifindex != 0) {
+        status = program_.register_tap(config.tap_ifindex);
     }
+    return status.and_then([&] { return socket_.fill_replenish(); });
+}
 
-    // Step 4: Register the socket (and the TAP device if requested)
-    if (auto status = program_.register_socket(config.queue_id, socket_.fd()); !status) {
-        close();
-        return status;
+auto XdpContext::launch_time_supported() const -> StatusValue<bool>
+{
+    if (!socket_.valid()) {
+        return failure(XdpError::not_open);
     }
-    if (config.tap_ifindex != 0) {
-        if (auto status = program_.register_tap(config.tap_ifindex); !status) {
-            close();
-            return status;
-        }
-    }
-
-    // Step 5: Initial fill
-    if (auto fill_status = socket_.fill_replenish(); !fill_status) {
-        close();
-        return fill_status;
-    }
-
-    return success();
+    return netdev::query_xsk_features(static_cast<int>(interface_.index)).transform([](netdev::XskFeatures const features) {
+        return features.launch_time();
+    });
 }
 
 void XdpContext::close() noexcept

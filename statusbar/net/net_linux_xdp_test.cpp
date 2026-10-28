@@ -13,6 +13,7 @@
 #    include "statusbar/status/status.hpp"
 
 #    include <array>
+#    include <cstddef>
 #    include <cstdint>
 #    include <expected>
 #    include <optional>
@@ -84,6 +85,7 @@ TEST(xdp_error, all_errors_have_messages)
     check(XdpError::bpf_pin_failed);
     check(XdpError::bpf_detach_failed);
     check(XdpError::zero_copy_needs_native_attach);
+    check(XdpError::tx_metadata_not_supported);
 }
 
 TEST(xdp_error, category_name)
@@ -117,6 +119,7 @@ TEST(xdp_config, default_values)
     EXPECT_TRUE(config.adopt);
     EXPECT_FALSE(config.detach_on_close.has_value());
     EXPECT_TRUE(config.need_wakeup);
+    EXPECT_FALSE(config.tx_launch_time);
 }
 
 TEST(xdp_config, a_default_umem_frame_holds_a_whole_frame_in_kib_buffers)
@@ -333,6 +336,133 @@ TEST(xdp_scopeguard, fires_on_early_return)
     test_fn();
     EXPECT_TRUE(fired);
 }
+
+//
+// TX metadata - Documentation/networking/xsk-tx-metadata.rst
+//
+
+namespace {
+
+/// The octlet at `at` of `bytes`, host order (the kernel's).
+auto octlet_at(std::span<uint8_t const> const bytes, size_t const at) -> uint64_t
+{
+    uint64_t value = 0;
+    span_load(value, bytes.subspan(at, sizeof(value)));
+    return value;
+}
+
+}  // namespace
+
+TEST(xdp_tx_metadata, layout_is_struct_xsk_tx_metadata)
+{
+    EXPECT_EQ(detail::TX_METADATA_SIZE, size_t{24});
+    EXPECT_EQ(offsetof(detail::XskTxMetadata, flags), size_t{0});
+    EXPECT_EQ(offsetof(detail::XskTxMetadata, csum_start), size_t{8});
+    EXPECT_EQ(offsetof(detail::XskTxMetadata, csum_offset), size_t{10});
+    EXPECT_EQ(offsetof(detail::XskTxMetadata, launch_time), size_t{16});
+    EXPECT_EQ(detail::TX_METADATA_LAUNCH_TIME, uint64_t{4});  // XDP_TXMD_FLAGS_LAUNCH_TIME
+    EXPECT_EQ(detail::TX_DESC_METADATA, uint32_t{2});         // XDP_TX_METADATA
+    EXPECT_EQ(detail::UMEM_TX_METADATA_LEN, uint32_t{4});     // XDP_UMEM_TX_METADATA_LEN
+#    if defined(XDP_TX_METADATA)
+    EXPECT_EQ(detail::TX_DESC_METADATA, uint32_t{XDP_TX_METADATA});
+#    endif
+}
+
+TEST(xdp_tx_metadata, a_launch_time_is_written_just_before_the_data)
+{
+    // A 4 KiB UMEM frame with 64 octets of configured headroom: the metadata takes the
+    // 24 octets after it, and the data (what tx_start() hands out) starts at 88.
+    constexpr size_t HEADROOM = 64;
+    std::array<uint8_t, 4096> frame{};
+    frame.fill(0xA5);
+    auto const metadata = std::span{frame}.subspan(HEADROOM, detail::TX_METADATA_SIZE);
+    detail::write_tx_metadata(metadata, 1'700'000'000'123'456'789);
+    EXPECT_EQ(octlet_at(frame, HEADROOM), detail::TX_METADATA_LAUNCH_TIME);
+    EXPECT_EQ(octlet_at(frame, HEADROOM + 16), uint64_t{1'700'000'000'123'456'789});
+    EXPECT_EQ(detail::tx_metadata_options(metadata), detail::TX_DESC_METADATA);
+    EXPECT_EQ(frame[HEADROOM - 1], 0xA5);                         // the headroom is left alone
+    EXPECT_EQ(frame[HEADROOM + detail::TX_METADATA_SIZE], 0xA5);  // and so is the data
+}
+
+TEST(xdp_tx_metadata, no_launch_time_clears_a_stale_request)
+{
+    std::array<uint8_t, detail::TX_METADATA_SIZE> metadata{};
+    detail::write_tx_metadata(metadata, 5'000);
+    detail::write_tx_metadata(metadata, 0);  // the frame is reused for an untimed send
+    EXPECT_EQ(octlet_at(metadata, 0), uint64_t{0});
+    EXPECT_EQ(detail::tx_metadata_options(metadata), uint32_t{0});
+    detail::write_tx_metadata(metadata, -1);
+    EXPECT_EQ(detail::tx_metadata_options(metadata), uint32_t{0});
+}
+
+TEST(xdp_tx_metadata, without_reserved_metadata_nothing_is_written)
+{
+    std::array<uint8_t, 8> bytes{};
+    bytes.fill(0x5A);
+    detail::write_tx_metadata(std::span<uint8_t>{}, 5'000);
+    detail::write_tx_metadata(bytes, 5'000);  // shorter than the struct: not metadata
+    EXPECT_EQ(bytes[0], 0x5A);
+    EXPECT_EQ(detail::tx_metadata_options(std::span<uint8_t const>{}), uint32_t{0});
+}
+
+TEST(xdp_tx_metadata, launch_time_needs_libxdp_with_umem_options)
+{
+    EXPECT_TRUE(detail::tx_metadata_len(false) == size_t{0});
+#    if defined(HAVE_XSK_TX_METADATA)
+    EXPECT_TRUE(detail::tx_metadata_len(true) == detail::TX_METADATA_SIZE);
+#    else
+    EXPECT_TRUE(detail::tx_metadata_len(true) == std::unexpected(XdpError::tx_metadata_not_supported));
+#    endif
+}
+
+#    if defined(HAVE_XDP)
+TEST(xdp_tx_metadata, the_umem_headroom_grows_by_the_metadata)
+{
+    XdpConfig const config{.interface_name = "eth0", .umem_headroom = 64, .tx_launch_time = true};
+    auto const geometry = detail::umem_geometry(config);
+#        if defined(HAVE_XSK_TX_METADATA)
+    EXPECT_TRUE(geometry.has_value());
+    EXPECT_TRUE(geometry && geometry->headroom == 64 && geometry->tx_metadata_len == detail::TX_METADATA_SIZE);
+    // A received frame still fits a 3 KiB buffer of a 4 KiB frame.
+    EXPECT_TRUE(config.umem_frame_size - 64 - detail::TX_METADATA_SIZE - XDP_PACKET_HEADROOM >= 3072);
+#        else
+    EXPECT_TRUE(!geometry && geometry.error() == XdpError::tx_metadata_not_supported);
+#        endif
+    auto const plain = detail::umem_geometry({.interface_name = "eth0"});
+    EXPECT_TRUE(plain && plain->tx_metadata_len == 0 && plain->headroom == 0);
+}
+
+TEST(xdp_tx_metadata, a_valid_geometry_is_one_the_kernel_takes)
+{
+    detail::UmemGeometry const good{
+        .frame_count = 64, .frame_size = 4096, .headroom = 0, .tx_metadata_len = 24, .fill_ring_size = 32, .comp_ring_size = 64};
+    EXPECT_TRUE(detail::valid_umem_geometry(good, 4096));
+    auto odd_frame = good;
+    odd_frame.frame_size = 3000;
+    EXPECT_FALSE(detail::valid_umem_geometry(odd_frame, 4096));
+    EXPECT_FALSE(detail::valid_umem_geometry(good, 2048));  // a chunk larger than a page
+    auto no_room = good;
+    no_room.headroom = 4096 - XDP_PACKET_HEADROOM - 24;
+    EXPECT_FALSE(detail::valid_umem_geometry(no_room, 4096));
+    auto odd_ring = good;
+    odd_ring.fill_ring_size = 48;
+    EXPECT_FALSE(detail::valid_umem_geometry(odd_ring, 4096));
+}
+
+TEST(xdp_tx_metadata, open_refuses_launch_time_before_touching_the_interface)
+{
+    XdpContext ctx;
+    auto const status = ctx.open({.interface_name = "nonexistent_iface_xyz", .tx_launch_time = true});
+    EXPECT_FALSE(status.has_value());
+#        if defined(HAVE_XSK_TX_METADATA)
+    EXPECT_TRUE(!status && status.error() == XdpError::interface_not_found);
+#        else
+    EXPECT_TRUE(!status && status.error() == XdpError::tx_metadata_not_supported);
+#        endif
+    EXPECT_FALSE(ctx.tx_launch_time());
+    EXPECT_TRUE(!ctx.launch_time_supported() && ctx.launch_time_supported().error() == XdpError::not_open);
+}
+#    endif
 
 //
 // XdpContextOpen RAII wrapper test
@@ -1123,6 +1253,46 @@ TEST(xdp_integration, tx_flush_kicks_only_when_there_is_something_to_send)
     EXPECT_TRUE(ctx.join_multicast(group).has_value());
     EXPECT_TRUE(ctx.leave_multicast(group).has_value());
 }
+
+#        if defined(HAVE_XSK_TX_METADATA)
+// Generic (copy) mode turns XDP_TXMD_FLAGS_LAUNCH_TIME into skb->skb_mstamp_ns, which only
+// an ETF qdisc acts on: veth sends at once. This checks timed and untimed frames still go.
+TEST(xdp_integration, frames_with_launch_time_metadata_are_sent)
+{
+    if (!xdp_privileged()) {
+        return;
+    }
+    Veth veth;
+    if (!veth.ok) {
+        return;
+    }
+    XdpContext ctx;
+    auto const opened = ctx.open(
+        {.interface_name = "xdptest0",
+         .fill_ring_size = 32,
+         .umem_frame_count = 64,
+         .attach_mode = XdpAttachMode::generic,
+         .tx_launch_time = true});
+    EXPECT_TRUE(opened.has_value());
+    EXPECT_TRUE(ctx.tx_launch_time());
+    auto const supported = ctx.launch_time_supported();
+    EXPECT_TRUE(supported.has_value() && !*supported);  // veth has no launch-time offload
+    struct timespec now{};
+    (void)::clock_gettime(CLOCK_TAI, &now);
+    int64_t const soon = (static_cast<int64_t>(now.tv_sec) * 1'000'000'000) + now.tv_nsec + 1'000'000;
+    for (int64_t const launch_time : {soon, int64_t{0}}) {
+        auto slot = ctx.tx_start(launch_time);
+        EXPECT_TRUE(slot.has_value());
+        std::fill_n(slot->buffer.begin(), 64, uint8_t{0xFF});
+        slot->buffer[12] = 0x90;
+        slot->buffer[13] = 0x00;
+        EXPECT_TRUE(ctx.tx_commit(slot->handle, 64).has_value());
+        EXPECT_TRUE(ctx.tx_flush().has_value());
+    }
+    EXPECT_EQ(ctx.stats().tx_count, uint64_t{2});
+    EXPECT_EQ(ctx.stats().tx_flush_failed, uint64_t{0});
+}
+#        endif
 
 #    endif  // __linux__ && HAVE_XDP
 

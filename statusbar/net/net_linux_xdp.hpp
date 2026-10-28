@@ -100,6 +100,7 @@ enum class XdpError
     bpf_pin_failed,
     bpf_detach_failed,
     zero_copy_needs_native_attach,
+    tx_metadata_not_supported,
 };
 
 class XdpErrorCategory : public std::error_category
@@ -170,6 +171,7 @@ struct XdpConfig
     /// tx_start() draws from what the fill ring leaves: umem_frame_count -
     /// fill_ring_size after open() (none if not larger), less frames held in RX.
     size_t umem_frame_count{1024};
+    /// Octets reserved at the start of each frame; tx_launch_time adds TX_METADATA_SIZE to it.
     size_t umem_headroom{0};
     unsigned int tap_ifindex{0};
     size_t rx_drain_max{32};
@@ -193,6 +195,10 @@ struct XdpConfig
     /// Bind with XDP_USE_NEED_WAKEUP: tx_flush() kicks only when the kernel
     /// asks for it, fill_replenish() wakes RX only when the fill ring ran dry.
     bool need_wakeup{true};
+    /// Reserve AF_XDP TX metadata so tx_start(launch_time_ns) carries launch times. open() fails with
+    /// tx_metadata_not_supported without libxdp >= 1.5 or kernel support; whether the driver honours
+    /// the time is launch_time_supported()'s to say (copy mode works without it).
+    bool tx_launch_time{false};
 };
 
 /// The XDP program attached to an interface, as bpf_xdp_query() reports it.
@@ -242,6 +248,72 @@ struct AttachPlan
         return AttachPlan{.first = XdpAttachMode::native, .fallback = XdpAttachMode::generic};
     }
     return AttachPlan{.first = XdpAttachMode::generic, .fallback = std::nullopt};
+}
+
+//
+// TX metadata - Documentation/networking/xsk-tx-metadata.rst
+//
+
+/// struct xsk_tx_metadata (linux/if_xdp.h, 6.15+): what the driver reads from just before a
+/// TX descriptor's data when the descriptor carries XDP_TX_METADATA. Host byte order.
+struct XskTxMetadata
+{
+    uint64_t flags{0};
+    uint16_t csum_start{0};
+    uint16_t csum_offset{0};
+    uint32_t reserved{0};
+    uint64_t launch_time{0};  ///< ns on the NIC's PTP hardware clock
+};
+static_assert(sizeof(XskTxMetadata) == 24);
+static_assert(offsetof(XskTxMetadata, csum_start) == 8 && offsetof(XskTxMetadata, launch_time) == 16);
+
+/// The UMEM's tx_metadata_len when TX metadata is reserved.
+inline constexpr size_t TX_METADATA_SIZE = sizeof(XskTxMetadata);
+/// XDP_TXMD_FLAGS_LAUNCH_TIME: the driver sends the frame at request.launch_time.
+inline constexpr uint64_t TX_METADATA_LAUNCH_TIME = 1U << 2U;
+/// XDP_TX_METADATA: xdp_desc::options bit saying the metadata before the data is valid.
+inline constexpr uint32_t TX_DESC_METADATA = 1U << 1U;
+/// XDP_UMEM_TX_METADATA_LEN: xdp_umem_reg::flags bit that makes the kernel honour tx_metadata_len.
+inline constexpr uint32_t UMEM_TX_METADATA_LEN = 1U << 2U;
+
+/// The UMEM's tx_metadata_len for `tx_launch_time`: TX_METADATA_SIZE, or 0 when not asked
+/// for. tx_metadata_not_supported when asked for but built without HAVE_XSK_TX_METADATA.
+[[nodiscard]] constexpr auto tx_metadata_len(bool const tx_launch_time) noexcept -> std::expected<size_t, XdpError>
+{
+    if (!tx_launch_time) {
+        return size_t{0};
+    }
+#if defined(HAVE_XSK_TX_METADATA)
+    return TX_METADATA_SIZE;
+#else
+    return std::unexpected(XdpError::tx_metadata_not_supported);
+#endif
+}
+
+/// Write a frame's TX metadata into `metadata` (its TX_METADATA_SIZE octets before the
+/// data; empty: none reserved, nothing written): LAUNCH_TIME at `launch_time_ns` when > 0, else no request.
+inline void write_tx_metadata(std::span<uint8_t> const metadata, int64_t const launch_time_ns) noexcept
+{
+    if (metadata.size() < TX_METADATA_SIZE) {
+        return;
+    }
+    bool const timed = launch_time_ns > 0;
+    span_store(
+        metadata,
+        XskTxMetadata{
+            .flags = timed ? TX_METADATA_LAUNCH_TIME : 0, .launch_time = timed ? static_cast<uint64_t>(launch_time_ns) : 0});
+}
+
+/// The xdp_desc::options for a frame whose metadata is `metadata`: TX_DESC_METADATA when
+/// it requests anything, else 0 (also for an empty span).
+[[nodiscard]] inline auto tx_metadata_options(std::span<uint8_t const> const metadata) noexcept -> uint32_t
+{
+    if (metadata.size() < TX_METADATA_SIZE) {
+        return 0;
+    }
+    uint64_t flags = 0;
+    span_load(flags, metadata.first(sizeof(flags)));
+    return flags != 0 ? TX_DESC_METADATA : 0;
 }
 
 /// The mode beside an attached program: native stays native, generic gives way to native.
@@ -422,6 +494,44 @@ struct RingSet
     struct xsk_ring_cons rx{};
 };
 
+/// The UMEM UmemRegion::allocate() creates.
+struct UmemGeometry
+{
+    size_t frame_count{0};
+    size_t frame_size{0};
+    size_t headroom{0};         ///< reserved at the start of each frame, before any TX metadata
+    size_t tx_metadata_len{0};  ///< 0 or TX_METADATA_SIZE, between the headroom and the data
+    size_t fill_ring_size{0};
+    size_t comp_ring_size{0};
+};
+
+/// The UMEM `config` asks for; tx_metadata_not_supported as tx_metadata_len(). The one
+/// validation of tx_launch_time: XdpContext::open() calls it before closing or attaching.
+/// @param config The socket's configuration
+[[nodiscard]] constexpr auto umem_geometry(XdpConfig const& config) noexcept -> std::expected<UmemGeometry, XdpError>
+{
+    return tx_metadata_len(config.tx_launch_time).transform([&](size_t const metadata) {
+        return UmemGeometry{
+            .frame_count = config.umem_frame_count,
+            .frame_size = config.umem_frame_size,
+            .headroom = config.umem_headroom,
+            .tx_metadata_len = metadata,
+            .fill_ring_size = config.fill_ring_size,
+            .comp_ring_size = config.completion_ring_size,
+        };
+    });
+}
+
+/// True when the kernel's XDP_UMEM_REG and libxdp's rings accept `geometry` (aligned chunks
+/// of a power of two from 2048 to `page_size`, room after the headroom, power-of-two rings).
+[[nodiscard]] constexpr auto valid_umem_geometry(UmemGeometry const& geometry, size_t const page_size) noexcept -> bool
+{
+    auto const power_of_two = [](size_t const n) { return n != 0 && (n & (n - 1)) == 0; };
+    return power_of_two(geometry.frame_size) && geometry.frame_size >= 2048 && geometry.frame_size <= page_size &&
+        geometry.headroom + geometry.tx_metadata_len + XDP_PACKET_HEADROOM < geometry.frame_size &&
+        power_of_two(geometry.fill_ring_size) && power_of_two(geometry.comp_ring_size);
+}
+
 /// Owns the mmap'd UMEM region, frame config, and free list.
 /// RAII — destructor calls close().
 class UmemRegion
@@ -444,16 +554,9 @@ class UmemRegion
     UmemRegion(UmemRegion const&) = delete;
     auto operator=(UmemRegion const&) -> UmemRegion& = delete;
 
-    /// mmap + prefault + xsk_umem__create. Returns xsk_umem* for xsk_socket__create.
-    /// @param frame_count Number of UMEM frames to allocate
-    /// @param frame_size Size of each UMEM frame in bytes
-    /// @param headroom Headroom bytes reserved at the start of each frame
-    /// @param fill_ring_size Number of entries in the fill ring
-    /// @param comp_ring_size Number of entries in the completion ring
-    /// @param rings Ring set to initialize with fill and completion rings
-    [[nodiscard]] auto allocate(
-        size_t frame_count, size_t frame_size, size_t headroom, size_t fill_ring_size, size_t comp_ring_size, RingSet& rings)
-        -> StatusValue<struct xsk_umem*>;
+    /// mmap + prefault + create the UMEM (its frame headroom geometry.headroom + tx_metadata_len)
+    /// with `rings`' fill and completion rings. Returns xsk_umem* for xsk_socket__create.
+    [[nodiscard]] auto allocate(UmemGeometry const& geometry, RingSet& rings) -> StatusValue<struct xsk_umem*>;
 
     void close() noexcept;
 
@@ -467,6 +570,21 @@ class UmemRegion
     /// @param len Number of bytes to expose as readable
     [[nodiscard]] auto readable_span(uint64_t addr, size_t len) -> std::span<uint8_t const> { return {area_ + addr, len}; }
 
+    /// The TX metadata just before frame `addr`'s data (empty when none is reserved).
+    /// @param addr UMEM frame address
+    [[nodiscard]] auto tx_metadata_span(uint64_t addr) noexcept -> std::span<uint8_t>
+    {
+        return {area_ + addr + headroom_ - tx_metadata_len_, tx_metadata_len_};
+    }
+
+    /// The TX descriptor for `length` octets of frame `addr`, flagged when its metadata requests anything.
+    /// @param addr UMEM frame address
+    [[nodiscard]] auto tx_desc(uint64_t addr, size_t length) noexcept -> xdp_desc
+    {
+        return {
+            .addr = addr + headroom_, .len = static_cast<uint32_t>(length), .options = tx_metadata_options(tx_metadata_span(addr))};
+    }
+
     [[nodiscard]] auto alloc_frame() -> std::optional<uint64_t> { return free_list_.pop(); }
 
     /// @param addr UMEM frame address to return to the free list
@@ -479,16 +597,32 @@ class UmemRegion
 
     [[nodiscard]] auto available_frames() const noexcept -> size_t { return free_list_.available(); }
     [[nodiscard]] auto frame_size() const noexcept -> size_t { return frame_size_; }
+    /// Octets before a frame's data: the configured headroom plus tx_metadata_len().
     [[nodiscard]] auto headroom() const noexcept -> size_t { return headroom_; }
+    [[nodiscard]] auto tx_metadata_len() const noexcept -> size_t { return tx_metadata_len_; }
 
   private:
-    void swap(UmemRegion& other) noexcept
+    /// mmap and prefault `size` octets for area_.
+    [[nodiscard]] auto map_area(size_t size) -> Status;
+    /// Register area_ as the UMEM; through xsk_umem__create_opts when TX metadata is reserved.
+    [[nodiscard]] auto create_umem(UmemGeometry const& geometry, RingSet& rings) -> Status;
+    /// Take on the frame layout of the UMEM just created.
+    void set_geometry(UmemGeometry const& geometry) noexcept
     {
+        frame_size_ = geometry.frame_size;
+        headroom_ = geometry.headroom + geometry.tx_metadata_len;
+        tx_metadata_len_ = geometry.tx_metadata_len;
+        free_list_ = UmemFreeList(geometry.frame_count, geometry.frame_size);
+    }
+
+    void swap(UmemRegion& other) noexcept
+    {  // NOLINT(statusbar-block-statements): member-wise swap
         std::swap(umem_, other.umem_);
         std::swap(area_, other.area_);
         std::swap(area_size_, other.area_size_);
         std::swap(frame_size_, other.frame_size_);
         std::swap(headroom_, other.headroom_);
+        std::swap(tx_metadata_len_, other.tx_metadata_len_);
         std::swap(free_list_, other.free_list_);
     }
 
@@ -497,6 +631,7 @@ class UmemRegion
     size_t area_size_{0};
     size_t frame_size_{0};
     size_t headroom_{0};
+    size_t tx_metadata_len_{0};
     UmemFreeList free_list_;
 };
 
@@ -762,9 +897,9 @@ class XdpSocket
     static constexpr size_t BIND_BUSY_RETRIES = 50;
     static constexpr long BIND_BUSY_PAUSE_NS = 10'000'000;
 
-    /// Allocate the UMEM and bind to `config.queue_id`, with xdp_bind_flags()
-    /// for a program attached in `attached` mode. Leaves the fill ring empty.
-    [[nodiscard]] auto open(XdpConfig const& config, XdpAttachMode attached) -> Status;
+    /// Allocate a UMEM of `geometry` (detail::umem_geometry(config)) and bind to `config.queue_id`,
+    /// with xdp_bind_flags() for a program attached in `attached` mode. Leaves the fill ring empty.
+    [[nodiscard]] auto open(XdpConfig const& config, detail::UmemGeometry const& geometry, XdpAttachMode attached) -> Status;
     void close() noexcept;
 
     [[nodiscard]] auto valid() const noexcept -> bool { return xsk_ != nullptr; }
@@ -773,20 +908,22 @@ class XdpSocket
     /// bind read back XDP_OPTIONS_ZEROCOPY.
     [[nodiscard]] auto zero_copy() const noexcept -> bool { return zero_copy_; }
     [[nodiscard]] auto bind_mode() const noexcept -> XdpBindMode { return bind_mode_; }
+    /// True when the UMEM reserves TX metadata (XdpConfig::tx_launch_time).
+    [[nodiscard]] auto tx_launch_time() const noexcept -> bool { return umem_.tx_metadata_len() != 0; }
 
     void begin_cycle() noexcept { budget_.rx_cycle_count = 0; }
 
     /// A free UMEM frame to fill and tx_commit(); free_list_empty when the fill
     /// ring and RX hold the rest (XdpConfig::umem_frame_count).
-    /// @param launch_time_ns TSN/AVB launch time in nanoseconds (currently unused, reserved)
+    /// @param launch_time_ns When to send, ns on the NIC's PHC; 0: now. Ignored without tx_launch_time().
     [[nodiscard]] auto tx_start(int64_t launch_time_ns = 0) -> StatusValue<EthernetTxSlot>
     {
-        (void)launch_time_ns;
         auto addr = umem_.alloc_frame();
         if (!addr) {
             ++stats_.umem_exhausted_count;
             return failure(XdpError::free_list_empty);
         }
+        detail::write_tx_metadata(umem_.tx_metadata_span(*addr), launch_time_ns);
         return EthernetTxSlot{
             .handle = *addr,
             .buffer = umem_.writable_span(*addr),
@@ -828,10 +965,11 @@ class XdpSocket
 
   private:
     /// Create the socket on `config.queue_id`, retrying while the queue is busy.
-    [[nodiscard]] auto bind_queue(XdpConfig const& config, uint16_t bind_flags) -> Status;
-    /// One fresh UMEM and socket create: true when bound, false when the queue
+    [[nodiscard]] auto bind_queue(XdpConfig const& config, detail::UmemGeometry const& geometry, uint16_t bind_flags) -> Status;
+    /// One fresh UMEM (`geometry`) and socket create: true when bound, false when the queue
     /// was busy (EBUSY; closed again), else the UMEM's or xsk_creation_failed.
-    [[nodiscard]] auto create_once(XdpConfig const& config, std::string const& ifname, xsk_socket_config const& xsk_cfg)
+    [[nodiscard]] auto create_once(
+        XdpConfig const& config, detail::UmemGeometry const& geometry, std::string const& ifname, xsk_socket_config const& xsk_cfg)
         -> StatusValue<bool>;
     /// Record what the bind obtained (mode, wakeup, zero-copy) and the cycle budget.
     void record_bind(XdpConfig const& config, XdpAttachMode attached) noexcept;
@@ -882,7 +1020,8 @@ class XdpContext
     XdpContext(XdpContext const&) = delete;
     auto operator=(XdpContext const&) -> XdpContext& = delete;
 
-    /// @param config Configuration specifying interface, filters, ring sizes, and UMEM layout
+    /// Open on `config.interface_name`. A config refused up front (tx_metadata_not_supported)
+    /// leaves the context as it was; any later failure leaves it closed.
     [[nodiscard]] auto open(XdpConfig const& config) -> Status;
     void close() noexcept;
     [[nodiscard]] auto valid() const noexcept -> bool { return socket_.valid(); }
@@ -903,6 +1042,11 @@ class XdpContext
     [[nodiscard]] auto attach_mode() const noexcept -> XdpAttachMode { return program_.attach_mode(); }
     /// True when open() adopted a pinned program.
     [[nodiscard]] auto adopted() const noexcept -> bool { return program_.adopted(); }
+    /// True when tx_start() carries launch times (XdpConfig::tx_launch_time).
+    [[nodiscard]] auto tx_launch_time() const noexcept -> bool { return socket_.tx_launch_time(); }
+    /// Whether the driver honours AF_XDP launch times (netdev xsk-features tx-launch-time-fifo):
+    /// one generic netlink query; not_open when closed. The queue also needs an offloaded ETF qdisc.
+    [[nodiscard]] auto launch_time_supported() const -> StatusValue<bool>;
 
     [[nodiscard]] auto program() noexcept -> XdpProgram& { return program_; }
     [[nodiscard]] auto program() const noexcept -> XdpProgram const& { return program_; }
@@ -917,7 +1061,8 @@ class XdpContext
         return fill_status ? comp_status : fill_status;
     }
 
-    /// @param launch_time_ns TSN/AVB launch time in nanoseconds (currently unused, reserved)
+    /// XdpSocket::tx_start().
+    /// @param launch_time_ns When to send, ns on the NIC's PHC; 0: now
     [[nodiscard]] auto tx_start(int64_t launch_time_ns = 0) -> StatusValue<EthernetTxSlot>
     {
         return socket_.tx_start(launch_time_ns);
@@ -969,6 +1114,10 @@ class XdpContext
     }
 
     [[nodiscard]] auto multicast_ioctl(unsigned long request, ieee::Eui48 const& addr, XdpError error) -> Status;
+    /// Adopt or attach the program on interface_ per `config`.
+    [[nodiscard]] auto open_program(XdpConfig const& config) -> Status;
+    /// Bind the socket, register it (and the TAP device) with the program, and prime the fill ring.
+    [[nodiscard]] auto open_socket(XdpConfig const& config, detail::UmemGeometry const& geometry) -> Status;
 
     XdpProgram program_;
     XdpSocket socket_;
@@ -1055,6 +1204,8 @@ class XdpContext
     [[nodiscard]] auto bind_mode() const noexcept -> XdpBindMode { return XdpBindMode::auto_; }
     [[nodiscard]] auto attach_mode() const noexcept -> XdpAttachMode { return XdpAttachMode::native; }
     [[nodiscard]] auto adopted() const noexcept -> bool { return false; }
+    [[nodiscard]] auto tx_launch_time() const noexcept -> bool { return false; }
+    [[nodiscard]] auto launch_time_supported() const -> StatusValue<bool> { return failure(XdpError::not_supported_on_platform); }
     [[nodiscard]] auto program() const noexcept -> XdpProgram const&
     {
         static XdpProgram const none{};
