@@ -22,6 +22,7 @@ static auto stats_through_an_incomplete_type(statusbar::net::XdpSocketStats cons
 #    include "statusbar/status/status.hpp"
 
 #    include <array>
+#    include <cerrno>
 #    include <cstdint>
 #    include <expected>
 #    include <optional>
@@ -96,6 +97,16 @@ TEST(xdp_error, all_errors_have_messages)
     check(XdpError::bpffs_not_mounted);
     check(XdpError::invalid_pin_path);
     check(XdpError::pin_failed);
+    check(XdpError::queue_busy);
+}
+
+TEST(xdp_error, a_busy_queue_says_so)
+{
+    // An operator reading this goes looking for the process holding the
+    // queue, which is the right next move; "XSK socket creation failed"
+    // would send them nowhere.
+    std::error_code const ec = XdpError::queue_busy;
+    EXPECT_TRUE(ec.message().find("busy") != std::string::npos);
 }
 
 TEST(xdp_error, category_name)
@@ -577,6 +588,155 @@ TEST(xdp_open, zero_copy_with_generic_attach_is_refused_before_any_syscall)
     if (!same) {
         EXPECT_TRUE(same.error() == XdpError::zero_copy_needs_native_attach);
     }
+}
+
+//
+// Bind retry: the policy
+//
+// A bind refused with EBUSY is a queue whose previous owner has not finished
+// handing it back, which is what every restart runs into. The window is
+// microseconds to milliseconds wide and cannot be opened on demand, so the
+// policy is tested against a counted attempt and a counted clock instead of
+// a socket: that is the only way to see the arms a developer host will not
+// produce, and it needs no privilege.
+//
+
+namespace {
+
+/// A bind that reports EBUSY the first `busy_for` times it is called and
+/// then succeeds, counting both the attempts and the pauses taken between
+/// them. Stands in for xsk_socket__create(), which reports a negative errno.
+struct CountedBind
+{
+    size_t busy_for{0};
+    int final_errno{0};
+    size_t attempts{0};
+    size_t pauses{0};
+
+    auto attempt() -> int
+    {
+        ++attempts;
+        return attempts <= busy_for ? -EBUSY : final_errno;
+    }
+
+    void pause() { ++pauses; }
+};
+
+}  // namespace
+
+TEST(xdp_bind_retry, a_queue_that_is_free_is_bound_once)
+{
+    CountedBind bind{.busy_for = 0};
+    auto const result =
+        detail::retry_while_busy(xdp_bind_busy_retries, [&bind] { return bind.attempt(); }, [&bind] { bind.pause(); });
+    EXPECT_EQ(result, 0);
+    EXPECT_EQ(bind.attempts, 1u);
+    // Nothing was waited for, so the common case costs no latency at all.
+    EXPECT_EQ(bind.pauses, 0u);
+}
+
+TEST(xdp_bind_retry, a_queue_still_being_released_is_waited_out)
+{
+    CountedBind bind{.busy_for = 3};
+    auto const result =
+        detail::retry_while_busy(xdp_bind_busy_retries, [&bind] { return bind.attempt(); }, [&bind] { bind.pause(); });
+    EXPECT_EQ(result, 0);
+    EXPECT_EQ(bind.attempts, 4u);
+    EXPECT_EQ(bind.pauses, 3u);
+}
+
+TEST(xdp_bind_retry, the_last_retry_still_counts)
+{
+    // The boundary from below: refused on every attempt but the last one the
+    // budget allows, and the open succeeds.
+    CountedBind bind{.busy_for = xdp_bind_busy_retries};
+    auto const result =
+        detail::retry_while_busy(xdp_bind_busy_retries, [&bind] { return bind.attempt(); }, [&bind] { bind.pause(); });
+    EXPECT_EQ(result, 0);
+    EXPECT_EQ(bind.attempts, xdp_bind_busy_retries + 1);
+    EXPECT_EQ(bind.pauses, xdp_bind_busy_retries);
+}
+
+TEST(xdp_bind_retry, a_queue_that_stays_busy_gives_up_as_busy)
+{
+    // The boundary from above. What comes back is the EBUSY itself, so the
+    // caller can say "busy" rather than "bind failed".
+    CountedBind bind{.busy_for = xdp_bind_busy_retries + 1};
+    auto const result =
+        detail::retry_while_busy(xdp_bind_busy_retries, [&bind] { return bind.attempt(); }, [&bind] { bind.pause(); });
+    EXPECT_EQ(result, -EBUSY);
+    EXPECT_EQ(bind.attempts, xdp_bind_busy_retries + 1);
+    EXPECT_EQ(bind.pauses, xdp_bind_busy_retries);
+}
+
+TEST(xdp_bind_retry, the_whole_wait_is_bounded)
+{
+    // The bound the comment on xdp_bind_busy_retries claims: one pause per
+    // retry and no more, so the worst case is the pause times the count.
+    // Counted in nanoseconds rather than measured, so this says what the
+    // policy costs without anybody waiting for it.
+    CountedBind bind{.busy_for = 1000};
+    auto const result =
+        detail::retry_while_busy(xdp_bind_busy_retries, [&bind] { return bind.attempt(); }, [&bind] { bind.pause(); });
+    EXPECT_EQ(result, -EBUSY);
+    auto const waited_ns = static_cast<long long>(bind.pauses) * xdp_bind_busy_pause_ns;
+    EXPECT_EQ(waited_ns, 500'000'000LL);
+}
+
+TEST(xdp_bind_retry, an_errno_that_is_not_ebusy_is_never_retried)
+{
+    // Asserted by the attempt count, not by timing: a real fault must come
+    // straight back instead of stalling half a second first and failing the
+    // same way. ENODEV is a wrong interface, EOPNOTSUPP a driver without
+    // zero-copy, EPERM a missing capability - none of them improve by
+    // waiting, and retrying them would hide them behind the busy message.
+    for (int const err : {ENODEV, EOPNOTSUPP, EINVAL, EPERM, ENOMEM, EFAULT}) {
+        CountedBind bind{.busy_for = 0, .final_errno = -err};
+        auto const result =
+            detail::retry_while_busy(xdp_bind_busy_retries, [&bind] { return bind.attempt(); }, [&bind] { bind.pause(); });
+        EXPECT_EQ(result, -err);
+        EXPECT_EQ(bind.attempts, 1u);
+        EXPECT_EQ(bind.pauses, 0u);
+    }
+}
+
+TEST(xdp_bind_retry, an_errno_that_is_not_ebusy_ends_a_retry_too)
+{
+    // A queue that is busy and then fails for another reason: the retry
+    // stops at the real error rather than carrying on to the bound.
+    CountedBind bind{.busy_for = 2, .final_errno = -ENODEV};
+    auto const result =
+        detail::retry_while_busy(xdp_bind_busy_retries, [&bind] { return bind.attempt(); }, [&bind] { bind.pause(); });
+    EXPECT_EQ(result, -ENODEV);
+    EXPECT_EQ(bind.attempts, 3u);
+    EXPECT_EQ(bind.pauses, 2u);
+}
+
+TEST(xdp_bind_retry, no_retries_means_the_refusal_is_seen_raw)
+{
+    // The seam a caller uses to fail fast, and the one a test uses to
+    // observe an EBUSY that the default would have waited out.
+    CountedBind bind{.busy_for = 1};
+    auto const result = detail::retry_while_busy(0, [&bind] { return bind.attempt(); }, [&bind] { bind.pause(); });
+    EXPECT_EQ(result, -EBUSY);
+    EXPECT_EQ(bind.attempts, 1u);
+    EXPECT_EQ(bind.pauses, 0u);
+}
+
+TEST(xdp_bind_retry, the_default_config_waits_the_window_out)
+{
+    // No caller wants the un-retried behaviour, so it is on without being
+    // asked for; a caller that names no retry count gets it.
+    XdpConfig const config{.interface_name = "lo"};
+    EXPECT_EQ(config.bind_busy_retries, xdp_bind_busy_retries);
+    EXPECT_EQ(config.bind_busy_retries, 50u);
+    EXPECT_EQ(xdp_bind_busy_pause_ns, 10'000'000L);
+}
+
+TEST(xdp_bind_retry, a_fresh_context_has_waited_for_nothing)
+{
+    XdpContext ctx;
+    EXPECT_EQ(ctx.bind_retries(), 0u);
 }
 
 #    if defined(__linux__) && defined(HAVE_XDP)
@@ -1409,6 +1569,53 @@ TEST(xdp_integration, set_rules)
 
     auto update_status = ctx.set_rules(rules2);
     EXPECT_TRUE(update_status.has_value());
+}
+
+// The failure FEAT-007 exists for, reproduced: close a queue and bind it
+// again immediately. Without the retry this fails - not every iteration,
+// which is what makes the bug so unpleasant to chase, but often enough that
+// twenty turns round the loop find it.
+TEST(xdp_integration, a_queue_rebound_the_instant_it_is_closed_still_opens)
+{
+    if (getuid() != 0) {
+        return;
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        return;
+    }
+    auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
+
+    XdpConfig const config{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .umem_frame_count = 64,
+    };
+
+    size_t waited = 0;
+    for (int i = 0; i < 20; ++i) {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        // The whole point: no iteration may come back queue_busy. The
+        // previous iteration's socket was closed microseconds ago.
+        EXPECT_TRUE(status.has_value());
+        if (!status) {
+            EXPECT_TRUE(status.error() != XdpError::queue_busy);
+            return;
+        }
+        waited += ctx.bind_retries();
+        ctx.close();
+    }
+
+    // Not asserted: whether any iteration actually caught the queue still
+    // registered depends on how fast this kernel's teardown happens to run,
+    // and a test that insists on seeing the race would be the flaky kind.
+    // It is reported instead, because a non-zero count is the evidence that
+    // the window is real on this machine rather than a story about RCU.
+    if (waited != 0) {
+        printf("    (the queue was still busy on %zu of 20 re-opens)\n", waited);
+    }
 }
 
 #    endif  // __linux__ && HAVE_XDP

@@ -18,7 +18,6 @@ extern unsigned int const xdp_filter_bpf_o_len;
 #    include <poll.h>
 #    include <unistd.h>
 
-#    include <cerrno>
 #    include <cstring>
 #    include <ctime>
 
@@ -46,6 +45,7 @@ extern unsigned int const xdp_filter_bpf_o_len;
 #include "statusbar/status/throw_or_abort.hpp"
 
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -94,6 +94,7 @@ enum class XdpError
     bpffs_not_mounted,
     invalid_pin_path,
     pin_failed,
+    queue_busy,
 };
 
 class XdpErrorCategory : public std::error_category
@@ -216,6 +217,26 @@ struct XdpAttachedProgram
     XdpAttachMode mode{XdpAttachMode::native};
 };
 
+/// How a bind refused because the queue is still busy is retried: this many
+/// pauses of xdp_bind_busy_pause_ns each.
+///
+/// Closing an AF_XDP socket does not release its queue there and then. The
+/// kernel keeps the socket's UMEM pool registered against the queue index
+/// until the teardown completes, which it does behind an RCU grace period
+/// and a deferred work item, and a bind arriving in that window is refused
+/// with EBUSY. A restart lands squarely in that window: the new process
+/// binds the same queue within a millisecond of the old one's descriptors
+/// being reaped, and the bind fails although nothing is wrong.
+///
+/// 50 pauses of 10 ms is up to 500 ms in all - comfortably longer than an
+/// RCU grace period, and short enough that a queue some other live process
+/// is holding still fails fast enough to report.
+inline constexpr size_t xdp_bind_busy_retries = 50;
+
+/// How long to wait between two attempts at a busy queue. 10 ms, on the
+/// open path only.
+inline constexpr long xdp_bind_busy_pause_ns = 10'000'000;
+
 struct XdpConfig
 {
     std::string_view interface_name;
@@ -247,6 +268,12 @@ struct XdpConfig
     /// a pin path wants the pin used. False forces a fresh attach and pins
     /// the result, which is what an upgrade with a changed program wants.
     bool adopt{true};
+    /// How many times to retry a bind the kernel refused with EBUSY, which
+    /// is a queue the previous owner has not finished releasing. The default
+    /// waits the window out; see xdp_bind_busy_retries. Zero makes the one
+    /// attempt and reports the refusal, which is what a caller that would
+    /// rather fail fast - or a test that wants to see the EBUSY - asks for.
+    size_t bind_busy_retries{xdp_bind_busy_retries};
 };
 
 }  // namespace statusbar::net
@@ -434,6 +461,35 @@ struct AttachPlan
     return true;
 }
 
+/// Call `attempt` until it stops reporting EBUSY, pausing with `pause`
+/// between tries and giving up after `retries` of them. Hands back whatever
+/// the last attempt said.
+///
+/// `attempt` reports 0 or a negative errno, the way libxdp's
+/// xsk_socket__create() does. Only -EBUSY is retried: on a bind it is the
+/// one refusal that means "not yet, the queue is still going away", and
+/// retrying any other errno would turn a real fault - a wrong interface, a
+/// driver without zero-copy - into a half-second stall and then the same
+/// failure. `retries` of 0 makes the single attempt.
+///
+/// The pause is a parameter rather than a call to nanosleep inside, so the
+/// policy can be tested against a counted attempt and a counted clock -
+/// with no socket, no privileges and no real waiting, which is the only way
+/// to check a window that a developer host will not reproduce on demand.
+/// @param retries How many further attempts a busy queue is given
+/// @param attempt What to call; returns 0 or a negative errno
+/// @param pause Called between two attempts
+template <typename Attempt, typename Pause>
+[[nodiscard]] constexpr auto retry_while_busy(size_t const retries, Attempt attempt, Pause pause) -> int
+{
+    int result = attempt();
+    for (size_t i = 0; i < retries && result == -EBUSY; ++i) {
+        pause();
+        result = attempt();
+    }
+    return result;
+}
+
 }  // namespace detail
 
 // ──────────────────────────────────────────────
@@ -577,6 +633,20 @@ namespace detail {
             break;
     }
     return 0;
+}
+
+/// Wait out one slice of the window in which a just-closed queue is still
+/// registered. On the open path, on the control thread - never on the
+/// real-time path.
+inline void pause_for_busy_bind() noexcept
+{
+    struct timespec remaining{};
+    remaining.tv_nsec = xdp_bind_busy_pause_ns;
+    // nanosleep() writes back what is left of the pause when a signal cuts
+    // it short, so this resumes the same 10 ms rather than starting it over
+    // and stretching the bound.
+    while (::nanosleep(&remaining, &remaining) != 0 && errno == EINTR) {
+    }
 }
 
 /// Whether the kernel bound this XSK socket zero-copy. Asked of the socket
@@ -1069,6 +1139,12 @@ class XdpContext
     /// fallback is not the mode that was asked for.
     [[nodiscard]] auto attach_mode() const noexcept -> XdpAttachMode { return bpf_.attach_mode(); }
 
+    /// How many times the bind had to be retried because the queue was still
+    /// registered to its previous owner. Normally 0; non-zero says this open
+    /// followed a close of the same queue closely enough to catch it being
+    /// released, which is what a restart does. Valid while open.
+    [[nodiscard]] auto bind_retries() const noexcept -> size_t { return bind_retries_; }
+
     /// The program in force, and its pins.
     [[nodiscard]] auto program() const noexcept -> XdpProgram const& { return program_; }
 
@@ -1195,6 +1271,7 @@ class XdpContext
         std::swap(budget_, other.budget_);
         std::swap(stats_, other.stats_);
         std::swap(program_, other.program_);
+        std::swap(bind_retries_, other.bind_retries_);
         std::swap(tx_pending_, other.tx_pending_);
         std::swap(zero_copy_, other.zero_copy_);
     }
@@ -1208,6 +1285,8 @@ class XdpContext
     detail::CycleBudget budget_;
     Stats stats_{};
     XdpProgram program_;
+    /// Pauses the bind needed before the queue was free; see bind_retries().
+    size_t bind_retries_{0};
     /// Frames are in the TX ring that the kernel has not been kicked for.
     /// Set by tx_commit(), cleared only by a kick the kernel accepted.
     bool tx_pending_{false};
@@ -1261,6 +1340,7 @@ class XdpContext
     [[nodiscard]] auto zero_copy() const noexcept -> bool { return false; }
     [[nodiscard]] auto bind_mode() const noexcept -> XdpBindMode { return XdpBindMode::copy; }
     [[nodiscard]] auto attach_mode() const noexcept -> XdpAttachMode { return XdpAttachMode::native; }
+    [[nodiscard]] auto bind_retries() const noexcept -> size_t { return 0; }
 
     [[nodiscard]] auto program() const noexcept -> XdpProgram const& { return program_; }
     [[nodiscard]] auto pinned() const noexcept -> bool { return false; }

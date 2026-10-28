@@ -72,6 +72,8 @@ auto XdpErrorCategory::message(int ev) const -> std::string
             return "Pin path is not under /sys/fs/bpf";
         case XdpError::pin_failed:
             return "Pinning the XDP program or one of its maps failed";
+        case XdpError::queue_busy:
+            return "Queue still busy after retrying the bind: another process is holding it";
         default:
             return "Unknown XDP error";
     }
@@ -714,15 +716,39 @@ auto XdpContext::open(XdpConfig const& config) -> Status
     xsk_cfg.bind_flags = detail::bind_flags(config.bind_mode);
 
     std::string const ifname_str(config.interface_name);
-    int const ret = xsk_socket__create(&xsk_, ifname_str.c_str(), config.queue_id, *umem_result, &rings_.rx, &rings_.tx, &xsk_cfg);
+    // A bind refused with EBUSY is a queue the last owner has not finished
+    // giving back, which is what a restart finds; it is retried rather than
+    // reported. The loop sits around the whole of xsk_socket__create()
+    // because that is where the bind is, and libxdp unwinds a failed bind
+    // completely - the RX and TX ring mappings go, the UMEM's refcount and
+    // its context list come back to where they were, the descriptor it
+    // borrowed from the UMEM is left open - so a second attempt starts from
+    // the same state as the first and `xsk_` is written only on success.
+    size_t pauses = 0;
+    int const ret = detail::retry_while_busy(
+        config.bind_busy_retries,
+        [&] {
+            return xsk_socket__create(&xsk_, ifname_str.c_str(), config.queue_id, *umem_result, &rings_.rx, &rings_.tx, &xsk_cfg);
+        },
+        [&pauses] {
+            ++pauses;
+            detail::pause_for_busy_bind();
+        });
     if (ret != 0) {
         bool const refused_zero_copy = config.bind_mode == XdpBindMode::zero_copy && (-ret == EOPNOTSUPP || -ret == EINVAL);
         close();
         // Told apart from every other reason the socket would not open: a
         // driver without zero-copy is a fact about the hardware, and the
-        // caller may well want to open again in copy mode.
+        // caller may well want to open again in copy mode. A queue that is
+        // still busy once the retries are spent is told apart too - that
+        // one sends an operator looking for the process holding it, which
+        // "XSK socket creation failed" would not.
+        if (-ret == EBUSY) {
+            return failure(XdpError::queue_busy);
+        }
         return failure(refused_zero_copy ? XdpError::zero_copy_unavailable : XdpError::xsk_creation_failed);
     }
+    bind_retries_ = pauses;
     zero_copy_ = detail::socket_has_zero_copy(xsk_socket__fd(xsk_));
 
     // Step 5: Attach BPF + register socket. An adopted program is already
@@ -787,6 +813,7 @@ void XdpContext::close() noexcept
 
     zero_copy_ = false;
     tx_pending_ = false;
+    bind_retries_ = 0;
     interface_ = {};
     rings_ = {};
     budget_ = {};
