@@ -164,7 +164,9 @@ struct XdpConfig
     /// fill_replenish() keeps up to this many free frames in the fill ring for RX.
     size_t fill_ring_size{512};
     size_t completion_ring_size{512};
-    size_t umem_frame_size{2048};
+    /// A received frame must fit one NIC buffer: the frame size less the XDP headroom,
+    /// rounded down to the driver's buffer granularity (igb: 1 KiB). 4096 leaves 3 KiB.
+    size_t umem_frame_size{4096};
     /// tx_start() draws from what the fill ring leaves: umem_frame_count -
     /// fill_ring_size after open() (none if not larger), less frames held in RX.
     size_t umem_frame_count{1024};

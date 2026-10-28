@@ -21,6 +21,8 @@
 #    include <system_error>
 #    include <vector>
 
+#    include <linux/bpf.h>
+
 using namespace statusbar;
 using namespace statusbar::net;
 
@@ -104,7 +106,7 @@ TEST(xdp_config, default_values)
     EXPECT_EQ(config.tx_ring_size, 256u);
     EXPECT_EQ(config.fill_ring_size, 512u);
     EXPECT_EQ(config.completion_ring_size, 512u);
-    EXPECT_EQ(config.umem_frame_size, 2048u);
+    EXPECT_EQ(config.umem_frame_size, 4096u);
     EXPECT_EQ(config.umem_frame_count, 1024u);
     EXPECT_EQ(config.umem_headroom, 0u);
     EXPECT_EQ(config.tap_ifindex, 0u);
@@ -115,6 +117,17 @@ TEST(xdp_config, default_values)
     EXPECT_TRUE(config.adopt);
     EXPECT_FALSE(config.detach_on_close.has_value());
     EXPECT_TRUE(config.need_wakeup);
+}
+
+TEST(xdp_config, a_default_umem_frame_holds_a_whole_frame_in_kib_buffers)
+{
+    // igb sizes RX buffers in 1 KiB steps below the frame less XDP_PACKET_HEADROOM;
+    // a 1522-octet frame (1500 MTU, VLAN tag, FCS) must fit one buffer.
+    constexpr size_t LARGEST_FRAME = 1522;
+    XdpConfig const config{.interface_name = "eth0"};
+    size_t const buffer = config.umem_frame_size - config.umem_headroom - XDP_PACKET_HEADROOM;
+    EXPECT_TRUE((buffer / 1024 * 1024) >= LARGEST_FRAME);
+    EXPECT_TRUE(config.umem_frame_size <= 4096u);
 }
 
 TEST(xdp_config, bind_flags_follow_the_attach_mode)

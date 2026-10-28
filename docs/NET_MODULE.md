@@ -102,6 +102,7 @@ int main() {
 - `set_dscp` writes IPv4 TOS or IPv6 traffic-class based on `family`; `is_valid_dscp` accepts `-1` (unset) or `0..63`.
 - `RawnetContext` needs `CAP_NET_RAW` on Linux; root or BPF device access on macOS. AF_XDP needs kernel ≥ 5.4, libbpf, libxdp, and an XDP-capable driver — otherwise `XdpContext` compiles as a stub.
 - An AF_XDP socket binds one RX queue, and RSS spreads received IP flows (multicast UDP included) over all of them: steer every bucket to the socket's queue with `set_rss_indirection_all` (needs `CAP_NET_ADMIN`; NICs without RSS, such as `lo` and `veth`, report `operation_not_supported`). Non-IP frames such as AVTP are not hashed and land on queue 0 on most NICs (igb, igc).
+- A zero-copy driver sizes each RX buffer from the UMEM frame less `XDP_PACKET_HEADROOM` (256 octets), rounded down to its granularity; igb programs SRRCTL.BSIZEPACKET in 1 KiB steps, so 2048-octet frames give 1 KiB buffers and a longer frame reaches XDP cut to its first buffer. `XdpConfig::umem_frame_size` defaults to 4096 (3 KiB buffers); the UMEM is `umem_frame_count` × that, locked (`CAP_IPC_LOCK` or `RLIMIT_MEMLOCK`).
 - `SocketAddress::from_string` takes host *and* port plus a socket type (`SocketStream` / `SocketDatagram`) — the type drives `getaddrinfo` hints.
 - `NetError::would_block` is the expected end-of-drain on nonblocking `recv` / `send` — treat as success, not failure.
 
