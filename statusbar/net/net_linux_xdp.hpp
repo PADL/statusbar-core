@@ -251,6 +251,12 @@ struct XdpAttachedProgram
 /// 50 pauses of 10 ms is up to 500 ms in all - comfortably longer than an
 /// RCU grace period, and short enough that a queue some other live process
 /// is holding still fails fast enough to report.
+/// UMEM frames kept out of the fill ring so transmit has somewhere to write.
+/// A quarter of the default 1024-frame UMEM; see detail::fillable_frames for
+/// why a reserve is needed at all, and detail::effective_tx_reserve for what
+/// happens to this number when the UMEM is smaller.
+inline constexpr size_t xdp_default_tx_frame_reserve = 256;
+
 inline constexpr size_t xdp_bind_busy_retries = 50;
 
 /// How long to wait between two attempts at a busy queue. 10 ms, on the
@@ -299,6 +305,12 @@ struct XdpConfig
     /// attempt and reports the refusal, which is what a caller that would
     /// rather fail fast - or a test that wants to see the EBUSY - asks for.
     size_t bind_busy_retries{xdp_bind_busy_retries};
+    /// How many UMEM frames to keep out of the fill ring for transmit. RX and
+    /// TX share one free list, so without a reserve the fill ring can take
+    /// every frame and leave tx_start() nothing. Capped at half the UMEM.
+    /// Zero gives the old behaviour: receive may take everything, and a
+    /// receive-only context loses nothing by it.
+    size_t tx_frame_reserve{xdp_default_tx_frame_reserve};
 };
 
 }  // namespace statusbar::net
@@ -553,6 +565,43 @@ template <typename Attempt, typename Pause>
 [[nodiscard]] constexpr auto fill_reserve_count(size_t const available, uint32_t const ring_free) noexcept -> uint32_t
 {
     return available < ring_free ? static_cast<uint32_t>(available) : ring_free;
+}
+
+/// Free UMEM frames the fill ring may have, keeping `tx_reserve` of them back
+/// for transmit.
+///
+/// RX and TX share one UMEM and one free list. fill_replenish() would
+/// otherwise hand the fill ring every free frame it could, which it can
+/// whenever the UMEM is no larger than the fill ring - and then tx_start()
+/// finds the free list empty and the context can receive but never send.
+/// With the shipped defaults the fill ring is the smaller of the two and the
+/// leftover happens to be enough, so the fault is invisible until someone
+/// configures a UMEM that fits inside the fill ring. The reserve makes it a
+/// decision rather than an accident of ring sizing.
+///
+/// @param available Free UMEM frames
+/// @param tx_reserve Frames to keep out of the fill ring for transmit
+/// @return What is left for the fill ring, which may be none
+[[nodiscard]] constexpr auto fillable_frames(size_t const available, size_t const tx_reserve) noexcept -> size_t
+{
+    return available > tx_reserve ? available - tx_reserve : 0;
+}
+
+/// The transmit reserve actually applied, which is never more than half the
+/// UMEM however large a reserve was configured.
+///
+/// Without the cap a reserve bigger than the pool would starve receive in
+/// exactly the way the reserve exists to stop happening to transmit, and the
+/// shipped default - sized for the default 1024-frame UMEM - would do it to
+/// anyone who asked for a smaller one.
+///
+/// @param requested XdpConfig::tx_frame_reserve
+/// @param frame_count XdpConfig::umem_frame_count
+/// @return The reserve to apply
+[[nodiscard]] constexpr auto effective_tx_reserve(size_t const requested, size_t const frame_count) noexcept -> size_t
+{
+    size_t const cap = frame_count / 2;
+    return requested < cap ? requested : cap;
 }
 
 }  // namespace detail
@@ -1298,6 +1347,10 @@ class XdpContext
     /// released, which is what a restart does. Valid while open.
     [[nodiscard]] auto bind_retries() const noexcept -> size_t { return bind_retries_; }
 
+    /// UMEM frames held back from the fill ring for transmit, after the
+    /// half-the-UMEM cap. Zero before open().
+    [[nodiscard]] auto tx_frame_reserve() const noexcept -> size_t { return tx_frame_reserve_; }
+
     /// The program in force, and its pins.
     [[nodiscard]] auto program() const noexcept -> XdpProgram const& { return program_; }
 
@@ -1425,6 +1478,7 @@ class XdpContext
         std::swap(stats_, other.stats_);
         std::swap(program_, other.program_);
         std::swap(bind_retries_, other.bind_retries_);
+        std::swap(tx_frame_reserve_, other.tx_frame_reserve_);
         std::swap(tx_pending_, other.tx_pending_);
         std::swap(zero_copy_, other.zero_copy_);
     }
@@ -1440,6 +1494,9 @@ class XdpContext
     XdpProgram program_;
     /// Pauses the bind needed before the queue was free; see bind_retries().
     size_t bind_retries_{0};
+    /// detail::effective_tx_reserve() of the configured reserve, settled at
+    /// open() so fill_replenish() does not recompute it per cycle.
+    size_t tx_frame_reserve_{0};
     /// Frames are in the TX ring that the kernel has not been kicked for.
     /// Set by tx_commit(), cleared only by a kick the kernel accepted.
     bool tx_pending_{false};

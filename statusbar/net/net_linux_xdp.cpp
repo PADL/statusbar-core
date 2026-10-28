@@ -951,6 +951,7 @@ auto XdpContext::open(XdpConfig const& config) -> Status
     budget_.rx_drain_max = config.rx_drain_max;
     budget_.completion_drain_max = config.completion_drain_max;
     budget_.rx_clock_id = config.rx_clock_id;
+    tx_frame_reserve_ = detail::effective_tx_reserve(config.tx_frame_reserve, config.umem_frame_count);
 
     auto fill_status = fill_replenish();
     if (!fill_status) {
@@ -974,6 +975,7 @@ void XdpContext::close() noexcept
     zero_copy_ = false;
     tx_pending_ = false;
     bind_retries_ = 0;
+    tx_frame_reserve_ = 0;
     interface_ = {};
     rings_ = {};
     budget_ = {};
@@ -1055,7 +1057,10 @@ auto XdpContext::rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
 
 auto XdpContext::fill_replenish() -> Status
 {
-    auto available = umem_.available_frames();
+    // What receive may have: everything free except the transmit reserve.
+    // Without this the fill ring takes the lot and tx_start() never gets a
+    // frame again - see detail::fillable_frames.
+    auto const available = detail::fillable_frames(umem_.available_frames(), tx_frame_reserve_);
     if (available == 0) {
         return success();
     }

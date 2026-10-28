@@ -433,6 +433,74 @@ TEST(xdp_fill_reserve, is_constexpr)
 }
 
 //
+// Transmit reserve: RX and TX share one UMEM free list, and the fill ring
+// will take every frame in it unless something holds some back.
+//
+
+TEST(xdp_tx_reserve, the_reserve_is_what_the_fill_ring_does_not_get)
+{
+    EXPECT_EQ(detail::fillable_frames(1024, 256), size_t{768});
+    EXPECT_EQ(detail::fillable_frames(64, 32), size_t{32});
+    // No reserve is the old behaviour, and is right for a receive-only
+    // context: receive may have the lot.
+    EXPECT_EQ(detail::fillable_frames(64, 0), size_t{64});
+}
+
+TEST(xdp_tx_reserve, a_reserve_as_big_as_what_is_free_leaves_the_ring_nothing)
+{
+    // Not an error: the frames are out with transmit, and the next cycle
+    // fills whatever completion has handed back.
+    EXPECT_EQ(detail::fillable_frames(32, 32), size_t{0});
+    EXPECT_EQ(detail::fillable_frames(10, 32), size_t{0});
+    EXPECT_EQ(detail::fillable_frames(0, 32), size_t{0});
+}
+
+TEST(xdp_tx_reserve, the_reserve_is_capped_at_half_the_umem)
+{
+    // The shipped default against the shipped UMEM: taken as asked.
+    EXPECT_EQ(detail::effective_tx_reserve(xdp_default_tx_frame_reserve, 1024), size_t{256});
+    // ...and against a UMEM smaller than the default reserve, capped - which
+    // is the case that would otherwise starve receive instead of transmit.
+    EXPECT_EQ(detail::effective_tx_reserve(xdp_default_tx_frame_reserve, 64), size_t{32});
+    EXPECT_EQ(detail::effective_tx_reserve(xdp_default_tx_frame_reserve, 8), size_t{4});
+    EXPECT_EQ(detail::effective_tx_reserve(1024, 1024), size_t{512});
+    EXPECT_EQ(detail::effective_tx_reserve(0, 1024), size_t{0});
+}
+
+TEST(xdp_tx_reserve, neither_side_is_starved_at_any_umem_size)
+{
+    // The bug this reserve exists for: with a 64-frame UMEM and a 512-entry
+    // fill ring, the first fill_replenish() took all 64 frames and tx_start()
+    // never saw another one. Checked across sizes rather than at the one that
+    // happened to fail.
+    for (size_t frames = 2; frames <= 4096; frames *= 2) {
+        auto const reserve = detail::effective_tx_reserve(xdp_default_tx_frame_reserve, frames);
+        auto const fillable = detail::fillable_frames(frames, reserve);
+        EXPECT_TRUE(reserve > 0);   // transmit can always get a frame
+        EXPECT_TRUE(fillable > 0);  // and receive is never shut out for it
+        EXPECT_TRUE(reserve + fillable == frames);
+    }
+}
+
+TEST(xdp_tx_reserve, is_constexpr)
+{
+    static_assert(detail::fillable_frames(64, 32) == 32);
+    static_assert(detail::fillable_frames(32, 64) == 0);
+    static_assert(detail::effective_tx_reserve(256, 64) == 32);
+    static_assert(detail::effective_tx_reserve(256, 1024) == 256);
+    // The default config, resolved at compile time: a context opened with it
+    // can both send and receive.
+    static_assert(detail::effective_tx_reserve(xdp_default_tx_frame_reserve, 1024) > 0);
+    static_assert(detail::fillable_frames(1024, detail::effective_tx_reserve(xdp_default_tx_frame_reserve, 1024)) > 0);
+}
+
+TEST(xdp_tx_reserve, a_fresh_context_reserves_nothing_until_it_is_open)
+{
+    XdpContext ctx;
+    EXPECT_EQ(ctx.tx_frame_reserve(), size_t{0});
+}
+
+//
 // ScopeGuard tests
 //
 
