@@ -124,10 +124,28 @@ class XdpErrorCategory : public std::error_category
 // Configuration types
 // ──────────────────────────────────────────────
 
+/// What the BPF program does with a frame.
 enum class XdpAction : uint8_t
 {
+    /// To the AF_XDP socket, for this process to read.
     redirect_xsk,
+    /// Up the ordinary kernel stack, as though no filter were there.
     pass_kernel,
+    /// Out of the interface registered in the devmap - XdpConfig::tap_ifindex,
+    /// in practice a net::TapBridge.
+    ///
+    /// It **diverts, it does not mirror.** A frame sent to the tap does not
+    /// also reach the AF_XDP socket, and a rule carrying both flag::process
+    /// and flag::forward_tap goes to the tap only: the BPF program checks
+    /// forward_tap first, so process is silently the loser. The use this
+    /// serves is getting traffic that is not ours off the real-time path and
+    /// into something that can take its time with it, not watching traffic
+    /// that is ours.
+    ///
+    /// A redirect into a devmap whose device is down, gone or busier than the
+    /// source drops the frame without saying so. For a diversion of
+    /// non-real-time traffic that is a reasonable bargain; anything that
+    /// needs to know a frame was delivered must not use this.
     redirect_tap,
 };
 
@@ -252,6 +270,11 @@ struct XdpConfig
     size_t umem_frame_size{2048};
     size_t umem_frame_count{1024};
     size_t umem_headroom{0};
+    /// Interface the devmap points at, for rules whose action is
+    /// XdpAction::redirect_tap. Zero - the default - registers nothing, and
+    /// then a forward_tap rule has nowhere to send a frame. Registering it
+    /// needs the same privilege as loading the program. See
+    /// XdpAction::redirect_tap for what reaching it does and does not mean.
     unsigned int tap_ifindex{0};
     size_t rx_drain_max{32};
     size_t completion_drain_max{64};
@@ -1107,7 +1130,13 @@ class BpfState
     /// @param pin_path The pin directory to create and fill
     [[nodiscard]] auto pin(std::string_view pin_path) -> Status;
 
-    /// Register TAP interface in devmap
+    /// Point the devmap's single entry at an interface, so a frame matching
+    /// a forward_tap rule is redirected out of it by the BPF program.
+    ///
+    /// Internal on purpose. The devmap holds one entry at key 0 and
+    /// XdpConfig::tap_ifindex is how a caller fills it; a public entry point
+    /// would invite a second owner for a map the program reads on every
+    /// frame.
     /// @param tap_ifindex Interface index of the TAP device
     [[nodiscard]] auto register_tap(unsigned int tap_ifindex) -> Status
     {

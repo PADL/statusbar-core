@@ -49,12 +49,23 @@ struct
     __type(value, __u32);
 } devmap SEC(".maps");
 
+// The three action bits are mutually exclusive and this is the order that
+// makes them so: drop, then tap, then process. A rule carrying more than
+// one gets the first of them and nothing else - in particular
+// PROCESS|FORWARD_TAP is a diversion to the tap, not a copy to both. XDP
+// gives one verdict per frame, so mirroring would mean cloning the frame
+// (bpf_clone_redirect, or a second program), which this does not do.
 static __always_inline int verdict_for(struct xdp_md* ctx, __u64 flags)
 {
     if (flags & TCAM_FLAG_DROP) {
         return XDP_DROP;
     }
     if (flags & TCAM_FLAG_FORWARD_TAP) {
+        // The third argument is what a *failed lookup* returns, so with no
+        // tap registered the frame goes up the stack rather than vanishing.
+        // A lookup that succeeds commits the frame: if the device then
+        // cannot transmit it, it is dropped at flush time and nothing here
+        // hears about it.
         return bpf_redirect_map(&devmap, 0, XDP_PASS);
     }
     if (flags & TCAM_FLAG_PROCESS) {

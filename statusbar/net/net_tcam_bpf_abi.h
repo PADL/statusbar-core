@@ -75,7 +75,12 @@ struct tcam_rule
 /* Action bits inspected by the BPF program. Must stay aligned with
  * statusbar::net::flag::process/forward_tap/drop — kept as macros
  * because an enum can't portably hold the 1ULL suffix needed for
- * 64-bit bit-flag arithmetic in C. */
+ * 64-bit bit-flag arithmetic in C.
+ *
+ * Mutually exclusive, and evaluated in the order DROP, FORWARD_TAP,
+ * PROCESS: a rule carrying several gets the first one only. So
+ * PROCESS|FORWARD_TAP diverts to the tap and the AF_XDP socket never
+ * sees the frame — see verdict_for() in xdp_filter.bpf.c. */
 
 /* NOLINTBEGIN(cppcoreguidelines-macro-usage) */
 #define TCAM_FLAG_PROCESS (1ULL << 0)
