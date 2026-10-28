@@ -15,15 +15,19 @@
 
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <expected>
 #include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 
 using namespace statusbar;
 using namespace statusbar::net;
@@ -266,6 +270,299 @@ TEST(net_addr, from_string_invalid_returns_getaddrinfo_failed)
     EXPECT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), make_error_code(NetError::getaddrinfo_failed));
 }
+
+//
+// AF_LOCAL (AF_UNIX) SocketAddress Tests
+//
+
+namespace {
+
+constexpr size_t sun_path_size = sizeof(sockaddr_un::sun_path);
+constexpr size_t sun_path_offset = offsetof(sockaddr_un, sun_path);
+
+#ifdef __linux__
+/// A socket path under /tmp, tagged per test and per process so two runs
+/// can overlap. Deliberately short: sun_path is the tightest buffer in the
+/// sockets API, and these are real files in a real directory.
+auto local_test_path(std::string_view tag) -> std::string
+{
+    std::string path{"/tmp/sb_addr_"};
+    path += tag;
+    path += '_';
+    path += std::to_string(::getpid());
+    path += ".sock";
+    return path;
+}
+
+/// Owns a test socket path: clears a leftover on the way in and removes
+/// the socket on the way out. A failed EXPECT_* leaves the test by return
+/// or by exception depending on the build, so an unlink written at the
+/// bottom of a test runs only while the test passes -- which is exactly
+/// when it is not needed.
+class LocalSocketPath
+{
+  public:
+    explicit LocalSocketPath(std::string_view tag)
+        : path_{local_test_path(tag)}
+    {
+        ::unlink(path_.c_str());
+    }
+    ~LocalSocketPath() { ::unlink(path_.c_str()); }
+    LocalSocketPath(LocalSocketPath const&) = delete;
+    LocalSocketPath(LocalSocketPath&&) = delete;
+    auto operator=(LocalSocketPath const&) -> LocalSocketPath& = delete;
+    auto operator=(LocalSocketPath&&) -> LocalSocketPath& = delete;
+
+    [[nodiscard]] auto get() const noexcept -> std::string const& { return path_; }
+
+  private:
+    std::string path_;
+};
+#endif  // __linux__
+
+}  // namespace
+
+TEST(net_addr_local, a_path_round_trips_with_its_terminator_counted)
+{
+    std::string_view const want{"/tmp/statusbar_addr_round_trip.sock"};
+    auto addr = SocketAddress::local(want);
+    EXPECT_TRUE(addr.has_value());
+    if (addr) {
+        EXPECT_TRUE(addr->valid());
+        EXPECT_EQ(addr->family(), AF_UNIX);
+        EXPECT_EQ(addr->path(), want);
+        // The same length getsockname() reports for this address: the
+        // offset of sun_path, the path, and its NUL.
+        EXPECT_EQ(addr->length(), static_cast<socklen_t>(sun_path_offset + want.size() + 1));
+        // A local address has no port, and asking does not read garbage
+        // out of sun_path.
+        EXPECT_EQ(addr->port(), 0);
+    }
+}
+
+TEST(net_addr_local, the_longest_path_that_fits_round_trips)
+{
+    // One byte short of the field, leaving room for the NUL. Asserted
+    // against sizeof rather than 107: sun_path is 108 bytes on Linux and
+    // 104 on macOS, and the limit belongs to the platform.
+    std::string const longest = "/" + std::string(sun_path_size - 2, 'a');
+    auto addr = SocketAddress::local(longest);
+    EXPECT_TRUE(addr.has_value());
+    if (addr) {
+        EXPECT_EQ(addr->path(), longest);
+        EXPECT_EQ(addr->path().size(), sun_path_size - 1);
+        EXPECT_EQ(addr->length(), static_cast<socklen_t>(sizeof(sockaddr_un)));
+    }
+}
+
+TEST(net_addr_local, one_byte_past_sun_path_is_refused)
+{
+    std::string const too_long = "/" + std::string(sun_path_size - 1, 'a');
+    auto addr = SocketAddress::local(too_long);
+    EXPECT_FALSE(addr.has_value());
+    EXPECT_EQ(addr.error(), make_error_code(NetError::invalid_address));
+}
+
+TEST(net_addr_local, an_empty_path_is_refused)
+{
+    auto addr = SocketAddress::local("");
+    EXPECT_FALSE(addr.has_value());
+    EXPECT_EQ(addr.error(), make_error_code(NetError::invalid_address));
+}
+
+TEST(net_addr_local, a_relative_path_is_refused)
+{
+    // It would bind, and then resolve against whatever the current
+    // directory is when the owner unlinks it.
+    auto addr = SocketAddress::local("statusbar.sock");
+    EXPECT_FALSE(addr.has_value());
+    EXPECT_EQ(addr.error(), make_error_code(NetError::invalid_address));
+}
+
+TEST(net_addr_local, a_path_with_an_embedded_nul_is_refused)
+{
+    // Truncated at the NUL it would name /tmp/a, not what the caller
+    // asked for -- and a caller only gets here by mishandling a buffer.
+    std::string_view const smuggled{"/tmp/a\0b.sock", 13};
+    auto addr = SocketAddress::local(smuggled);
+    EXPECT_FALSE(addr.has_value());
+    EXPECT_EQ(addr.error(), make_error_code(NetError::invalid_address));
+}
+
+TEST(net_addr_local, path_is_empty_for_every_other_family)
+{
+    EXPECT_TRUE(SocketAddress{}.path().empty());
+    EXPECT_TRUE(SocketAddress::ipv4_loopback(8080).path().empty());
+    EXPECT_TRUE(SocketAddress::ipv6_loopback(8080).path().empty());
+}
+
+TEST(net_addr_local, the_path_view_belongs_to_the_object_it_came_from)
+{
+    auto original = SocketAddress::local("/tmp/statusbar_addr_copy.sock");
+    EXPECT_TRUE(original.has_value());
+    if (original) {
+        SocketAddress const copy = *original;
+        EXPECT_EQ(copy.path(), original->path());
+        // Each address views its own storage, so a copy outliving the
+        // original is not a dangling path.
+        EXPECT_TRUE(copy.path().data() != original->path().data());
+    }
+}
+
+TEST(net_addr_local, path_stops_at_the_end_of_sun_path)
+{
+    // Nothing hands this back today: the kernel NUL-terminates the address
+    // it reports and never claims more of sun_path than it wrote. path()
+    // still clamps to the field and bounds its scan, so a length nobody
+    // wrote cannot walk it off the end of the address.
+    SocketAddress crafted;
+    crafted.reset_length();
+    std::memset(crafted.sockaddr(), 'x', sizeof(sockaddr_storage));
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    reinterpret_cast<sockaddr_un*>(crafted.sockaddr())->sun_family = AF_UNIX;
+    crafted.set_length(static_cast<socklen_t>(sizeof(sockaddr_storage)));
+
+    EXPECT_EQ(crafted.path().size(), sun_path_size);
+}
+
+TEST(net_addr_local, to_string_is_the_path_itself)
+{
+    auto addr = SocketAddress::local("/tmp/statusbar_addr_to_string.sock");
+    EXPECT_TRUE(addr.has_value());
+    if (addr) {
+        EXPECT_EQ(addr->to_string(), "/tmp/statusbar_addr_to_string.sock");
+    }
+}
+
+#ifdef __linux__
+
+TEST(net_addr_local, an_autobound_abstract_name_renders_with_an_at_sign)
+{
+    // local() will not make an abstract name, so the only source of one is
+    // the kernel: binding with nothing but the family asks Linux to
+    // autobind, which produces an abstract name of five hex digits after a
+    // leading NUL. Rendering what we are handed is still our job.
+    int const fd = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+    EXPECT_TRUE(fd >= 0);
+    if (fd < 0) {
+        return;
+    }
+    sockaddr_un family_only{};
+    family_only.sun_family = AF_UNIX;
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    auto const* as_sockaddr = reinterpret_cast<struct sockaddr const*>(&family_only);
+    EXPECT_EQ(::bind(fd, as_sockaddr, static_cast<socklen_t>(sizeof(sa_family_t))), 0);
+
+    SocketAddress bound;
+    bound.reset_length();
+    EXPECT_EQ(::getsockname(fd, bound.sockaddr(), bound.length_ptr()), 0);
+    ::close(fd);
+
+    EXPECT_TRUE(bound.valid());
+    EXPECT_EQ(bound.family(), AF_UNIX);
+    // Abstract: no filesystem path to report.
+    EXPECT_TRUE(bound.path().empty());
+    auto const rendered = bound.to_string();
+    EXPECT_EQ(rendered.size(), 6U);
+    EXPECT_EQ(rendered.front(), '@');
+}
+
+TEST(net_addr_local, an_accepted_unnamed_peer_is_valid_and_pathless)
+{
+    LocalSocketPath const path{"accept"};
+    auto listen_addr = SocketAddress::local(path.get());
+    EXPECT_TRUE(listen_addr.has_value());
+    if (!listen_addr) {
+        return;
+    }
+
+    auto listener = create_tcp_listener(*listen_addr, 1);
+    EXPECT_TRUE(listener.has_value());
+    if (listener) {
+        // A client that never binds has no address of its own, and accept()
+        // reports exactly that: AF_UNIX with nothing after the family. It is
+        // a valid address -- a caller reading an empty path as failure would
+        // reject a legitimate connection.
+        auto client = create_tcp_socket(*listen_addr, false);
+        EXPECT_TRUE(client.has_value());
+        if (client) {
+            EXPECT_EQ(::connect(client->get(), listen_addr->sockaddr(), listen_addr->length()), 0);
+
+            SocketAddress peer;
+            peer.reset_length();
+            int const accepted = ::accept(listener->get(), peer.sockaddr(), peer.length_ptr());
+            EXPECT_TRUE(accepted >= 0);
+            if (accepted >= 0) {
+                ::close(accepted);
+            }
+            EXPECT_TRUE(peer.valid());
+            EXPECT_EQ(peer.family(), AF_UNIX);
+            EXPECT_TRUE(peer.path().empty());
+            EXPECT_EQ(peer.to_string(), "<unnamed>");
+        }
+    }
+}
+
+TEST(net_addr_local, a_datagram_exchange_names_the_sender_by_its_path)
+{
+    // The shape the linuxptp management socket wants: bind a path of our
+    // own, send to theirs, and read the sender's path back off the reply
+    // address. Everything here goes through the public API.
+    LocalSocketPath const server_path{"srv"};
+    LocalSocketPath const client_path{"cli"};
+
+    auto server_addr = SocketAddress::local(server_path.get());
+    auto client_addr = SocketAddress::local(client_path.get());
+    EXPECT_TRUE(server_addr.has_value());
+    EXPECT_TRUE(client_addr.has_value());
+    if (server_addr && client_addr) {
+        auto server = create_udp_socket(*server_addr, true);
+        auto client = create_udp_socket(*client_addr, true);
+        EXPECT_TRUE(server.has_value());
+        EXPECT_TRUE(client.has_value());
+        if (server && client) {
+            std::string_view const question{"GET_TIME_STATUS_NP"};
+            auto const sent =
+                ::sendto(client->get(), question.data(), question.size(), 0, server_addr->sockaddr(), server_addr->length());
+            EXPECT_EQ(sent, static_cast<ssize_t>(question.size()));
+
+            std::array<char, 64> buf{};
+            SocketAddress from;
+            from.reset_length();
+            auto const received = ::recvfrom(server->get(), buf.data(), buf.size(), 0, from.sockaddr(), from.length_ptr());
+            EXPECT_EQ(received, static_cast<ssize_t>(question.size()));
+            EXPECT_EQ(from.family(), AF_UNIX);
+            EXPECT_EQ(from.path(), client_path.get());
+            // The length the kernel reports for the address we built is the
+            // length we built: this is why local() counts the NUL.
+            EXPECT_EQ(from.length(), client_addr->length());
+
+            std::string_view const answer{"OK"};
+            auto const replied = ::sendto(server->get(), answer.data(), answer.size(), 0, from.sockaddr(), from.length());
+            EXPECT_EQ(replied, static_cast<ssize_t>(answer.size()));
+
+            std::array<char, 64> reply{};
+            auto const back = ::recv(client->get(), reply.data(), reply.size(), 0);
+            EXPECT_EQ(back, static_cast<ssize_t>(answer.size()));
+            EXPECT_EQ(std::string_view(reply.data(), answer.size()), answer);
+        }
+    }
+}
+
+TEST(net_addr_local, a_dscp_request_is_skipped_rather_than_failing_a_local_socket)
+{
+    LocalSocketPath const path{"dscp"};
+    auto addr = SocketAddress::local(path.get());
+    EXPECT_TRUE(addr.has_value());
+    if (addr) {
+        // DSCP is an IP header field. Setting it on a unix socket fails,
+        // and failing it here would take the whole open down.
+        auto sock = create_udp_socket(*addr, true, 46);
+        EXPECT_TRUE(sock.has_value());
+    }
+}
+
+#endif  // __linux__
 
 TEST(net_util, split_host_port_ipv4)
 {

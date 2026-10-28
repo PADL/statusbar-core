@@ -7,14 +7,39 @@
 
 #include <netdb.h>
 
+#include <algorithm>
 #include <array>
+#include <cstddef>
+#include <cstring>
 #include <string>
+#include <string_view>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 
 namespace statusbar::net {
+
+namespace {
+
+/// Where sun_path begins in a sockaddr_un. Everything about an AF_UNIX
+/// address is this offset plus a length the kernel reports; sun_path
+/// itself is not a C string and need not be NUL-terminated.
+constexpr size_t sun_path_offset = offsetof(sockaddr_un, sun_path);
+
+/// Bytes of sun_path an address of this length carries, clamped to the
+/// field so a length the kernel never wrote cannot widen the view.
+auto sun_path_extent(sockaddr_un const& sun, socklen_t length) noexcept -> size_t
+{
+    auto const total = static_cast<size_t>(length);
+    if (total <= sun_path_offset) {
+        return 0;
+    }
+    return std::min(total - sun_path_offset, sizeof(sun.sun_path));
+}
+
+}  // namespace
 
 auto SocketAddress::ipv6(std::span<uint8_t const, 16> addr, uint16_t port, uint32_t scope_id) noexcept -> SocketAddress
 {
@@ -27,6 +52,51 @@ auto SocketAddress::ipv6(std::span<uint8_t const, 16> addr, uint16_t port, uint3
     span_copy(make_span(sin6->sin6_addr), addr);
     result.length_ = sizeof(sockaddr_in6);
     return result;
+}
+
+auto SocketAddress::local(std::string_view path) noexcept -> StatusValue<SocketAddress>
+{
+    SocketAddress result;
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    auto* sun = reinterpret_cast<sockaddr_un*>(&result.storage_);
+
+    // Absolute only. A relative path is resolved against the current
+    // directory at every syscall, so the owner's later unlink() can remove
+    // a different file than the one it bound. '/' is also what tells a
+    // path apart from an abstract name at a glance in a log.
+    //
+    // `>=` on the size, not `>`: the terminator has to fit too. sun_path is
+    // 108 bytes on Linux and 104 on macOS, so the limit is a platform fact
+    // and the test asserts against sizeof, not against 107.
+    if (path.empty() || path.front() != '/' || path.size() >= sizeof(sun->sun_path) || path.find('\0') != std::string_view::npos) {
+        return failure(NetError::invalid_address);
+    }
+
+    sun->sun_family = AF_UNIX;
+    span_copy(make_span(sun->sun_path).first(path.size()), make_const_span(path));
+    sun->sun_path[path.size()] = '\0';
+    // Count the NUL in the length. The kernel accepts either, but a length
+    // that includes it is what getsockname() hands back for the same
+    // address, so a round trip compares equal.
+    result.length_ = static_cast<socklen_t>(sun_path_offset + path.size() + 1);
+    return success(result);
+}
+
+auto SocketAddress::path() const noexcept -> std::string_view
+{
+    if (storage_.ss_family != AF_UNIX) {
+        return {};
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    auto const& sun = *reinterpret_cast<sockaddr_un const*>(&storage_);
+    size_t const extent = sun_path_extent(sun, length_);
+    if (extent == 0) {
+        return {};
+    }
+    // strnlen, not strlen: a path that fills sun_path exactly has no
+    // terminator to find. An abstract name starts with the NUL and so
+    // reads as empty here, which is what the header promises.
+    return {sun.sun_path, ::strnlen(sun.sun_path, extent)};
 }
 
 auto SocketAddress::from_string(std::string_view host, std::string_view port, int socket_type) -> StatusValue<SocketAddress>
@@ -88,10 +158,43 @@ auto SocketAddress::from_string(std::string_view host, std::string_view port, in
     return success(addr);
 }
 
+namespace {
+
+/// Render an AF_UNIX address that path() found no path in: a Linux abstract
+/// or autobind name as "@name" (as ss(8) prints it), or "<unnamed>" for a
+/// socket that never bound. An unnamed peer gets a word rather than an
+/// empty string, so a log line about it does not look truncated — and so
+/// it cannot be mistaken for a nameless failure.
+auto local_nameless_to_string(sockaddr_un const& sun, socklen_t length) -> std::string
+{
+    // extent 0 is family-only, what accept() reports for a peer that never
+    // bound; extent 1 is a lone NUL, bound to nothing a name is made of.
+    size_t const extent = sun_path_extent(sun, length);
+    if (extent <= 1) {
+        return "<unnamed>";
+    }
+    // An abstract name is a byte string, not a C string: it may hold NULs
+    // and has no terminator, so the whole extent past the leading NUL is
+    // the name.
+    std::string result{"@"};
+    result += std::string_view{sun.sun_path, extent}.substr(1);
+    return result;
+}
+
+}  // namespace
+
 auto SocketAddress::to_string() const -> std::string
 {
     if (!valid()) {
         return "<invalid>";
+    }
+
+    if (storage_.ss_family == AF_UNIX) {
+        if (auto const socket_path = path(); !socket_path.empty()) {
+            return std::string{socket_path};
+        }
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+        return local_nameless_to_string(*reinterpret_cast<sockaddr_un const*>(&storage_), length_);
     }
 
     std::array<char, 128> host_buf{};
@@ -125,10 +228,16 @@ auto create_udp_socket(SocketAddress const& addr, bool do_bind, int dscp, bool i
     }
 
     FileDescriptor result{fd};
+    // SO_REUSEADDR and DSCP are IP notions. On an AF_UNIX socket the first
+    // is accepted and does nothing and the second fails outright, so the
+    // only thing asking for them can achieve is to fail the open.
+    bool const is_local = addr.family() == AF_UNIX;
 
     if (do_bind) {
-        if (auto status = set_reuse_addr(fd); !status) {
-            return forward_failure(status);
+        if (!is_local) {
+            if (auto status = set_reuse_addr(fd); !status) {
+                return forward_failure(status);
+            }
         }
         if (ipv6_only && addr.family() == AF_INET6) {
             int const on = 1;
@@ -141,8 +250,8 @@ auto create_udp_socket(SocketAddress const& addr, bool do_bind, int dscp, bool i
         }
     }
 
-    // Set DSCP if specified
-    if (dscp >= 0) {
+    // Set DSCP if specified (IP families only)
+    if (dscp >= 0 && !is_local) {
         if (auto status = set_dscp(fd, addr.family(), static_cast<uint8_t>(dscp)); !status) {
             return forward_failure(status);
         }
@@ -159,18 +268,21 @@ auto create_tcp_socket(SocketAddress const& addr, bool do_bind, int dscp) -> Sta
     }
 
     FileDescriptor result{fd};
+    bool const is_local = addr.family() == AF_UNIX;
 
     if (do_bind) {
-        if (auto status = set_reuse_addr(fd); !status) {
-            return forward_failure(status);
+        if (!is_local) {
+            if (auto status = set_reuse_addr(fd); !status) {
+                return forward_failure(status);
+            }
         }
         if (::bind(fd, addr.sockaddr(), addr.length()) < 0) {
             return failure(NetError::bind_failed);
         }
     }
 
-    // Set DSCP if specified
-    if (dscp >= 0) {
+    // Set DSCP if specified (IP families only)
+    if (dscp >= 0 && !is_local) {
         if (auto status = set_dscp(fd, addr.family(), static_cast<uint8_t>(dscp)); !status) {
             return forward_failure(status);
         }
