@@ -23,6 +23,7 @@ static auto stats_through_an_incomplete_type(statusbar::net::XdpSocketStats cons
 
 #    include <array>
 #    include <cerrno>
+#    include <cstddef>
 #    include <cstdint>
 #    include <expected>
 #    include <optional>
@@ -98,6 +99,8 @@ TEST(xdp_error, all_errors_have_messages)
     check(XdpError::invalid_pin_path);
     check(XdpError::pin_failed);
     check(XdpError::queue_busy);
+    check(XdpError::foreign_program);
+    check(XdpError::pin_not_adoptable);
 }
 
 TEST(xdp_error, a_busy_queue_says_so)
@@ -107,6 +110,17 @@ TEST(xdp_error, a_busy_queue_says_so)
     // would send them nowhere.
     std::error_code const ec = XdpError::queue_busy;
     EXPECT_TRUE(ec.message().find("busy") != std::string::npos);
+}
+
+TEST(xdp_error, the_two_ways_a_pin_is_not_adopted_read_differently)
+{
+    // One of these says "left alone", the other says "replaced", and an
+    // operator has to be able to tell which happened from the message.
+    std::error_code const foreign = XdpError::foreign_program;
+    std::error_code const stale = XdpError::pin_not_adoptable;
+    EXPECT_TRUE(foreign.message() != stale.message());
+    EXPECT_TRUE(foreign.message().find("not ours") != std::string::npos);
+    EXPECT_TRUE(foreign.message().find("left alone") != std::string::npos);
 }
 
 TEST(xdp_error, category_name)
@@ -591,6 +605,105 @@ TEST(xdp_open, zero_copy_with_generic_attach_is_refused_before_any_syscall)
 }
 
 //
+// Program identity: the pure parts
+//
+// What makes a pinned program adoptable is that it is the program this
+// build would have attached. Structure cannot answer that - a recompiled
+// filter declares exactly the same maps - so the answer is written into the
+// pin directory and read back. The fingerprint and the identity it goes
+// into need no kernel, so they are checked here.
+//
+
+TEST(xdp_identity, the_fingerprint_is_fnv1a)
+{
+    // Against the published vectors, so the function is the hash it says it
+    // is rather than merely some hash. constexpr, so a build that got this
+    // wrong does not compile. Spelled as byte arrays because a string
+    // literal can only be reinterpret_cast to bytes at run time.
+    constexpr std::array<unsigned char, 0> nothing{};
+    constexpr std::array<unsigned char, 1> letter_a{'a'};
+    constexpr std::array<unsigned char, 6> foobar{'f', 'o', 'o', 'b', 'a', 'r'};
+    static_assert(detail::fnv1a64(nothing) == 0xcbf2'9ce4'8422'2325ULL);
+    static_assert(detail::fnv1a64(letter_a) == 0xaf63'dc4c'8601'ec8cULL);
+    static_assert(detail::fnv1a64(foobar) == 0x8594'4171'f739'67e8ULL);
+    constexpr std::array<unsigned char, 9> name{'s', 't', 'a', 't', 'u', 's', 'b', 'a', 'r'};
+    EXPECT_EQ(detail::fnv1a64(name), 0x8745'ebff'7c18'9690ULL);
+}
+
+TEST(xdp_identity, one_byte_is_enough_to_tell_two_programs_apart)
+{
+    // The property the whole scheme rests on: a filter that was recompiled
+    // must not fingerprint the same as the one before it. A single flipped
+    // byte standing in for a code change.
+    std::array<unsigned char, 64> bytes{};
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        bytes[i] = static_cast<unsigned char>(i);
+    }
+    auto const before = detail::fnv1a64(bytes);
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        auto flipped = bytes;
+        flipped[i] = static_cast<unsigned char>(flipped[i] ^ 0x01U);
+        EXPECT_TRUE(detail::fnv1a64(flipped) != before);
+    }
+    // And length matters, so a truncated object is not the whole one.
+    EXPECT_TRUE(detail::fnv1a64(std::span{bytes}.first(63)) != before);
+}
+
+TEST(xdp_identity, this_build_knows_what_it_is)
+{
+    auto const self = XdpProgram::identity();
+    EXPECT_EQ(self.magic, xdp_pin_magic);
+    // The embedded object is real, so its fingerprint is not the empty one.
+    EXPECT_TRUE(self.program_hash != 0);
+    EXPECT_TRUE(self.program_hash != 0xcbf2'9ce4'8422'2325ULL);
+    EXPECT_EQ(self.window_bytes, static_cast<uint32_t>(TCAM_WINDOW_BYTES));
+    EXPECT_EQ(self.max_rules, static_cast<uint32_t>(TCAM_MAX_RULES));
+}
+
+TEST(xdp_identity, the_answer_does_not_move_within_a_build)
+{
+    // A restart has to compute the same fingerprint the previous run pinned,
+    // or nothing is ever adopted.
+    auto const first = XdpProgram::identity();
+    auto const second = XdpProgram::identity();
+    EXPECT_EQ(first.program_hash, second.program_hash);
+    EXPECT_EQ(first.magic, second.magic);
+}
+
+TEST(xdp_identity, the_magic_spells_something_on_purpose)
+{
+    // Readable in a hex dump of the pinned map, which is the point of
+    // choosing bytes over a random constant.
+    std::array<char, 8> text{};
+    for (size_t i = 0; i < text.size(); ++i) {
+        text[i] = static_cast<char>((xdp_pin_magic >> (56U - (8U * i))) & 0xFFU);
+    }
+    EXPECT_EQ(std::string(text.data(), text.size()), std::string("STATUSBR"));
+}
+
+TEST(xdp_identity, the_pinned_layout_is_fixed)
+{
+    // An older build reads this struct out of bpffs, so its layout is an
+    // ABI between releases and not an implementation detail.
+    static_assert(std::is_trivially_copyable_v<XdpPinIdentity>);
+    static_assert(sizeof(XdpPinIdentity) == 24);
+    static_assert(offsetof(XdpPinIdentity, magic) == 0);
+    static_assert(offsetof(XdpPinIdentity, program_hash) == 8);
+    static_assert(offsetof(XdpPinIdentity, window_bytes) == 16);
+    static_assert(offsetof(XdpPinIdentity, max_rules) == 20);
+    // Default-constructed must not look like ours, since that is what a
+    // failed read leaves behind.
+    XdpPinIdentity const empty{};
+    EXPECT_TRUE(empty.magic != xdp_pin_magic);
+}
+
+TEST(xdp_identity, the_entry_name_is_fixed_like_the_others)
+{
+    auto const dir = XdpProgram::pin_path_for("eth0");
+    EXPECT_TRUE(XdpProgram::pin_entry(dir, XdpProgram::PIN_IDENTITY) == "/sys/fs/bpf/statusbar/eth0/identity");
+}
+
+//
 // Bind retry: the policy
 //
 // A bind refused with EBUSY is a queue whose previous owner has not finished
@@ -867,6 +980,43 @@ TEST(xdp_detach, an_unknown_interface_is_reported_as_one)
     EXPECT_FALSE(status.has_value());
     if (!status) {
         EXPECT_TRUE(status.error() == std::errc::no_such_device);
+    }
+}
+
+TEST(xdp_owner, a_path_that_could_not_hold_a_pin_is_refused)
+{
+    // Same gate as pinnable(), and for the same reason: this call opens
+    // things by path, so the path has to be one of ours first.
+    for (auto const* const path : {"/tmp/statusbar-elsewhere/lo", "/sys/fs/bpf", "/etc", ""}) {
+        auto const owner = XdpProgram::owner(path);
+        EXPECT_FALSE(owner.has_value());
+        if (!owner) {
+            EXPECT_TRUE(owner.error() == XdpError::invalid_pin_path);
+        }
+    }
+}
+
+TEST(xdp_owner, an_empty_pin_directory_is_claimed_by_nobody)
+{
+    // Nothing of ours has ever been pinned for this made-up interface, so
+    // there is no identity to find and the directory is ours to use.
+    //
+    // Unprivileged, /sys/fs/bpf cannot be opened at all, and then the call
+    // reports that errno rather than answering "nobody" - which is the
+    // distinction that matters, since "I cannot tell" must never be acted
+    // on as "unclaimed".
+    auto const path = XdpProgram::pin_path_for("statusbar-none");
+    EXPECT_FALSE(path.empty());
+    auto const owner = XdpProgram::owner(path);
+    if (getuid() == 0) {
+        EXPECT_TRUE(owner.has_value());
+        if (owner) {
+            EXPECT_TRUE(*owner == XdpPinOwner::none);
+        }
+    } else if (!owner) {
+        // Whatever stopped us, it is not a verdict about the directory.
+        EXPECT_TRUE(owner.error() != XdpError::foreign_program);
+        EXPECT_TRUE(owner.error() != XdpError::invalid_pin_path);
     }
 }
 
@@ -1168,7 +1318,7 @@ TEST(xdp_integration, a_pinned_program_outlives_the_context_and_is_adopted)
 // Adopting a map that is not the one this build declares would mean writing
 // rules into someone else's memory. A pin with a wrong-shaped rules_map must
 // be replaced, and must come out of it untouched.
-TEST(xdp_integration, a_foreign_pinned_map_is_replaced_and_never_written_to)
+TEST(xdp_integration, a_pinned_map_of_the_wrong_shape_is_replaced_and_never_written_to)
 {
     if (getuid() != 0) {
         return;
@@ -1201,7 +1351,9 @@ TEST(xdp_integration, a_foreign_pinned_map_is_replaced_and_never_written_to)
     }
 
     // Swap the pinned rules_map for one with a different capacity - the shape
-    // an older build of the program would have left behind.
+    // an older build of the program would have left behind. The identity is
+    // left alone, so the directory is still recognisably ours: what is being
+    // tested here is the structural check, not the ownership one.
     auto const rules_pin = XdpProgram::pin_entry(pin_path, XdpProgram::PIN_RULES_MAP);
     EXPECT_EQ(::unlink(rules_pin.c_str()), 0);
     int const foreign = bpf_map_create(BPF_MAP_TYPE_ARRAY, "rules_map", sizeof(uint32_t), sizeof(uint32_t), 4, nullptr);
@@ -1569,6 +1721,276 @@ TEST(xdp_integration, set_rules)
 
     auto update_status = ctx.set_rules(rules2);
     EXPECT_TRUE(update_status.has_value());
+}
+
+// Overwrite what a pin directory claims about itself. Needed because the
+// interesting cases - somebody else's program, and our own from a different
+// build - cannot otherwise be produced without a second build to hand.
+static bool rewrite_pinned_identity(std::string_view pin_path, XdpPinIdentity const& identity)
+{
+    int const fd = bpf_obj_get(XdpProgram::pin_entry(pin_path, XdpProgram::PIN_IDENTITY).c_str());
+    if (fd < 0) {
+        return false;
+    }
+    uint32_t const key = 0;
+    bool const written = bpf_map_update_elem(fd, &key, &identity, BPF_ANY) == 0;
+    ::close(fd);
+    return written;
+}
+
+TEST(xdp_integration, a_pin_that_belongs_to_somebody_else_is_left_strictly_alone)
+{
+    // The dangerous case, and the one the identity exists for. A directory
+    // claiming an owner that is not us must not be adopted - that would
+    // write our rules into a stranger's map - and must not be replaced
+    // either, because replacing means unlinking their pins and taking their
+    // program off the interface. Open fails, and nothing moves.
+    if (getuid() != 0) {
+        return;
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        return;
+    }
+    auto const pin_path = XdpProgram::pin_path_for("xdptest0");
+    auto cleanup = detail::scopeguard([&] {
+        (void)XdpProgram::detach(::if_nametoindex("xdptest0"), pin_path);
+        destroy_veth_pair("xdptest0");
+    });
+
+    XdpConfig const config{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .umem_frame_count = 64,
+        .pin_path = pin_path,
+    };
+
+    unsigned int if_index = 0;
+    uint32_t attached_id = 0;
+    {
+        XdpContext ctx;
+        if (!ctx.open(config)) {
+            return;
+        }
+        EXPECT_TRUE(ctx.pinned());
+        if_index = ctx.interface_index();
+        attached_id = ctx.program().id();
+    }
+    EXPECT_TRUE(attached_id != 0);
+
+    // Someone else's magic in our directory. Contrived here; in the field it
+    // would be a pin path pointed somewhere it should not have been.
+    XdpPinIdentity theirs = XdpProgram::identity();
+    theirs.magic = 0x0102'0304'0506'0708ULL;
+    EXPECT_TRUE(rewrite_pinned_identity(pin_path, theirs));
+
+    auto const owner = XdpProgram::owner(pin_path);
+    EXPECT_TRUE(owner.has_value());
+    if (owner) {
+        EXPECT_TRUE(*owner == XdpPinOwner::foreign);
+    }
+
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        EXPECT_FALSE(status.has_value());
+        if (!status) {
+            EXPECT_TRUE(status.error() == XdpError::foreign_program);
+        }
+        EXPECT_FALSE(ctx.valid());
+        EXPECT_FALSE(ctx.adopted());
+        EXPECT_FALSE(ctx.pinned());
+    }
+
+    // Untouched: the program is the same one, still on the interface, and
+    // the pins are all still there.
+    auto const still = XdpProgram::query(if_index);
+    EXPECT_TRUE(still.has_value());
+    if (still && still->has_value()) {
+        EXPECT_EQ((*still)->program_id, attached_id);
+    } else {
+        EXPECT_TRUE(false);  // the attachment was removed, which is the bug
+    }
+    for (auto const entry :
+         {XdpProgram::PIN_IDENTITY,
+          XdpProgram::PIN_PROG,
+          XdpProgram::PIN_RULES_MAP,
+          XdpProgram::PIN_XSK_MAP,
+          XdpProgram::PIN_DEVMAP}) {
+        EXPECT_EQ(::access(XdpProgram::pin_entry(pin_path, entry).c_str(), F_OK), 0);
+    }
+
+    // And the claim still reads as theirs: we did not quietly restamp it.
+    auto const after = XdpProgram::owner(pin_path);
+    EXPECT_TRUE(after.has_value());
+    if (after) {
+        EXPECT_TRUE(*after == XdpPinOwner::foreign);
+    }
+}
+
+TEST(xdp_integration, a_pin_from_a_different_build_of_ours_is_replaced)
+{
+    // The common case, and the one a structural check cannot catch: same
+    // maps, same names, same capacities, different code. A redeploy. It has
+    // to be detected - adopting it would run the old filter while believing
+    // the new one is in force - and it has to be replaced rather than
+    // refused, or no upgrade could ever restart.
+    if (getuid() != 0) {
+        return;
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        return;
+    }
+    auto const pin_path = XdpProgram::pin_path_for("xdptest0");
+    auto cleanup = detail::scopeguard([&] {
+        (void)XdpProgram::detach(::if_nametoindex("xdptest0"), pin_path);
+        destroy_veth_pair("xdptest0");
+    });
+
+    XdpConfig const config{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .umem_frame_count = 64,
+        .pin_path = pin_path,
+    };
+
+    uint32_t first_id = 0;
+    {
+        XdpContext ctx;
+        if (!ctx.open(config)) {
+            return;
+        }
+        first_id = ctx.program().id();
+    }
+
+    // Our magic, a different program. One bit of the fingerprint is all it
+    // takes, which is the point of fingerprinting the object at all.
+    XdpPinIdentity older = XdpProgram::identity();
+    older.program_hash ^= 1ULL;
+    EXPECT_TRUE(rewrite_pinned_identity(pin_path, older));
+
+    // Still ours, so the directory may be replaced.
+    auto const owner = XdpProgram::owner(pin_path);
+    EXPECT_TRUE(owner.has_value());
+    if (owner) {
+        EXPECT_TRUE(*owner == XdpPinOwner::ours);
+    }
+
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        EXPECT_TRUE(status.has_value());
+        if (!status) {
+            return;
+        }
+        EXPECT_FALSE(ctx.adopted());
+        EXPECT_TRUE(ctx.pinned());
+        // A fresh program, not the one that was there.
+        EXPECT_TRUE(ctx.program().id() != 0);
+        EXPECT_TRUE(ctx.program().id() != first_id);
+    }
+
+    // And the directory now claims this build again, so the *next* restart
+    // adopts instead of replacing.
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            EXPECT_TRUE(ctx.adopted());
+            EXPECT_TRUE(ctx.pinned());
+        }
+    }
+}
+
+TEST(xdp_integration, pinned_and_adopted_report_every_combination_truthfully)
+{
+    if (getuid() != 0) {
+        return;
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        return;
+    }
+    auto const pin_path = XdpProgram::pin_path_for("xdptest0");
+    auto cleanup = detail::scopeguard([&] {
+        (void)XdpProgram::detach(::if_nametoindex("xdptest0"), pin_path);
+        destroy_veth_pair("xdptest0");
+    });
+
+    // Neither: no pin path, so nothing outlives the context.
+    unsigned int if_index = 0;
+    {
+        XdpContext ctx;
+        XdpConfig const unpinned{
+            .interface_name = "xdptest0",
+            .default_action = XdpAction::pass_kernel,
+            .umem_frame_count = 64,
+        };
+        if (!ctx.open(unpinned)) {
+            return;
+        }
+        EXPECT_FALSE(ctx.pinned());
+        EXPECT_FALSE(ctx.adopted());
+        if_index = ctx.interface_index();
+        ctx.close();
+
+        // The other half of the close policy: a program we attached and did
+        // *not* pin comes off the interface with us.
+        auto const gone = XdpProgram::query(if_index);
+        EXPECT_TRUE(gone.has_value());
+        if (gone) {
+            EXPECT_FALSE(gone->has_value());
+        }
+    }
+
+    XdpConfig const config{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .umem_frame_count = 64,
+        .pin_path = pin_path,
+    };
+
+    // Pinned, not adopted: the first run.
+    {
+        XdpContext ctx;
+        if (!ctx.open(config)) {
+            return;
+        }
+        EXPECT_TRUE(ctx.pinned());
+        EXPECT_FALSE(ctx.adopted());
+    }
+
+    // Pinned and adopted: every run after it.
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            EXPECT_TRUE(ctx.pinned());
+            EXPECT_TRUE(ctx.adopted());
+        }
+    }
+
+    // Adopted but not pinned is the fourth combination, and it cannot
+    // happen: adoption reads a pin, so it implies one. Asked for
+    // explicitly rather than left to be obvious.
+    {
+        XdpContext ctx;
+        XdpConfig fresh = config;
+        fresh.adopt = false;
+        auto const status = ctx.open(fresh);
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            EXPECT_FALSE(ctx.adopted());
+            EXPECT_TRUE(ctx.pinned());
+        }
+        EXPECT_TRUE(!ctx.adopted() || ctx.pinned());
+    }
 }
 
 // The failure FEAT-007 exists for, reproduced: close a queue and bind it

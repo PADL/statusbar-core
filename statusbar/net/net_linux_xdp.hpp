@@ -95,6 +95,8 @@ enum class XdpError
     invalid_pin_path,
     pin_failed,
     queue_busy,
+    foreign_program,
+    pin_not_adoptable,
 };
 
 class XdpErrorCategory : public std::error_category
@@ -461,6 +463,29 @@ struct AttachPlan
     return true;
 }
 
+/// FNV-1a over `bytes`, 64 bits wide.
+///
+/// Used to fingerprint the embedded BPF object, so a filter that has been
+/// recompiled is recognised as a different program without anybody having
+/// to remember to bump a version number - which is the version number that
+/// would have been forgotten.
+///
+/// Not a cryptographic hash and not trying to be. The question is "are
+/// these the same bytes this build was made from", an accident is all that
+/// has to be ruled out, and a wrong answer costs one program reload.
+/// @param bytes The bytes to fingerprint
+[[nodiscard]] constexpr auto fnv1a64(std::span<unsigned char const> const bytes) noexcept -> uint64_t
+{
+    constexpr uint64_t Basis = 0xcbf2'9ce4'8422'2325ULL;
+    constexpr uint64_t Prime = 0x0000'0100'0000'01b3ULL;
+    uint64_t hash = Basis;
+    for (unsigned char const byte : bytes) {
+        hash ^= static_cast<uint64_t>(byte);
+        hash *= Prime;
+    }
+    return hash;
+}
+
 /// Call `attempt` until it stops reporting EBUSY, pausing with `pause`
 /// between tries and giving up after `retries` of them. Hands back whatever
 /// the last attempt said.
@@ -491,6 +516,63 @@ template <typename Attempt, typename Pause>
 }
 
 }  // namespace detail
+
+/// The magic in a pin directory's identity entry: the bytes "STATUSBR".
+inline constexpr uint64_t xdp_pin_magic = 0x5354'4154'5553'4252ULL;
+
+/// What a pin directory says about itself, kept in a one-entry array map
+/// pinned beside the program as XdpProgram::PIN_IDENTITY.
+///
+/// This is an ABI between one run of statusbar and the next rather than one
+/// between userspace and the BPF program: a restart reads it to decide
+/// whether the program already on the interface is the one this build would
+/// have attached. Structure alone cannot answer that - a recompiled filter
+/// with the same maps has exactly the same shape as the old one, and that
+/// is the common case, not the rare one - so the answer is written down
+/// instead of inferred.
+///
+/// Also the only thing that distinguishes somebody else's pin from our own.
+/// Adoption writes our rules into the map it adopts, so being wrong here
+/// means writing into a stranger's memory; being deliberately
+/// unadventurous is cheap by comparison.
+struct XdpPinIdentity
+{
+    /// xdp_pin_magic when we wrote it. Anything else means the directory is
+    /// not ours, and then nothing in it may be read, written or removed.
+    uint64_t magic{0};
+    /// fnv1a64() over the embedded BPF object. Changes whenever
+    /// xdp_filter.bpf.c does, so a redeploy is detected by the build rather
+    /// than declared by a developer.
+    uint64_t program_hash{0};
+    /// The TCAM geometry this build compiled against. Redundant against the
+    /// checks on the pinned maps themselves, and kept because it makes the
+    /// entry mean something on its own under `bpftool map dump`.
+    uint32_t window_bytes{0};
+    uint32_t max_rules{0};
+};
+
+static_assert(std::is_trivially_copyable_v<XdpPinIdentity>);
+// The value size of a pinned map is part of what is on bpffs, so a change
+// here is a change an older build will see. It is meant to be caught by the
+// identity check rather than by luck, which is what the size check in
+// XdpProgram::owner() is for - but a change should still be deliberate.
+static_assert(sizeof(XdpPinIdentity) == 24);
+
+/// Who the pin directory at a path belongs to, as far as it will say.
+enum class XdpPinOwner : uint8_t
+{
+    /// Nothing claims it. Either nothing is pinned there, or what is
+    /// pinned predates identities or was half written by a process that
+    /// died mid-pin. All three mean the directory is ours to replace.
+    none,
+    /// Ours. Whether it is *this build's* is the further question that
+    /// adoption asks.
+    ours,
+    /// Somebody else's. Nothing in it may be read, written, unlinked or
+    /// detached - including by the replace path, which is every bit as
+    /// destructive as adoption would be.
+    foreign,
+};
 
 // ──────────────────────────────────────────────
 // XdpProgram — the program on the interface, and its pins
@@ -540,6 +622,9 @@ class XdpProgram
     static constexpr std::string_view PIN_RULES_MAP = "rules_map";
     static constexpr std::string_view PIN_XSK_MAP = "xsk_map";
     static constexpr std::string_view PIN_DEVMAP = "devmap";
+    /// Written last, so a directory that claims an identity is a directory
+    /// whose other pins are all there.
+    static constexpr std::string_view PIN_IDENTITY = "identity";
 
     /// The pin directory for an interface: BPFFS_ROOT/PIN_NAMESPACE/<name>,
     /// so two interfaces never collide. Pure - no filesystem is touched and
@@ -568,6 +653,28 @@ class XdpProgram
     /// startup.
     /// @param pin_path A pin directory, from pin_path_for()
     [[nodiscard]] static auto pinnable(std::string_view pin_path) -> Status;
+
+    /// The identity this build writes into a pin directory, and the one it
+    /// insists on finding before it will adopt. Reads the embedded BPF
+    /// object and nothing else - no filesystem, no privilege - and gives
+    /// the same answer every time within one build.
+    [[nodiscard]] static auto identity() -> XdpPinIdentity;
+
+    /// Who the pin directory at `pin_path` belongs to, from its identity
+    /// entry alone. Opens a pin to read it; creates nothing and writes
+    /// nothing.
+    ///
+    /// open() asks this before it adopts *and* before it replaces. Replacing
+    /// means unlinking pins and taking a program off an interface, which is
+    /// no more ours to do to a stranger's directory than adopting it would
+    /// be - so the one question has to come before both answers.
+    ///
+    /// Reading a pin needs the same privilege pinning does. Where it is
+    /// missing the call fails with that errno rather than answering `none`:
+    /// not being able to tell who owns a directory is not the same as the
+    /// directory being unclaimed, and only one of those is safe to act on.
+    /// @param pin_path A pin directory, from pin_path_for()
+    [[nodiscard]] static auto owner(std::string_view pin_path) -> StatusValue<XdpPinOwner>;
 
     /// What is attached to an interface now, if anything - so open(), or a
     /// caller, can tell whether a pinned program is the one in force.
