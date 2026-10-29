@@ -192,6 +192,18 @@ function(statusbar_package_module_init)
     PROPERTY STATUSBAR_INSTALL_TARGETS
     BRIEF_DOCS "install targets"
     FULL_DOCS "accumulated install targets")
+  define_property(
+    TARGET
+    PROPERTY STATUSBAR_UNPREFIXED
+    BRIEF_DOCS "install this executable without the statusbar- prefix"
+    FULL_DOCS
+      "Set TRUE on one executable target to keep its on-disk name exactly as \
+      given, instead of the uniform statusbar-<name>. For something that is a \
+      system service rather than part of this project's tool surface: a daemon \
+      with a conventional name, a man page and a unit file. A target property, \
+      not a variable, so one opt-out cannot leak to its neighbours. Set it \
+      before statusbar_prefix_tool_names() runs (the package's top-level \
+      CMakeLists, after add_subdirectory).")
   # A standalone build resets these per package. Under an outer aggregate build
   # the outer project initialises them once and lets them accumulate across
   # every aggregated package.
@@ -253,6 +265,15 @@ endfunction()
 # Give every installed executable a statusbar- prefixed on-disk name, so the
 # bin/ directory is uniform (tools that set no OUTPUT_NAME, and examples, would
 # otherwise install unprefixed).
+#
+# One target can opt out:
+#
+# set_target_properties(mydaemon PROPERTIES STATUSBAR_UNPREFIXED TRUE)
+#
+# which leaves its name exactly as given — including any underscores, since
+# opting out means the name is the author's to choose. The prefix remains the
+# default; this is the escape hatch for a daemon that has to answer to a
+# conventional name, not a way to turn the convention off.
 function(statusbar_prefix_tool_names)
   get_property(_exe_targets GLOBAL PROPERTY STATUSBAR_INSTALL_TARGETS)
   foreach(_t ${_exe_targets})
@@ -261,6 +282,12 @@ function(statusbar_prefix_tool_names)
     endif()
     get_target_property(_t_type ${_t} TYPE)
     if(NOT _t_type STREQUAL "EXECUTABLE")
+      continue()
+    endif()
+    # Opted out by its own target property: leave the name alone. An unset
+    # property reads as <PROP>-NOTFOUND here, which is false.
+    get_target_property(_t_unprefixed ${_t} STATUSBAR_UNPREFIXED)
+    if(_t_unprefixed)
       continue()
     endif()
     get_target_property(_t_name ${_t} OUTPUT_NAME)
