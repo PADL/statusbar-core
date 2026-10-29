@@ -3,8 +3,8 @@
 
 // The rtnetlink qdisc request builders, against bytes checked by hand from
 // linux/rtnetlink.h (nlmsghdr, tcmsg, rtattr) and linux/pkt_sched.h
-// (tc_mqprio_qopt, tc_cbs_qopt, TCA_CBS_PARMS), framed as iproute2's
-// q_mqprio.c and q_cbs.c frame them, and the parser against replies framed as
+// (tc_mqprio_qopt, tc_cbs_qopt, TCA_CBS_PARMS, tc_etf_qopt, TCA_ETF_PARMS), framed as
+// iproute2's q_mqprio.c, q_cbs.c and q_etf.c frame them, and the parser against replies framed as
 // the kernel's tc_fill_qdisc writes them. Netlink is host byte order: the
 // expected bytes are little-endian. Nothing is changed (that needs
 // CAP_NET_ADMIN); the interface helpers and a qdisc read are exercised on
@@ -181,6 +181,36 @@ TEST(tc_qdisc, cbs)
     EXPECT_TRUE(same_bytes(std::span{out}.first(*length), want));
 }
 
+// `tc qdisc replace dev <if3> parent 8001:1 etf clockid CLOCK_TAI delta 150000 offload skip_sock_check`
+TEST(tc_qdisc, an_etf_request_is_framed_as_q_etf_does)
+{
+    if (!LITTLE) {
+        return;
+    }
+    EtfQdisc const q{.parent = make_handle(0x8001, 1), .delta_ns = 150'000, .offload = true, .skip_sock_check = true};
+    // clang-format off
+    std::array<uint8_t, 64> const want{
+        // nlmsghdr: len 64, RTM_NEWQDISC, REQUEST|ACK|REPLACE|CREATE, seq 8, pid 0
+        0x40, 0x00, 0x00, 0x00,  0x24, 0x00,  0x05, 0x05,  0x08, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+        // tcmsg: ifindex 3, handle 0 (kernel assigns), parent 8001:1
+        0x00, 0x00, 0x00, 0x00,  0x03, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,  0x01, 0x00, 0x01, 0x80,  0x00, 0x00, 0x00, 0x00,
+        // TCA_KIND, len 4 + 4: "etf\0"
+        0x08, 0x00, 0x01, 0x00,  'e', 't', 'f', 0x00,
+        // TCA_OPTIONS (nest), len 4 + 16 > TCA_ETF_PARMS (1), len 4 + 12
+        0x14, 0x00, 0x02, 0x00,  0x10, 0x00, 0x01, 0x00,
+        // struct tc_etf_qopt: delta 150000 = 0x000249f0, clockid 11 (CLOCK_TAI),
+        // flags OFFLOAD_ON (2) | SKIP_SOCK_CHECK (4)
+        0xf0, 0x49, 0x02, 0x00,  0x0b, 0x00, 0x00, 0x00,  0x06, 0x00, 0x00, 0x00,
+    };
+    // clang-format on
+    RequestBuffer out{};
+    auto const length = build_replace_etf(out, 3, q, 8);
+    EXPECT_TRUE(length.has_value());
+    EXPECT_TRUE(same_bytes(std::span{out}.first(*length), want));
+    auto const deadline = build_replace_etf(out, 3, EtfQdisc{.parent = q.parent, .offload = false, .deadline_mode = true}, 8);
+    EXPECT_TRUE(deadline.has_value() && out[60] == 0x01 && out[52] == 0x00);  // DEADLINE_MODE_ON alone, delta 0
+}
+
 // `tc qdisc del dev <if3> root handle 9000:`
 TEST(tc_qdisc, delete_root)
 {
@@ -351,6 +381,41 @@ TEST(tc_qdisc, parse_cbs_reply)
     auto no_parms = reply;
     no_parms[50] = 0x02;  // the nested attribute is TCA_CBS_MAXSDU, not TCA_CBS_PARMS
     EXPECT_FALSE(parse_qdisc(no_parms).has_value());
+}
+
+// An offloaded etf under a cbs (8001:1), as tc_fill_qdisc and etf_dump write it.
+TEST(tc_qdisc, an_etf_reply_parses_to_its_parameters)
+{
+    if (!LITTLE) {
+        return;
+    }
+    // clang-format off
+    std::array<uint8_t, 72> const reply{
+        0x48, 0x00, 0x00, 0x00,  0x24, 0x00,  0x00, 0x00,  0x0b, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+        // tcmsg: handle 8003:0, parent 8001:1
+        0x00, 0x00, 0x00, 0x00,  0x03, 0x00, 0x00, 0x00,  0x00, 0x00, 0x03, 0x80,  0x01, 0x00, 0x01, 0x80,  0x01, 0x00, 0x00, 0x00,
+        0x08, 0x00, 0x01, 0x00,  'e', 't', 'f', 0x00,
+        // TCA_OPTIONS, len 20 > TCA_ETF_PARMS (1), len 16: delta 150000, clockid 11, flags OFFLOAD_ON
+        0x14, 0x00, 0x02, 0x00,  0x10, 0x00, 0x01, 0x00,
+        0xf0, 0x49, 0x02, 0x00,  0x0b, 0x00, 0x00, 0x00,  0x02, 0x00, 0x00, 0x00,
+        // TCA_HW_OFFLOAD 1
+        0x05, 0x00, 0x0c, 0x00,  0x01,  0x00, 0x00, 0x00,
+    };
+    // clang-format on
+    auto const info = parse_qdisc(reply);
+    EXPECT_TRUE(info.has_value());
+    if (!info) {
+        return;
+    }
+    EXPECT_EQ(info->handle, make_handle(0x8003, 0));
+    EXPECT_TRUE(info->kind == "etf");
+    EXPECT_FALSE(info->cbs.has_value());
+    EtfQdisc const want{.parent = make_handle(0x8001, 1), .delta_ns = 150'000, .offload = true};
+    EXPECT_TRUE(info->etf.has_value() && *info->etf == want);
+
+    auto short_parms = reply;
+    short_parms[48] = 0x0c;  // TCA_ETF_PARMS of 8 octets: shorter than tc_etf_qopt
+    EXPECT_FALSE(parse_qdisc(short_parms).has_value());
 }
 
 // Any other kind (the default fq_codel the kernel put on legacy queue 2,

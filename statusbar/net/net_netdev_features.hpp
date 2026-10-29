@@ -141,6 +141,9 @@ class NetdevClient
 
 /// One NetdevClient query: `ifindex`'s xsk-features. Errors: NetdevClient::open()'s and features()'s.
 [[nodiscard]] auto query_xsk_features(int ifindex) -> StatusValue<XskFeatures>;
+/// Whether `ifindex`'s driver honours AF_XDP launch times (tx-launch-time-fifo): one query, to ask
+/// once and hand to every user (stream socket, shaper). Errors: query_xsk_features()'s.
+[[nodiscard]] auto launch_time_supported(int ifindex) -> StatusValue<bool>;
 
 }  // namespace statusbar::net::netdev
 

@@ -786,7 +786,7 @@ auto XdpSocket::tx_flush() -> Status
     // Descriptors the kernel has not consumed yet (copy mode sends at most a
     // batch per kick, so some may be left from the last one).
     if (*rings_.tx.producer - __atomic_load_n(rings_.tx.consumer, __ATOMIC_ACQUIRE) == 0 ||
-        (need_wakeup_ && !xsk_ring_prod__needs_wakeup(&rings_.tx))) {
+        (need_wakeup_ && xsk_ring_prod__needs_wakeup(&rings_.tx) == 0)) {
         ++stats_.tx_flush_skipped;
         return success();
     }
@@ -874,7 +874,7 @@ auto XdpSocket::fill_replenish() -> Status
         }
     }
     // The driver ran out of fill entries and stopped: wake it.
-    if (need_wakeup_ && xsk_ != nullptr && xsk_ring_prod__needs_wakeup(&rings_.fill)) {
+    if (need_wakeup_ && xsk_ != nullptr && xsk_ring_prod__needs_wakeup(&rings_.fill) != 0) {
         ++stats_.rx_wakeup_count;
         (void)::recvfrom(xsk_socket__fd(xsk_), nullptr, 0, MSG_DONTWAIT, nullptr, nullptr);
     }
@@ -936,9 +936,7 @@ auto XdpContext::launch_time_supported() const -> StatusValue<bool>
     if (!socket_.valid()) {
         return failure(XdpError::not_open);
     }
-    return netdev::query_xsk_features(static_cast<int>(interface_.index)).transform([](netdev::XskFeatures const features) {
-        return features.launch_time();
-    });
+    return netdev::launch_time_supported(static_cast<int>(interface_.index));
 }
 
 void XdpContext::close() noexcept

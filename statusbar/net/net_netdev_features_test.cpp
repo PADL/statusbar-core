@@ -218,6 +218,9 @@ TEST(netdev_features, loopback_has_no_launch_time)
     EXPECT_FALSE(device->xsk.launch_time());
     auto const missing = client.features(0x7fff'fff0);
     EXPECT_FALSE(missing.has_value());
+    auto const once = launch_time_supported(1);
+    EXPECT_TRUE(once.has_value() && !*once);
+    EXPECT_FALSE(launch_time_supported(0x7fff'fff0).has_value());
 }
 
 #endif  // __linux__

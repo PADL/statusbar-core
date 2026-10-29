@@ -8,6 +8,7 @@
 #    include "statusbar/buffer/buffer.hpp"
 
 #    include <cstddef>
+#    include <ctime>
 #    include <optional>
 #    include <system_error>
 #    include <utility>
@@ -29,6 +30,9 @@ static_assert(offsetof(tc_mqprio_qopt, prio_tc_map) == 1 && offsetof(tc_mqprio_q
 static_assert(offsetof(tc_mqprio_qopt, count) == 18 && offsetof(tc_mqprio_qopt, offset) == 50);
 static_assert(sizeof(tc_cbs_qopt) == 20);
 static_assert(offsetof(tc_cbs_qopt, hicredit) == 4 && offsetof(tc_cbs_qopt, sendslope) == 16);
+static_assert(sizeof(tc_etf_qopt) == 12);
+static_assert(offsetof(tc_etf_qopt, clockid) == 4 && offsetof(tc_etf_qopt, flags) == 8);
+static_assert(ETF_CLOCK_TAI == CLOCK_TAI);
 static_assert(PRIORITY_COUNT == TC_QOPT_BITMASK + 1 && MAX_TRAFFIC_CLASSES == TC_QOPT_MAX_QUEUE);
 static_assert(ROOT == TC_H_ROOT);
 
@@ -157,6 +161,28 @@ auto build_replace_cbs(std::span<uint8_t> const out, int const ifindex, CbsQdisc
     return netlink::finish(b, length);
 }
 
+auto build_replace_etf(std::span<uint8_t> const out, int const ifindex, EtfQdisc const& qdisc, uint32_t const seq)
+    -> StatusValue<size_t>
+{  // NOLINT(statusbar-block-statements): the etf request, field by field
+    constexpr std::string_view KIND = "etf";
+    constexpr size_t QOPT = sizeof(tc_etf_qopt);
+    constexpr size_t PARMS = RTA_HEADER + QOPT;  // 16: already aligned
+    size_t const length = NLMSG_HEADER + TCMSG_SIZE + kind_size(KIND) + RTA_HEADER + PARMS;
+    uint32_t const flags = (qdisc.deadline_mode ? TC_ETF_DEADLINE_MODE_ON : 0U) | (qdisc.offload ? TC_ETF_OFFLOAD_ON : 0U) |
+        (qdisc.skip_sock_check ? TC_ETF_SKIP_SOCK_CHECK : 0U);
+
+    MutableBuffer buffer{out};
+    BufferSerializerBuilder b{buffer};
+    netlink::put_header(b, length, RTM_NEWQDISC, REPLACE_FLAGS, seq);
+    put_tcmsg(b, ifindex, 0, qdisc.parent);
+    put_kind(b, KIND);
+    // TCA_OPTIONS nests TCA_ETF_PARMS (q_etf.c: addattr_nest + addattr_l(TCA_ETF_PARMS, &opt)).
+    put_rta(b, PARMS, TCA_OPTIONS);
+    put_rta(b, QOPT, TCA_ETF_PARMS);
+    b.append(qdisc.delta_ns).append(qdisc.clockid).append(flags);
+    return netlink::finish(b, length);
+}
+
 auto build_replace_kind(
     std::span<uint8_t> const out, int const ifindex, uint32_t const parent, std::string_view const kind, uint32_t const seq)
     -> StatusValue<size_t>
@@ -239,6 +265,25 @@ using netlink::without_trailing_nuls;
     };
 }
 
+/// TCA_ETF_PARMS inside etf's nested TCA_OPTIONS.
+[[nodiscard]] auto parse_etf(std::span<uint8_t const> const options, uint32_t const parent) -> StatusValue<EtfQdisc>
+{
+    auto const found = netlink::find_attribute(options, TCA_ETF_PARMS);
+    if (!found || !*found || (*found)->size() < sizeof(tc_etf_qopt)) {
+        return failure(bad_message());
+    }
+    auto const parms = **found;
+    auto const flags = load<uint32_t>(parms, offsetof(tc_etf_qopt, flags));
+    return EtfQdisc{
+        .parent = parent,
+        .clockid = load<int32_t>(parms, offsetof(tc_etf_qopt, clockid)),
+        .delta_ns = load<int32_t>(parms, offsetof(tc_etf_qopt, delta)),
+        .offload = (flags & TC_ETF_OFFLOAD_ON) != 0,
+        .deadline_mode = (flags & TC_ETF_DEADLINE_MODE_ON) != 0,
+        .skip_sock_check = (flags & TC_ETF_SKIP_SOCK_CHECK) != 0,
+    };
+}
+
 /// The tcmsg fields of a qdisc message at least NLMSG_HEADER + TCMSG_SIZE long.
 [[nodiscard]] auto read_tcmsg(std::span<uint8_t const> const message) noexcept -> QdiscInfo
 {
@@ -249,28 +294,36 @@ using netlink::without_trailing_nuls;
     return info;
 }
 
-/// Decode the TCA_OPTIONS of a kind we know (mqprio, cbs) into @p info;
+/// @p parse (options -> StatusValue<T>) applied to @p options, into @p out; bad_message when
+/// the kind came without options.
+template <typename T, typename Parse>
+[[nodiscard]] auto decode_into(std::optional<std::span<uint8_t const>> const options, Parse const& parse, std::optional<T>& out)
+    -> Status
+{
+    if (!options) {
+        return failure(bad_message());
+    }
+    auto parsed = parse(*options);
+    if (!parsed) {
+        return failure(parsed.error());
+    }
+    out = *parsed;
+    return success();
+}
+
+/// Decode the TCA_OPTIONS of a kind we know (mqprio, cbs, etf) into @p info;
 /// bad_message when that kind has none.
 [[nodiscard]] auto parse_options(QdiscInfo& info, std::optional<std::span<uint8_t const>> const options) -> Status
 {
+    using Options = std::span<uint8_t const>;
     if (info.kind == "mqprio") {
-        if (!options) {
-            return failure(bad_message());
-        }
-        auto mqprio = parse_mqprio(*options, info.handle);
-        if (!mqprio) {
-            return failure(mqprio.error());
-        }
-        info.mqprio = *mqprio;
-    } else if (info.kind == "cbs") {
-        if (!options) {
-            return failure(bad_message());
-        }
-        auto cbs = parse_cbs(*options, info.parent);
-        if (!cbs) {
-            return failure(cbs.error());
-        }
-        info.cbs = *cbs;
+        return decode_into(options, [&](Options const o) { return parse_mqprio(o, info.handle); }, info.mqprio);
+    }
+    if (info.kind == "cbs") {
+        return decode_into(options, [&](Options const o) { return parse_cbs(o, info.parent); }, info.cbs);
+    }
+    if (info.kind == "etf") {
+        return decode_into(options, [&](Options const o) { return parse_etf(o, info.parent); }, info.etf);
     }
     return success();
 }
@@ -329,6 +382,11 @@ auto TcClient::replace_mqprio(int const ifindex, MqprioQdisc const& qdisc) -> St
 auto TcClient::replace_cbs(int const ifindex, CbsQdisc const& qdisc) -> Status
 {
     return send([&](std::span<uint8_t> out, uint32_t seq) { return build_replace_cbs(out, ifindex, qdisc, seq); });
+}
+
+auto TcClient::replace_etf(int const ifindex, EtfQdisc const& qdisc) -> Status
+{
+    return send([&](std::span<uint8_t> out, uint32_t seq) { return build_replace_etf(out, ifindex, qdisc, seq); });
 }
 
 auto TcClient::replace_kind(int const ifindex, uint32_t const parent, std::string_view const kind) -> Status

@@ -930,6 +930,14 @@ class XdpSocket
         };
     }
 
+    /// Set (or, with 0, clear) the launch time of frame `handle`, taken by tx_start() and not yet
+    /// committed: for frames taken ahead of time. Nothing without tx_launch_time().
+    /// @param launch_time_ns When to send, ns on the NIC's PHC; 0: now
+    void tx_set_launch_time(uint64_t handle, int64_t launch_time_ns) noexcept
+    {
+        detail::write_tx_metadata(umem_.tx_metadata_span(handle), launch_time_ns);
+    }
+
     /// @param handle UMEM frame address from tx_start()
     /// @param frame_length Total frame size including Ethernet header
     [[nodiscard]] auto tx_commit(uint64_t handle, size_t frame_length) -> Status;
@@ -1066,6 +1074,13 @@ class XdpContext
     [[nodiscard]] auto tx_start(int64_t launch_time_ns = 0) -> StatusValue<EthernetTxSlot>
     {
         return socket_.tx_start(launch_time_ns);
+    }
+
+    /// XdpSocket::tx_set_launch_time().
+    /// @param launch_time_ns When to send, ns on the NIC's PHC; 0: now
+    void tx_set_launch_time(uint64_t handle, int64_t launch_time_ns) noexcept
+    {
+        socket_.tx_set_launch_time(handle, launch_time_ns);
     }
 
     /// @param handle UMEM frame address from tx_start()
@@ -1221,6 +1236,7 @@ class XdpContext
         (void)launch_time_ns;
         return failure(XdpError::not_supported_on_platform);
     }
+    void tx_set_launch_time(uint64_t /*handle*/, int64_t /*launch_time_ns*/) noexcept {}
     [[nodiscard]] auto tx_commit(uint64_t, size_t) -> Status { return failure(XdpError::not_supported_on_platform); }
     [[nodiscard]] auto tx_cancel(uint64_t) -> Status { return failure(XdpError::not_supported_on_platform); }
     [[nodiscard]] auto tx_flush() -> Status { return failure(XdpError::not_supported_on_platform); }

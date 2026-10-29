@@ -5,7 +5,7 @@
 
 /// @file net_tc_qdisc.hpp
 /// @brief A small rtnetlink traffic-control client: install, replace and
-/// delete queueing disciplines (mqprio, cbs, and option-less ones such as
+/// delete queueing disciplines (mqprio, cbs, etf, and option-less ones such as
 /// pfifo_fast) the way `tc qdisc replace|del` does, without libnl or iproute2.
 ///
 /// Two layers:
@@ -15,11 +15,11 @@
 ///     reads one RTM_NEWQDISC of the kernel's qdisc dump: socket-free,
 ///     unit-tested against hand-checked bytes. Netlink is host byte order; the layouts are
 ///     linux/rtnetlink.h's struct tcmsg and linux/pkt_sched.h's
-///     struct tc_mqprio_qopt / struct tc_cbs_qopt, written field by field
-///     (the .cpp static_asserts the kernel's sizes and offsets), with the
-///     attribute framing iproute2's q_mqprio.c / q_cbs.c use: mqprio's
-///     TCA_OPTIONS is the flat tc_mqprio_qopt, cbs's is a nest holding
-///     TCA_CBS_PARMS.
+///     struct tc_mqprio_qopt / tc_cbs_qopt / tc_etf_qopt, written field by
+///     field (the .cpp static_asserts the kernel's sizes and offsets), with the
+///     attribute framing iproute2's q_mqprio.c / q_cbs.c / q_etf.c use:
+///     mqprio's TCA_OPTIONS is the flat tc_mqprio_qopt, cbs's and etf's are
+///     nests holding TCA_CBS_PARMS / TCA_ETF_PARMS.
 ///   - TcClient, a NETLINK_ROUTE socket that sends one request with
 ///     NLM_F_ACK and returns the kernel's answer as a Status (its errno),
 ///     keeping the kernel's extended-ack text for logs. It implements
@@ -86,6 +86,24 @@ struct CbsQdisc
     auto operator==(CbsQdisc const&) const noexcept -> bool = default;
 };
 
+/// CLOCK_TAI, the only clock etf takes (sch_etf.c, validate_input_params).
+inline constexpr int32_t ETF_CLOCK_TAI = 11;
+
+/// An earliest-TxTime-first qdisc: `tc qdisc replace dev <if> parent <parent> etf clockid
+/// CLOCK_TAI delta <ns> [offload] [deadline_mode] [skip_sock_check]` (tc-etf(8)). With offload the
+/// driver puts the queue in launch-time mode and sends each frame at its txtime.
+struct EtfQdisc
+{
+    uint32_t parent{0};              ///< the class it hangs on: a cbs's major:1, or mqprio_major:(queue + 1)
+    int32_t clockid{ETF_CLOCK_TAI};  ///< the clock txtimes are read on
+    int32_t delta_ns{0};             ///< how long before its txtime a queued frame goes to the driver (>= 0)
+    bool offload{true};              ///< program the NIC's launch time (TC_ETF_OFFLOAD_ON)
+    bool deadline_mode{false};       ///< txtime is a deadline: send at once (TC_ETF_DEADLINE_MODE_ON)
+    bool skip_sock_check{false};     ///< take frames of sockets without SO_TXTIME (TC_ETF_SKIP_SOCK_CHECK)
+
+    auto operator==(EtfQdisc const&) const noexcept -> bool = default;
+};
+
 /// One qdisc as the kernel reports it (`tc qdisc show`): its handle, parent
 /// and kind, with the options of the kinds this client writes.
 struct QdiscInfo
@@ -101,6 +119,7 @@ struct QdiscInfo
     std::string kind{};
     std::optional<MqprioQdisc> mqprio{};  ///< kind "mqprio": its layout (major from the handle)
     std::optional<CbsQdisc> cbs{};        ///< kind "cbs": its parameters (parent as above)
+    std::optional<EtfQdisc> etf{};        ///< kind "etf": its parameters (parent as above)
 };
 
 /// Room for any request the builders write (the largest, mqprio, is 136 bytes).
@@ -119,6 +138,12 @@ using RequestBuffer = std::array<uint8_t, MAX_REQUEST_SIZE>;
 /// REPLACE, tcm_handle 0: the kernel numbers it; a cbs already on that parent
 /// is changed in place) into @p out. Returns the message length.
 [[nodiscard]] auto build_replace_cbs(std::span<uint8_t> out, int ifindex, CbsQdisc const& qdisc, uint32_t seq)
+    -> StatusValue<size_t>;
+
+/// Build `tc qdisc replace ... parent <parent> etf ...` (RTM_NEWQDISC, CREATE | REPLACE, tcm_handle
+/// 0: the kernel numbers it) into @p out. etf has no change operation: the kernel refuses (EINVAL) a
+/// replace of an etf already on that parent. Returns the message length.
+[[nodiscard]] auto build_replace_etf(std::span<uint8_t> out, int ifindex, EtfQdisc const& qdisc, uint32_t seq)
     -> StatusValue<size_t>;
 
 /// Build `tc qdisc replace ... parent <parent> <kind>` for a qdisc that takes
@@ -146,7 +171,7 @@ using RequestBuffer = std::array<uint8_t, MAX_REQUEST_SIZE>;
 /// Parse one RTM_NEWQDISC message (nlmsghdr + tcmsg + attributes), one part
 /// of the kernel's answer to build_dump. mqprio's TCA_OPTIONS is the flat
 /// tc_mqprio_qopt followed by optional attributes (ignored); cbs's nests
-/// TCA_CBS_PARMS. Errors: bad_message for a truncated or malformed message,
+/// TCA_CBS_PARMS, etf's TCA_ETF_PARMS. Errors: bad_message for a truncated or malformed message,
 /// another type, or a known kind whose options are short.
 [[nodiscard]] auto parse_qdisc(std::span<uint8_t const> message) -> StatusValue<QdiscInfo>;
 
@@ -158,6 +183,7 @@ class TcControl
 
     [[nodiscard]] virtual auto replace_mqprio(int ifindex, MqprioQdisc const& qdisc) -> Status = 0;
     [[nodiscard]] virtual auto replace_cbs(int ifindex, CbsQdisc const& qdisc) -> Status = 0;
+    [[nodiscard]] virtual auto replace_etf(int ifindex, EtfQdisc const& qdisc) -> Status = 0;
     [[nodiscard]] virtual auto replace_kind(int ifindex, uint32_t parent, std::string_view kind) -> Status = 0;
     [[nodiscard]] virtual auto remove(int ifindex, uint32_t handle, uint32_t parent) -> Status = 0;
     /// The qdisc on @p parent (ROOT: the root) of @p ifindex. Errors: ENOENT
@@ -186,6 +212,7 @@ class TcClient final : public TcControl
 
     [[nodiscard]] auto replace_mqprio(int ifindex, MqprioQdisc const& qdisc) -> Status override;
     [[nodiscard]] auto replace_cbs(int ifindex, CbsQdisc const& qdisc) -> Status override;
+    [[nodiscard]] auto replace_etf(int ifindex, EtfQdisc const& qdisc) -> Status override;
     [[nodiscard]] auto replace_kind(int ifindex, uint32_t parent, std::string_view kind) -> Status override;
     [[nodiscard]] auto remove(int ifindex, uint32_t handle, uint32_t parent) -> Status override;
     [[nodiscard]] auto get(int ifindex, uint32_t parent) -> StatusValue<QdiscInfo> override;

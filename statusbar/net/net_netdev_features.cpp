@@ -253,6 +253,11 @@ auto query_xsk_features(int const ifindex) -> StatusValue<XskFeatures>
     });
 }
 
+auto launch_time_supported(int const ifindex) -> StatusValue<bool>
+{
+    return query_xsk_features(ifindex).transform([](XskFeatures const xsk) { return xsk.launch_time(); });
+}
+
 }  // namespace statusbar::net::netdev
 
 #endif  // __linux__
