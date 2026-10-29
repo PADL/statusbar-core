@@ -50,6 +50,10 @@ auto monitor_tripwire(
     int poll_interval_us) -> std::thread
 {
     return std::thread([&controller, &tripwire, shutdown_token, running_flag, poll_interval_us]() -> void {
+        // `run_guarded`'s label names the thread in our own diagnostics; this
+        // names it for top -H, perf and a core dump, which is where a missed
+        // deadline is usually being investigated from.
+        set_current_thread_name("rt-tripwire");
         // Exception barrier: a thread entry must never let an exception escape
         // (that calls std::terminate and aborts the process). The body is
         // effectively no-throw today, but run_guarded keeps it that way if a
