@@ -38,6 +38,8 @@ auto PcapErrorCategory::message(int ev) const -> std::string
             return "Truncated or invalid pcapng Enhanced Packet Block";
         case PcapError::invalid_simple_packet:
             return "Truncated or invalid pcapng Simple Packet Block";
+        case PcapError::invalid_original_length:
+            return "Original (wire) length is smaller than the captured bytes";
     }
     return "Unknown pcap error";
 }

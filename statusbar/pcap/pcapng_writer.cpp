@@ -111,6 +111,14 @@ auto PcapngFileWriter::write_interface_description_block() -> Status
 
 auto PcapngFileWriter::write_packet(uint64_t timestamp_us, std::span<uint8_t const> packet) -> Status
 {
+    return write_packet(timestamp_us, packet, static_cast<uint32_t>(packet.size()));
+}
+
+auto PcapngFileWriter::write_packet(uint64_t timestamp_us, std::span<uint8_t const> packet, uint32_t original_len) -> Status
+{
+    if (original_len < packet.size()) {
+        return failure(PcapError::invalid_original_length);
+    }
     // Any length, as in FileWriter::write_packet. write_raw() already
     // answers success for a zero-size body, and align_to_4() pads a short
     // frame to the block alignment, so the block after it still parses.
@@ -127,7 +135,7 @@ auto PcapngFileWriter::write_packet(uint64_t timestamp_us, std::span<uint8_t con
     body.timestamp_high = static_cast<uint32_t>(timestamp_us >> 32);
     body.timestamp_low = static_cast<uint32_t>(timestamp_us & 0xFFFFFFFFU);
     body.captured_length = captured_len;
-    body.original_length = captured_len;
+    body.original_length = original_len;
 
     if (auto s = write_raw(&header, sizeof(header)); !s) {
         return s;

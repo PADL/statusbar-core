@@ -54,6 +54,17 @@ class PcapngFileWriter
     /// Write a complete Ethernet frame with an explicit microsecond timestamp.
     [[nodiscard]] auto write_packet(uint64_t timestamp_us, std::span<uint8_t const> packet) -> Status;
 
+    /// Write a snapped (truncated) capture: the bytes kept, plus the length
+    /// the frame had on the wire, as the EPB's original_length. See
+    /// FileWriter::write_packet for why a reader needs the second number.
+    /// @param timestamp_us Timestamp in microseconds since epoch.
+    /// @param packet The captured bytes.
+    /// @param original_len The frame's length on the wire; equal to
+    ///        packet.size() for a complete frame.
+    /// @return PcapError::invalid_original_length if @p original_len is
+    ///         smaller than @p packet.
+    [[nodiscard]] auto write_packet(uint64_t timestamp_us, std::span<uint8_t const> packet, uint32_t original_len) -> Status;
+
     /// Write an Ethernet frame from its header components and payload, current timestamp.
     [[nodiscard]] auto write_packet(
         ieee::Eui48 const& da, ieee::Eui48 const& sa, uint16_t ethertype, std::span<uint8_t const> payload) -> Status

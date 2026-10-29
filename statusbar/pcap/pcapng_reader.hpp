@@ -64,6 +64,14 @@ class PcapngReader
     /// or failure(PcapError::...) on a read error.
     [[nodiscard]] auto read_packet(uint64_t* timestamp_us, Packet& packet) -> StatusValue<bool>;
 
+    /// Read the next packet block and report the length the frame had on the
+    /// wire — the EPB's original_length, or the SPB's, which is the only
+    /// length an SPB carries.
+    /// @param timestamp_us Receives the timestamp (0 for a Simple Packet Block)
+    /// @param packet Receives the captured bytes
+    /// @param original_len Receives the wire length; may be nullptr
+    [[nodiscard]] auto read_packet(uint64_t* timestamp_us, Packet& packet, uint32_t* original_len) -> StatusValue<bool>;
+
     /// Read the next packet and parse the Ethernet header.
     /// @return success(true) if a packet was read, success(false) on clean EOF,
     /// or failure(PcapError::...) on a read error.
@@ -76,8 +84,10 @@ class PcapngReader
     {}
 
     [[nodiscard]] auto read_interface_description(size_t body_length) -> bool;
-    [[nodiscard]] auto read_enhanced_packet(size_t body_length, uint64_t* timestamp_us, Packet& packet) -> bool;
-    [[nodiscard]] auto read_simple_packet(size_t body_length, uint64_t* timestamp_us, Packet& packet) -> bool;
+    [[nodiscard]] auto read_enhanced_packet(size_t body_length, uint64_t* timestamp_us, Packet& packet, uint32_t* original_len)
+        -> bool;
+    [[nodiscard]] auto read_simple_packet(size_t body_length, uint64_t* timestamp_us, Packet& packet, uint32_t* original_len)
+        -> bool;
 
     FilePtr file_{nullptr, [](FILE*) -> void {}};
     std::string filename_;

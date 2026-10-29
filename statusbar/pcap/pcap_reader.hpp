@@ -53,6 +53,16 @@ class FileReader
     /// or failure(PcapError::...) on a read error.
     [[nodiscard]] auto read_packet(uint64_t* timestamp_us, Packet& packet) -> StatusValue<bool>;
 
+    /// Read the next record and report the length the frame had on the wire.
+    /// @param timestamp_us Receives the timestamp, relative to the first record
+    /// @param packet Receives the captured bytes
+    /// @param original_len Receives the record's orig_len — larger than
+    ///        packet.size() for a snapped capture, equal for a complete
+    ///        frame. May be nullptr. A file claiming an orig_len below its
+    ///        own incl_len is malformed and reported verbatim; a negative
+    ///        one is refused as an invalid record header.
+    [[nodiscard]] auto read_packet(uint64_t* timestamp_us, Packet& packet, uint32_t* original_len) -> StatusValue<bool>;
+
     /// Read the next packet and parse the Ethernet header.
     /// @param timestamp_us Output: timestamp in microseconds (relative to first packet).
     /// @param da Output: destination MAC address (6 bytes).

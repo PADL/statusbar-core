@@ -48,6 +48,10 @@ enum class PcapError
     invalid_enhanced_packet,
     /// PcapNG Simple Packet Block was short or malformed.
     invalid_simple_packet,
+    /// A write asked for an original (wire) length smaller than the bytes
+    /// being written, which would describe a frame shorter than its own
+    /// capture.
+    invalid_original_length,
 };
 
 class PcapErrorCategory : public std::error_category

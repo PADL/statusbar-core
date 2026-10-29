@@ -40,6 +40,11 @@ auto FileReader::open(std::string const& filename) -> StatusValue<FileReader>
 
 auto FileReader::read_packet(uint64_t* timestamp_us, Packet& packet) -> StatusValue<bool>
 {
+    return read_packet(timestamp_us, packet, nullptr);
+}
+
+auto FileReader::read_packet(uint64_t* timestamp_us, Packet& packet, uint32_t* original_len) -> StatusValue<bool>
+{
     if (std::feof(file_.get()) != 0) {
         return success(false);
     }
@@ -58,6 +63,14 @@ auto FileReader::read_packet(uint64_t* timestamp_us, Packet& packet) -> StatusVa
     }
     if (rec_header.incl_len > 32768 || rec_header.incl_len < 0) {
         return failure(PcapError::record_too_large);
+    }
+    // A negative orig_len is the same class of nonsense as a negative
+    // incl_len: a 32-bit field read as signed, from a file we did not write.
+    if (rec_header.orig_len < 0) {
+        return failure(PcapError::invalid_record_header);
+    }
+    if (original_len != nullptr) {
+        *original_len = static_cast<uint32_t>(rec_header.orig_len);
     }
     uint64_t const timestamp = (static_cast<uint64_t>(rec_header.ts_sec) * 1000000) + rec_header.ts_usec;
     packet.resize(static_cast<size_t>(rec_header.incl_len));
