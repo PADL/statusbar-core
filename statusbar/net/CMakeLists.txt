@@ -13,6 +13,7 @@ statusbar_add_module(
   net_linux_mmap.cpp
   net_linux_xdp.cpp
   net_message_reactor.cpp
+  net_netdev_features.cpp
   net_netlink.cpp
   net_rawnet.cpp
   net_rawnet_port.cpp
@@ -45,6 +46,7 @@ statusbar_add_module(
   net_group_membership_test.cpp
   net_link_monitor_test.cpp
   net_linux_xdp_test.cpp
+  net_netdev_features_test.cpp
   net_netlink_test.cpp
   net_interface_info_test.cpp
   net_launch_order_test.cpp
@@ -60,6 +62,10 @@ statusbar_add_module(
   net_xdp_launch_time_test.cpp
   net_xdp_avtp_rules_test.cpp
   net_xdp_equiv_test.cpp)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  statusbar_add_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_netdev_features_fuzzer.cpp)
+endif()
 
 add_executable(net_tcp_echo_example net_tcp_echo_example.cpp)
 target_link_libraries(net_tcp_echo_example PRIVATE statusbar)
@@ -88,6 +94,27 @@ set_property(
 
 # Optional: libbpf/libxdp for AF_XDP support (Linux only)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # The netdev uapi constants net_netdev_features.cpp asserts against, where the
+  # headers have them (xsk-features 6.8, tx-launch-time-fifo 6.15).
+  include(CheckCXXSourceCompiles)
+  include(CMakePushCheckState)
+  cmake_push_check_state(RESET)
+  set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+  check_cxx_source_compiles(
+    "#include <linux/netdev.h>
+    static_assert(NETDEV_A_DEV_XSK_FEATURES > NETDEV_A_DEV_XDP_RX_METADATA_FEATURES);"
+    STATUSBAR_HAVE_NETDEV_XSK_FEATURES)
+  check_cxx_source_compiles(
+    "#include <linux/netdev.h>
+    static_assert(NETDEV_XSK_FLAGS_TX_LAUNCH_TIME_FIFO != 0);"
+    STATUSBAR_HAVE_NETDEV_XSK_LAUNCH_TIME)
+  cmake_pop_check_state()
+  foreach(_have XSK_FEATURES XSK_LAUNCH_TIME)
+    if(STATUSBAR_HAVE_NETDEV_${_have})
+      target_compile_definitions(statusbar-net PRIVATE HAVE_NETDEV_${_have}=1)
+    endif()
+  endforeach()
+
   find_package(PkgConfig)
   if(PkgConfig_FOUND)
     pkg_check_modules(LIBBPF libbpf)
