@@ -2034,14 +2034,6 @@ inline constexpr bool xdp_tx_metadata_built = true;
 inline constexpr bool xdp_tx_metadata_built = false;
 #    endif
 
-/// The CTRL_ATTR_FAMILY_ID a generic-netlink family lookup answered with, if
-/// the reply holds one. Pure; here for the tests.
-[[nodiscard]] auto genl_family_id_in(std::span<uint8_t const> reply) noexcept -> std::optional<uint16_t>;
-
-/// The NETDEV_A_DEV_XSK_FEATURES a netdev dev-get answered with, if the reply
-/// holds one.
-[[nodiscard]] auto xsk_features_in(std::span<uint8_t const> reply) noexcept -> std::optional<uint64_t>;
-
 }  // namespace detail
 
 #else  // !(__linux__ && HAVE_XDP)
