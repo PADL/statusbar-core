@@ -28,6 +28,15 @@
 /// At capacity, new connections are accepted and immediately closed
 /// (otherwise the pending connection would keep the listener readable and
 /// spin the poll); on_rejected(peer) reports it.
+///
+/// An AF_UNIX bind address (SocketAddress::local()) makes this a local
+/// control socket instead of a TCP listener, reusing the same reactor slot,
+/// connection accounting and read/write paths. A local socket is not
+/// reachable from the network at all and carries filesystem permissions, so
+/// "only this user may drive the daemon" becomes expressible — see
+/// TcpServerOptions::unix_mode and ::unix_seqpacket. The pool owns the
+/// socket file: it replaces one left behind by a previous run, refuses to
+/// touch a live one, and removes its own on destruction.
 
 #include "statusbar/net/net_address.hpp"
 #include "statusbar/net/net_fd_multiplexer.hpp"
@@ -36,6 +45,7 @@
 
 #include <cstdint>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace statusbar::net {
@@ -63,6 +73,20 @@ struct TcpServerOptions
     int dscp = -1;                ///< applied to accepted sockets when >= 0
     bool nodelay = true;          ///< TCP_NODELAY on accepted sockets
     int64_t idle_timeout_ns = 0;  ///< close slots idle this long; 0 = never
+
+    /// AF_UNIX only: the socket file's mode, applied after bind and before
+    /// listen so the socket never answers at its final path with whatever
+    /// the umask happened to allow. -1 leaves the umask result alone.
+    int unix_mode = -1;
+
+    /// AF_UNIX only: listen on SOCK_SEQPACKET rather than SOCK_STREAM.
+    /// Seqpacket keeps message boundaries — one write() is one whole
+    /// message or nothing — which suits a latest-value telemetry feed where
+    /// a dropped sample does not matter. A command/response protocol wants
+    /// the stream; picking seqpacket for one of those just moves the
+    /// framing problem. The stale-socket probe uses this same type, since a
+    /// live socket of the other type must not read as stale.
+    bool unix_seqpacket = false;
 };
 
 class TcpConnectionPool : public Pollable
@@ -73,6 +97,11 @@ class TcpConnectionPool : public Pollable
         size_t max_connections,
         TcpConnectionHandler& handler,
         TcpServerOptions const& options = {});
+
+    /// Removes the AF_UNIX socket file if this pool still owns it: the
+    /// check is by device and inode, not by path, so a file somebody else
+    /// put there in the meantime is left alone.
+    ~TcpConnectionPool();
 
     TcpConnectionPool(TcpConnectionPool const&) = delete;
     auto operator=(TcpConnectionPool const&) -> TcpConnectionPool& = delete;
@@ -123,6 +152,12 @@ class TcpConnectionPool : public Pollable
 
     TcpConnectionHandler& handler_;
     TcpServerOptions options_;
+    /// Non-empty when we created an AF_UNIX socket file we are responsible
+    /// for. The device and inode are what we created, so the destructor can
+    /// tell our socket apart from anything that replaced it.
+    std::string unix_path_{};
+    uint64_t unix_dev_{0};
+    uint64_t unix_ino_{0};
     FileDescriptor listener_{};
     FdMultiplexer mux_;
     std::vector<Slot> slots_;     ///< sized at construction

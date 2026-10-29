@@ -7,10 +7,13 @@
 
 #include <cassert>
 #include <cerrno>
+#include <string>
+#include <utility>
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 
 namespace statusbar::net {
 
@@ -27,17 +30,163 @@ constexpr int SEND_FLAGS = 0;
 void set_accepted_options(int fd, TcpServerOptions const& options, int family)
 {
     (void)set_nonblocking(fd);
-    if (options.nodelay) {
+    // TCP_NODELAY and DSCP are TCP and IP notions. On an AF_UNIX connection
+    // there is no Nagle to disable and no IP header to mark, so they are
+    // skipped rather than attempted and ignored.
+    bool const is_local = family == AF_UNIX;
+    if (options.nodelay && !is_local) {
         int const one = 1;
         (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     }
-    if (options.dscp >= 0) {
+    if (options.dscp >= 0 && !is_local) {
         (void)set_dscp(fd, family, uint8_t(options.dscp));
     }
 #if defined(SO_NOSIGPIPE)
     int const one = 1;
     (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
+}
+
+/// Remove a socket file only while it is still the one we created. Compared
+/// by device and inode rather than by path: between bind and here, somebody
+/// may have replaced the name, and unlinking by path would delete their file.
+void unlink_if_ours(std::string const& path, uint64_t dev, uint64_t ino)
+{
+    if (path.empty()) {
+        return;
+    }
+    struct stat st{};
+    if (::lstat(path.c_str(), &st) < 0) {
+        return;  // already gone
+    }
+    if (static_cast<uint64_t>(st.st_dev) != dev || static_cast<uint64_t>(st.st_ino) != ino) {
+        return;  // not ours any more
+    }
+    (void)::unlink(path.c_str());
+}
+
+/// What is sitting at a socket path we have been asked to bind.
+enum class PathVerdict
+{
+    absent,    ///< nothing there; bind away
+    stale,     ///< a socket file nobody is listening on: ours to replace
+    occupied,  ///< something is listening: a second instance must not steal it
+    unusable,  ///< not a socket, or a symlink: not ours to remove either
+};
+
+auto inspect_socket_path(std::string const& path, int sock_type) -> PathVerdict
+{
+    struct stat st{};
+    if (::lstat(path.c_str(), &st) < 0) {
+        return (errno == ENOENT) ? PathVerdict::absent : PathVerdict::unusable;
+    }
+    // lstat, never stat: a symlink must report as a symlink, so it fails the
+    // test below and is refused. Through stat() a link pointing at somebody
+    // else's stale socket would read as stale, and "replace the stale socket"
+    // would delete the link and bind in its place -- or, with a live target,
+    // probe through it. A regular file is not ours to delete either.
+    if (!S_ISSOCK(st.st_mode)) {
+        return PathVerdict::unusable;
+    }
+
+    auto probe_addr = SocketAddress::local(path);
+    if (!probe_addr) {
+        return PathVerdict::unusable;
+    }
+    // The listener's own socket type, so a live peer answers the probe
+    // outright instead of through an error code. It is not what makes the
+    // verdict safe -- that is the ECONNREFUSED rule below, which refuses to
+    // call anything else stale whatever type is at the path.
+    int const probe = ::socket(AF_UNIX, sock_type, 0);
+    if (probe < 0) {
+        return PathVerdict::unusable;
+    }
+    (void)set_nonblocking(probe);
+    int const rc = ::connect(probe, probe_addr->sockaddr(), probe_addr->length());
+    int const err = (rc == 0) ? 0 : errno;
+    ::close(probe);
+
+    if (rc == 0) {
+        return PathVerdict::occupied;  // somebody answered
+    }
+    // ECONNREFUSED is the one answer that means nobody is listening. ENOENT
+    // means it vanished under us, which is just as good. Everything else --
+    // EAGAIN from a full backlog, EPROTOTYPE from a live socket of the other
+    // type, a permission error -- is a reason to leave the path alone.
+    if (err == ECONNREFUSED || err == ENOENT) {
+        return PathVerdict::stale;
+    }
+    return PathVerdict::occupied;
+}
+
+struct LocalListener
+{
+    FileDescriptor fd{};
+    uint64_t dev{0};
+    uint64_t ino{0};
+};
+
+/// Bind, chmod, listen -- in that order, so the socket never answers at its
+/// final path with umask permissions. (A path swapped between bind and chmod
+/// would take the mode with it; binding in a private directory and renaming
+/// into place closes that window and is the next step if we ever need it.)
+auto create_local_listener(SocketAddress const& addr, TcpServerOptions const& options) -> StatusValue<LocalListener>
+{
+    std::string const path{addr.path()};
+    if (path.empty()) {
+        // An unnamed or abstract address has no file to own or protect.
+        return failure(NetError::invalid_address);
+    }
+    int const sock_type = options.unix_seqpacket ? SOCK_SEQPACKET : SOCK_STREAM;
+
+    switch (inspect_socket_path(path, sock_type)) {
+        case PathVerdict::absent:
+            break;
+        case PathVerdict::stale:
+            if (::unlink(path.c_str()) < 0) {
+                return failure(NetError::bind_failed);
+            }
+            break;
+        case PathVerdict::occupied:
+        case PathVerdict::unusable:
+            return failure(NetError::bind_failed);
+    }
+
+    int const fd = ::socket(AF_UNIX, sock_type, 0);
+    if (fd < 0) {
+        return failure(NetError::socket_creation_failed);
+    }
+    FileDescriptor sock{fd};
+    // No SO_REUSEADDR: on AF_UNIX it does nothing, and the stale path has
+    // already been dealt with above.
+    if (::bind(fd, addr.sockaddr(), addr.length()) < 0) {
+        return failure(NetError::bind_failed);
+    }
+
+    // The file exists now, so from here every failure has to remove it.
+    // Ownership is the device and inode bind just created, read back from
+    // the filesystem -- fstat() on the socket reports the socket's own
+    // inode, which is a different number.
+    struct stat bound{};
+    if (::lstat(path.c_str(), &bound) < 0 || S_ISSOCK(bound.st_mode) == 0) {
+        (void)::unlink(path.c_str());
+        return failure(NetError::bind_failed);
+    }
+    LocalListener out;
+    out.dev = static_cast<uint64_t>(bound.st_dev);
+    out.ino = static_cast<uint64_t>(bound.st_ino);
+
+    if (options.unix_mode >= 0 && ::chmod(path.c_str(), static_cast<mode_t>(options.unix_mode)) < 0) {
+        unlink_if_ours(path, out.dev, out.ino);
+        return failure(NetError::socket_option_failed);
+    }
+    if (::listen(fd, options.backlog) < 0) {
+        unlink_if_ours(path, out.dev, out.ino);
+        return failure(NetError::listen_failed);
+    }
+
+    out.fd = std::move(sock);
+    return out;
 }
 
 }  // namespace
@@ -53,6 +202,25 @@ TcpConnectionPool::TcpConnectionPool(
     for (size_t i = max_connections; i > 0; --i) {
         free_.push_back(uint32_t(i - 1));  // pop_back hands out low slots first
     }
+
+    if (bind_addr.family() == AF_UNIX) {
+        auto local = create_local_listener(bind_addr, options);
+        if (!local || !mux_.valid()) {
+            return;
+        }
+        unix_path_ = std::string{bind_addr.path()};
+        unix_dev_ = local->dev;
+        unix_ino_ = local->ino;
+        listener_ = FileDescriptor{local->fd.release()};
+        (void)set_nonblocking(listener_.get());
+        if (!mux_.add(listener_.get(), LISTENER_TAG, true, false)) {
+            listener_.close();
+            unlink_if_ours(unix_path_, unix_dev_, unix_ino_);
+            unix_path_.clear();
+        }
+        return;
+    }
+
     auto listener = create_tcp_listener(bind_addr, options.backlog, options.dscp);
     if (!listener || !mux_.valid()) {
         return;
@@ -62,6 +230,11 @@ TcpConnectionPool::TcpConnectionPool(
     if (!mux_.add(listener_.get(), LISTENER_TAG, true, false)) {
         listener_.close();
     }
+}
+
+TcpConnectionPool::~TcpConnectionPool()
+{
+    unlink_if_ours(unix_path_, unix_dev_, unix_ino_);
 }
 
 auto TcpConnectionPool::valid() const noexcept -> bool
