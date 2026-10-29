@@ -615,19 +615,185 @@ TEST(toml_quoted_dotted_key, an_array_of_tables_can_be_named_with_a_dot)
     }
 }
 
-TEST(toml_quoted_dotted_key, a_sub_table_under_an_array_of_tables_fails_either_way)
+TEST(toml_quoted_dotted_key, a_sub_table_under_an_array_of_tables_parses_either_way)
 {
-    // Not a quoting problem. TOML says `[s.a]` after `[[s]]` attaches to the
-    // last element of the array; we do not implement that at all -- `s` is an
-    // Array, get_or_create_table() needs a Table, and the parse fails. Both
-    // spellings are asserted so this cannot later be mistaken for fallout
-    // from the quoted-key work. Filed as BUG-006.
+    // This test used to assert that both spellings FAILED -- the limitation
+    // it pinned became BUG-006, and BUG-006 is fixed, so it now pins the
+    // behaviour instead. Kept here as well as in the BUG-006 group because
+    // the quoted spelling is what makes it this group's business.
     auto bare = parse("[[s]]\nx = 1\n[s.a]\nv = 7\n");
     auto quoted = parse("[[s]]\nx = 1\n[s.\"a.b\"]\nv = 7\n");
-    EXPECT_FALSE(bare.has_value());
-    EXPECT_FALSE(quoted.has_value());
-    if (!bare && !quoted) {
-        EXPECT_EQ(bare.error(), quoted.error());
+    EXPECT_TRUE(bare.has_value());
+    EXPECT_TRUE(quoted.has_value());
+    if (bare && quoted) {
+        EXPECT_EQ(*(*bare->get("s")->as_array())[0].as_table()->get("a")->as_table()->get("v")->as_integer(), 7);
+        EXPECT_EQ(*(*quoted->get("s")->as_array())[0].as_table()->get("a.b")->as_table()->get("v")->as_integer(), 7);
+    }
+}
+
+//
+// Table headers under an array of tables (BUG-006)
+//
+// `[s.x]` after `[[s]]` belongs to the element `[[s]]` last appended. We
+// used to reject the document: `s` is an Array where the walk wanted a
+// Table. Only table headers work this way -- TOML does not let a dotted key
+// extend an array -- so the descent lives in the parser, not in
+// Table::get_or_create_table().
+//
+
+TEST(toml_array_subtable, a_sub_table_attaches_to_the_last_element)
+{
+    auto result = parse("[[s]]\n"
+                        "x = 1\n"
+                        "[[s]]\n"
+                        "x = 2\n"
+                        "[s.extra]\n"
+                        "v = 9\n");
+    EXPECT_TRUE(result.has_value());
+    if (!result) {
+        return;
+    }
+    auto const* arr = result->get("s")->as_array();
+    EXPECT_TRUE(arr != nullptr);
+    if (arr == nullptr) {
+        return;
+    }
+    EXPECT_EQ(arr->size(), 2U);
+
+    // The second element, the one `[[s]]` appended last.
+    auto const* second = (*arr)[1].as_table();
+    EXPECT_TRUE(second != nullptr);
+    if (second != nullptr) {
+        EXPECT_EQ(*second->get("x")->as_integer(), 2);
+        auto const* extra = second->get("extra");
+        EXPECT_TRUE(extra != nullptr && extra->as_table() != nullptr);
+        if (extra != nullptr && extra->as_table() != nullptr) {
+            EXPECT_EQ(*extra->as_table()->get("v")->as_integer(), 9);
+        }
+    }
+
+    // And not the first, which is the part a "descend into the array"
+    // shortcut would get wrong.
+    auto const* first = (*arr)[0].as_table();
+    EXPECT_TRUE(first != nullptr);
+    if (first != nullptr) {
+        EXPECT_FALSE(first->contains("extra"));
+    }
+}
+
+TEST(toml_array_subtable, values_after_the_sub_table_header_land_in_the_sub_table)
+{
+    // The header also changes where following key-values go -- it returns the
+    // table the document is now writing into.
+    auto result = parse("[[s]]\n"
+                        "[s.a]\n"
+                        "one = 1\n"
+                        "two = 2\n");
+    EXPECT_TRUE(result.has_value());
+    if (result) {
+        auto const* a = (*result->get("s")->as_array())[0].as_table()->get("a");
+        EXPECT_TRUE(a != nullptr && a->as_table() != nullptr);
+        if (a != nullptr && a->as_table() != nullptr) {
+            EXPECT_EQ(a->as_table()->size(), 2U);
+            EXPECT_EQ(*a->as_table()->get("two")->as_integer(), 2);
+        }
+    }
+}
+
+TEST(toml_array_subtable, an_array_of_tables_nests_under_an_array_of_tables)
+{
+    // `[[s.t]]` has to resolve `s` the same way before appending to `t`.
+    auto result = parse("[[s]]\n"
+                        "x = 1\n"
+                        "[[s.t]]\n"
+                        "v = 1\n"
+                        "[[s.t]]\n"
+                        "v = 2\n");
+    EXPECT_TRUE(result.has_value());
+    if (!result) {
+        return;
+    }
+    auto const* outer = result->get("s")->as_array();
+    EXPECT_TRUE(outer != nullptr);
+    if (outer == nullptr || outer->size() != 1) {
+        return;
+    }
+    auto const* inner = (*outer)[0].as_table()->get("t");
+    EXPECT_TRUE(inner != nullptr && inner->as_array() != nullptr);
+    if (inner != nullptr && inner->as_array() != nullptr) {
+        EXPECT_EQ(inner->as_array()->size(), 2U);
+        EXPECT_EQ(*(*inner->as_array())[1].as_table()->get("v")->as_integer(), 2);
+    }
+}
+
+TEST(toml_array_subtable, a_deeper_path_descends_through_two_arrays)
+{
+    auto result = parse("[[s]]\n"
+                        "[[s.t]]\n"
+                        "[s.t.leaf]\n"
+                        "v = 5\n");
+    EXPECT_TRUE(result.has_value());
+    if (result) {
+        auto const* s = result->get("s")->as_array();
+        EXPECT_TRUE(s != nullptr);
+        if (s != nullptr && s->size() == 1) {
+            auto const* t = (*s)[0].as_table()->get("t")->as_array();
+            EXPECT_TRUE(t != nullptr);
+            if (t != nullptr && t->size() == 1) {
+                auto const* leaf = (*t)[0].as_table()->get("leaf");
+                EXPECT_TRUE(leaf != nullptr && leaf->as_table() != nullptr);
+                if (leaf != nullptr && leaf->as_table() != nullptr) {
+                    EXPECT_EQ(*leaf->as_table()->get("v")->as_integer(), 5);
+                }
+            }
+        }
+    }
+}
+
+TEST(toml_array_subtable, an_empty_array_has_no_element_to_attach_to)
+{
+    // `s = []` then `[s.x]`: the array exists and has no last element, so
+    // there is nothing the header could belong to. Still a failure, and the
+    // line number locates it.
+    Parser parser{"s = []\n[s.x]\nv = 1\n"};
+    auto result = parser.parse_document_public();
+    EXPECT_FALSE(result.has_value());
+    if (!result) {
+        EXPECT_EQ(result.error(), make_error_code(TomlError::type_mismatch));
+        EXPECT_EQ(parser.error_line(), 2U);
+    }
+}
+
+TEST(toml_array_subtable, an_array_of_plain_values_is_not_a_table_path)
+{
+    auto result = parse("s = [1, 2]\n[s.x]\nv = 1\n");
+    EXPECT_FALSE(result.has_value());
+    if (!result) {
+        EXPECT_EQ(result.error(), make_error_code(TomlError::type_mismatch));
+    }
+}
+
+TEST(toml_array_subtable, a_plain_value_in_the_path_still_fails)
+{
+    // The pre-existing guard, unchanged: a segment that holds an integer is
+    // not a table and not an array.
+    auto result = parse("s = 1\n[s.x]\nv = 1\n");
+    EXPECT_FALSE(result.has_value());
+    if (!result) {
+        EXPECT_EQ(result.error(), make_error_code(TomlError::type_mismatch));
+    }
+}
+
+TEST(toml_array_subtable, a_dotted_key_may_not_extend_an_array)
+{
+    // The other half of the rule, and why the descent is not in
+    // Table::get_or_create_table(): TOML allows a table HEADER to reach into
+    // an array's last element, but a dotted key may not. `s.y = 2` with `s`
+    // an array stays an error.
+    auto result = parse("s = [{ x = 1 }]\ns.y = 2\n");
+    EXPECT_FALSE(result.has_value());
+    if (!result) {
+        EXPECT_EQ(result.error(), make_error_code(TomlError::type_mismatch));
     }
 }
 

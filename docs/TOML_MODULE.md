@@ -137,9 +137,14 @@ int main()
   keeps splitting by design. Writing quotes such keys back
   (`Config::to_toml_string()`), so a load/save round trip preserves the
   document. See BUG-004.
-- A table header under an array of tables (`[s.x]` after `[[s]]`) is not
-  supported and fails the parse; TOML attaches it to the array's last
-  element. See BUG-006.
+- A table header under an array of tables (`[s.x]` after `[[s]]`) attaches
+  to the element `[[s]]` last appended, and `[[s.t]]` resolves `s` the same
+  way. Only *headers* descend into an array: TOML does not allow a dotted
+  key to extend one, so `s.y = 2` with `s` an array stays a
+  `type_mismatch`, and the descent lives in the parser rather than in
+  `Table::get_or_create_table()`. A header under an empty array
+  (`s = []`, then `[s.x]`) has no element to attach to and fails. See
+  BUG-006.
 - `get_list<T>` skips elements whose type doesn't match `T`. Pre-
   validate the array shape if strict typing matters.
 - `parse_value_string()` is for CLI overrides that aren't TOML

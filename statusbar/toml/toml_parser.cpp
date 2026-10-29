@@ -71,7 +71,7 @@ auto Parser::parse_table_header(Table& root) -> StatusValue<Table*>
         return success(arr->operator[](arr->size() - 1).as_table());
     }
 
-    Table* tbl = root.get_or_create_table(std::span<std::string const>{*key_result});
+    Table* tbl = resolve_table_path(root, std::span<std::string const>{*key_result});
     if (tbl == nullptr) {
         return failure(TomlError::type_mismatch);
     }
@@ -138,6 +138,39 @@ auto Parser::parse_document() -> StatusValue<Table>
     return success(std::move(root));
 }
 
+auto Parser::resolve_table_path(Table& root, std::span<std::string const> path) -> Table*
+{
+    Table* current = &root;
+    for (auto const& segment : path) {
+        Value* v = current->get(segment);
+        if (v == nullptr) {
+            current->set(segment, Table{});
+            v = current->get(segment);
+        }
+
+        if (Array* arr = v->as_array(); arr != nullptr) {
+            // `[[s]]` made an array; `[s.x]` belongs to the element that
+            // `[[s]]` last appended, not to a table named `s`.
+            if (arr->empty()) {
+                return nullptr;  // nothing for the header to attach to
+            }
+            Table* last = (*arr)[arr->size() - 1].as_table();
+            if (last == nullptr) {
+                return nullptr;  // an array of something other than tables
+            }
+            current = last;
+            continue;
+        }
+
+        Table* t = v->as_table();
+        if (t == nullptr) {
+            return nullptr;  // the key exists and is a plain value
+        }
+        current = t;
+    }
+    return current;
+}
+
 auto Parser::get_or_create_array_of_tables(Table& root, std::span<std::string const> path) -> Array*
 {
     if (path.empty()) {
@@ -145,7 +178,7 @@ auto Parser::get_or_create_array_of_tables(Table& root, std::span<std::string co
     }
     Table* parent = &root;
     if (path.size() > 1) {
-        parent = root.get_or_create_table(path.first(path.size() - 1));
+        parent = resolve_table_path(root, path.first(path.size() - 1));
         if (parent == nullptr) {
             return nullptr;
         }
