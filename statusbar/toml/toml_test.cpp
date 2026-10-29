@@ -13,8 +13,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <span>
 #include <string>
 #include <system_error>
+#include <vector>
 
 using namespace statusbar::toml;
 
@@ -447,6 +449,221 @@ TEST(toml_parser, array_of_tables)
 
     EXPECT_EQ(*(*arr)[0].as_table()->get("name")->as_string(), "first");
     EXPECT_EQ(*(*arr)[1].as_table()->get("name")->as_string(), "second");
+}
+
+//
+// Quoted keys that contain a dot (BUG-004)
+//
+// `[port."eth0.100"]` names ONE table called `eth0.100` inside `port`.
+// The quoting is what makes the dot a character rather than a separator,
+// so a key path has to stay segmented from the parser down to the table
+// walk -- joining it into a dotted string loses the distinction, and
+// `eth0.100` is how every VLAN subinterface on Linux is named.
+//
+
+TEST(toml_quoted_dotted_key, a_quoted_table_name_is_one_table)
+{
+    auto result = parse("[port.\"eth0.100\"]\n"
+                        "vlan = 100\n");
+    EXPECT_TRUE(result.has_value());
+    if (!result) {
+        return;
+    }
+
+    auto const* port = result->get("port");
+    EXPECT_TRUE(port != nullptr);
+    if (port == nullptr || port->as_table() == nullptr) {
+        return;
+    }
+    // Exactly one key, spelled with its dot, and no phantom "eth0" level.
+    EXPECT_EQ(port->as_table()->size(), 1U);
+    EXPECT_TRUE(port->as_table()->contains("eth0.100"));
+    EXPECT_FALSE(port->as_table()->contains("eth0"));
+
+    auto const* iface = port->as_table()->get("eth0.100");
+    EXPECT_TRUE(iface != nullptr);
+    if (iface != nullptr && iface->as_table() != nullptr) {
+        EXPECT_EQ(*iface->as_table()->get("vlan")->as_integer(), 100);
+    }
+}
+
+TEST(toml_quoted_dotted_key, the_dotted_string_lookup_cannot_reach_it)
+{
+    // get_path() splits on every dot, so it addresses the three-level path
+    // `port` -> `eth0` -> `100`, which this document does not contain. That
+    // is the price of the string API and the reason for the span overload
+    // below; it is asserted here so the semantics cannot drift back.
+    auto result = parse("[port.\"eth0.100\"]\n"
+                        "vlan = 100\n");
+    EXPECT_TRUE(result.has_value());
+    if (result) {
+        EXPECT_TRUE(result->get_path("port.eth0.100.vlan") == nullptr);
+    }
+}
+
+TEST(toml_quoted_dotted_key, a_segmented_lookup_reaches_a_literal_dot)
+{
+    auto result = parse("[port.\"eth0.100\"]\n"
+                        "vlan = 100\n"
+                        "[port]\n"
+                        "\"mtu.bytes\" = 1500\n");
+    EXPECT_TRUE(result.has_value());
+    if (!result) {
+        return;
+    }
+
+    // A dotted segment in the middle of the path.
+    std::vector<std::string> const through{"port", "eth0.100", "vlan"};
+    auto const* v = result->get_path(std::span<std::string const>{through});
+    EXPECT_TRUE(v != nullptr);
+    if (v != nullptr) {
+        EXPECT_EQ(*v->as_integer(), 100);
+    }
+
+    // And one at the end, which is the step a dotted-string lookup of the
+    // final key would quietly split apart.
+    std::vector<std::string> const leaf{"port", "mtu.bytes"};
+    auto const* mtu = result->get_path(std::span<std::string const>{leaf});
+    EXPECT_TRUE(mtu != nullptr);
+    if (mtu != nullptr) {
+        EXPECT_EQ(*mtu->as_integer(), 1500);
+    }
+}
+
+TEST(toml_quoted_dotted_key, quoting_makes_a_different_document)
+{
+    // These two were indistinguishable before: both became three tables.
+    auto quoted = parse("[port.\"eth0.100\"]\nvlan = 100\n");
+    auto bare = parse("[port.eth0.100]\nvlan = 100\n");
+    EXPECT_TRUE(quoted.has_value());
+    EXPECT_TRUE(bare.has_value());
+    if (!quoted || !bare) {
+        return;
+    }
+
+    EXPECT_TRUE(quoted->get("port")->as_table()->contains("eth0.100"));
+    EXPECT_FALSE(quoted->get("port")->as_table()->contains("eth0"));
+
+    EXPECT_FALSE(bare->get("port")->as_table()->contains("eth0.100"));
+    EXPECT_TRUE(bare->get("port")->as_table()->contains("eth0"));
+    EXPECT_EQ(*bare->get_path("port.eth0.100.vlan")->as_integer(), 100);
+}
+
+TEST(toml_quoted_dotted_key, a_bare_and_a_quoted_segment_mix_in_one_header)
+{
+    auto result = parse("[a.\"b.c\".d]\n"
+                        "v = 1\n");
+    EXPECT_TRUE(result.has_value());
+    if (!result) {
+        return;
+    }
+    auto const* a = result->get("a");
+    EXPECT_TRUE(a != nullptr && a->as_table() != nullptr);
+    if (a == nullptr || a->as_table() == nullptr) {
+        return;
+    }
+    auto const* bc = a->as_table()->get("b.c");
+    EXPECT_TRUE(bc != nullptr && bc->as_table() != nullptr);
+    if (bc != nullptr && bc->as_table() != nullptr) {
+        auto const* d = bc->as_table()->get("d");
+        EXPECT_TRUE(d != nullptr && d->as_table() != nullptr);
+        if (d != nullptr && d->as_table() != nullptr) {
+            EXPECT_EQ(*d->as_table()->get("v")->as_integer(), 1);
+        }
+    }
+}
+
+TEST(toml_quoted_dotted_key, a_quoted_dotted_key_value_pair_stays_one_key)
+{
+    auto result = parse("\"eth0.100\" = 5\n");
+    EXPECT_TRUE(result.has_value());
+    if (result) {
+        EXPECT_TRUE(result->contains("eth0.100"));
+        EXPECT_FALSE(result->contains("eth0"));
+        EXPECT_EQ(*result->get("eth0.100")->as_integer(), 5);
+    }
+}
+
+TEST(toml_quoted_dotted_key, a_quoted_dotted_key_in_an_inline_table_stays_one_key)
+{
+    auto result = parse("x = { \"a.b\" = 1 }\n");
+    EXPECT_TRUE(result.has_value());
+    if (result) {
+        auto const* x = result->get("x");
+        EXPECT_TRUE(x != nullptr && x->as_table() != nullptr);
+        if (x != nullptr && x->as_table() != nullptr) {
+            EXPECT_TRUE(x->as_table()->contains("a.b"));
+            EXPECT_FALSE(x->as_table()->contains("a"));
+        }
+    }
+}
+
+TEST(toml_quoted_dotted_key, an_array_of_tables_can_be_named_with_a_dot)
+{
+    auto result = parse("[[\"eth0.100\"]]\n"
+                        "x = 1\n"
+                        "[[\"eth0.100\"]]\n"
+                        "x = 2\n");
+    EXPECT_TRUE(result.has_value());
+    if (result) {
+        auto const* v = result->get("eth0.100");
+        EXPECT_TRUE(v != nullptr);
+        if (v != nullptr && v->as_array() != nullptr) {
+            EXPECT_EQ(v->as_array()->size(), 2U);
+            EXPECT_EQ(*(*v->as_array())[1].as_table()->get("x")->as_integer(), 2);
+        }
+    }
+}
+
+TEST(toml_quoted_dotted_key, a_sub_table_under_an_array_of_tables_fails_either_way)
+{
+    // Not a quoting problem. TOML says `[s.a]` after `[[s]]` attaches to the
+    // last element of the array; we do not implement that at all -- `s` is an
+    // Array, get_or_create_table() needs a Table, and the parse fails. Both
+    // spellings are asserted so this cannot later be mistaken for fallout
+    // from the quoted-key work. Filed as BUG-006.
+    auto bare = parse("[[s]]\nx = 1\n[s.a]\nv = 7\n");
+    auto quoted = parse("[[s]]\nx = 1\n[s.\"a.b\"]\nv = 7\n");
+    EXPECT_FALSE(bare.has_value());
+    EXPECT_FALSE(quoted.has_value());
+    if (!bare && !quoted) {
+        EXPECT_EQ(bare.error(), quoted.error());
+    }
+}
+
+TEST(toml_quoted_dotted_key, the_interface_as_a_value_form_keeps_its_dots)
+{
+    // The shape to prefer in a schema, and the documented workaround while
+    // this was broken: the name is a value, not a key.
+    auto result = parse("[[stream]]\n"
+                        "interface = \"eth0.100\"\n"
+                        "[[stream]]\n"
+                        "interface = \"eth1.200\"\n");
+    EXPECT_TRUE(result.has_value());
+    if (result) {
+        auto const* arr = result->get("stream")->as_array();
+        EXPECT_TRUE(arr != nullptr);
+        if (arr != nullptr) {
+            EXPECT_EQ(arr->size(), 2U);
+            EXPECT_EQ(*(*arr)[0].as_table()->get("interface")->as_string(), "eth0.100");
+            EXPECT_EQ(*(*arr)[1].as_table()->get("interface")->as_string(), "eth1.200");
+        }
+    }
+}
+
+TEST(toml_quoted_dotted_key, an_unquoted_dotted_path_still_nests)
+{
+    // The other half of the contract: nothing about ordinary dotted keys
+    // changes, including a dotted key-value pair.
+    auto result = parse("[server]\n"
+                        "a.b.c = 1\n"
+                        "[x.y.z]\n"
+                        "v = 2\n");
+    EXPECT_TRUE(result.has_value());
+    if (result) {
+        EXPECT_EQ(*result->get_path("server.a.b.c")->as_integer(), 1);
+        EXPECT_EQ(*result->get_path("x.y.z.v")->as_integer(), 2);
+    }
 }
 
 //

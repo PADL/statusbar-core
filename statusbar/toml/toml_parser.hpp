@@ -16,9 +16,11 @@
 #include <cstdlib>
 #include <fstream>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace statusbar::toml {
 
@@ -66,11 +68,14 @@ class Parser
 
     [[nodiscard]] auto parse_document() -> StatusValue<Table>;
 
-    [[nodiscard]] auto get_or_create_array_of_tables(Table& root, std::string_view path) -> Array*;
+    [[nodiscard]] auto get_or_create_array_of_tables(Table& root, std::span<std::string const> path) -> Array*;
 
-    [[nodiscard]] auto parse_key_value() -> StatusValue<std::pair<std::string, Value>>;
+    [[nodiscard]] auto parse_key_value() -> StatusValue<std::pair<std::vector<std::string>, Value>>;
 
-    [[nodiscard]] auto parse_key_path() -> StatusValue<std::string>;
+    /// Parse a key path into one string per segment. Segments, not a joined
+    /// dotted string: a quoted segment may contain a dot of its own, and
+    /// joining would make `["a.b"]` and `[a.b]` the same key path.
+    [[nodiscard]] auto parse_key_path() -> StatusValue<std::vector<std::string>>;
 
     [[nodiscard]] auto parse_key() -> StatusValue<std::string>;
 

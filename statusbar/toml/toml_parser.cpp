@@ -71,7 +71,7 @@ auto Parser::parse_table_header(Table& root) -> StatusValue<Table*>
         return success(arr->operator[](arr->size() - 1).as_table());
     }
 
-    Table* tbl = root.get_or_create_table(*key_result);
+    Table* tbl = root.get_or_create_table(std::span<std::string const>{*key_result});
     if (tbl == nullptr) {
         return failure(TomlError::type_mismatch);
     }
@@ -85,26 +85,21 @@ auto Parser::insert_key_value(Table* current_table) -> Status
         return failure(kv_result.error());
     }
 
-    auto& [key, value] = *kv_result;
+    auto& [segments, value] = *kv_result;
 
-    size_t const dot = key.rfind('.');
-    if (dot != std::string::npos) {
-        std::string const parent_path = key.substr(0, dot);
-        std::string final_key = key.substr(dot + 1);
-        Table* parent = current_table->get_or_create_table(parent_path);
+    // The last segment is the key; anything before it is the path to the
+    // table that holds it. parse_key_path() never returns an empty path.
+    Table* parent = current_table;
+    if (segments.size() > 1) {
+        parent = current_table->get_or_create_table(std::span<std::string const>{segments}.first(segments.size() - 1));
         if (parent == nullptr) {
             return failure(TomlError::type_mismatch);
         }
-        if (parent->contains(final_key)) {
-            return failure(TomlError::duplicate_key);
-        }
-        parent->set(std::move(final_key), std::move(value));
-    } else {
-        if (current_table->contains(key)) {
-            return failure(TomlError::duplicate_key);
-        }
-        current_table->set(std::move(key), std::move(value));
     }
+    if (parent->contains(segments.back())) {
+        return failure(TomlError::duplicate_key);
+    }
+    parent->set(std::move(segments.back()), std::move(value));
 
     return success();
 }
@@ -143,29 +138,30 @@ auto Parser::parse_document() -> StatusValue<Table>
     return success(std::move(root));
 }
 
-auto Parser::get_or_create_array_of_tables(Table& root, std::string_view path) -> Array*
+auto Parser::get_or_create_array_of_tables(Table& root, std::span<std::string const> path) -> Array*
 {
-    size_t const dot = path.rfind('.');
+    if (path.empty()) {
+        return nullptr;
+    }
     Table* parent = &root;
-
-    if (dot != std::string::npos) {
-        parent = root.get_or_create_table(path.substr(0, dot));
+    if (path.size() > 1) {
+        parent = root.get_or_create_table(path.first(path.size() - 1));
         if (parent == nullptr) {
             return nullptr;
         }
-        path = path.substr(dot + 1);
     }
 
-    Value* v = parent->get(path);
+    std::string const& name = path.back();
+    Value* v = parent->get(name);
     if (v == nullptr) {
-        parent->set(std::string{path}, Array{});
-        v = parent->get(path);
+        parent->set(name, Array{});
+        v = parent->get(name);
     }
 
     return v->as_array();
 }
 
-auto Parser::parse_key_value() -> StatusValue<std::pair<std::string, Value>>
+auto Parser::parse_key_value() -> StatusValue<std::pair<std::vector<std::string>, Value>>
 {
     auto key_result = parse_key_path();
     if (!key_result) {
@@ -194,9 +190,9 @@ auto Parser::parse_key_value() -> StatusValue<std::pair<std::string, Value>>
     return success(std::make_pair(std::move(*key_result), std::move(*value_result)));
 }
 
-auto Parser::parse_key_path() -> StatusValue<std::string>
+auto Parser::parse_key_path() -> StatusValue<std::vector<std::string>>
 {
-    std::string result;
+    std::vector<std::string> segments;
 
     while (true) {
         auto key_result = parse_key();
@@ -204,10 +200,7 @@ auto Parser::parse_key_path() -> StatusValue<std::string>
             return forward_failure(key_result);
         }
 
-        if (!result.empty()) {
-            result += '.';
-        }
-        result += *key_result;
+        segments.push_back(std::move(*key_result));
 
         skip_whitespace();
         if (peek() != '.') {
@@ -217,7 +210,7 @@ auto Parser::parse_key_path() -> StatusValue<std::string>
         skip_whitespace();
     }
 
-    return success(std::move(result));
+    return success(std::move(segments));
 }
 
 auto Parser::parse_key() -> StatusValue<std::string>
@@ -783,20 +776,16 @@ auto Parser::parse_inline_table() -> StatusValue<Table>
             return forward_failure(value_result);
         }
 
-        // Handle dotted keys in inline tables
-        size_t const dot = key_result->rfind('.');
-        if (dot != std::string::npos) {
-            std::string const parent_path = key_result->substr(0, dot);
-            std::string final_key = key_result->substr(dot + 1);
-            Table* parent = result.get_or_create_table(parent_path);
+        // Dotted keys in inline tables, by the same rule as insert_key_value.
+        Table* parent = &result;
+        if (key_result->size() > 1) {
+            parent = result.get_or_create_table(std::span<std::string const>{*key_result}.first(key_result->size() - 1));
             if (parent == nullptr) {
                 --nesting_depth_;
                 return failure(TomlError::type_mismatch);
             }
-            parent->set(std::move(final_key), std::move(*value_result));
-        } else {
-            result.set(std::move(*key_result), std::move(*value_result));
         }
+        parent->set(std::move(key_result->back()), std::move(*value_result));
 
         skip_whitespace();
 

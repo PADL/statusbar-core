@@ -8,6 +8,7 @@
 #include "statusbar/toml/toml_parser.hpp"
 #include "statusbar/toml/toml_value.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <filesystem>
 #include <format>
@@ -303,45 +304,89 @@ void Config::merge_table(toml::Table& dest, toml::Table const& source)
     }
 }
 
+namespace {
+
+/// Write a TOML basic string: the quotes plus the escapes the spec requires.
+/// Shared by string values and by keys that cannot be written bare.
+void write_basic_string(std::ostream& out, std::string_view text)
+{
+    out << '"';
+    for (char const c : text) {
+        switch (c) {
+            case '"':
+                out << "\\\"";
+                break;
+            case '\\':
+                out << "\\\\";
+                break;
+            case '\n':
+                out << "\\n";
+                break;
+            case '\r':
+                out << "\\r";
+                break;
+            case '\t':
+                out << "\\t";
+                break;
+            case '\b':
+                out << "\\b";
+                break;
+            case '\f':
+                out << "\\f";
+                break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20 || c == 0x7F) {
+                    // TOML spec requires control characters to be escaped as \uXXXX
+                    out << "\\u" << std::format("{:04x}", static_cast<unsigned int>(static_cast<unsigned char>(c)));
+                } else {
+                    out << c;
+                }
+                break;
+        }
+    }
+    out << '"';
+}
+
+/// A bare key may hold only A-Za-z0-9_- . Anything else -- a dot above all,
+/// which would otherwise read back as another level of table -- has to be
+/// quoted, or the file we write means something different from the document
+/// we hold.
+[[nodiscard]] auto key_needs_quoting(std::string_view key) -> bool
+{
+    if (key.empty()) {
+        return true;
+    }
+    return std::ranges::any_of(
+        key, [](char const c) { return std::isalnum(static_cast<unsigned char>(c)) == 0 && c != '_' && c != '-'; });
+}
+
+/// Write a key as itself, or as a quoted string when it cannot be bare.
+void write_key(std::ostream& out, std::string_view key)
+{
+    if (key_needs_quoting(key)) {
+        write_basic_string(out, key);
+    } else {
+        out << key;
+    }
+}
+
+/// The key as it appears inside a table header, quoted if it has to be.
+[[nodiscard]] auto header_segment(std::string_view key) -> std::string
+{
+    if (!key_needs_quoting(key)) {
+        return std::string{key};
+    }
+    std::ostringstream segment;
+    write_basic_string(segment, key);
+    return segment.str();
+}
+
+}  // namespace
+
 void Config::write_value(std::ostream& out, toml::Value const& value)
 {
     if (auto const str = value.as_string(); str.has_value()) {
-        // Escape string properly
-        out << '"';
-        for (char const c : *str) {
-            switch (c) {
-                case '"':
-                    out << "\\\"";
-                    break;
-                case '\\':
-                    out << "\\\\";
-                    break;
-                case '\n':
-                    out << "\\n";
-                    break;
-                case '\r':
-                    out << "\\r";
-                    break;
-                case '\t':
-                    out << "\\t";
-                    break;
-                case '\b':
-                    out << "\\b";
-                    break;
-                case '\f':
-                    out << "\\f";
-                    break;
-                default:
-                    if (static_cast<unsigned char>(c) < 0x20 || c == 0x7F) {
-                        // TOML spec requires control characters to be escaped as \uXXXX
-                        out << "\\u" << std::format("{:04x}", static_cast<unsigned int>(static_cast<unsigned char>(c)));
-                    } else {
-                        out << c;
-                    }
-                    break;
-            }
-        }
-        out << '"';
+        write_basic_string(out, *str);
     } else if (auto const i = value.as_integer(); i.has_value()) {
         out << *i;
     } else if (auto const f = value.as_float(); f.has_value()) {
@@ -366,7 +411,8 @@ void Config::write_value(std::ostream& out, toml::Value const& value)
                 out << ", ";
             }
             first = false;
-            out << key << " = ";
+            write_key(out, key);
+            out << " = ";
             write_value(out, val);
         }
         out << '}';
@@ -432,16 +478,22 @@ void Config::write_table(std::ostream& out, toml::Table const& table, std::strin
         if (!value.is_table()) {
             std::string const full_key = prefix.empty() ? key : std::string{prefix} + "." + key;
             emit_description_comment(out, full_key, specs);
-            out << key << " = ";
+            write_key(out, key);
+            out << " = ";
             write_value(out, value);
             out << '\n';
         }
     }
 
-    // Then recurse into nested tables
+    // Then recurse into nested tables. The prefix carries each segment in
+    // the form a header needs, so a key holding a dot is quoted and parses
+    // back as the one key it is. A spec description is looked up by the
+    // same string, which costs nothing: an argument spec's name is a dotted
+    // path of bare keys, so a quoted segment could never have matched one.
     for (auto const& [key, value] : table) {
         if (value.is_table()) {
-            std::string const full_key = prefix.empty() ? key : std::string{prefix} + "." + key;
+            std::string const segment = header_segment(key);
+            std::string const full_key = prefix.empty() ? segment : std::string{prefix} + "." + segment;
             write_table(out, *value.as_table(), full_key, specs);
         }
     }

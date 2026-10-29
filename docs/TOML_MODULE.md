@@ -125,6 +125,21 @@ int main()
 - `as_boolean()` is strict: a TOML integer `1` does not satisfy it.
 - `Table::get_path()` walks dotted paths through nested tables; it
   returns `nullptr` at the first missing key or non-table interior.
+- **A quoted key may contain a dot, and that dot is part of the key.**
+  `[port."eth0.100"]` is one table named `eth0.100` inside `port` — not
+  three tables — which matters because `eth0.100` is how a VLAN
+  subinterface is named. The parser therefore carries a key path as
+  segments, and `get_or_create_table()` / `get_path()` each have a
+  `std::span<std::string const>` overload that takes one key per level.
+  The `std::string_view` overloads split on every dot and so cannot
+  address such a key: use the span form, or `get()` one level at a time.
+  `Config`'s own dotted-string API (`get_integer("a.b.c")`, `set()`)
+  keeps splitting by design. Writing quotes such keys back
+  (`Config::to_toml_string()`), so a load/save round trip preserves the
+  document. See BUG-004.
+- A table header under an array of tables (`[s.x]` after `[[s]]`) is not
+  supported and fails the parse; TOML attaches it to the array's last
+  element. See BUG-006.
 - `get_list<T>` skips elements whose type doesn't match `T`. Pre-
   validate the array shape if strict typing matters.
 - `parse_value_string()` is for CLI overrides that aren't TOML
