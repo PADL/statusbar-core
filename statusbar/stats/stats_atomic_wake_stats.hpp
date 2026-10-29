@@ -91,6 +91,29 @@ class AtomicWakeStats : public AtomicWakeStatsBase
         add_skipped(skipped_counts);
     }
 
+    /// Record how long a wake's work took, and how many ticks it missed, in
+    /// one update — the pair for update(), for a loop that knows its wake
+    /// error on waking and its duration only once the work is done.
+    ///
+    /// Call it *after* update() has taken the error, so a late wake is
+    /// counted as late and its duration lands in the same interval; that
+    /// ordering is the point, not the signature. The alternative today is
+    /// update_with_duration(0, duration_ns), which files a wake error of
+    /// zero that never happened and drags the error count, min, max and
+    /// standard deviation with it.
+    ///
+    /// Lock-free and noexcept like the rest: this runs inside the loop it
+    /// measures, where a stall is a stall in the thing being measured. The
+    /// counters are relaxed because nothing synchronises on them.
+    /// @param duration_ns How long the work took
+    /// @param skipped_counts Ticks missed, added to the running total
+    void update_duration(int64_t duration_ns, int64_t skipped_counts = 0) noexcept
+    {
+        duration_.update(duration_ns);
+        duration_histogram_.update(duration_ns);
+        add_skipped(skipped_counts);
+    }
+
     void reset() noexcept
     {
         error_.reset();
