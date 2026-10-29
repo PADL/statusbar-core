@@ -537,53 +537,11 @@ TEST(pcap_file_rw, write_and_read_with_ethernet_components)
     std::remove(filename.c_str());
 }
 
-TEST(pcap_file_rw, write_too_small_ignored)
-{
-    std::string const filename = "/tmp/statusbar_pcap_test_small.pcap";
-    std::remove(filename.c_str());
-
-    // Packet smaller than 14 bytes should be silently ignored
-    Packet small_frame;
-    for (int i = 0; i < 10; ++i) {
-        small_frame.push_back(static_cast<uint8_t>(i));
-    }
-
-    // Write a small frame (should be ignored) and a valid frame
-    {
-        auto wtr = FileWriter::open(filename);
-        EXPECT_TRUE(wtr.has_value());
-        auto& writer = *wtr;
-        (void)writer.write_packet(1000000ULL, small_frame);  // Should be ignored
-
-        Packet valid_frame;
-        for (int i = 0; i < 15; ++i) {
-            valid_frame.push_back(static_cast<uint8_t>(i));
-        }
-        (void)writer.write_packet(2000000ULL, valid_frame);  // Should be written
-        writer.flush();
-    }
-
-    // Read back - should only get the valid frame
-    {
-        auto rdr = FileReader::open(filename);
-        EXPECT_TRUE(rdr.has_value());
-        auto& reader = *rdr;
-        uint64_t timestamp = 0;
-        Packet read_frame;
-        auto step = reader.read_packet(&timestamp, read_frame);
-        EXPECT_TRUE(step.has_value());
-        bool got_packet = *step;
-        EXPECT_TRUE(got_packet);
-        EXPECT_EQ(read_frame.size(), 15U);
-
-        // No more packets
-        auto eof = reader.read_packet(&timestamp, read_frame);
-        EXPECT_TRUE(eof.has_value());
-        EXPECT_FALSE(*eof);
-    }
-
-    std::remove(filename.c_str());
-}
+// `write_too_small_ignored` lived here. It wrote a 10-byte frame and a
+// 15-byte frame and asserted the file held only the 15-byte one, which
+// pinned BUG-003 as intended behaviour. Its replacement is
+// `pcap_short_frame a_runt_between_two_frames_displaces_neither`, which
+// writes the same shape and asserts every frame survives.
 
 TEST(pcap_file_rw, open_nonexistent_throws)
 {
@@ -695,7 +653,9 @@ TEST(pcap_file_rw, read_short_frame_handled)
     std::string const filename = "/tmp/statusbar_pcap_test_short.pcap";
     std::remove(filename.c_str());
 
-    // Write a frame that's exactly 14 bytes (minimum for Ethernet)
+    // 15 bytes: an Ethernet header plus a single payload byte, which is
+    // what the payload-size assertion below reads. Exactly 14, and shorter,
+    // are covered by the pcap_short_frame group.
     Packet min_frame;
     for (int i = 0; i < 15; ++i) {
         min_frame.push_back(static_cast<uint8_t>(i));
@@ -1744,6 +1704,292 @@ TEST(pcap_writer_vector, write_packet_components_vector_with_ts)
     EXPECT_EQ(out[12], uint8_t{0x22});
     EXPECT_EQ(out[13], uint8_t{0xF0});
     EXPECT_EQ(out[14], uint8_t{0x55});
+
+    std::remove(path.c_str());
+}
+
+//
+// Short-frame tests (BUG-003)
+//
+// A capture is a record of what happened. A frame shorter than an Ethernet
+// header is a runt or a truncation -- a wire event, and usually the very
+// thing someone opened a capture to look at -- so the writers carry it
+// instead of discarding it. The raw-span overloads write what they are
+// given; only the (da, sa, ethertype, payload) overloads impose a header,
+// and they cannot produce anything shorter than one.
+//
+
+namespace {
+
+/// Fills a frame with a recognisable ramp so a byte assertion says which
+/// byte, not just that something differed.
+auto ramp_frame(size_t size) -> Packet
+{
+    Packet frame;
+    for (size_t i = 0; i < size; ++i) {
+        frame.push_back(static_cast<uint8_t>(i));
+    }
+    return frame;
+}
+
+}  // namespace
+
+TEST(pcap_short_frame, a_fourteen_byte_frame_round_trips)
+{
+    // Exactly 14 bytes is a complete Ethernet header with an empty payload:
+    // a frame, not a runt. The old `<= 14` guard destroyed it, and no test
+    // covered the boundary.
+    std::string const filename = "/tmp/statusbar_pcap_test_exactly_14.pcap";
+    std::remove(filename.c_str());
+    Packet const frame = ramp_frame(14);
+
+    {
+        auto wtr = FileWriter::open(filename);
+        EXPECT_TRUE(wtr.has_value());
+        if (wtr) {
+            EXPECT_TRUE(wtr->write_packet(1000000ULL, frame).has_value());
+            wtr->flush();
+        }
+    }
+
+    auto rdr = FileReader::open(filename);
+    EXPECT_TRUE(rdr.has_value());
+    if (rdr) {
+        uint64_t ts = 0;
+        Packet read_back;
+        auto step = rdr->read_packet(&ts, read_back);
+        EXPECT_TRUE(step.has_value());
+        EXPECT_TRUE(*step);
+        EXPECT_EQ(read_back.size(), size_t{14});
+        EXPECT_EQ(read_back[0], uint8_t{0});
+        EXPECT_EQ(read_back[13], uint8_t{13});
+    }
+
+    std::remove(filename.c_str());
+}
+
+TEST(pcap_short_frame, a_runt_frame_round_trips)
+{
+    std::string const filename = "/tmp/statusbar_pcap_test_runt.pcap";
+    std::remove(filename.c_str());
+    Packet const runt = ramp_frame(10);
+
+    {
+        auto wtr = FileWriter::open(filename);
+        EXPECT_TRUE(wtr.has_value());
+        if (wtr) {
+            EXPECT_TRUE(wtr->write_packet(1000000ULL, runt).has_value());
+            wtr->flush();
+        }
+    }
+
+    auto rdr = FileReader::open(filename);
+    EXPECT_TRUE(rdr.has_value());
+    if (rdr) {
+        uint64_t ts = 0;
+        Packet read_back;
+        auto step = rdr->read_packet(&ts, read_back);
+        EXPECT_TRUE(step.has_value());
+        EXPECT_TRUE(*step);
+        EXPECT_EQ(read_back.size(), size_t{10});
+        EXPECT_EQ(read_back[9], uint8_t{9});
+    }
+
+    std::remove(filename.c_str());
+}
+
+TEST(pcap_short_frame, a_runt_between_two_frames_displaces_neither)
+{
+    // The failure this replaces: the capture came back with two frames and
+    // read as complete, so nothing said the middle one had been dropped.
+    // This is what `write_too_small_ignored` used to assert as correct.
+    std::string const filename = "/tmp/statusbar_pcap_test_runt_middle.pcap";
+    std::remove(filename.c_str());
+    Packet const first = ramp_frame(15);
+    Packet const runt = ramp_frame(10);
+    Packet const last = ramp_frame(20);
+
+    {
+        auto wtr = FileWriter::open(filename);
+        EXPECT_TRUE(wtr.has_value());
+        if (wtr) {
+            EXPECT_TRUE(wtr->write_packet(1000000ULL, first).has_value());
+            EXPECT_TRUE(wtr->write_packet(2000000ULL, runt).has_value());
+            EXPECT_TRUE(wtr->write_packet(3000000ULL, last).has_value());
+            wtr->flush();
+        }
+    }
+
+    auto rdr = FileReader::open(filename);
+    EXPECT_TRUE(rdr.has_value());
+    if (rdr) {
+        std::array<size_t, 3> const want{15, 10, 20};
+        for (size_t const expected : want) {
+            uint64_t ts = 0;
+            Packet read_back;
+            auto step = rdr->read_packet(&ts, read_back);
+            EXPECT_TRUE(step.has_value());
+            EXPECT_TRUE(*step);
+            EXPECT_EQ(read_back.size(), expected);
+        }
+        uint64_t ts = 0;
+        Packet read_back;
+        auto eof = rdr->read_packet(&ts, read_back);
+        EXPECT_TRUE(eof.has_value());
+        EXPECT_FALSE(*eof);
+    }
+
+    std::remove(filename.c_str());
+}
+
+TEST(pcap_short_frame, a_runt_read_through_the_ethernet_overload_reports_no_addresses)
+{
+    // The record is kept, but it cannot be split into header and payload.
+    // The reader answers with zeroed addresses and an empty payload rather
+    // than refusing the record, so iteration continues; a caller that needs
+    // to tell this apart from a frame of zeroes must use the raw overload.
+    std::string const filename = "/tmp/statusbar_pcap_test_runt_eth.pcap";
+    std::remove(filename.c_str());
+    Packet const runt = ramp_frame(10);
+
+    {
+        auto wtr = FileWriter::open(filename);
+        EXPECT_TRUE(wtr.has_value());
+        if (wtr) {
+            EXPECT_TRUE(wtr->write_packet(1000000ULL, runt).has_value());
+            wtr->flush();
+        }
+    }
+
+    auto rdr = FileReader::open(filename);
+    EXPECT_TRUE(rdr.has_value());
+    if (rdr) {
+        uint64_t ts = 0;
+        statusbar::ieee::Eui48 da{};
+        statusbar::ieee::Eui48 sa{};
+        da.value = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        sa.value = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        uint16_t ethertype = 0xFFFF;
+        Packet payload;
+
+        auto step = rdr->read_packet(&ts, da, sa, &ethertype, payload);
+        EXPECT_TRUE(step.has_value());
+        EXPECT_TRUE(*step);
+        EXPECT_EQ(da.value[0], uint8_t{0});
+        EXPECT_EQ(sa.value[0], uint8_t{0});
+        EXPECT_EQ(ethertype, uint16_t{0});
+        EXPECT_TRUE(payload.empty());
+    }
+
+    std::remove(filename.c_str());
+}
+
+TEST(pcap_short_frame, an_empty_record_round_trips)
+{
+    // Not a frame anyone wants, but the writer no longer has a length it
+    // refuses, so an empty span has to go somewhere defined. It writes a
+    // zero-length record, and the reader reads one back instead of
+    // reporting file_read_failed on a zero-byte fread.
+    std::string const filename = "/tmp/statusbar_pcap_test_empty_record.pcap";
+    std::remove(filename.c_str());
+
+    {
+        auto wtr = FileWriter::open(filename);
+        EXPECT_TRUE(wtr.has_value());
+        if (wtr) {
+            EXPECT_TRUE(wtr->write_packet(1000000ULL, std::span<uint8_t const>{}).has_value());
+            EXPECT_TRUE(wtr->write_packet(2000000ULL, ramp_frame(20)).has_value());
+            wtr->flush();
+        }
+    }
+
+    auto rdr = FileReader::open(filename);
+    EXPECT_TRUE(rdr.has_value());
+    if (rdr) {
+        uint64_t ts = 0;
+        Packet read_back;
+        auto first = rdr->read_packet(&ts, read_back);
+        EXPECT_TRUE(first.has_value());
+        EXPECT_TRUE(*first);
+        EXPECT_TRUE(read_back.empty());
+        // The record that follows is still found, which is the part that
+        // matters: a zero-length record must not desynchronise the file.
+        auto second = rdr->read_packet(&ts, read_back);
+        EXPECT_TRUE(second.has_value());
+        EXPECT_TRUE(*second);
+        EXPECT_EQ(read_back.size(), size_t{20});
+    }
+
+    std::remove(filename.c_str());
+}
+
+TEST(pcapng_short_frame, a_fourteen_byte_frame_round_trips)
+{
+    std::string const path = "/tmp/statusbar_pcapng_test_exactly_14.pcapng";
+    std::remove(path.c_str());
+    Packet const frame = ramp_frame(14);
+
+    {
+        auto wtr = PcapngFileWriter::open(path);
+        EXPECT_TRUE(wtr.has_value());
+        if (wtr) {
+            EXPECT_TRUE(wtr->write_packet(uint64_t{1000000}, std::span<uint8_t const>{frame}).has_value());
+            wtr->flush();
+        }
+    }
+
+    auto rdr = PcapngReader::open(path);
+    EXPECT_TRUE(rdr.has_value());
+    if (rdr) {
+        uint64_t ts = 0;
+        Packet read_back;
+        auto step = rdr->read_packet(&ts, read_back);
+        EXPECT_TRUE(step.has_value());
+        EXPECT_TRUE(*step);
+        EXPECT_EQ(read_back.size(), size_t{14});
+        EXPECT_EQ(read_back[13], uint8_t{13});
+    }
+
+    std::remove(path.c_str());
+}
+
+TEST(pcapng_short_frame, a_runt_frame_round_trips_and_keeps_the_block_aligned)
+{
+    // 10 bytes pads to 12 in the block body. Getting that wrong does not
+    // corrupt the runt itself -- it desynchronises everything after it, so
+    // the frame that follows is the real assertion.
+    std::string const path = "/tmp/statusbar_pcapng_test_runt.pcapng";
+    std::remove(path.c_str());
+    Packet const runt = ramp_frame(10);
+    Packet const after = ramp_frame(21);
+
+    {
+        auto wtr = PcapngFileWriter::open(path);
+        EXPECT_TRUE(wtr.has_value());
+        if (wtr) {
+            EXPECT_TRUE(wtr->write_packet(uint64_t{1000000}, std::span<uint8_t const>{runt}).has_value());
+            EXPECT_TRUE(wtr->write_packet(uint64_t{2000000}, std::span<uint8_t const>{after}).has_value());
+            wtr->flush();
+        }
+    }
+
+    auto rdr = PcapngReader::open(path);
+    EXPECT_TRUE(rdr.has_value());
+    if (rdr) {
+        uint64_t ts = 0;
+        Packet read_back;
+        auto step = rdr->read_packet(&ts, read_back);
+        EXPECT_TRUE(step.has_value());
+        EXPECT_TRUE(*step);
+        EXPECT_EQ(read_back.size(), size_t{10});
+        EXPECT_EQ(read_back[9], uint8_t{9});
+
+        auto next = rdr->read_packet(&ts, read_back);
+        EXPECT_TRUE(next.has_value());
+        EXPECT_TRUE(*next);
+        EXPECT_EQ(read_back.size(), size_t{21});
+        EXPECT_EQ(read_back[20], uint8_t{20});
+    }
 
     std::remove(path.c_str());
 }

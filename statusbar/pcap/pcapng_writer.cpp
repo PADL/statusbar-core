@@ -111,9 +111,9 @@ auto PcapngFileWriter::write_interface_description_block() -> Status
 
 auto PcapngFileWriter::write_packet(uint64_t timestamp_us, std::span<uint8_t const> packet) -> Status
 {
-    if (packet.size() <= 14) {
-        return success();
-    }
+    // Any length, as in FileWriter::write_packet. write_raw() already
+    // answers success for a zero-size body, and align_to_4() pads a short
+    // frame to the block alignment, so the block after it still parses.
     uint32_t const captured_len = static_cast<uint32_t>(packet.size());
     uint32_t const padded_len = align_to_4(captured_len);
     uint32_t const block_length = BLOCK_FRAMING_SIZE + EPB_BODY_SIZE + padded_len;
