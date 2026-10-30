@@ -255,6 +255,33 @@ TEST(xdp_equiv, avtp_stream_rules_match_in_bpf_as_in_the_classifier)
     }
 }
 
+TEST(xdp_equiv, a_full_table_matches_in_its_last_slot_and_a_vacant_slot_ends_the_scan)
+{
+    struct rlimit const rlim = {.rlim_cur = RLIM_INFINITY, .rlim_max = RLIM_INFINITY};
+    (void)::setrlimit(RLIMIT_MEMLOCK, &rlim);
+
+    auto loaded = try_load_program();
+    if (loaded.prog_fd < 0) {
+        return;
+    }
+    // Every slot an EtherType of its own, 0x9000 + i: a frame of the last one matches only the last slot.
+    std::array<CompiledRule<32>, TCAM_MAX_RULES> rules{};
+    for (std::uint16_t i = 0; i < TCAM_MAX_RULES; ++i) {
+        rules[i] = ClassifierRuleBuilder<32>{}.ethertype(0x9000 + i).vlan_untagged().result(flag::drop).build()[0];
+    }
+    auto const last = make_frame(0x9000 + TCAM_MAX_RULES - 1);
+    EXPECT_TRUE(install_rules(loaded.rules_map_fd, rules));
+    EXPECT_EQ(run_prog(loaded.prog_fd, last), std::uint32_t{XDP_DROP});
+    EXPECT_EQ(run_prog(loaded.prog_fd, make_frame(0x9000 + TCAM_MAX_RULES)), std::uint32_t{XDP_PASS});
+
+    // A vacant slot before it: the scan stops there, as the installer never leaves a hole.
+    std::uint32_t const hole = 4;
+    CompiledRule<32> const vacant{};
+    EXPECT_EQ(::bpf_map_update_elem(loaded.rules_map_fd, &hole, &vacant, BPF_ANY), 0);
+    EXPECT_EQ(run_prog(loaded.prog_fd, last), std::uint32_t{XDP_PASS});
+    EXPECT_EQ(run_prog(loaded.prog_fd, make_frame(0x9000 + 3)), std::uint32_t{XDP_DROP});
+}
+
 TEST(xdp_equiv, short_frame_passes)
 {
     struct rlimit const rlim = {.rlim_cur = RLIM_INFINITY, .rlim_max = RLIM_INFINITY};

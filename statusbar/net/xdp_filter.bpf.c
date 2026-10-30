@@ -19,9 +19,9 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
-// Rules table. Userspace writes active rules into slots 0..N-1 and
-// zeroes the remaining slots; the evaluator treats min_frame_size == 0
-// as an "inactive slot" sentinel.
+// Rules table. Userspace writes the rules into slots 0..N-1 and zeroes
+// the rest; the first slot with min_frame_size == 0 is the end of the
+// table, where the evaluator stops.
 struct
 {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -88,7 +88,7 @@ int xdp_filter_prog(struct xdp_md* ctx)
             continue;  // Verifier-required NULL check; array maps never actually return NULL for in-range keys.
         }
         if (r->min_frame_size == 0) {
-            continue;  // Inactive slot.
+            break;  // The first vacant slot: the installer fills slots 0..N-1 and zeroes the rest.
         }
         if (frame_size < r->min_frame_size) {
             continue;  // Frame too short for this rule.
