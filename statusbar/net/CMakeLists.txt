@@ -16,6 +16,7 @@ statusbar_add_module(
   net_tap_bridge.cpp
   net_tcp_server.cpp
   net_util.cpp
+  net_vlan_link.cpp
   net_test_port.cpp
   net_traffic_classifier.cpp
   DEPS
@@ -36,6 +37,7 @@ statusbar_add_module(
   net_tcam_classifier_test.cpp
   net_tcp_server_test.cpp
   net_test.cpp
+  net_vlan_link_test.cpp
   net_xdp_abi_test.cpp
   net_xdp_equiv_test.cpp)
 
