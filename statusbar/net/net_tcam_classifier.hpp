@@ -24,10 +24,10 @@
 
 namespace statusbar::net {
 
-/// Default compile-time maximum rule count. Typical AVB/TSN setups
-/// configure 1-4 rules; 16 leaves comfortable headroom while staying
-/// small enough to sit on the stack or inside another class.
-inline constexpr std::size_t tcam_default_capacity = 16;
+/// Default compile-time maximum rule count: AVB/TSN setups use 1-4 rules, a host joining 16
+/// multicast groups plus a catch-all 17; 32 keeps the BPF map within a page and the classifier
+/// small enough for the stack or another class.
+inline constexpr std::size_t tcam_default_capacity = 32;
 
 template <std::size_t N = tcam_default_window_bytes, std::size_t Capacity = tcam_default_capacity>
 class TcamClassifier

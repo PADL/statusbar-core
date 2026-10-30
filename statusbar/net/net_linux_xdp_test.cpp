@@ -618,9 +618,9 @@ TEST(xdp_avtp_rules, untagged_only_and_overflow)
     classifier.set_rules(std::span<CompiledRule<32> const>{untagged->data(), untagged->size()});
     EXPECT_TRUE(classifier.classify_first(avtp_frame(0x04, false)) != 0);
     EXPECT_EQ(classifier.classify_first(avtp_frame(0x04, true)), 0u);
-    std::array<uint8_t, 9> const nine{};
-    EXPECT_FALSE(avtp_subtype_rules(nine, true).has_value());  // 18 > 16
-    EXPECT_TRUE(avtp_subtype_rules(nine, false).has_value());
+    std::array<uint8_t, 17> const seventeen{};
+    EXPECT_FALSE(avtp_subtype_rules(seventeen, true).has_value());  // 34 > 32
+    EXPECT_TRUE(avtp_subtype_rules(seventeen, false).has_value());
 }
 
 TEST(xdp_avtp_rules, payload_offset)

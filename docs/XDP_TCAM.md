@@ -66,7 +66,7 @@ and a small number of compile-time constants.
 #include <stdint.h>
 
 #define TCAM_WINDOW_BYTES 32
-#define TCAM_MAX_RULES    16
+#define TCAM_MAX_RULES    32
 
 struct tcam_rule {
     uint8_t  mask[TCAM_WINDOW_BYTES];
@@ -139,7 +139,7 @@ Verifier notes:
 - `__builtin_memcpy` of exactly 32 bytes lowers to four 64-bit loads;
   acceptable to recent verifiers. If a target kernel rejects it, fall
   back to four explicit `__u64` loads with bounds checks.
-- `#pragma unroll` on a bounded loop with `TCAM_MAX_RULES = 16` is
+- `#pragma unroll` on a bounded loop with `TCAM_MAX_RULES = 32` is
   fine on Linux 5.3+.
 - Empty slots break the loop early (`bpf_map_lookup_elem` returns 0
   for uninitialised entries? no — it returns the zeroed struct; use
@@ -301,9 +301,10 @@ bits.
   slots and the BPF program treats `min_frame_size == 0` as
   "done, stop iterating". Cheaper than a separate count map.
 
-- **`max_entries` sizing**: `TCAM_MAX_RULES = 16` matches
-  `TCAM_DEFAULT_CAPACITY`. Bump if users need more; each entry adds
-  80 bytes of map memory.
+- **`max_entries` sizing**: `TCAM_MAX_RULES = 32` matches
+  `tcam_default_capacity` (16 multicast groups and a catch-all need 17).
+  The scan stops at the first vacant slot, so a frame costs the active
+  rules, not the capacity; each entry adds 80 bytes of map memory.
 
 - **Future: larger windows**: if we later want an XDP path that also
   matches IPv6 UDP destination port, we'd need a second program
