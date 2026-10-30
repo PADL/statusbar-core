@@ -931,6 +931,32 @@ auto XdpContext::open_socket(XdpConfig const& config, detail::UmemGeometry const
     return status.and_then([&] { return socket_.fill_replenish(); });
 }
 
+namespace {
+
+/// Register and release a UMEM of `geometry`: the kernel's answer to its TX metadata.
+auto probe_umem(std::expected<detail::UmemGeometry, XdpError> const& geometry) -> Status
+{
+    if (!geometry) {
+        return failure(geometry.error());
+    }
+    detail::RingSet rings{};
+    detail::UmemRegion region{};
+    auto const allocated = region.allocate(*geometry, rings);
+    return allocated ? success() : failure(allocated.error());
+}
+
+}  // namespace
+
+auto probe_tx_metadata() -> Status
+{
+    if (auto const built = launch_time_support(true); !built) {
+        return built;
+    }
+    // 16 frames and rings of 16: 64 KiB, locked for the probe alone.
+    XdpConfig const config{.fill_ring_size = 16, .completion_ring_size = 16, .umem_frame_count = 16, .tx_launch_time = true};
+    return probe_umem(detail::umem_geometry(config));
+}
+
 auto XdpContext::launch_time_supported() const -> StatusValue<bool>
 {
     if (!socket_.valid()) {
@@ -980,6 +1006,13 @@ auto XdpContext::join_multicast(ieee::Eui48 const& addr) -> Status
 auto XdpContext::leave_multicast(ieee::Eui48 const& addr) -> Status
 {
     return multicast_ioctl(SIOCDELMULTI, addr, XdpError::leave_multicast_failed);
+}
+
+#else  // !(__linux__ && HAVE_XDP)
+
+auto probe_tx_metadata() -> Status
+{
+    return failure(XdpError::not_supported_on_platform);
 }
 
 #endif  // __linux__ && HAVE_XDP

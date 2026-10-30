@@ -18,6 +18,7 @@ statusbar_add_module(
   net_ring_buffer_base.cpp
   net_rss.cpp
   net_tap_bridge.cpp
+  net_tc_launch_time.cpp
   net_tc_qdisc.cpp
   net_tcp_server.cpp
   net_util.cpp
@@ -42,6 +43,8 @@ statusbar_add_module(
   net_link_monitor_test.cpp
   net_linux_xdp_test.cpp
   net_netdev_features_test.cpp
+  net_launch_order_test.cpp
+  net_tc_launch_time_test.cpp
   net_tc_qdisc_test.cpp
   net_tcam_classifier_test.cpp
   net_tcp_server_test.cpp

@@ -335,6 +335,49 @@ struct std::is_error_code_enum<statusbar::net::XdpError> : std::true_type
 
 namespace statusbar::net {
 
+/// Whether AF_XDP frames can carry launch times, given the driver's answer @p driver
+/// (netdev::launch_time_supported(), asked once by the host). Errors: the query's,
+/// operation_not_supported (the driver), XdpError::tx_metadata_not_supported (libxdp before 1.5).
+[[nodiscard]] inline auto launch_time_support(StatusValue<bool> const& driver) noexcept -> Status
+{
+    if (!driver) {
+        return failure(driver.error());
+    }
+    if (!*driver) {
+        return failure(std::errc::operation_not_supported);
+    }
+    if (auto const metadata = detail::tx_metadata_len(true); !metadata) {
+        return failure(metadata.error());
+    }
+    return success();
+}
+
+/// Register a small UMEM with TX metadata and let it go, before anything is attached to an interface:
+/// what a kernel before 6.11 refuses (XdpError::tx_metadata_not_supported); the build's refusal first.
+/// A caller that asked for launch time opens untimed on a refusal, with the reason.
+[[nodiscard]] auto probe_tx_metadata() -> Status;
+
+/// Launch time as a host can have it at start: possible (the driver and the build), or why not.
+struct LaunchTimePlan
+{
+    bool on{false};                   ///< wanted and possible: open the socket with TX metadata
+    StatusValue<bool> driver{false};  ///< netdev::launch_time_supported(), asked once, for every user
+    std::string why{};                ///< wanted and not possible: the reason
+};
+
+/// The plan for launch time @p wanted given the driver's answer @p driver (launch_time_support()).
+[[nodiscard]] inline auto plan_launch_time(bool const wanted, StatusValue<bool> const& driver) -> LaunchTimePlan
+{
+    LaunchTimePlan plan{.driver = driver};
+    auto const support = wanted ? launch_time_support(driver) : Status{};
+    plan.on = wanted && support.has_value();
+    if (!support) {
+        plan.why = support.error() == std::errc::operation_not_supported ? std::string{"the driver reports no tx-launch-time-fifo"}
+                                                                         : support.error().message();
+    }
+    return plan;
+}
+
 // ──────────────────────────────────────────────
 // Internal utilities (detail namespace — not part of public API contract)
 // ──────────────────────────────────────────────

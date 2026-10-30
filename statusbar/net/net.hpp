@@ -15,6 +15,7 @@
 #include "statusbar/net/net_compiled_rule.hpp"
 #include "statusbar/net/net_error.hpp"
 #include "statusbar/net/net_ethernet_port.hpp"
+#include "statusbar/net/net_launch_order.hpp"
 #include "statusbar/net/net_loopback_port.hpp"
 #include "statusbar/net/net_message_reactor.hpp"
 #include "statusbar/net/net_notify.hpp"

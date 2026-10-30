@@ -395,6 +395,33 @@ TEST(xdp_tx_metadata, no_launch_time_clears_a_stale_request)
     EXPECT_EQ(detail::tx_metadata_options(metadata), uint32_t{0});
 }
 
+// Launch time needs the driver's tx-launch-time-fifo (asked once by the host) and this build's TX
+// metadata (libxdp >= 1.5); a failed query is passed on.
+TEST(xdp_tx_metadata, launch_time_needs_the_driver_and_the_build)
+{
+    EXPECT_TRUE(launch_time_support(false).error() == std::errc::operation_not_supported);
+    auto const no_query = std::make_error_code(std::errc::no_such_file_or_directory);
+    EXPECT_TRUE(launch_time_support(failure(no_query)).error() == no_query);
+    bool const built = detail::tx_metadata_len(true).has_value();
+    auto const supported = launch_time_support(true);
+    EXPECT_EQ(supported.has_value(), built);
+    EXPECT_TRUE(built || supported.error() == XdpError::tx_metadata_not_supported);
+}
+
+// The plan: on only when wanted and possible; not wanted asks nothing of the build; the reason is kept.
+TEST(xdp_tx_metadata, the_plan_says_why_launch_time_is_off)
+{
+    auto const unwanted = plan_launch_time(false, false);
+    EXPECT_TRUE(!unwanted.on && unwanted.why.empty() && unwanted.driver && !*unwanted.driver);
+    auto const igb = plan_launch_time(true, false);
+    EXPECT_TRUE(!igb.on && igb.why == "the driver reports no tx-launch-time-fifo");
+    auto const unasked = plan_launch_time(true, failure(std::errc::no_such_file_or_directory));
+    EXPECT_TRUE(!unasked.on && !unasked.why.empty() && !unasked.driver);
+    auto const igc = plan_launch_time(true, true);
+    EXPECT_EQ(igc.on, detail::tx_metadata_len(true).has_value());
+    EXPECT_EQ(igc.why.empty(), igc.on);
+}
+
 TEST(xdp_tx_metadata, without_reserved_metadata_nothing_is_written)
 {
     std::array<uint8_t, 8> bytes{};
