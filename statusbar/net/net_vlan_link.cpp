@@ -52,6 +52,7 @@ static_assert(RTATTR_SIZE == 4, "rtattr is 4 bytes on every Linux ABI we build f
 /// re-point somebody else's VLAN link at our VID.
 constexpr std::uint16_t CREATE_FLAGS = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
 constexpr std::uint16_t DELETE_FLAGS = NLM_F_REQUEST | NLM_F_ACK;
+constexpr std::uint16_t SET_FLAGS = NLM_F_REQUEST | NLM_F_ACK;
 
 /// Sent without a terminator, which is what iproute2 does and what the
 /// kernel's `nla_strcmp` expects either way.
@@ -168,21 +169,32 @@ auto write_nlmsghdr(std::span<std::uint8_t> at, std::uint16_t type, std::uint16_
     std::memcpy(at.data(), &header, NLMSGHDR_SIZE);
 }
 
-/// Write the nlmsghdr and the ifinfomsg every link request starts with.
-///
-/// Every ifinfomsg field stays zero, and all of them deliberately:
-/// AF_UNSPEC because a link is not per address family, index 0 because a
-/// create has no link to name and a delete names it as an attribute
-/// instead, and no flags because the link must come up only when somebody
-/// asks for it.
-[[nodiscard]] auto put_preamble(Writer& writer, std::uint16_t type, std::uint16_t flags, std::uint32_t seq) noexcept -> bool
+/// An ifinfomsg naming no link (index 0, AF_UNSPEC), setting @p link_flags
+/// of the @p change mask.
+auto write_ifinfomsg(std::span<std::uint8_t> at, std::uint32_t link_flags, std::uint32_t change) noexcept -> void
+{
+    ifinfomsg const body{.ifi_family = AF_UNSPEC, .ifi_flags = link_flags, .ifi_change = change};
+    std::memcpy(at.data(), &body, IFINFOMSG_SIZE);
+}
+
+/// Write the nlmsghdr and the ifinfomsg every link request starts with: AF_UNSPEC, index 0 (a create
+/// names no link, the others name it as an attribute), and @p link_flags and @p change zero but for a
+/// request that sets the link up or down, which comes up only when somebody asks.
+[[nodiscard]] auto put_preamble(
+    Writer& writer,
+    std::uint16_t type,
+    std::uint16_t flags,
+    std::uint32_t seq,
+    std::uint32_t link_flags = 0,
+    std::uint32_t change = 0) noexcept -> bool
 {
     auto header_slot = writer.reserve(NLMSGHDR_SIZE);
-    auto const body_slot = writer.reserve(IFINFOMSG_SIZE);
+    auto body_slot = writer.reserve(IFINFOMSG_SIZE);
     if (header_slot.empty() || body_slot.empty()) {
         return false;
     }
     write_nlmsghdr(header_slot, type, flags, seq);
+    write_ifinfomsg(body_slot, link_flags, change);
     return true;
 }
 
@@ -244,6 +256,18 @@ auto write_nlmsghdr(std::span<std::uint8_t> at, std::uint16_t type, std::uint16_
     return kind && data;
 }
 
+/// IFLA_AF_SPEC > AF_INET6 > IFLA_INET6_ADDR_GEN_MODE none, as iproute2's
+/// iplink.c nests it.
+[[nodiscard]] auto put_no_ipv6_addresses(Writer& writer) noexcept -> bool
+{
+    auto const spec = writer.open_nest(IFLA_AF_SPEC);
+    auto const inet6 = writer.open_nest(AF_INET6);
+    bool const ok = writer.put_attribute(IFLA_INET6_ADDR_GEN_MODE, std::array<std::uint8_t, 1>{IN6_ADDR_GEN_MODE_NONE});
+    writer.close_nest(inet6);
+    writer.close_nest(spec);
+    return ok;
+}
+
 [[nodiscard]] auto validate_name(std::string_view name) noexcept -> Status
 {
     if (name.empty() || name.size() > MAX_LINK_NAME_LENGTH) {
@@ -302,6 +326,33 @@ auto build_delete_link(std::span<std::uint8_t> out, std::string_view name, std::
     }
     Writer writer{out};
     bool const written = put_preamble(writer, RTM_DELLINK, DELETE_FLAGS, seq) && put_name(writer, name);
+    if (!written) {
+        return failure(NetError::invalid_argument);
+    }
+    return finish(writer);
+}
+
+auto build_set_link_up(std::span<std::uint8_t> out, std::string_view name, bool up, std::uint32_t seq) -> StatusValue<std::size_t>
+{
+    if (auto status = validate_name(name); !status) {
+        return forward_failure(status);
+    }
+    Writer writer{out};
+    std::uint32_t const link_flags = up ? std::uint32_t{IFF_UP} : 0U;
+    if (!put_preamble(writer, RTM_SETLINK, SET_FLAGS, seq, link_flags, IFF_UP) || !put_name(writer, name)) {
+        return failure(NetError::invalid_argument);
+    }
+    return finish(writer);
+}
+
+auto build_no_ipv6_addresses(std::span<std::uint8_t> out, std::string_view name, std::uint32_t seq) -> StatusValue<std::size_t>
+{
+    if (auto status = validate_name(name); !status) {
+        return forward_failure(status);
+    }
+    Writer writer{out};
+    bool const written =
+        put_preamble(writer, RTM_SETLINK, SET_FLAGS, seq) && put_name(writer, name) && put_no_ipv6_addresses(writer);
     if (!written) {
         return failure(NetError::invalid_argument);
     }
@@ -776,6 +827,21 @@ auto VlanLinkClient::remove_link(std::string_view name) -> Status
         std::erase(created_, std::string{name});
     }
     return status;
+}
+
+auto VlanLinkClient::bring_up(std::string_view name) -> Status
+{
+    // Two requests, because do_setlink() applies the flags before
+    // IFLA_AF_SPEC. EAFNOSUPPORT is a kernel without IPv6, which makes no
+    // address to suppress.
+    std::array<std::uint8_t, MAX_REQUEST_SIZE> request{};
+    auto const length = build_no_ipv6_addresses(request, name, ++sequence_);
+    auto const no_ipv6 = length.and_then([&](std::size_t n) { return transact({request.data(), n}); });
+    if (!no_ipv6 && no_ipv6.error() != std::errc::address_family_not_supported) {
+        return no_ipv6;
+    }
+    auto const up = build_set_link_up(request, name, true, ++sequence_);
+    return up.and_then([&](std::size_t n) { return transact({request.data(), n}); });
 }
 
 auto VlanLinkClient::remove_created_links() -> Status
