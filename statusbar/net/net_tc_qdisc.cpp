@@ -389,6 +389,16 @@ auto TcClient::replace_etf(int const ifindex, EtfQdisc const& qdisc) -> Status
     return send([&](std::span<uint8_t> out, uint32_t seq) { return build_replace_etf(out, ifindex, qdisc, seq); });
 }
 
+auto remove_own_mqprio_root(TcControl& tc, int const ifindex, uint16_t const major) -> StatusValue<bool>
+{
+    uint32_t const handle = make_handle(major, 0);
+    auto const root = tc.get(ifindex, ROOT);
+    if (major == 0 || !root || root->handle != handle || root->kind != "mqprio") {
+        return false;
+    }
+    return tc.remove(ifindex, handle, ROOT).transform([] { return true; });
+}
+
 auto TcClient::replace_kind(int const ifindex, uint32_t const parent, std::string_view const kind) -> Status
 {
     return send([&](std::span<uint8_t> out, uint32_t seq) { return build_replace_kind(out, ifindex, parent, kind, seq); });

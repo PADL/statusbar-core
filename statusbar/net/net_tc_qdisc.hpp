@@ -197,6 +197,11 @@ class TcControl
     TcControl() noexcept = default;
 };
 
+/// Delete @p ifindex's root if it is an mqprio with handle @p major:0, which only its own user lays:
+/// any other root is left alone. Its children go with it (on igb/igc, one adapter reset). Returns
+/// whether it was deleted. Errors: the delete's netlink errno.
+[[nodiscard]] auto remove_own_mqprio_root(TcControl& tc, int ifindex, uint16_t major) -> StatusValue<bool>;
+
 /// A blocking NETLINK_ROUTE socket for qdisc requests. Each call sends one
 /// request and waits (at most about a second) for its acknowledgement. Not
 /// thread-safe; meant for the reactor thread, where a request is rare

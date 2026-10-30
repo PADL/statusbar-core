@@ -81,12 +81,9 @@ auto install(TcControl& tc, int const ifindex, LaunchTimeQueue const& queue) -> 
 /// Our root for @p queue, if @p ifindex has it, deleted with its etf.
 auto remove_ours(TcControl& tc, int const ifindex, LaunchTimeQueue const& queue) -> StatusValue<LaunchTimeQueueAction>
 {
-    uint32_t const handle = make_handle(queue.major, 0);
-    auto const root = tc.get(ifindex, ROOT);
-    if (!root || root->handle != handle || root->kind != "mqprio") {
-        return LaunchTimeQueueAction::none;
-    }
-    return tc.remove(ifindex, handle, ROOT).transform([] { return LaunchTimeQueueAction::removed; });
+    return remove_own_mqprio_root(tc, ifindex, queue.major).transform([](bool const removed) {
+        return removed ? LaunchTimeQueueAction::removed : LaunchTimeQueueAction::none;
+    });
 }
 
 }  // namespace

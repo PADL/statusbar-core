@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 // The launch-time mode from the driver's answer, and the launch-time queue's mqprio layout and its
-// requests against a recording TcControl. Nothing is sent to the kernel.
+// requests (and remove_own_mqprio_root's) against a recording TcControl. Nothing is sent to the kernel.
 
 #include "statusbar/net/net_tc_launch_time.hpp"
 
@@ -193,6 +193,23 @@ TEST(tc_launch_time, unsupported_asks_nothing_and_off_removes_only_ours)
     EXPECT_TRUE(removed && *removed == LaunchTimeQueueAction::removed);
     EXPECT_TRUE((tc.take() == std::vector<std::string>{"show root", "del root 9100:"}));
     EXPECT_TRUE(tc.children.empty());
+}
+
+// remove_own_mqprio_root: an mqprio under another handle, or another kind under ours, is left alone
+TEST(tc_own_root, only_an_mqprio_with_our_handle_is_removed)
+{
+    RecordingTc tc;
+    tc.root = default_root();
+    EXPECT_TRUE(remove_own_mqprio_root(tc, IFINDEX, 0x9000) == StatusValue<bool>{false});
+    tc.root = QdiscInfo{.handle = make_handle(0x8000, 0), .parent = ROOT, .kind = "mqprio"};
+    EXPECT_TRUE(remove_own_mqprio_root(tc, IFINDEX, 0x9000) == StatusValue<bool>{false});
+    tc.root = QdiscInfo{.handle = make_handle(0x9000, 0), .parent = ROOT, .kind = "taprio"};
+    EXPECT_TRUE(remove_own_mqprio_root(tc, IFINDEX, 0x9000) == StatusValue<bool>{false});
+    EXPECT_TRUE((tc.take() == std::vector<std::string>{"show root", "show root", "show root"}));
+    tc.root = QdiscInfo{.handle = make_handle(0x9000, 0), .parent = ROOT, .kind = "mqprio"};
+    EXPECT_TRUE(remove_own_mqprio_root(tc, IFINDEX, 0x9000) == StatusValue<bool>{true});
+    EXPECT_TRUE((tc.take() == std::vector<std::string>{"show root", "del root 9000:"}));
+    EXPECT_FALSE(tc.root.has_value());
 }
 
 // A refused etf (EOPNOTSUPP: no etf offload) is the result, our root left in place.
