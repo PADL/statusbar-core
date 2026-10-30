@@ -520,6 +520,14 @@ TEST(xdp_stub, open_fails)
     EXPECT_FALSE(status.has_value());
 }
 
+TEST(xdp_stats, reset_zeroes_the_counters_of_a_closed_context)
+{
+    XdpContext ctx;
+    EXPECT_EQ(ctx.stats().rx_count, uint64_t{0});
+    ctx.reset_stats();  // closed: nothing to count, nothing to break
+    EXPECT_TRUE(ctx.stats().tx_count == 0 && ctx.stats().tx_flush_errno == 0);
+}
+
 TEST(xdp_stub, not_valid_by_default)
 {
     XdpContext ctx;

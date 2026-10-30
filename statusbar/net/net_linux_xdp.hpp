@@ -1013,6 +1013,8 @@ class XdpSocket
     [[nodiscard]] auto tx_complete() -> Status;
 
     [[nodiscard]] auto stats() const noexcept -> Stats const& { return stats_; }
+    /// Zero the counters (the last errno too); on the socket's thread, between operations.
+    void reset_stats() noexcept { stats_ = {}; }
 
   private:
     /// Create the socket on `config.queue_id`, retrying while the queue is busy.
@@ -1162,6 +1164,8 @@ class XdpContext
     [[nodiscard]] auto leave_multicast(ieee::Eui48 const& addr) -> Status;
 
     [[nodiscard]] auto stats() const noexcept -> Stats const& { return socket_.stats(); }
+    /// Zero the socket's counters; on its thread, between operations.
+    void reset_stats() noexcept { socket_.reset_stats(); }
 
   private:
     void swap(XdpContext& other) noexcept
@@ -1302,6 +1306,8 @@ class XdpContext
     [[nodiscard]] auto leave_multicast(ieee::Eui48 const&) -> Status { return failure(XdpError::not_supported_on_platform); }
 
     [[nodiscard]] auto stats() const noexcept -> Stats const& { return stats_; }
+    /// Zero the counters (nothing counts without AF_XDP); as the Linux one, on the socket's thread.
+    void reset_stats() noexcept { stats_ = {}; }
 
   private:
     void swap(XdpContext& other) noexcept { std::swap(stats_, other.stats_); }
