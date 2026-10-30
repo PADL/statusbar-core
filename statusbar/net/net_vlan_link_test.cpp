@@ -708,6 +708,64 @@ TEST(vlan_link, a_delete_request_refuses_a_name_the_kernel_would_refuse)
 }
 
 // ===========================================================================
+// build_set_link_up, build_no_ipv6_addresses
+// ===========================================================================
+
+TEST(vlan_link, a_set_link_up_request_is_byte_for_byte_what_iproute2_sends)
+{
+    // `ip link set dev dummy0.2 up`, then `down`. Little-endian host assumed.
+    // clang-format off
+    std::array<std::uint8_t, 48> want{
+        // nlmsghdr: len 48, RTM_SETLINK (19), REQUEST|ACK (0x0005), seq 7, pid 0
+        0x30, 0x00, 0x00, 0x00,  0x13, 0x00,  0x05, 0x00,  0x07, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+        // ifinfomsg: index 0 (the link is named), flags IFF_UP, change IFF_UP
+        0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,  0x01, 0x00, 0x00, 0x00,  0x01, 0x00, 0x00, 0x00,
+        // IFLA_IFNAME (3), len 4 + 9: "dummy0.2\0", 3 pad bytes
+        0x0d, 0x00, 0x03, 0x00,  'd', 'u', 'm', 'm', 'y', '0', '.', '2', 0x00,  0x00, 0x00, 0x00,
+    };
+    // clang-format on
+    std::array<std::uint8_t, vlan::MAX_REQUEST_SIZE> request{};
+    auto const up = vlan::build_set_link_up(request, "dummy0.2", true, 7);
+    EXPECT_TRUE(up.has_value());
+    if (up) {
+        expect_bytes({request.data(), *up}, want);
+    }
+    want[24] = 0x00;  // down: IFF_UP cleared, still in change
+    auto const down = vlan::build_set_link_up(request, "dummy0.2", false, 7);
+    EXPECT_TRUE(down.has_value());
+    if (down) {
+        expect_bytes({request.data(), *down}, want);
+    }
+    EXPECT_FALSE(vlan::build_set_link_up(request, "", true, 7).has_value());
+}
+
+TEST(vlan_link, a_no_ipv6_addresses_request_nests_the_mode_as_iproute2_does)
+{
+    // `ip link set dev dummy0.2 addrgenmode none`.
+    // clang-format off
+    std::array<std::uint8_t, 64> const want{
+        // nlmsghdr: len 64, RTM_SETLINK (19), REQUEST|ACK (0x0005), seq 8, pid 0
+        0x40, 0x00, 0x00, 0x00,  0x13, 0x00,  0x05, 0x00,  0x08, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+        // ifinfomsg: index 0, flags 0, change 0
+        0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+        // IFLA_IFNAME (3), len 4 + 9: "dummy0.2\0", 3 pad bytes
+        0x0d, 0x00, 0x03, 0x00,  'd', 'u', 'm', 'm', 'y', '0', '.', '2', 0x00,  0x00, 0x00, 0x00,
+        // IFLA_AF_SPEC (26, nest), len 4 + 12; AF_INET6 (10, nest), len 4 + 8
+        0x10, 0x00, 0x1a, 0x00,  0x0c, 0x00, 0x0a, 0x00,
+        // IFLA_INET6_ADDR_GEN_MODE (8), len 4 + 1: IN6_ADDR_GEN_MODE_NONE (1), 3 pad bytes
+        0x05, 0x00, 0x08, 0x00,  0x01,  0x00, 0x00, 0x00,
+    };
+    // clang-format on
+    std::array<std::uint8_t, vlan::MAX_REQUEST_SIZE> request{};
+    auto const length = vlan::build_no_ipv6_addresses(request, "dummy0.2", 8);
+    EXPECT_TRUE(length.has_value());
+    if (length) {
+        expect_bytes({request.data(), *length}, want);
+    }
+    EXPECT_FALSE(vlan::build_no_ipv6_addresses(request, "a_name_too_long_x", 8).has_value());
+}
+
+// ===========================================================================
 // parse_ack
 // ===========================================================================
 
