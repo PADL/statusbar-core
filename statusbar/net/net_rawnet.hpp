@@ -32,6 +32,7 @@
 
 #include "statusbar/buffer/buffer.hpp"
 #include "statusbar/ieee/ieee.hpp"
+#include "statusbar/net/net_cbpf_emit.hpp"
 #include "statusbar/net/net_error.hpp"
 #include "statusbar/net/net_socket.hpp"
 #include "statusbar/sg14/inplace_function.h"
@@ -93,6 +94,7 @@ class RawnetContext
         : fd_{other.fd_}
         , ethertype_{other.ethertype_}
         , interface_index_{other.interface_index_}
+        , transmit_only_{other.transmit_only_}
         , my_mac_{other.my_mac_}
         , default_dest_mac_{other.default_dest_mac_}
         , tx_tap_{std::move(other.tx_tap_)}
@@ -102,6 +104,7 @@ class RawnetContext
     {
         other.fd_ = -1;
         other.interface_index_ = -1;
+        other.transmit_only_ = false;
         other.tx_tap_ = {};
     }
 
@@ -116,12 +119,23 @@ class RawnetContext
     ///        wire — but it skips the egress tap, so bypass frames are invisible
     ///        to tcpdump/AF_PACKET on the *sending* host. Default-off keeps local
     ///        capture working; enable only for latency-critical TX.
+    /// @param transmit_only Open a socket that never receives. A talker that
+    ///        only sends should not be handed a copy of every frame of its
+    ///        ethertype: today a send-only socket still pays for a receive
+    ///        path it drains and throws away. On Linux this opens protocol 0
+    ///        and never binds, so the socket is not registered for receive at
+    ///        all; on macOS BPF the equivalent is a drop-all read filter.
+    ///        `join_multicast`, `leave_multicast` and `set_subtype_filter`
+    ///        all refuse on such a socket — joining a group would bind it and
+    ///        put it back on the receive path. `send` and `set_priority` work
+    ///        normally.
     /// @return Status indicating success or failure
     [[nodiscard]] auto open(
         std::string_view interface_name,
         uint16_t ethertype,
         Eui48 const* multicast_mac = nullptr,
-        bool qdisc_bypass = false) noexcept -> Status;
+        bool qdisc_bypass = false,
+        bool transmit_only = false) noexcept -> Status;
 
     /// Close the socket
     void close() noexcept;
@@ -175,6 +189,51 @@ class RawnetContext
     /// @return Status indicating success or failure
     [[nodiscard]] auto leave_multicast(Eui48 const& multicast_mac) const noexcept -> Status;
 
+    /// Narrow the kernel-side filter to this socket's ethertype plus a set
+    /// of AVTP subtypes, matching both untagged frames and frames carrying
+    /// one 802.1Q tag.
+    ///
+    /// The socket is opened on ETH_P_ALL (see open()), so without a filter
+    /// the kernel wakes us for every frame on the wire — on a busy link tens
+    /// of thousands of times a second, nearly all for frames we discard in
+    /// user space after a syscall and a copy. open() already attaches an
+    /// ethertype-only filter; this narrows it further to the subtypes we
+    /// actually consume, which for a listener is the difference between
+    /// costing a core and costing a few percent of one.
+    ///
+    /// Attaching replaces any filter already on the socket. Frames that
+    /// arrived under the previous, wider filter are still queued, so this
+    /// attaches a drop-all program, drains the queue, and only then
+    /// attaches the real one — otherwise the caller's next reads return
+    /// frames the new filter would have rejected.
+    ///
+    /// @param subtypes 1 to `rawnet_filter::MAX_SUBTYPES` AVTP subtype
+    ///        values (the first payload byte). Validated before the socket
+    ///        is touched.
+    /// @return Status; `invalid_argument` for an empty or oversized set or
+    ///         on a transmit-only socket, `not_connected` if not open.
+    [[nodiscard]] auto set_subtype_filter(std::span<uint8_t const> subtypes) const noexcept -> Status;
+
+    /// Set the socket's egress priority (SO_PRIORITY on Linux).
+    ///
+    /// This is a prerequisite, not an optimisation: SO_PRIORITY is what
+    /// `packet_pick_tx_queue` reads to choose the TX queue for a frame.
+    /// Without it every frame we send lands on the default queue, so an
+    /// mqprio map and a credit-based shaper configured on the NIC have no
+    /// effect on our traffic at all.
+    ///
+    /// Permitted on a transmit-only socket — that is the socket that most
+    /// needs it.
+    ///
+    /// @param priority Non-negative priority; maps to the skb priority the
+    ///        mqprio priority-to-traffic-class map is indexed by.
+    /// @return Status; `invalid_argument` if negative, `not_connected` if
+    ///         not open, `not_supported` on platforms without SO_PRIORITY.
+    [[nodiscard]] auto set_priority(int priority) noexcept -> Status;
+
+    /// Whether this socket was opened transmit-only.
+    [[nodiscard]] auto transmit_only() const noexcept -> bool { return transmit_only_; }
+
     /// Check if the socket is valid
     [[nodiscard]] auto valid() const noexcept -> bool { return fd_ >= 0; }
 
@@ -213,9 +272,29 @@ class RawnetContext
 #endif
 
   private:
+    /// The part of set_subtype_filter()'s contract that can fail before any
+    /// program is built: the subtype set, then the socket, then the mode.
+    [[nodiscard]] auto check_filter_preconditions(std::span<uint8_t const> subtypes) const noexcept -> Status;
+
+    /// Install a cBPF program as this socket's receive filter
+    /// (SO_ATTACH_FILTER on Linux, BIOCSETF on macOS BPF). Replaces any
+    /// program already attached.
+    [[nodiscard]] auto attach_cbpf(std::span<cbpf::Instruction const> program) const noexcept -> Status;
+
+    /// Install `program` such that nothing admitted by the previous filter
+    /// survives in the receive queue.
+    [[nodiscard]] auto replace_filter(std::span<cbpf::Instruction const> program) const noexcept -> Status;
+
+#if defined(__linux__)
+    /// Read and discard whatever is already queued, bounded so a socket
+    /// under live flood cannot turn a filter change into an endless loop.
+    void drain_receive_queue() const noexcept;
+#endif
+
     int fd_{-1};
     uint16_t ethertype_{0};
     int interface_index_{-1};
+    bool transmit_only_{false};
     Eui48 my_mac_{};
     Eui48 default_dest_mac_{};
     TxTap tx_tap_{};
