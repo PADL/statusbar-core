@@ -147,23 +147,30 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 
     set(XDP_BPF_SRC "${CMAKE_CURRENT_SOURCE_DIR}/xdp_filter.bpf.c")
     set(XDP_BPF_OBJ "${CMAKE_CURRENT_BINARY_DIR}/xdp_filter.bpf.o")
+    set(XDP_BPF_HASH "${CMAKE_CURRENT_BINARY_DIR}/xdp_filter_bpf_hash.h")
 
+    # The object's hash goes into a header the embedding TU includes, so a
+    # compiler cache (which does not hash #embed'ded files) recompiles it when
+    # the object changes.
     add_custom_command(
-      OUTPUT ${XDP_BPF_OBJ}
+      OUTPUT ${XDP_BPF_OBJ} ${XDP_BPF_HASH}
       COMMAND ${BPF_CLANG} -target bpf -O2 -g -I${LIBBPF_INCLUDE_DIRS}
               ${MULTIARCH_INCLUDE} -c ${XDP_BPF_SRC} -o ${XDP_BPF_OBJ}
+      COMMAND ${CMAKE_COMMAND} -DOBJ=${XDP_BPF_OBJ} -DOUT=${XDP_BPF_HASH} -P
+              ${CMAKE_CURRENT_SOURCE_DIR}/xdp_filter_bpf_hash.cmake
       DEPENDS ${XDP_BPF_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/net_tcam_bpf_abi.h
+              ${CMAKE_CURRENT_SOURCE_DIR}/xdp_filter_bpf_hash.cmake
       COMMENT "Compiling XDP BPF program"
       VERBATIM)
 
-    add_custom_target(xdp_bpf_obj DEPENDS ${XDP_BPF_OBJ})
+    add_custom_target(xdp_bpf_obj DEPENDS ${XDP_BPF_OBJ} ${XDP_BPF_HASH})
     add_dependencies(statusbar-net xdp_bpf_obj)
 
     target_sources(statusbar-net
                    PRIVATE ${CMAKE_CURRENT_LIST_DIR}/xdp_filter_bpf_embed.cpp)
     set_source_files_properties(
       ${CMAKE_CURRENT_LIST_DIR}/xdp_filter_bpf_embed.cpp
-      PROPERTIES OBJECT_DEPENDS "${XDP_BPF_OBJ}")
+      PROPERTIES OBJECT_DEPENDS "${XDP_BPF_OBJ};${XDP_BPF_HASH}")
 
     # HAVE_XDP must be visible to consumers so the gated parts of
     # net_linux_xdp.hpp compile in their TUs too.
