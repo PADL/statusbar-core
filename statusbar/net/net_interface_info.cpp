@@ -34,9 +34,18 @@ namespace {
 constexpr std::string_view SYSFS_NET = "/sys/class/net/";
 
 /// errno as an error_code in the **generic** category, not the system
-/// category. The two never compare equal even for the same value, so a
-/// caller writing `== std::errc::no_such_device` only works if we report
-/// errno generically — which on POSIX is exactly what these values are.
+/// category.
+///
+/// Which category this is matters for one comparison and not the other,
+/// and the difference is easy to state backwards. Against a `std::errc`,
+/// either category compares equal: `ec == std::errc::no_such_device` goes
+/// through the category's `default_error_condition`, and the system
+/// category maps a POSIX errno straight onto the generic one. Against
+/// another `error_code` it does not, because `error_code` equality
+/// compares the category identity too — so a caller writing
+/// `== std::make_error_code(std::errc::no_such_device)`, which is the
+/// form this module's own tests use, sees false for a system-category
+/// code of the very same value.
 [[nodiscard]] auto errno_error(int value) noexcept -> std::error_code
 {
     return std::error_code{value, std::generic_category()};
