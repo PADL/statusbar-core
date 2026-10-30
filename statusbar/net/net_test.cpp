@@ -1829,6 +1829,19 @@ TEST(net_socket, makes_a_nonblocking_udp_socket)
     EXPECT_TRUE(refused.error().category() == std::system_category());
 }
 
+TEST(net_socket, a_group_membership_is_a_joined_socket_or_the_join_s_errno)
+{
+    auto const refused = open_group_membership(statusbar::ip::IPv4Address{10, 0, 0, 1}, 0);
+    EXPECT_FALSE(refused.has_value());
+    EXPECT_TRUE(refused.error() == std::errc::invalid_argument);  // not a group
+    auto const lo = ::if_nametoindex("lo");
+    if (lo == 0) {
+        return;
+    }
+    auto const joined = open_group_membership(statusbar::ip::IPv4Address{239, 69, 0, 1}, lo);
+    EXPECT_TRUE(joined.has_value() && joined->valid());
+}
+
 int statusbar_net_net_test(int argc, char** argv)
 {
     (void)argc;

@@ -15,7 +15,9 @@
 /// the link is up, and unregisters it when the last such link is deleted. The
 /// link is left down: a down VLAN link takes no addresses and, for frames on
 /// its VID, only the real device's ETH_P_ALL taps (packet sockets bound to
-/// it) see them.
+/// it) see them. Brought up with no address (bring_up()), it lets a socket
+/// join an IP group on it, so the kernel reports the membership tagged with
+/// the VID (IGMP snooping on that VLAN, RFC 4541).
 ///
 /// Two layers, as net_tc_qdisc's: pure builders (build_new_vlan,
 /// build_delete_link) writing one RTM_NEWLINK / RTM_DELLINK request into a
@@ -62,6 +64,16 @@ inline constexpr size_t MAX_LINK_NAME = 15;
 /// invalid_argument for an empty name or one over MAX_LINK_NAME.
 [[nodiscard]] auto build_delete_link(std::span<uint8_t> out, std::string_view name, uint32_t seq) -> StatusValue<size_t>;
 
+/// Build `ip link set dev <name> up` (or `down`): RTM_SETLINK, NLM_F_REQUEST |
+/// NLM_F_ACK, IFF_UP in ifi_flags and ifi_change. Returns the message length.
+/// Errors: invalid_argument for an empty name or one over MAX_LINK_NAME.
+[[nodiscard]] auto build_set_link_up(std::span<uint8_t> out, std::string_view name, bool up, uint32_t seq) -> StatusValue<size_t>;
+
+/// Build `ip link set dev <name> addrgenmode none` (RTM_SETLINK; IFLA_AF_SPEC >
+/// AF_INET6 > IFLA_INET6_ADDR_GEN_MODE): the link makes no IPv6 link-local
+/// address when it comes up. Errors: as build_set_link_up().
+[[nodiscard]] auto build_no_ipv6_addresses(std::span<uint8_t> out, std::string_view name, uint32_t seq) -> StatusValue<size_t>;
+
 /// The link requests a caller makes (VlanLinkClient in a host; a recorder in tests).
 class VlanControl
 {
@@ -74,6 +86,9 @@ class VlanControl
     [[nodiscard]] virtual auto add_vlan(int parent_ifindex, std::string_view name, uint16_t vid) -> Status = 0;
     /// Delete link @p name. Errors: the netlink errno (ENODEV: no such link).
     [[nodiscard]] virtual auto remove_link(std::string_view name) -> Status = 0;
+    /// Bring link @p name up with no address: no IPv6 address is generated
+    /// (where the kernel has IPv6), none of IPv4 is given. Errors: the netlink errno.
+    [[nodiscard]] virtual auto bring_up(std::string_view name) -> Status = 0;
     /// The kernel's extended-ack message for the last failed request.
     [[nodiscard]] virtual auto last_message() const noexcept -> std::string const& = 0;
 
@@ -94,6 +109,7 @@ class VlanLinkClient final : public VlanControl
 
     [[nodiscard]] auto add_vlan(int parent_ifindex, std::string_view name, uint16_t vid) -> Status override;
     [[nodiscard]] auto remove_link(std::string_view name) -> Status override;
+    [[nodiscard]] auto bring_up(std::string_view name) -> Status override;
     [[nodiscard]] auto last_message() const noexcept -> std::string const& override { return rtnl_.last_message(); }
 
   private:

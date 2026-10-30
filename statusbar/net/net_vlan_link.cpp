@@ -10,6 +10,7 @@
 #    include <cstddef>
 #    include <system_error>
 
+#    include <linux/if_addr.h>
 #    include <linux/if_link.h>
 #    include <linux/netlink.h>
 #    include <linux/rtnetlink.h>
@@ -32,6 +33,7 @@ constexpr size_t IFINFO_SIZE = sizeof(ifinfomsg);
 constexpr size_t RTA_HEADER = sizeof(rtattr);
 constexpr uint16_t NEW_FLAGS = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
 constexpr uint16_t DELETE_FLAGS = NLM_F_REQUEST | NLM_F_ACK;
+constexpr uint16_t SET_FLAGS = NLM_F_REQUEST | NLM_F_ACK;
 constexpr uint16_t MAX_VID = 4094;
 constexpr std::string_view KIND = "vlan";
 
@@ -62,11 +64,19 @@ void put_string(BufferSerializerBuilder& b, uint16_t const type, std::string_vie
     }
 }
 
-void put_header(BufferSerializerBuilder& b, size_t const length, uint16_t const type, uint16_t const flags, uint32_t const seq)
+/// The netlink header and an ifinfomsg naming no index (the link is named), setting `link_flags` of `change`.
+void put_header(
+    BufferSerializerBuilder& b,
+    size_t const length,
+    uint16_t const type,
+    uint16_t const flags,
+    uint32_t const seq,
+    uint32_t const link_flags = 0,
+    uint32_t const change = 0)
 {
     b.append(static_cast<uint32_t>(length)).append(type).append(flags).append(seq).append(uint32_t{0});  // nlmsg_pid: the kernel
-    // ifinfomsg: family AF_UNSPEC, pad, type 0, index 0 (the link is named), flags 0, change 0.
-    b.append(uint8_t{AF_UNSPEC}).append(uint8_t{0}).append(uint16_t{0}).append(int32_t{0}).append(uint32_t{0}).append(uint32_t{0});
+    // ifinfomsg: family AF_UNSPEC, pad, type 0, index 0, flags, change.
+    b.append(uint8_t{AF_UNSPEC}).append(uint8_t{0}).append(uint16_t{0}).append(int32_t{0}).append(link_flags).append(change);
 }
 
 [[nodiscard]] auto valid_name(std::string_view const name) noexcept -> bool
@@ -137,6 +147,40 @@ auto build_delete_link(std::span<uint8_t> const out, std::string_view const name
     return finish(b, length);
 }
 
+auto build_set_link_up(std::span<uint8_t> const out, std::string_view const name, bool const up, uint32_t const seq)
+    -> StatusValue<size_t>
+{  // NOLINT(statusbar-block-statements): the RTM_SETLINK request, field by field
+    if (!valid_name(name)) {
+        return failure(std::make_error_code(std::errc::invalid_argument));
+    }
+    size_t const length = NLMSG_HEADER + IFINFO_SIZE + string_size(name);
+    MutableBuffer buffer{out};
+    BufferSerializerBuilder b{buffer};
+    put_header(b, length, RTM_SETLINK, SET_FLAGS, seq, up ? uint32_t{IFF_UP} : 0U, IFF_UP);
+    put_string(b, IFLA_IFNAME, name);
+    return finish(b, length);
+}
+
+auto build_no_ipv6_addresses(std::span<uint8_t> const out, std::string_view const name, uint32_t const seq) -> StatusValue<size_t>
+{  // NOLINT(statusbar-block-statements): the RTM_SETLINK request, field by field
+    if (!valid_name(name)) {
+        return failure(std::make_error_code(std::errc::invalid_argument));
+    }
+    constexpr size_t MODE = align4(RTA_HEADER + sizeof(uint8_t));
+    constexpr size_t INET6 = RTA_HEADER + MODE;
+    size_t const length = NLMSG_HEADER + IFINFO_SIZE + string_size(name) + RTA_HEADER + INET6;
+    MutableBuffer buffer{out};
+    BufferSerializerBuilder b{buffer};
+    put_header(b, length, RTM_SETLINK, SET_FLAGS, seq);
+    put_string(b, IFLA_IFNAME, name);
+    // IFLA_AF_SPEC nests AF_INET6, which nests IFLA_INET6_ADDR_GEN_MODE (iproute2's iplink.c).
+    put_rta(b, INET6, IFLA_AF_SPEC);
+    put_rta(b, MODE, AF_INET6);
+    put_rta(b, sizeof(uint8_t), IFLA_INET6_ADDR_GEN_MODE);
+    b.append(uint8_t{IN6_ADDR_GEN_MODE_NONE}).append(uint8_t{0}).append(uint16_t{0});  // the mode, then the padding
+    return finish(b, length);
+}
+
 auto VlanLinkClient::add_vlan(int const parent_ifindex, std::string_view const name, uint16_t const vid) -> Status
 {
     return rtnl_.request([&](std::span<uint8_t> out, uint32_t seq) { return build_new_vlan(out, parent_ifindex, name, vid, seq); });
@@ -145,6 +189,16 @@ auto VlanLinkClient::add_vlan(int const parent_ifindex, std::string_view const n
 auto VlanLinkClient::remove_link(std::string_view const name) -> Status
 {
     return rtnl_.request([&](std::span<uint8_t> out, uint32_t seq) { return build_delete_link(out, name, seq); });
+}
+
+auto VlanLinkClient::bring_up(std::string_view const name) -> Status
+{
+    auto const no_ipv6 =
+        rtnl_.request([&](std::span<uint8_t> out, uint32_t seq) { return build_no_ipv6_addresses(out, name, seq); });
+    if (!no_ipv6 && no_ipv6.error() != std::errc::address_family_not_supported) {  // EAFNOSUPPORT: no IPv6 at all
+        return no_ipv6;
+    }
+    return rtnl_.request([&](std::span<uint8_t> out, uint32_t seq) { return build_set_link_up(out, name, true, seq); });
 }
 
 }  // namespace statusbar::net::vlan

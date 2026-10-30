@@ -237,6 +237,22 @@ using FileDescriptor = ::statusbar::FileDescriptor;
     return success();
 }
 
+/// A UDP socket joined to IPv4 multicast `group` on the interface with index `interface_index`: the
+/// kernel holds the membership, and reports it (IGMP), until the socket closes. Unbound, it receives
+/// nothing. Errors: the socket's or the join's errno.
+[[nodiscard]] inline auto open_group_membership(ip::IPv4Address const& group, unsigned int interface_index) noexcept
+    -> StatusValue<FileDescriptor>
+{
+    auto fd = make_udp_socket();
+    if (!fd) {
+        return fd;
+    }
+    if (auto joined = join_group(fd->get(), group, interface_index); !joined) {
+        return failure(joined.error());
+    }
+    return fd;
+}
+
 /// Prepare an IPv4 socket to send multicast: out of the interface with index
 /// `interface_index` (0: the routing table's choice; Linux only otherwise),
 /// with hop limit `ttl`, and looped back to local listeners when `loop`.

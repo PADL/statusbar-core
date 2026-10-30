@@ -4,8 +4,9 @@
 // The rtnetlink VLAN link request builders, against bytes checked by hand
 // from linux/rtnetlink.h (nlmsghdr, ifinfomsg, rtattr) and linux/if_link.h
 // (IFLA_IFNAME, IFLA_LINK, IFLA_LINKINFO > IFLA_INFO_KIND + IFLA_INFO_DATA >
-// IFLA_VLAN_ID), framed as iproute2's `ip link add ... type vlan id N` frames
-// them. Netlink is host byte order: the expected bytes are little-endian.
+// IFLA_VLAN_ID; IFLA_AF_SPEC > AF_INET6 > IFLA_INET6_ADDR_GEN_MODE), framed as
+// iproute2's `ip link add ... type vlan id N` and `ip link set` frame them.
+// Netlink is host byte order: the expected bytes are little-endian.
 // Nothing is created (that needs CAP_NET_ADMIN).
 
 #include "statusbar/test/test.hpp"
@@ -121,6 +122,60 @@ TEST(vlan_link, delete_link)
     EXPECT_TRUE(same_bytes(std::span{out}.first(*length), want));
     EXPECT_FALSE(build_delete_link(out, "", 6).has_value());
     EXPECT_FALSE(build_delete_link(out, "a_name_too_long_x", 6).has_value());
+}
+
+// `ip link set dev enp8s0.2 up`, then `down`
+TEST(vlan_link, set_link_up)
+{
+    if (!LITTLE) {
+        return;
+    }
+    // clang-format off
+    std::array<uint8_t, 48> want{
+        // nlmsghdr: len 48, RTM_SETLINK (19), REQUEST|ACK (0x0005), seq 7, pid 0
+        0x30, 0x00, 0x00, 0x00,  0x13, 0x00,  0x05, 0x00,  0x07, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+        // ifinfomsg: index 0 (the link is named), flags IFF_UP, change IFF_UP
+        0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,  0x01, 0x00, 0x00, 0x00,  0x01, 0x00, 0x00, 0x00,
+        // IFLA_IFNAME (3), len 4 + 9: "enp8s0.2\0", 3 pad bytes
+        0x0d, 0x00, 0x03, 0x00,  'e', 'n', 'p', '8', 's', '0', '.', '2', 0x00,  0x00, 0x00, 0x00,
+    };
+    // clang-format on
+    tc::RequestBuffer out{};
+    auto const up = build_set_link_up(out, "enp8s0.2", true, 7);
+    EXPECT_TRUE(up.has_value());
+    EXPECT_TRUE(same_bytes(std::span{out}.first(*up), want));
+    want[24] = 0x00;  // down: IFF_UP cleared, still in change
+    auto const down = build_set_link_up(out, "enp8s0.2", false, 7);
+    EXPECT_TRUE(down.has_value());
+    EXPECT_TRUE(same_bytes(std::span{out}.first(*down), want));
+    EXPECT_FALSE(build_set_link_up(out, "", true, 7).has_value());
+}
+
+// `ip link set dev enp8s0.2 addrgenmode none`
+TEST(vlan_link, no_ipv6_addresses)
+{
+    if (!LITTLE) {
+        return;
+    }
+    // clang-format off
+    std::array<uint8_t, 64> const want{
+        // nlmsghdr: len 64, RTM_SETLINK (19), REQUEST|ACK (0x0005), seq 8, pid 0
+        0x40, 0x00, 0x00, 0x00,  0x13, 0x00,  0x05, 0x00,  0x08, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+        // ifinfomsg: index 0, flags 0, change 0
+        0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+        // IFLA_IFNAME (3), len 4 + 9: "enp8s0.2\0", 3 pad bytes
+        0x0d, 0x00, 0x03, 0x00,  'e', 'n', 'p', '8', 's', '0', '.', '2', 0x00,  0x00, 0x00, 0x00,
+        // IFLA_AF_SPEC (26, nest), len 4 + 12; AF_INET6 (10, nest), len 4 + 8
+        0x10, 0x00, 0x1a, 0x00,  0x0c, 0x00, 0x0a, 0x00,
+        // IFLA_INET6_ADDR_GEN_MODE (8), len 4 + 1: IN6_ADDR_GEN_MODE_NONE (1), 3 pad bytes
+        0x05, 0x00, 0x08, 0x00,  0x01,  0x00, 0x00, 0x00,
+    };
+    // clang-format on
+    tc::RequestBuffer out{};
+    auto const length = build_no_ipv6_addresses(out, "enp8s0.2", 8);
+    EXPECT_TRUE(length.has_value());
+    EXPECT_TRUE(same_bytes(std::span{out}.first(*length), want));
+    EXPECT_FALSE(build_no_ipv6_addresses(out, "a_name_too_long_x", 8).has_value());
 }
 
 }  // namespace
