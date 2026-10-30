@@ -53,6 +53,7 @@ statusbar_add_module(
   net_tcp_server_test.cpp
   net_test.cpp
   net_vlan_link_test.cpp
+  net_vlan_link_veth_test.cpp
   net_xdp_abi_test.cpp
   net_xdp_launch_time_test.cpp
   net_xdp_avtp_rules_test.cpp
