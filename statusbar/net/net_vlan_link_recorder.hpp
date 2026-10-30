@@ -39,6 +39,7 @@ class VlanRecorder final : public VlanControl
     {
         add_vlan,
         remove_link,
+        bring_up,
     };
 
     /// One recorded call. `vid` and `parent_ifindex` are meaningful only
@@ -105,6 +106,15 @@ class VlanRecorder final : public VlanControl
     auto remove_link(std::string_view name) -> Status override
     {
         requests_.push_back(Request{.operation = Operation::remove_link, .name = std::string{name}});
+        if (auto failure_code = take_failure()) {
+            return failure(*failure_code);
+        }
+        return success();
+    }
+
+    auto bring_up(std::string_view name) -> Status override
+    {
+        requests_.push_back(Request{.operation = Operation::bring_up, .name = std::string{name}});
         if (auto failure_code = take_failure()) {
             return failure(*failure_code);
         }
