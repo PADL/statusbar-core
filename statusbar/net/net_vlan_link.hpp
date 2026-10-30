@@ -20,7 +20,9 @@
 /// the real device's `ETH_P_ALL` taps and AF_XDP sockets see the tagged
 /// frames as normal. Leaving it down is the behaviour we want, not an
 /// oversight: bringing it up gives the host an extra interface, which may
-/// pick up an address or start answering ARP.
+/// pick up an address or start answering ARP. The exception is an IP
+/// listener on the VLAN, whose group memberships must be reported tagged
+/// with its VID (RFC 4541): `bring_up()` brings a link up with no address.
 ///
 /// Two layers, as in `net_tc_qdisc.hpp` and for the same reason:
 ///
@@ -51,11 +53,10 @@ namespace statusbar::net::vlan {
 
 #if defined(__linux__)
 
-/// Covers every request this module builds. The larger of the two is the
-/// create: 16 (nlmsghdr) + 16 (ifinfomsg) + 8 (IFLA_LINK) + 20
-/// (IFLA_IFNAME, padded) + 24 (IFLA_LINKINFO nesting the kind and the
-/// VLAN id) = 80 bytes for a 15-byte name. A request therefore lives on
-/// the stack with no allocation.
+/// Covers every request this module builds. The largest is the create:
+/// 16 (nlmsghdr) + 16 (ifinfomsg) + 8 (IFLA_LINK) + 20 (IFLA_IFNAME, padded)
+/// + 24 (IFLA_LINKINFO nesting the kind and the VLAN id) = 80 bytes for a
+/// 15-byte name. A request therefore lives on the stack with no allocation.
 inline constexpr std::size_t MAX_REQUEST_SIZE = 128;
 
 /// IFNAMSIZ - 1: the kernel's limit on a link name, not counting the
@@ -188,6 +189,18 @@ struct VlanLinkFacts
 ///         `ENAMETOOLONG` if the name could not be one.
 [[nodiscard]] auto read_vlan_link(std::string_view name) -> StatusValue<VlanLinkFacts>;
 
+/// Build `ip link set dev <name> up` (or `down`): RTM_SETLINK, IFF_UP in ifi_flags and ifi_change.
+/// Returns the length, or `NetError::invalid_argument` for a name the kernel would refuse or a
+/// buffer too small.
+[[nodiscard]] auto build_set_link_up(std::span<std::uint8_t> out, std::string_view name, bool up, std::uint32_t seq)
+    -> StatusValue<std::size_t>;
+
+/// Build `ip link set dev <name> addrgenmode none` (RTM_SETLINK; IFLA_AF_SPEC > AF_INET6 >
+/// IFLA_INET6_ADDR_GEN_MODE): the link makes no IPv6 link-local address when it comes up.
+/// Returns as `build_set_link_up()`.
+[[nodiscard]] auto build_no_ipv6_addresses(std::span<std::uint8_t> out, std::string_view name, std::uint32_t seq)
+    -> StatusValue<std::size_t>;
+
 /// Registering a VLAN ID, as an interface, so a listener's tests can
 /// assert what it registered without touching a kernel.
 class VlanControl
@@ -217,6 +230,10 @@ class VlanControl
     /// Delete a link by name. Unconditional: the ownership returned by
     /// `add_vlan` is what decides whether calling this is right.
     [[nodiscard]] virtual auto remove_link(std::string_view name) -> Status = 0;
+
+    /// Bring a link up with no address (no IPv6 one generated, no IPv4 one given), so an IP group joined on it
+    /// is reported tagged. The default refuses with operation_not_supported, so older implementations build.
+    [[nodiscard]] virtual auto bring_up(std::string_view /*name*/) -> Status { return failure(std::errc::operation_not_supported); }
 
     /// The kernel's extended-ack text for the last call, or empty.
     [[nodiscard]] virtual auto last_message() const noexcept -> std::string const& = 0;
@@ -249,6 +266,7 @@ class VlanLinkClient final : public VlanControl
         -> StatusValue<LinkOwnership> override;
 
     [[nodiscard]] auto remove_link(std::string_view name) -> Status override;
+    [[nodiscard]] auto bring_up(std::string_view name) -> Status override;
 
     [[nodiscard]] auto last_message() const noexcept -> std::string const& override { return last_message_; }
 
