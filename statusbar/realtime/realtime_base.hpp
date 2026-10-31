@@ -28,9 +28,12 @@
 
 #include "statusbar/itc/itc_stop_token.hpp"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <csignal>
+#include <cstddef>
 #include <print>
 #include <string>
 #include <string_view>
@@ -413,6 +416,73 @@ struct RealtimeCapabilities
 [[nodiscard]] inline auto get_min_fifo_priority() noexcept -> int
 {
     return sched_get_priority_min(SCHED_FIFO);
+}
+
+//
+// Spin Hints and Thread Names
+//
+
+/// Tell the CPU that this is a spin-wait: `pause` on x86, `yield` on ARM.
+/// A spin loop without it burns the pipeline, slows the sibling hyperthread
+/// and draws power for nothing.
+///
+/// It is only a hint, so correctness must never depend on it — an
+/// architecture with no such instruction compiles to an empty function
+/// rather than failing the build. The per-architecture spelling lives here
+/// once because it is exactly the kind of thing that gets copied wrongly.
+inline void cpu_relax() noexcept
+{
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield");
+#endif
+}
+
+/// The longest thread name the kernel keeps, NUL included — Linux's
+/// TASK_COMM_LEN. A name at or over this length is refused outright by
+/// prctl()/pthread_setname_np(), so we truncate to fit instead.
+inline constexpr std::size_t thread_name_max = 16;
+
+/// Name the calling thread, so `top -H`, `perf` and a core dump say
+/// `rt-timer` instead of an anonymous LWP id. That is the difference
+/// between a bug report we can act on and one we cannot.
+///
+/// A name longer than 15 bytes is truncated here, before the call. It has
+/// to be: `pthread_setname_np()` returns ERANGE for an over-long name and
+/// sets nothing, leaving the thread anonymous — the exact outcome this
+/// function exists to prevent. (Linux's `prctl(PR_SET_NAME)` would truncate
+/// for us instead, but then the behaviour would be the platform's rather
+/// than ours, and macOS allows 64 bytes where Linux allows 15. Truncating
+/// here means one name, the same everywhere.) Prefer short prefixed names
+/// (`rt-timer`, `avtp-tx`) that stay distinguishable once truncated.
+///
+/// An empty name is a no-op rather than a request to erase the name a
+/// thread already has — a caller passing an unset config value should not
+/// silently anonymise the thread.
+///
+/// Never fails and never throws: a thread must not break because naming it
+/// did. Takes no thread handle because macOS can only name the current
+/// thread, and an API we cannot implement portably is worse than a narrow
+/// one.
+/// @param name The name to set; truncated to 15 bytes
+inline void set_current_thread_name(std::string_view name) noexcept
+{
+    if (name.empty()) {
+        return;
+    }
+    std::array<char, thread_name_max> buf{};
+    std::size_t const n = std::min(name.size(), buf.size() - 1);
+    std::copy_n(name.data(), n, buf.data());
+    buf[n] = '\0';
+
+#if defined(__linux__)
+    (void)::pthread_setname_np(::pthread_self(), buf.data());
+#elif defined(__APPLE__)
+    (void)::pthread_setname_np(buf.data());  // macOS names only the caller
+#else
+    (void)buf;  // no thread names on this platform
+#endif
 }
 
 //
