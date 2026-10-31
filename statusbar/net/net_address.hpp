@@ -4,7 +4,8 @@
 // SPDX-License-Identifier: MIT
 
 /// Network address utilities
-/// Provides SocketAddress wrapper around sockaddr_storage
+/// Provides SocketAddress wrapper around sockaddr_storage: IPv4, IPv6, and
+/// AF_LOCAL (AF_UNIX) filesystem paths
 
 #include "statusbar/buffer/buffer.hpp"
 #include "statusbar/net/net_error.hpp"
@@ -14,6 +15,7 @@
 #include <netdb.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <expected>
@@ -25,6 +27,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 
 namespace statusbar::net {
 
@@ -112,6 +115,15 @@ class SocketAddress
         return ipv6(addr, port, scope_id);
     }
 
+    /// Create an AF_LOCAL (AF_UNIX) address for an absolute filesystem path.
+    /// The abstract namespace is deliberately not offered: an abstract name
+    /// carries no filesystem permissions, which is most of the reason to
+    /// choose AF_UNIX. One handed to us is still read back and rendered.
+    /// @param path Absolute path of the socket file. Must be non-empty, start
+    ///        with '/', hold no NUL, and fit sun_path with its terminator.
+    /// @return The address, or NetError::invalid_address
+    [[nodiscard]] static auto local(std::string_view path) noexcept -> StatusValue<SocketAddress>;
+
     /// Get pointer to sockaddr for system calls
     [[nodiscard]] auto sockaddr() noexcept -> struct sockaddr*
     {
@@ -161,6 +173,15 @@ class SocketAddress
         return 0;
     }
 
+    /// Get the socket file path (AF_UNIX only). Empty for any other family,
+    /// for an unnamed peer — what accept() reports for a client that never
+    /// bound, which is a valid address and not an error — and for a Linux
+    /// abstract name, which has no filesystem path; to_string() renders
+    /// those as "<unnamed>" and "@name" respectively.
+    /// The view is into this object's storage, so it dies with it and does
+    /// not survive an assignment.
+    [[nodiscard]] auto path() const noexcept -> std::string_view;
+
     /// Get the scope ID (IPv6 only, for link-local addresses)
     [[nodiscard]] auto scope_id() const noexcept -> uint32_t
     {
@@ -193,9 +214,13 @@ class SocketAddress
 };
 
 /// Create a UDP socket bound to the given address
+/// For an AF_UNIX address this is a datagram unix socket: SO_REUSEADDR and
+/// DSCP mean nothing there and are skipped, and the caller owns whatever
+/// filesystem entry bind creates — including unlinking a stale one first,
+/// since bind fails with EADDRINUSE on an existing path.
 /// @param addr The address to use (determines address family)
 /// @param do_bind If true, bind to the address
-/// @param dscp Optional DSCP value (0-63). If >= 0, sets the DSCP on the socket.
+/// @param dscp Optional DSCP value (0-63). If >= 0, sets the DSCP on the socket (IP families only).
 /// @param ipv6_only When true and `addr` is AF_INET6, sets IPV6_V6ONLY
 ///        before bind so the socket does not also claim IPv4. Required
 ///        when a separate AF_INET socket binds the same port.
@@ -203,9 +228,11 @@ class SocketAddress
     -> StatusValue<FileDescriptor>;
 
 /// Create a TCP socket optionally bound to the given address
+/// For an AF_UNIX address this is a stream unix socket, with the same
+/// exclusions and the same caller-owned socket file as create_udp_socket.
 /// @param addr The address to use (determines address family)
 /// @param do_bind If true, bind to the address
-/// @param dscp Optional DSCP value (0-63). If >= 0, sets the DSCP on the socket.
+/// @param dscp Optional DSCP value (0-63). If >= 0, sets the DSCP on the socket (IP families only).
 [[nodiscard]] auto create_tcp_socket(SocketAddress const& addr, bool do_bind, int dscp = -1) -> StatusValue<FileDescriptor>;
 
 /// Create a TCP socket, bind, and listen
