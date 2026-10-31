@@ -133,6 +133,30 @@ inline auto name_ifreq(ifreq& ifr, std::string_view const iface) noexcept -> voi
     return success();
 }
 
+/// Whether `name` is a name the kernel would accept for an interface - which
+/// is also exactly what makes it safe to paste into a path, be it an XDP pin
+/// directory or /sys/class/net: no '/', so it cannot climb out, and neither
+/// "." nor "..".
+/// Mirrors the kernel's dev_valid_name(). The length limit is spelled out
+/// rather than taken from IFNAMSIZ so this stays usable off Linux.
+/// @param name The candidate interface name
+[[nodiscard]] constexpr auto valid_interface_name(std::string_view const name) noexcept -> bool
+{
+    constexpr size_t MaxNameLength = 15;  // IFNAMSIZ - 1
+    if (name.empty() || name.size() > MaxNameLength) {
+        return false;
+    }
+    if (name == "." || name == "..") {
+        return false;
+    }
+    for (char const c : name) {
+        if (c == '/' || c == ':' || c == '\0' || c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r') {
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace detail
 
 [[nodiscard]] inline auto ifreq_ioctl(std::string_view const iface, unsigned long const request, ifreq& ifr) noexcept -> Status

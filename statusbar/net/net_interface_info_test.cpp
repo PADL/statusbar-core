@@ -230,6 +230,27 @@ TEST(interface_info, an_oversized_name_is_refused_before_any_syscall)
     }
 }
 
+TEST(interface_info, a_name_that_is_a_path_is_refused_before_any_path_is_built)
+{
+    // Short enough to pass the length check, and each would otherwise be
+    // pasted into /sys/class/net/<name>/speed or /queues and followed:
+    // "../../x/y" walks out of the directory, ".." counts the entries of
+    // /sys/class. No interface can have these names, so no_such_device.
+    auto const expected = std::make_error_code(std::errc::no_such_device);
+    for (std::string_view const name : {"../../x/y", "..", ".", "a/b"}) {
+        auto const speed = link_speed_mbps(name);
+        EXPECT_FALSE(speed.has_value());
+        if (!speed) {
+            EXPECT_EQ(speed.error(), expected);
+        }
+        auto const queues = tx_queue_count(name);
+        EXPECT_FALSE(queues.has_value());
+        if (!queues) {
+            EXPECT_EQ(queues.error(), expected);
+        }
+    }
+}
+
 TEST(interface_info, a_name_of_exactly_ifnamsiz_minus_one_is_not_refused_for_length)
 {
     // The boundary. IFNAMSIZ-1 characters plus the terminator is exactly

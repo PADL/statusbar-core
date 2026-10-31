@@ -40,6 +40,7 @@ extern unsigned int const xdp_filter_bpf_o_len;
 #include "statusbar/ieee/ieee.hpp"
 #include "statusbar/net/net_compiled_rule.hpp"
 #include "statusbar/net/net_ethernet_port.hpp"
+#include "statusbar/net/net_posix_util.hpp"
 #include "statusbar/net/net_tcam_bpf_abi.h"
 #include "statusbar/status/status.hpp"
 #include "statusbar/status/throw_or_abort.hpp"
@@ -514,29 +515,6 @@ struct AttachPlan
 [[nodiscard]] constexpr auto transient_kick_errno(int const err) noexcept -> bool
 {
     return err == EAGAIN || err == EWOULDBLOCK || err == EBUSY || err == ENOBUFS || err == ENETDOWN;
-}
-
-/// Whether `name` is a name the kernel would accept for an interface - which
-/// is also exactly what makes it safe to paste into a pin path: no '/', so it
-/// cannot climb out of the pin directory, and neither "." nor "..".
-/// Mirrors the kernel's dev_valid_name(). The length limit is spelled out
-/// rather than taken from IFNAMSIZ so this stays usable off Linux.
-/// @param name The candidate interface name
-[[nodiscard]] constexpr auto valid_interface_name(std::string_view const name) noexcept -> bool
-{
-    constexpr size_t MaxNameLength = 15;  // IFNAMSIZ - 1
-    if (name.empty() || name.size() > MaxNameLength) {
-        return false;
-    }
-    if (name == "." || name == "..") {
-        return false;
-    }
-    for (char const c : name) {
-        if (c == '/' || c == ':' || c == '\0' || c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r') {
-            return false;
-        }
-    }
-    return true;
 }
 
 /// FNV-1a over `bytes`, 64 bits wide.

@@ -72,11 +72,14 @@ constexpr std::string_view SYSFS_NET = "/sys/class/net/";
 /// and the early return is observable in a test.
 [[nodiscard]] auto validate_name(std::string_view name) noexcept -> Status
 {
-    if (name.empty()) {
-        return failure(std::make_error_code(std::errc::no_such_device));
-    }
     if (name.size() >= IFNAMSIZ) {
         return failure(std::make_error_code(std::errc::filename_too_long));
+    }
+    // Empty, "." or "..", or holding a '/' or a separator: no interface has
+    // such a name, and two of the facts are read from /sys/class/net/<name>,
+    // where "../../x" would have walked somewhere else entirely.
+    if (!detail::valid_interface_name(name)) {
+        return failure(std::make_error_code(std::errc::no_such_device));
     }
     return success();
 }
