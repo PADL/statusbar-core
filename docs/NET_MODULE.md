@@ -81,7 +81,9 @@ int main() {
 - `statusbar/net/net_rawnet.hpp`, `net_ethernet_port.hpp` — `RawnetContext` and the `EthernetPort` concept + slot/guard types.
 - `statusbar/net/net_traffic_classifier.hpp`, `net_tcam_classifier.hpp`, `net_compiled_rule.hpp`, `net_cbpf_emit.hpp` — classification and cBPF emission.
 - `statusbar/net/net_test_port.hpp`, `net_loopback_port.hpp`, `net_bpf_port.hpp`, `net_tap_bridge.hpp` — `EthernetPort` backends.
-- `statusbar/net/net_linux_mmap.hpp`, `net_linux_xdp.hpp` — Linux `PACKET_MMAP` and AF_XDP contexts (Linux-only).
+- `statusbar/net/net_linux_mmap.hpp`, `net_linux_xdp.hpp` — Linux `PACKET_MMAP` and AF_XDP contexts (Linux-only). `XdpConfig` chooses the bind mode (`auto_` / `zero_copy` / `copy`) and attach mode (`native` / `generic`, native first with a fall back to generic unless zero-copy was demanded), retries a bind refused with EBUSY while the previous socket's queue is still being released, and with a `pin_path` pins the program and its maps under `/sys/fs/bpf/statusbar/<interface>` so a restart adopts the running program instead of re-attaching (`XdpProgram::pin_path_for`, `query`, `owner`, `detach`). `socket_stats()` counts the user-space side of the rings; `kernel_stats()` reads the kernel's `XDP_STATISTICS`.
+- `statusbar/net/net_xdp_avtp_rules.hpp` — the TCAM rules that steer an AVTP stream ID into AF_XDP, tagged and untagged, and `avtp_payload_offset`.
+- `statusbar/net/net_rss.hpp` — ethtool RSS indirection: read a NIC's table, steer every bucket to one queue (`RssSteering` puts the table back when it goes out of scope), with a recorder double for tests.
 
 ## Dependencies
 
@@ -98,7 +100,7 @@ int main() {
 - `MessageReactor` is single-threaded; only `NotificationPipe::notify()` and the `StopToken` are safe across threads.
 - `Pollable::fd()` may return `-1` for tick-only ports — `tick(now_ns)` still fires each cycle. `poll_events()` defaults to `POLLIN`; override for `POLLOUT` / `on_writable`.
 - `set_dscp` writes IPv4 TOS or IPv6 traffic-class based on `family`; `is_valid_dscp` accepts `-1` (unset) or `0..63`.
-- `RawnetContext` needs `CAP_NET_RAW` on Linux; root or BPF device access on macOS. AF_XDP needs kernel ≥ 5.4, libbpf, libxdp, and an XDP-capable driver — otherwise `XdpContext` compiles as a stub.
+- `RawnetContext` needs `CAP_NET_RAW` on Linux; root or BPF device access on macOS. AF_XDP needs a kernel with `CONFIG_XDP_SOCKETS` (≥ 5.4), libbpf, libxdp, and an XDP-capable driver — otherwise `XdpContext` compiles as a stub. A driver without native XDP (the Raspberry Pi 5's `macb`, for one) gets generic attach and a copy-mode bind, which `attach_mode()` and `zero_copy()` report.
 - `SocketAddress::from_string` takes host *and* port plus a socket type (`SocketStream` / `SocketDatagram`) — the type drives `getaddrinfo` hints.
 - `NetError::would_block` is the expected end-of-drain on nonblocking `recv` / `send` — treat as success, not failure.
 

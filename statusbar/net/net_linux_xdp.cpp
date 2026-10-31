@@ -93,6 +93,12 @@ auto XdpErrorCategory::message(int ev) const -> std::string
 #if defined(__linux__) && defined(HAVE_XDP)
 namespace {
 
+/// The name the embedded program is loaded under. The kernel records it,
+/// and it is how one of ours that has no pin to speak for it - left by a
+/// crash between attach and pin, or by an unpinned build that died - is
+/// told from somebody else's program on the same interface.
+constexpr char const* XDP_PROGRAM_NAME = "xdp_filter_prog";
+
 /// The kernel's id for whatever the descriptor refers to, 0 if it will not
 /// say. Used to tell "the program we pinned" from "a program".
 /// @param prog_fd A BPF program descriptor
@@ -267,6 +273,26 @@ constexpr uint32_t IdentityEntries = 1;
     return success();
 }
 
+/// Whether the attached program with this id is one of ours, by the name
+/// the kernel recorded for it. Any build of ours answers yes, which is the
+/// point: an orphan left by an older build is ours to clear away, not a
+/// stranger's to be refused forever.
+/// @param id A program id from XdpProgram::query(); 0 (programs in both
+///           modes at once) is nobody's, since the kernel will not name one
+[[nodiscard]] auto is_our_program(uint32_t const id) noexcept -> bool
+{
+    OwnedFd const prog{id == 0 ? -1 : bpf_prog_get_fd_by_id(id)};
+    if (!prog.valid()) {
+        return false;
+    }
+    struct bpf_prog_info info{};
+    uint32_t length = sizeof(info);
+    if (bpf_prog_get_info_by_fd(prog.get(), &info, &length) != 0) {
+        return false;
+    }
+    return std::string_view{static_cast<char const*>(info.name)} == XDP_PROGRAM_NAME;
+}
+
 }  // namespace
 #endif  // __linux__ && HAVE_XDP
 
@@ -299,11 +325,35 @@ auto XdpProgram::pin_entry(std::string_view const pin_path, std::string_view con
     return path;
 }
 
+namespace {
+
+/// Whether every path component below the bpffs root is a name a directory
+/// there could have: not empty, not "." or "..", none of the separators.
+/// A path that passes the prefix test and then climbs out with ".." would
+/// otherwise be created, unlinked in and removed wherever it lands.
+[[nodiscard]] auto pin_components_valid(std::string_view below_root) noexcept -> bool
+{
+    for (std::string_view rest = below_root;;) {
+        auto const slash = rest.find('/');
+        if (!statusbar::net::detail::valid_interface_name(rest.substr(0, slash))) {
+            return false;
+        }
+        if (slash == std::string_view::npos) {
+            return true;
+        }
+        rest.remove_prefix(slash + 1);
+    }
+}
+
+}  // namespace
+
 auto XdpProgram::pinnable([[maybe_unused]] std::string_view const pin_path) -> Status
 {
     // The shape first, which is pure: a pin has to live inside the bpf
-    // filesystem and name something below its root.
-    if (!pin_path.starts_with(BPFFS_ROOT) || pin_path.size() <= BPFFS_ROOT.size() || pin_path[BPFFS_ROOT.size()] != '/') {
+    // filesystem and name something below its root, by components that
+    // stay below it.
+    if (!pin_path.starts_with(BPFFS_ROOT) || pin_path.size() <= BPFFS_ROOT.size() || pin_path[BPFFS_ROOT.size()] != '/' ||
+        !pin_components_valid(pin_path.substr(BPFFS_ROOT.size() + 1))) {
         return failure(XdpError::invalid_pin_path);
     }
 #if defined(__linux__) && defined(HAVE_XDP)
@@ -387,30 +437,22 @@ auto XdpProgram::query([[maybe_unused]] unsigned int const if_index) -> StatusVa
 #endif
 }
 
-auto XdpProgram::detach([[maybe_unused]] unsigned int const if_index, [[maybe_unused]] std::string_view const pin_path) -> Status
-{
 #if defined(__linux__) && defined(HAVE_XDP)
-    // This call unlinks files and removes a directory, so the path has to be
-    // one a pin could be at before any of that happens. Without the check a
-    // caller that built a path by hand could have us deleting somewhere else
-    // entirely. An empty path asks for no unlinking at all and is fine.
-    if (!pin_path.empty()) {
-        if (auto status = pinnable(pin_path); !status) {
-            return status;
-        }
-    }
+namespace {
 
-    Status result = success();
-    auto const keep_first_error = [&result](Status status) noexcept {
-        if (!status && result) {
-            result = status;
-        }
-    };
-
-    // The pins first: they are what an outside tool sees, and removing them
-    // while the program is still attached is the harmless order of the two.
-    for (auto const entry : {PIN_IDENTITY, PIN_PROG, PIN_RULES_MAP, PIN_XSK_MAP, PIN_DEVMAP}) {
-        auto const path = pin_entry(pin_path, entry);
+/// The pins first: they are what an outside tool sees, and removing them
+/// while the program is still attached is the harmless order of the two.
+/// @param keep_first_error Where the first failure, if any, is kept
+template <typename Keep>
+auto unpin(std::string_view const pin_path, Keep const& keep_first_error) -> void
+{
+    for (auto const entry :
+         {XdpProgram::PIN_IDENTITY,
+          XdpProgram::PIN_PROG,
+          XdpProgram::PIN_RULES_MAP,
+          XdpProgram::PIN_XSK_MAP,
+          XdpProgram::PIN_DEVMAP}) {
+        auto const path = XdpProgram::pin_entry(pin_path, entry);
         if (path.empty()) {
             continue;
         }
@@ -423,19 +465,26 @@ auto XdpProgram::detach([[maybe_unused]] unsigned int const if_index, [[maybe_un
         // clean up, and leaving it is not a failure of this call.
         (void)::rmdir(std::string{pin_path}.c_str());
     }
+}
 
-    // Then the attachment, in the mode it is actually in: flags of 0 mean
-    // "native" to the kernel on any driver with ndo_bpf, so a generic attach
-    // would survive a detach that did not say so.
+/// Then the attachment, in the mode it is actually in: flags of 0 mean
+/// "native" to the kernel on any driver with ndo_bpf, so a generic attach
+/// would survive a detach that did not say so. Only a program of ours, by
+/// name: one somebody else attached stays, and that is a success here -
+/// there was nothing of ours to remove.
+/// @param keep_first_error Where the first failure, if any, is kept
+template <typename Keep>
+auto detach_ours(unsigned int const if_index, Keep const& keep_first_error) -> void
+{
     struct bpf_xdp_query_opts opts{};
     opts.sz = sizeof(opts);
     if (int const ret = bpf_xdp_query(static_cast<int>(if_index), 0, &opts); ret != 0) {
         keep_first_error(failure(std::error_code{-ret, std::generic_category()}));
-        return result;
+        return;
     }
     for (auto const& [id, mode] :
          {std::pair{opts.drv_prog_id, XdpAttachMode::native}, std::pair{opts.skb_prog_id, XdpAttachMode::generic}}) {
-        if (id == 0) {
+        if (id == 0 || !is_our_program(id)) {
             continue;
         }
         if (int const ret = bpf_xdp_detach(static_cast<int>(if_index), detail::BpfAttachment::attach_flags(mode), nullptr);
@@ -443,6 +492,42 @@ auto XdpProgram::detach([[maybe_unused]] unsigned int const if_index, [[maybe_un
             keep_first_error(failure(std::error_code{-ret, std::generic_category()}));
         }
     }
+}
+
+}  // namespace
+#endif  // __linux__ && HAVE_XDP
+
+auto XdpProgram::detach([[maybe_unused]] unsigned int const if_index, [[maybe_unused]] std::string_view const pin_path) -> Status
+{
+#if defined(__linux__) && defined(HAVE_XDP)
+    // This call unlinks files and removes a directory, so the path has to be
+    // one a pin could be at before any of that happens. Without the check a
+    // caller that built a path by hand could have us deleting somewhere else
+    // entirely. An empty path asks for no unlinking at all and is fine.
+    if (!pin_path.empty()) {
+        if (auto status = pinnable(pin_path); !status) {
+            return status;
+        }
+        // Somebody else's pins are not ours to unlink, whatever is on the
+        // interface. Nobody's - absent, or unreadable to the point of saying
+        // nothing - are ours to clear.
+        auto const owner = XdpProgram::owner(pin_path);
+        if (!owner) {
+            return failure(owner.error());
+        }
+        if (*owner == XdpPinOwner::foreign) {
+            return failure(XdpError::foreign_program);
+        }
+    }
+
+    Status result = success();
+    auto const keep_first_error = [&result](Status status) noexcept {
+        if (!status && result) {
+            result = status;
+        }
+    };
+    unpin(pin_path, keep_first_error);
+    detach_ours(if_index, keep_first_error);
     return result;
 #else
     return failure(XdpError::not_supported_on_platform);
@@ -466,8 +551,8 @@ static_assert(
 
 auto detail::kernel_stats_from(struct xdp_statistics const& raw, socklen_t reported_length) -> XdpKernelStats
 {
-    // Clamped: a kernel newer than this header answers with a longer struct,
-    // and claiming counters we have no fields for would be a lie.
+    // Clamped: a kernel newer than this header fills more counters than
+    // there are fields here, and claiming them would be a lie.
     auto const reported = std::min(static_cast<size_t>(reported_length) / sizeof(uint64_t), KERNEL_STAT_COUNT);
     return XdpKernelStats{
         .rx_dropped = raw.rx_dropped,
@@ -489,11 +574,19 @@ auto detail::read_xdp_kernel_stats(int fd) -> StatusValue<XdpKernelStats>
     // No test can reach this: a kernel since 5.9 fills all six, so there is
     // nothing left unwritten for the garbage to show through. It stays
     // because the one kernel that would expose it is the one we cannot test.
-    struct xdp_statistics raw{};
-    socklen_t length = sizeof(raw);
-    if (::getsockopt(fd, SOL_XDP, XDP_STATISTICS, &raw, &length) < 0) {
+    //
+    // Read into room the kernel's struct will not outgrow for a while. Given
+    // a buffer shorter than its own struct, the kernel does not truncate: it
+    // falls back to the oldest three counters, so a kernel with a seventh
+    // counter would have hidden the three this header knows about. The
+    // length it reports back is still what says how many it filled.
+    std::array<uint64_t, 4 * KERNEL_STAT_COUNT> room{};
+    socklen_t length = sizeof(room);
+    if (::getsockopt(fd, SOL_XDP, XDP_STATISTICS, room.data(), &length) < 0) {
         return failure(XdpError::stats_read_failed);
     }
+    struct xdp_statistics raw{};
+    std::memcpy(&raw, room.data(), sizeof(raw));
     return kernel_stats_from(raw, length);
 }
 
@@ -598,7 +691,7 @@ auto detail::BpfState::load(std::span<CompiledRule<32> const> rules, XdpAction d
         return status;
     }
 
-    struct bpf_program* prog = bpf_object__find_program_by_name(obj.get(), "xdp_filter_prog");
+    struct bpf_program* prog = bpf_object__find_program_by_name(obj.get(), XDP_PROGRAM_NAME);
     if (prog == nullptr) {
         return failure(XdpError::bpf_load_failed);
     }
@@ -613,8 +706,9 @@ auto detail::BpfState::adopt(
     std::string_view const pin_path,
     unsigned int const if_index,
     std::span<CompiledRule<32> const> const rules,
-    XdpAction const default_action) -> Status
-{
+    XdpAction const default_action,
+    AttachPlan const& plan) -> Status
+{  // NOLINT(statusbar-block-statements) a pin is checked piece by piece, each refusal its own
     close();
 
     // Every pinned entry has to be there. A directory with some of them is a
@@ -684,6 +778,15 @@ auto detail::BpfState::adopt(
     if (!attached->has_value() || (*attached)->program_id != id) {
         return failure(XdpError::bpf_attach_failed);
     }
+    // And attached the way this open() would attach it. A generic-mode
+    // program is no use to a zero-copy bind, and a native one is not what
+    // a caller who asked for generic asked for: either is replaced, which
+    // the fresh path does, rather than adopted into a policy it breaks.
+    XdpAttachMode const mode = (*attached)->mode;
+    if (mode != plan.first && mode != plan.fallback) {
+        return failure(XdpError::pin_not_adoptable);
+    }
+    attachment_.adopt(if_index, mode);
 
     prog_fd_ = prog.release();
     rules_map_fd_ = rules_map.release();
@@ -764,30 +867,20 @@ namespace {
     return std::nullopt;
 }
 
-/// Whether the replace path may take what is on the interface off it:
-/// nothing is attached, or what is attached is the program our pins name.
-/// The pin directory being ours - or nobody's - says nothing about the
-/// attachment: a program somebody else attached without pinning under our
-/// path is theirs, and the ownership contract says it may not be detached.
-/// Programs in two modes at once report an id of zero, which never matches:
-/// a guess is not a claim.
+/// Whether open() may take what is on the interface off it: nothing is
+/// attached, or what is attached is one of ours by name. The pin directory
+/// being ours - or nobody's - says nothing about the attachment: a program
+/// somebody else attached, pinned elsewhere or nowhere, is theirs, and the
+/// ownership contract says it may not be detached. Programs in two modes at
+/// once report an id of zero, which is nobody's: a guess is not a claim.
 /// @param if_index The interface
-/// @param pin_path Our pin directory
-[[nodiscard]] auto attachment_replaceable(unsigned int const if_index, std::string_view const pin_path) -> StatusValue<bool>
+[[nodiscard]] auto attachment_replaceable(unsigned int const if_index) -> StatusValue<bool>
 {
     auto const attached = XdpProgram::query(if_index);
     if (!attached) {
         return failure(attached.error());
     }
-    if (!attached->has_value()) {
-        return true;
-    }
-    OwnedFd const pinned{bpf_obj_get(XdpProgram::pin_entry(pin_path, XdpProgram::PIN_PROG).c_str())};
-    if (!pinned.valid()) {
-        return false;
-    }
-    uint32_t const ours = program_info_id(pinned.get());
-    return ours != 0 && (*attached)->program_id == ours;
+    return !attached->has_value() || is_our_program((*attached)->program_id);
 }
 
 }  // namespace
@@ -854,6 +947,14 @@ auto XdpContext::open(XdpConfig const& config) -> Status
         }
     }
 
+    // A name no interface can have is refused here - after the pin path,
+    // the earlier of the two pure checks - rather than truncated into an
+    // ifreq, where a sixteen-character name would have named whichever
+    // interface its first fifteen characters do.
+    if (!detail::valid_interface_name(config.interface_name)) {
+        return failure(XdpError::interface_not_found);
+    }
+
     // Step 1: Look up interface index and MAC address
     int sock_fd = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (sock_fd < 0) {
@@ -896,17 +997,6 @@ auto XdpContext::open(XdpConfig const& config) -> Status
         }
     }
 
-    // Step 1c: Make the pin directory, now the interface is known to exist
-    // and before anything has been allocated. What can go wrong here is
-    // permissions, and a daemon started without CAP_BPF should hear about it
-    // before it maps a UMEM.
-    if (pinning) {
-        if (auto status = prepare_pin_dir(config.pin_path); !status) {
-            close();
-            return status;
-        }
-    }
-
     // Step 2: Allocate UMEM
     auto umem_result = umem_.allocate(
         config.umem_frame_count,
@@ -928,31 +1018,28 @@ auto XdpContext::open(XdpConfig const& config) -> Status
         // half-written one, is not an error - it only means there is nothing
         // here to adopt, and the fresh path below takes over. A pin that is
         // nobody's to touch cannot reach this point.
-        (void)bpf_.adopt(config.pin_path, interface_.index, config.filter_rules, config.default_action);
+        (void)bpf_.adopt(config.pin_path, interface_.index, config.filter_rules, config.default_action, *plan);
     }
     if (!bpf_.adopted()) {
-        if (pinning) {
-            // Ours, and not adoptable: an older build's program, or the
-            // remains of one. Its pins would collide with the ones we are
-            // about to make, so both go. We never write into a map we did
-            // not recognise; we replace it.
-            //
-            // "Both" is the pins and OUR program. What the interface holds
-            // is asked separately, because the pin directory does not say:
-            // a program somebody else attached and pinned elsewhere, or
-            // nowhere, is theirs, and detaching it would be the very thing
-            // the ownership check in step 1b exists to prevent.
-            auto const replaceable = attachment_replaceable(interface_.index, config.pin_path);
-            if (!replaceable) {
-                close();
-                return failure(replaceable.error());
-            }
-            if (!*replaceable) {
-                close();
-                return failure(XdpError::foreign_program);
-            }
-            (void)XdpProgram::detach(interface_.index, config.pin_path);
+        // What the interface holds is asked before anything is put there,
+        // pinned or not, because the pin directory does not say: a program
+        // somebody else attached, pinned elsewhere or nowhere, is theirs,
+        // and detaching it would be the very thing the ownership check in
+        // step 1b exists to prevent. One of ours - an older build's, or an
+        // orphan left by a crash between attach and pin - is known by its
+        // name, and goes, with any pins that would collide with the ones
+        // about to be made. We never write into a map we did not recognise;
+        // we replace it.
+        auto const replaceable = attachment_replaceable(interface_.index);
+        if (!replaceable) {
+            close();
+            return failure(replaceable.error());
         }
+        if (!*replaceable) {
+            close();
+            return failure(XdpError::foreign_program);
+        }
+        (void)XdpProgram::detach(interface_.index, config.pin_path);
         if (auto status = bpf_.load(config.filter_rules, config.default_action); !status) {
             close();
             return status;
@@ -965,7 +1052,11 @@ auto XdpContext::open(XdpConfig const& config) -> Status
     xsk_cfg.tx_size = static_cast<__u32>(config.tx_ring_size);
     xsk_cfg.libxdp_flags = XSK_LIBXDP_FLAGS__INHIBIT_PROG_LOAD;
     xsk_cfg.xdp_flags = 0;
-    xsk_cfg.bind_flags = detail::bind_flags(config.bind_mode);
+    // XDP_USE_NEED_WAKEUP: the driver tells us, through the ring flags, when
+    // it needs a kick to notice a new fill or TX submission, and sleeps
+    // otherwise instead of polling the rings. tx_flush() and the fill path
+    // both honour the flag.
+    xsk_cfg.bind_flags = detail::bind_flags(config.bind_mode) | XDP_USE_NEED_WAKEUP;
 
     std::string const ifname_str(config.interface_name);
     // A bind refused with EBUSY is a queue the last owner has not finished
@@ -1031,12 +1122,15 @@ auto XdpContext::open(XdpConfig const& config) -> Status
     program_.pinned_ = pinning;
     program_.adopted_ = bpf_.adopted();
 
-    // Step 6: Register TAP device if requested
-    if (config.tap_ifindex != 0) {
-        if (auto status = bpf_.register_tap(config.tap_ifindex); !status) {
-            close();
-            return status;
-        }
+    // Step 6: Register TAP device if requested. An adopted program carries
+    // the previous process's devmap, so with no TAP asked for its one slot
+    // is emptied rather than left pointing wherever it pointed before.
+    if (auto status = config.tap_ifindex != 0 ? bpf_.register_tap(config.tap_ifindex)
+            : bpf_.adopted()                  ? bpf_.unregister_tap()
+                                              : success();
+        !status) {
+        close();
+        return status;
     }
 
     // Step 7: Store budget config + initial fill
@@ -1181,10 +1275,8 @@ auto XdpContext::fill_replenish() -> Status
 
     // The counterpart of the TX kick: a driver that asked to be woken for the
     // fill ring is waiting on a recvfrom before it will pick the new frames
-    // up. The flag is only ever set on a socket bound with
-    // XDP_USE_NEED_WAKEUP, which we do not ask for yet, so today this costs
-    // nothing and the counter stays at zero - but the wakeup is here and
-    // correct for when the bind flag is added.
+    // up. The socket is bound with XDP_USE_NEED_WAKEUP, so the flag is the
+    // driver's to set, and a driver that never sleeps never sets it.
     if (xsk_ring_prod__needs_wakeup(&rings_.fill) != 0) {
         (void)::recvfrom(xsk_socket__fd(xsk_), nullptr, 0, MSG_DONTWAIT, nullptr, nullptr);
         ++stats_.rx_wakeup_count;

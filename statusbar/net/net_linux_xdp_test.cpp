@@ -1134,6 +1134,25 @@ TEST(xdp_pinnable, a_path_outside_the_bpf_filesystem_is_refused)
     }
 }
 
+TEST(xdp_pinnable, a_path_that_climbs_out_of_bpffs_is_refused)
+{
+    // Starts with the mount point, then leaves it. prepare_pin_dir() and
+    // detach() create, unlink and rmdir at the path they are given, so
+    // this one has to be refused on shape alone, before any statfs.
+    for (auto const* const path :
+         {"/sys/fs/bpf/../../tmp/x",
+          "/sys/fs/bpf/statusbar/..",
+          "/sys/fs/bpf/statusbar/./lo",
+          "/sys/fs/bpf//lo",
+          "/sys/fs/bpf/statusbar/lo/"}) {
+        auto const status = XdpProgram::pinnable(path);
+        EXPECT_FALSE(status.has_value());
+        if (!status) {
+            EXPECT_TRUE(status.error() == XdpError::invalid_pin_path);
+        }
+    }
+}
+
 TEST(xdp_pinnable, a_path_in_a_mounted_bpffs_is_accepted_without_privilege)
 {
     // Needs no capability and creates nothing: it is the question a daemon
@@ -1702,6 +1721,23 @@ TEST(xdp_integration, a_program_somebody_else_attached_is_left_alone_and_open_re
         }
     }
 
+    // An unpinned open has no pin directory to ask about and used to attach
+    // straight over the top; it is refused the same way.
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(XdpConfig{
+            .interface_name = "xdptest0",
+            .default_action = XdpAction::pass_kernel,
+            .umem_frame_count = 64,
+        });
+        EXPECT_FALSE(status.has_value());
+        if (!status) {
+            EXPECT_EQ(status.error(), XdpError::foreign_program);
+        }
+    }
+    // And detach() - the operator's broom - sweeps only ours.
+    EXPECT_TRUE(XdpProgram::detach(if_index, "").has_value());
+
     // Still theirs, still attached, and the same program.
     auto const attached = XdpProgram::query(if_index);
     EXPECT_TRUE(attached.has_value() && attached->has_value());
@@ -1710,6 +1746,269 @@ TEST(xdp_integration, a_program_somebody_else_attached_is_left_alone_and_open_re
         EXPECT_EQ((*attached)->mode, XdpAttachMode::generic);
     }
     ::close(foreign);
+}
+
+TEST(xdp_integration, our_own_orphaned_attachment_is_replaced_whether_pinned_or_not)
+{
+    if (getuid() != 0) {
+        SKIP("needs root");
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        SKIP("could not create a veth pair");
+    }
+    unsigned int const if_index = ::if_nametoindex("xdptest0");
+    auto const pin_path = XdpProgram::pin_path_for("xdptest0");
+    auto cleanup = detail::scopeguard([&] {
+        (void)XdpProgram::detach(if_index, pin_path);
+        destroy_veth_pair("xdptest0");
+    });
+
+    // A program of ours on the interface with no pin to say so: the shape a
+    // crash between attach and pin leaves, and the shape an unpinned build
+    // leaves when it dies. Made here by pinning and then removing the pins.
+    uint32_t orphan_id = 0;
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(XdpConfig{
+            .interface_name = "xdptest0",
+            .default_action = XdpAction::pass_kernel,
+            .umem_frame_count = 64,
+            .pin_path = pin_path,
+        });
+        EXPECT_TRUE(status.has_value());
+        if (!status) {
+            return;
+        }
+        orphan_id = ctx.program().id();
+    }
+    for (auto const entry :
+         {XdpProgram::PIN_IDENTITY,
+          XdpProgram::PIN_PROG,
+          XdpProgram::PIN_RULES_MAP,
+          XdpProgram::PIN_XSK_MAP,
+          XdpProgram::PIN_DEVMAP}) {
+        EXPECT_EQ(::unlink(XdpProgram::pin_entry(pin_path, entry).c_str()), 0);
+    }
+    EXPECT_EQ(::rmdir(pin_path.c_str()), 0);
+    auto const before = XdpProgram::query(if_index);
+    EXPECT_TRUE(before.has_value() && before->has_value());
+
+    // An unpinned open recognises it as ours by name and replaces it,
+    // where a stranger's program is refused (the test above).
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(XdpConfig{
+            .interface_name = "xdptest0",
+            .default_action = XdpAction::pass_kernel,
+            .umem_frame_count = 64,
+        });
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            EXPECT_FALSE(ctx.adopted());
+            EXPECT_NE(ctx.program().id(), orphan_id);
+        }
+    }
+    // Unpinned, so closing detached it: the interface is clear again.
+    auto const between = XdpProgram::query(if_index);
+    EXPECT_TRUE(between.has_value() && !between->has_value());
+
+    // The same orphan, met by a pinned open: replaced and pinned.
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(XdpConfig{
+            .interface_name = "xdptest0",
+            .default_action = XdpAction::pass_kernel,
+            .umem_frame_count = 64,
+            .pin_path = pin_path,
+        });
+        EXPECT_TRUE(status.has_value());
+        if (!status) {
+            return;
+        }
+    }
+    EXPECT_TRUE(XdpProgram::detach(if_index, "").has_value());  // detach only; pins stay
+    auto const orphaned_again = XdpProgram::query(if_index);
+    EXPECT_TRUE(orphaned_again.has_value() && !orphaned_again->has_value());
+    // Pins without an attachment are the other half-state, and a pinned
+    // open replaces them too (adopt() refuses a pin whose program is not
+    // the one on the interface).
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(XdpConfig{
+            .interface_name = "xdptest0",
+            .default_action = XdpAction::pass_kernel,
+            .umem_frame_count = 64,
+            .pin_path = pin_path,
+        });
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            EXPECT_FALSE(ctx.adopted());
+            EXPECT_TRUE(ctx.pinned());
+        }
+    }
+}
+
+TEST(xdp_integration, an_adopted_program_reports_the_mode_it_is_attached_in)
+{
+    if (getuid() != 0) {
+        SKIP("needs root");
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        SKIP("could not create a veth pair");
+    }
+    unsigned int const if_index = ::if_nametoindex("xdptest0");
+    auto const pin_path = XdpProgram::pin_path_for("xdptest0");
+    auto cleanup = detail::scopeguard([&] {
+        (void)XdpProgram::detach(if_index, pin_path);
+        destroy_veth_pair("xdptest0");
+    });
+
+    // Attached in generic mode on purpose, where veth would have taken
+    // native: the adopted answer has to come from the interface, not from
+    // the default.
+    XdpConfig const generic{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .umem_frame_count = 64,
+        .attach_mode = XdpAttachMode::generic,
+        .pin_path = pin_path,
+    };
+    uint32_t first_id = 0;
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(generic);
+        EXPECT_TRUE(status.has_value());
+        if (!status) {
+            return;
+        }
+        EXPECT_EQ(ctx.attach_mode(), XdpAttachMode::generic);
+        first_id = ctx.program().id();
+    }
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(generic);
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            EXPECT_TRUE(ctx.adopted());
+            EXPECT_EQ(ctx.program().id(), first_id);
+            EXPECT_EQ(ctx.attach_mode(), XdpAttachMode::generic);
+        }
+    }
+
+    // The default plan - native, falling back to generic - accepts a
+    // generic program and adopts it as what it is.
+    XdpConfig const by_default{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .umem_frame_count = 64,
+        .pin_path = pin_path,
+    };
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(by_default);
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            EXPECT_TRUE(ctx.adopted());
+            EXPECT_EQ(ctx.attach_mode(), XdpAttachMode::generic);
+        }
+    }
+
+    // A caller who asked for generic and finds a native program - the
+    // reverse - is not given native: the program is replaced in the mode
+    // asked for. Set up by attaching natively, then opening for generic.
+    EXPECT_TRUE(XdpProgram::detach(if_index, pin_path).has_value());
+    uint32_t native_id = 0;
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(by_default);
+        EXPECT_TRUE(status.has_value());
+        if (!status) {
+            return;
+        }
+        EXPECT_EQ(ctx.attach_mode(), XdpAttachMode::native);
+        native_id = ctx.program().id();
+    }
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(generic);
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            EXPECT_FALSE(ctx.adopted());
+            EXPECT_TRUE(ctx.pinned());
+            EXPECT_NE(ctx.program().id(), native_id);
+            EXPECT_EQ(ctx.attach_mode(), XdpAttachMode::generic);
+        }
+    }
+}
+
+TEST(xdp_integration, an_adopted_program_with_no_tap_asked_for_forwards_to_no_tap)
+{
+    if (getuid() != 0) {
+        SKIP("needs root");
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        SKIP("could not create a veth pair");
+    }
+    unsigned int const if_index = ::if_nametoindex("xdptest0");
+    unsigned int const peer_index = ::if_nametoindex("xdptest1");
+    auto const pin_path = XdpProgram::pin_path_for("xdptest0");
+    auto cleanup = detail::scopeguard([&] {
+        (void)XdpProgram::detach(if_index, pin_path);
+        destroy_veth_pair("xdptest0");
+    });
+
+    // Run 1 points the devmap at the peer. Any netdev will do for the map;
+    // the peer is one this test owns.
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(XdpConfig{
+            .interface_name = "xdptest0",
+            .default_action = XdpAction::pass_kernel,
+            .umem_frame_count = 64,
+            .tap_ifindex = peer_index,
+            .pin_path = pin_path,
+        });
+        EXPECT_TRUE(status.has_value());
+        if (!status) {
+            return;
+        }
+    }
+    auto const devmap_pin = XdpProgram::pin_entry(pin_path, XdpProgram::PIN_DEVMAP);
+    auto const slot = [&devmap_pin]() -> std::optional<uint32_t> {
+        int const fd = bpf_obj_get(devmap_pin.c_str());
+        if (fd < 0) {
+            return std::nullopt;
+        }
+        uint32_t key = 0;
+        uint32_t value = 0;
+        int const ret = bpf_map_lookup_elem(fd, &key, &value);
+        ::close(fd);
+        return ret == 0 ? std::optional<uint32_t>{value} : std::nullopt;
+    };
+    EXPECT_EQ(slot(), std::optional<uint32_t>{peer_index});
+
+    // Run 2 adopts with no TAP: the slot it inherited is emptied, so a
+    // forward_tap rule has nowhere to go, as the config says.
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(XdpConfig{
+            .interface_name = "xdptest0",
+            .default_action = XdpAction::pass_kernel,
+            .umem_frame_count = 64,
+            .pin_path = pin_path,
+        });
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            EXPECT_TRUE(ctx.adopted());
+            EXPECT_EQ(slot(), std::nullopt);
+        }
+    }
 }
 
 TEST(xdp_integration, tx_rx_loopback)
@@ -2151,6 +2450,11 @@ TEST(xdp_integration, a_pin_that_belongs_to_somebody_else_is_left_strictly_alone
     }
     auto const pin_path = XdpProgram::pin_path_for("xdptest0");
     auto cleanup = detail::scopeguard([&] {
+        // detach() refuses a foreign pin directory too - that is asserted
+        // below - so the identity goes back to ours before the broom runs,
+        // or the stranger's pins would outlive this test and refuse every
+        // pinned open after it.
+        (void)rewrite_pinned_identity(pin_path, XdpProgram::identity());
         (void)XdpProgram::detach(::if_nametoindex("xdptest0"), pin_path);
         destroy_veth_pair("xdptest0");
     });
@@ -2197,6 +2501,14 @@ TEST(xdp_integration, a_pin_that_belongs_to_somebody_else_is_left_strictly_alone
         EXPECT_FALSE(ctx.valid());
         EXPECT_FALSE(ctx.adopted());
         EXPECT_FALSE(ctx.pinned());
+    }
+    // And the operator's broom will not sweep it either.
+    {
+        auto const refused = XdpProgram::detach(::if_nametoindex("xdptest0"), pin_path);
+        EXPECT_FALSE(refused.has_value());
+        if (!refused) {
+            EXPECT_TRUE(refused.error() == XdpError::foreign_program);
+        }
     }
 
     // Untouched: the program is the same one, still on the interface, and

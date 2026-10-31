@@ -239,6 +239,12 @@ struct XdpAttachedProgram
     XdpAttachMode mode{XdpAttachMode::native};
 };
 
+/// UMEM frames kept out of the fill ring so transmit has somewhere to write.
+/// A quarter of the default 1024-frame UMEM; see detail::fillable_frames for
+/// why a reserve is needed at all, and detail::effective_tx_reserve for what
+/// happens to this number when the UMEM is smaller.
+inline constexpr size_t xdp_default_tx_frame_reserve = 256;
+
 /// How a bind refused because the queue is still busy is retried: this many
 /// pauses of xdp_bind_busy_pause_ns each.
 ///
@@ -253,12 +259,6 @@ struct XdpAttachedProgram
 /// 50 pauses of 10 ms is up to 500 ms in all - comfortably longer than an
 /// RCU grace period, and short enough that a queue some other live process
 /// is holding still fails fast enough to report.
-/// UMEM frames kept out of the fill ring so transmit has somewhere to write.
-/// A quarter of the default 1024-frame UMEM; see detail::fillable_frames for
-/// why a reserve is needed at all, and detail::effective_tx_reserve for what
-/// happens to this number when the UMEM is smaller.
-inline constexpr size_t xdp_default_tx_frame_reserve = 256;
-
 inline constexpr size_t xdp_bind_busy_retries = 50;
 
 /// How long to wait between two attempts at a busy queue. 10 ms, on the
@@ -746,7 +746,7 @@ class XdpProgram
 
     /// One entry within a pin directory, e.g. pin_entry(dir, PIN_PROG).
     /// @param pin_path A pin directory, from pin_path_for()
-    /// @param entry One of PIN_PROG, PIN_RULES_MAP, PIN_XSK_MAP, PIN_DEVMAP
+    /// @param entry One of PIN_IDENTITY, PIN_PROG, PIN_RULES_MAP, PIN_XSK_MAP, PIN_DEVMAP
     /// @return The full path, or empty if either argument is empty
     [[nodiscard]] static auto pin_entry(std::string_view pin_path, std::string_view entry) -> std::string;
 
@@ -796,6 +796,10 @@ class XdpProgram
     /// is long gone - which, once a crash leaves the program attached, is a
     /// normal state and not an exceptional one. Succeeds when there is
     /// nothing left to remove.
+    /// Only ours: a pin directory that is somebody else's is refused as
+    /// foreign_program and left as it is, and a program on the interface
+    /// that is not ours by name stays attached - that counts as nothing of
+    /// ours to remove, and succeeds.
     /// A non-empty `pin_path` must be one pinnable() accepts - this call
     /// unlinks within it and then removes it, so a path built by hand rather
     /// than by pin_path_for() is refused instead of followed.
@@ -1068,25 +1072,41 @@ class BpfAttachment
     [[nodiscard]] auto attach(BpfObject&& obj, int prog_fd, unsigned int if_index, AttachPlan const& plan) -> Status
     {
         detach();
-        auto const attempt = [prog_fd, if_index](XdpAttachMode const mode) {
-            return bpf_xdp_attach(static_cast<int>(if_index), prog_fd, attach_flags(mode), nullptr);
-        };
-
-        auto mode = plan.first;
-        int ret = attempt(mode);
-        if (ret != 0 && plan.fallback.has_value()) {
-            mode = *plan.fallback;
-            ret = attempt(mode);
-        }
+        auto const [ret, mode] = try_attach(prog_fd, if_index, plan);
         if (ret != 0) {
-            return failure(XdpError::bpf_attach_failed);
+            // A refusal because something is already there is somebody
+            // else's program - open() has cleared away anything of ours
+            // first - or one that arrived in the gap: theirs, not replaced.
+            return failure(ret == -EBUSY || ret == -EEXIST ? XdpError::foreign_program : XdpError::bpf_attach_failed);
         }
+        hold(std::move(obj), if_index, mode);
+        return success();
+    }
 
+    /// One attempt per mode in the plan, the first and then the fallback.
+    /// XDP_FLAGS_UPDATE_IF_NOEXIST on each: never over the top of a program
+    /// that is already there, whoever's it is.
+    /// @return bpf_xdp_attach()'s result, and the mode it belongs to
+    [[nodiscard]] static auto try_attach(int const prog_fd, unsigned int const if_index, AttachPlan const& plan) noexcept
+        -> std::pair<int, XdpAttachMode>
+    {
+        auto const attempt = [prog_fd, if_index](XdpAttachMode const mode) {
+            return bpf_xdp_attach(static_cast<int>(if_index), prog_fd, attach_flags(mode) | XDP_FLAGS_UPDATE_IF_NOEXIST, nullptr);
+        };
+        int const first = attempt(plan.first);
+        if (first == 0 || !plan.fallback.has_value()) {
+            return {first, plan.first};
+        }
+        return {attempt(*plan.fallback), *plan.fallback};
+    }
+
+    /// Take the attached program on: its object, where it is, and how.
+    void hold(BpfObject&& obj, unsigned int const if_index, XdpAttachMode const mode) noexcept
+    {
         obj_ = std::move(obj);
         if_index_ = if_index;
         mode_ = mode;
         attached_ = true;
-        return success();
     }
 
     void detach() noexcept
@@ -1101,6 +1121,19 @@ class BpfAttachment
             mode_ = XdpAttachMode::native;
         }
         obj_.reset();
+    }
+
+    /// Take note of a program adopted from a pin: attached by an earlier
+    /// process, in this mode, and the pin's to keep - not ours to detach at
+    /// close, so it is recorded as not attached by us, the way disown()
+    /// leaves a pinned one.
+    /// @param if_index The interface it is on
+    /// @param mode The mode XdpProgram::query() found it attached in
+    void adopt(unsigned int const if_index, XdpAttachMode const mode) noexcept
+    {
+        detach();
+        if_index_ = if_index;
+        mode_ = mode;
     }
 
     /// Leave the program on the interface when this object goes away, keeping
@@ -1205,9 +1238,14 @@ class BpfState
     /// @param if_index The interface the program must already be attached to
     /// @param rules Compiled TCAM rules to install into the adopted map
     /// @param default_action Action applied to frames that match no user rule
+    /// @param plan The attach modes this open() would accept; a program
+    ///             attached in any other mode is not adopted
     [[nodiscard]] auto adopt(
-        std::string_view pin_path, unsigned int if_index, std::span<CompiledRule<32> const> rules, XdpAction default_action)
-        -> Status;
+        std::string_view pin_path,
+        unsigned int if_index,
+        std::span<CompiledRule<32> const> rules,
+        XdpAction default_action,
+        AttachPlan const& plan) -> Status;
 
     /// Pin the loaded program and its maps under `pin_path`, creating the
     /// directory. On success the attachment is disowned, so the program stays
@@ -1228,6 +1266,19 @@ class BpfState
         uint32_t zero_key = 0;
         int const ret = bpf_map_update_elem(devmap_fd_, &zero_key, &tap_ifindex, BPF_ANY);
         if (ret != 0) {
+            return failure(XdpError::bpf_map_update_failed);
+        }
+        return success();
+    }
+
+    /// Empty the devmap's one slot, so a forward_tap rule has nowhere to
+    /// send a frame. What an adopted program would otherwise inherit from
+    /// the process before: devmap entries outlive the process that made
+    /// them, and the interface index they hold may by now be somebody else.
+    [[nodiscard]] auto unregister_tap() -> Status
+    {
+        uint32_t zero_key = 0;
+        if (bpf_map_delete_elem(devmap_fd_, &zero_key) != 0 && errno != ENOENT) {
             return failure(XdpError::bpf_map_update_failed);
         }
         return success();
@@ -1267,8 +1318,6 @@ class BpfState
         program_id_ = 0;
         adopted_ = false;
     }
-
-    [[nodiscard]] auto rules_map_fd() const noexcept -> int { return rules_map_fd_; }
 
     /// The mode the program is attached in, native unless nothing is attached.
     [[nodiscard]] auto attach_mode() const noexcept -> XdpAttachMode { return attachment_.attach_mode(); }
@@ -1449,11 +1498,13 @@ class XdpContext
     /// Tell the kernel there are frames in the TX ring, when there are.
     ///
     /// The kick is skipped when nothing has been submitted since the last one
-    /// got through: without XDP_USE_NEED_WAKEUP the kernel needs a kick for
-    /// every submission, so "nothing submitted" is the only thing it is safe
-    /// to skip on - and it is the common case for a sender ticking faster
+    /// got through: "nothing submitted" is the one thing it is always safe
+    /// to skip on, and it is the common case for a sender ticking faster
     /// than it sends. A healthy sender therefore skips most kicks, which
-    /// makes a *low* skip ratio in the counters a signal in itself.
+    /// makes a *low* skip ratio in the counters a signal in itself. The
+    /// socket is bound with XDP_USE_NEED_WAKEUP, so a driver that is awake
+    /// anyway may not need the kick - it is sent regardless when frames are
+    /// pending, which costs a syscall and never a frame.
     ///
     /// A kick refused with EAGAIN and friends leaves the frames pending, so
     /// the next call tries again rather than counting them as delivered.
