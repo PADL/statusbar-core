@@ -1611,6 +1611,7 @@ class XdpContext
     [[nodiscard]] auto bind_mode() const noexcept -> XdpBindMode { return XdpBindMode::copy; }
     [[nodiscard]] auto attach_mode() const noexcept -> XdpAttachMode { return XdpAttachMode::native; }
     [[nodiscard]] auto bind_retries() const noexcept -> size_t { return 0; }
+    [[nodiscard]] auto tx_frame_reserve() const noexcept -> size_t { return 0; }
 
     [[nodiscard]] auto program() const noexcept -> XdpProgram const& { return program_; }
     [[nodiscard]] auto pinned() const noexcept -> bool { return false; }
