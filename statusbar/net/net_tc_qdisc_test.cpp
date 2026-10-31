@@ -80,7 +80,7 @@ constexpr std::size_t PAYLOAD_START = NLMSGHDR_SIZE + TCMSG_SIZE;  // 36
 [[nodiscard]] auto sample_mqprio() -> tc::MqprioQdisc
 {
     tc::MqprioQdisc qdisc;
-    qdisc.handle_major = 0x8001;
+    qdisc.major = 0x8001;
     qdisc.num_tc = 3;
     qdisc.prio_tc_map = {0, 0, 0, 1, 1, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0};
     qdisc.count = {1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -95,10 +95,10 @@ constexpr std::size_t PAYLOAD_START = NLMSGHDR_SIZE + TCMSG_SIZE;  // 36
     tc::CbsQdisc qdisc;
     qdisc.parent = tc::make_handle(0x8001, 1);
     qdisc.handle_major = 0x8002;
-    qdisc.idleslope = 7808;     // kbit/s
-    qdisc.sendslope = -992192;  // kbit/s
-    qdisc.hicredit = 2;         // bytes
-    qdisc.locredit = -249;      // bytes
+    qdisc.idleslope_kbps = 7808;     // kbit/s
+    qdisc.sendslope_kbps = -992192;  // kbit/s
+    qdisc.hicredit = 2;              // bytes
+    qdisc.locredit = -249;           // bytes
     qdisc.offload = true;
     return qdisc;
 }
@@ -429,7 +429,7 @@ TEST(tc_qdisc, a_handle_major_of_zero_is_refused)
 {
     // The kernel's own diagnosis of this is poor, so validate first.
     auto qdisc = sample_mqprio();
-    qdisc.handle_major = 0;
+    qdisc.major = 0;
 
     std::array<std::uint8_t, tc::MAX_REQUEST_SIZE> out{};
     auto const length = tc::build_replace_mqprio(out, IFINDEX, qdisc, SEQ);
@@ -546,8 +546,8 @@ TEST(tc_qdisc, parse_qdisc_round_trips_the_cbs_builder_including_its_slopes)
     EXPECT_EQ(info->handle, 0x80020000U);
     EXPECT_EQ(info->parent, tc::make_handle(0x8001, 1));
     EXPECT_TRUE(info->has_cbs_params);
-    EXPECT_EQ(info->cbs.idleslope, 7808);
-    EXPECT_EQ(info->cbs.sendslope, -992192);
+    EXPECT_EQ(info->cbs.idleslope_kbps, 7808);
+    EXPECT_EQ(info->cbs.sendslope_kbps, -992192);
     EXPECT_EQ(info->cbs.hicredit, 2);
     EXPECT_EQ(info->cbs.locredit, -249);
     EXPECT_TRUE(info->cbs.offload);
@@ -1020,7 +1020,7 @@ TEST(tc_recorder, records_the_full_request_sequence)
     EXPECT_EQ(requests[0].mqprio.num_tc, 3u);
     EXPECT_EQ(requests[0].parent, tc::ROOT);
     EXPECT_TRUE(requests[1].operation == tc::TcRecorder::Operation::replace_cbs);
-    EXPECT_EQ(requests[1].cbs.idleslope, 7808);
+    EXPECT_EQ(requests[1].cbs.idleslope_kbps, 7808);
     EXPECT_EQ(requests[1].parent, tc::make_handle(0x8001, 1));
     EXPECT_TRUE(requests[2].operation == tc::TcRecorder::Operation::replace_kind);
     EXPECT_EQ(requests[2].kind, "pfifo_fast");
@@ -1070,14 +1070,14 @@ TEST(tc_recorder, get_answers_nothing_installed_until_a_result_is_set)
     installed.kind = {'c', 'b', 's', '\0'};
     installed.has_cbs_params = true;
     installed.cbs = sample_cbs();
-    installed.cbs.idleslope = 5000;  // the driver gave us less than we asked
+    installed.cbs.idleslope_kbps = 5000;  // the driver gave us less than we asked
     recorder.set_get_result(installed);
 
     auto const read_back = recorder.get(IFINDEX, tc::make_handle(0x8001, 1));
     EXPECT_TRUE(read_back.has_value());
     if (read_back) {
         EXPECT_EQ(read_back->kind_name(), "cbs");
-        EXPECT_EQ(read_back->cbs.idleslope, 5000);
+        EXPECT_EQ(read_back->cbs.idleslope_kbps, 5000);
     }
     EXPECT_EQ(recorder.requests().size(), 2u);
 }

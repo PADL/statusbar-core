@@ -85,7 +85,7 @@ class TcRecorder final : public TcControl
         requests_.push_back(Request{
             .operation = Operation::replace_mqprio,
             .ifindex = ifindex,
-            .handle = make_handle(qdisc.handle_major, 0),
+            .handle = make_handle(qdisc.major, 0),
             .parent = ROOT,
             .kind = "mqprio",
             .mqprio = qdisc,

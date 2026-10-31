@@ -81,6 +81,10 @@ inline constexpr std::uint32_t UNSPEC = 0U;
 inline constexpr std::size_t MAX_TRAFFIC_CLASSES = 16;
 inline constexpr std::size_t PRIO_MAP_SIZE = 16;
 
+/// The same count, under the name another implementation of this module
+/// gives it, so a caller that spells the map type out compiles either way.
+inline constexpr std::size_t PRIORITY_COUNT = PRIO_MAP_SIZE;
+
 /// Longest qdisc kind name we build or store. The kernel's own limit
 /// (IFNAMSIZ) is 16 including the terminator.
 inline constexpr std::size_t MAX_KIND_LENGTH = 15;
@@ -114,7 +118,7 @@ inline constexpr std::size_t MAX_KIND_LENGTH = 15;
 struct MqprioQdisc
 {
     /// Handle major; the qdisc is installed as `major:0`. Must not be 0.
-    std::uint16_t handle_major{0};
+    std::uint16_t major{0};
 
     /// Number of traffic classes, 1..MAX_TRAFFIC_CLASSES.
     std::uint8_t num_tc{0};
@@ -140,20 +144,34 @@ struct MqprioQdisc
 /// port transmit rate) and `locredit` is normally negative.
 struct CbsQdisc
 {
+    // The first six fields are named and ordered as another implementation
+    // of this module names and orders them, so that a positional
+    // CbsQdisc{...} written against either one means the same thing. That
+    // ordering is the reason to care: the names merely fail to compile when
+    // they disagree, where a different order silently assigns a credit to a
+    // slope. handle_major is ours alone and comes last for the same reason.
+    //
+    // `offload` keeps our name and our default. Both implementations call it
+    // offload, but the other one's MqprioQdisc defaults its equivalent
+    // (`hw`) to false; defaulting a shaper to software is the failure
+    // FEAT-008 exists to prevent, so ours stays on.
+
     /// The mqprio class this shaper serves, e.g. make_handle(0x8001, 1).
     std::uint32_t parent{0};
-
-    /// Handle major for the cbs itself; installed as `major:0`. Not 0.
-    std::uint16_t handle_major{0};
-
-    std::int32_t idleslope{0};  ///< kbit/s the class may accumulate at
-    std::int32_t sendslope{0};  ///< kbit/s credit drains at while sending
-    std::int32_t hicredit{0};   ///< bytes, credit ceiling
-    std::int32_t locredit{0};   ///< bytes, credit floor
 
     /// Offload to the driver's hardware shaper. Defaults on: see the
     /// second trap in this file's header comment.
     bool offload{true};
+
+    std::int32_t hicredit{0};        ///< bytes, credit ceiling
+    std::int32_t locredit{0};        ///< bytes, credit floor
+    std::int32_t idleslope_kbps{0};  ///< kbit/s the class may accumulate at
+    std::int32_t sendslope_kbps{0};  ///< kbit/s credit drains at while sending
+
+    /// Handle major for the cbs itself; installed as `major:0`. Not 0.
+    /// Ours only - the other implementation takes the major from the handle
+    /// it is written with.
+    std::uint16_t handle_major{0};
 
     auto operator==(CbsQdisc const&) const noexcept -> bool = default;
 };

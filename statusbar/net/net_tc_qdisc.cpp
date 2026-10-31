@@ -189,7 +189,7 @@ auto write_tcmsg(std::span<std::uint8_t> at, int ifindex, std::uint32_t handle, 
 {
     // The kernel's own diagnosis of each of these is poor, and the third
     // one it may simply accept.
-    if (qdisc.handle_major == 0) {
+    if (qdisc.major == 0) {
         return failure(NetError::invalid_argument);
     }
     if (qdisc.num_tc == 0 || qdisc.num_tc > MAX_TRAFFIC_CLASSES) {
@@ -229,8 +229,8 @@ auto copy_mqprio_queues(MqprioQdisc const& qdisc, tc_mqprio_qopt& qopt) noexcept
         ._pad = {},
         .hicredit = qdisc.hicredit,
         .locredit = qdisc.locredit,
-        .idleslope = qdisc.idleslope,
-        .sendslope = qdisc.sendslope,
+        .idleslope = qdisc.idleslope_kbps,
+        .sendslope = qdisc.sendslope_kbps,
     };
 }
 
@@ -263,7 +263,7 @@ auto build_replace_mqprio(std::span<std::uint8_t> out, int ifindex, MqprioQdisc 
         return forward_failure(status);
     }
     Writer writer{out};
-    if (!put_preamble(writer, RTM_NEWQDISC, REPLACE_FLAGS, seq, ifindex, make_handle(qdisc.handle_major, 0), ROOT) ||
+    if (!put_preamble(writer, RTM_NEWQDISC, REPLACE_FLAGS, seq, ifindex, make_handle(qdisc.major, 0), ROOT) ||
         !put_kind(writer, "mqprio")) {
         return failure(NetError::invalid_argument);
     }
@@ -374,12 +374,12 @@ auto store_cbs_params(std::span<std::uint8_t const> payload, QdiscInfo& info) no
     std::memcpy(&qopt, payload.data(), sizeof(qopt));
     info.cbs = CbsQdisc{
         .parent = info.parent,
-        .handle_major = handle_major(info.handle),
-        .idleslope = qopt.idleslope,
-        .sendslope = qopt.sendslope,
+        .offload = qopt.offload != 0,
         .hicredit = qopt.hicredit,
         .locredit = qopt.locredit,
-        .offload = qopt.offload != 0,
+        .idleslope_kbps = qopt.idleslope,
+        .sendslope_kbps = qopt.sendslope,
+        .handle_major = handle_major(info.handle),
     };
     info.has_cbs_params = true;
 }
