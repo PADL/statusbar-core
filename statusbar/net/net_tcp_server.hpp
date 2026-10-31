@@ -148,6 +148,16 @@ class TcpConnectionPool : public Pollable
 
     void accept_ready(int64_t now_ns);
     void close_slot(size_t slot, int64_t now_ns);
+
+    /// The constructor's two halves, one per address family: bind, then
+    /// hand the listener to register_listener(). Each leaves the pool
+    /// invalid on failure with nothing of its own left behind - for the
+    /// local one, that includes the socket file bind() created.
+    void open_local_listener(SocketAddress const& bind_addr);
+    void open_tcp_listener(SocketAddress const& bind_addr);
+    /// Take a bound, listening descriptor and put it on the multiplexer.
+    /// False, with the descriptor closed, if the multiplexer refuses it.
+    [[nodiscard]] auto register_listener(int fd) -> bool;
     [[nodiscard]] auto slot_ok(size_t slot) const noexcept -> bool { return slot < slots_.size() && slots_[slot].in_use; }
 
     TcpConnectionHandler& handler_;

@@ -204,32 +204,48 @@ TcpConnectionPool::TcpConnectionPool(
     }
 
     if (bind_addr.family() == AF_UNIX) {
-        auto local = create_local_listener(bind_addr, options);
-        if (!local || !mux_.valid()) {
-            return;
-        }
-        unix_path_ = std::string{bind_addr.path()};
-        unix_dev_ = local->dev;
-        unix_ino_ = local->ino;
-        listener_ = FileDescriptor{local->fd.release()};
-        (void)set_nonblocking(listener_.get());
-        if (!mux_.add(listener_.get(), LISTENER_TAG, true, false)) {
-            listener_.close();
-            unlink_if_ours(unix_path_, unix_dev_, unix_ino_);
-            unix_path_.clear();
-        }
+        open_local_listener(bind_addr);
+    } else {
+        open_tcp_listener(bind_addr);
+    }
+}
+
+void TcpConnectionPool::open_local_listener(SocketAddress const& bind_addr)
+{
+    auto local = create_local_listener(bind_addr, options_);
+    if (!local) {
         return;
     }
+    if (!mux_.valid() || !register_listener(local->fd.release())) {
+        // Bound but never serving: the socket file bind() just made is
+        // ours to remove, and nobody else will. The destructor goes by
+        // the path recorded below, which this path never reaches.
+        unlink_if_ours(std::string{bind_addr.path()}, local->dev, local->ino);
+        return;
+    }
+    unix_path_ = std::string{bind_addr.path()};
+    unix_dev_ = local->dev;
+    unix_ino_ = local->ino;
+}
 
-    auto listener = create_tcp_listener(bind_addr, options.backlog, options.dscp);
+void TcpConnectionPool::open_tcp_listener(SocketAddress const& bind_addr)
+{
+    auto listener = create_tcp_listener(bind_addr, options_.backlog, options_.dscp);
     if (!listener || !mux_.valid()) {
         return;
     }
-    listener_ = FileDescriptor{listener->release()};
+    (void)register_listener(listener->release());
+}
+
+auto TcpConnectionPool::register_listener(int fd) -> bool
+{
+    listener_ = FileDescriptor{fd};
     (void)set_nonblocking(listener_.get());
-    if (!mux_.add(listener_.get(), LISTENER_TAG, true, false)) {
-        listener_.close();
+    if (mux_.add(listener_.get(), LISTENER_TAG, true, false)) {
+        return true;
     }
+    listener_.close();
+    return false;
 }
 
 TcpConnectionPool::~TcpConnectionPool()
