@@ -109,39 +109,6 @@ struct IPv4Address
 static_assert(sizeof(IPv4Address) == 4, "IPv4Address must be exactly 4 bytes");
 static_assert(alignof(IPv4Address) == 1, "IPv4Address must have 1-byte alignment");
 
-namespace detail {
-
-/// One decimal octet of a dotted quad: one to three digits with a value of
-/// 0-255, and no leading zero unless the octet is exactly "0". nullopt for
-/// anything else, an empty part and a sign included.
-///
-/// The leading zero is refused rather than interpreted. inet_aton(3) reads
-/// "032" as octal 26 and a decimal parser reads it as 32, so the text has two
-/// readings and no way to choose between them; a peer that disagrees with us
-/// about what an address means is how an address check passes while the
-/// traffic goes elsewhere (CVE-2021-29418 and its relatives). Refusing is the
-/// one answer that cannot disagree.
-/// @param part The text of a single octet, without the dots
-[[nodiscard]] constexpr auto parse_ipv4_octet(std::string_view const part) noexcept -> std::optional<uint8_t>
-{
-    if (part.empty() || part.size() > 3 || (part.size() > 1 && part.front() == '0')) {
-        return std::nullopt;
-    }
-    unsigned value = 0;
-    for (char const c : part) {
-        if (c < '0' || c > '9') {
-            return std::nullopt;
-        }
-        value = (value * 10) + static_cast<unsigned>(c - '0');
-    }
-    if (value > 255) {
-        return std::nullopt;
-    }
-    return static_cast<uint8_t>(value);
-}
-
-}  // namespace detail
-
 /// Parse a dotted-quad IPv4 address ("239.69.1.2"): exactly four decimal
 /// octets of 0-255 separated by three dots, with nothing before, between or
 /// after them. nullopt otherwise - no inet_aton(3) shorthand ("10.1",
@@ -149,28 +116,64 @@ namespace detail {
 ///
 /// Strict because the text arrives from the network: SDP session descriptions
 /// carried over SAP are written by whoever is announcing, and an address we
-/// accept from one must have a single unambiguous reading. See
-/// detail::parse_ipv4_octet for why a leading zero is a refusal.
+/// accept from one must have a single unambiguous reading.
+///
+/// A leading zero is refused rather than interpreted. inet_aton(3) reads
+/// "032" as octal 26 and a decimal parser reads it as 32, so the text has two
+/// readings and no way to choose between them; a peer that disagrees with us
+/// about what an address means is how an address check passes while the
+/// traffic goes elsewhere (CVE-2021-29418 and its relatives). Refusing is the
+/// one answer that cannot disagree.
+///
+/// Written as one pass over the characters rather than find()/substr() and a
+/// per-octet helper. That is not a style choice: g++ 16.2.1 miscompiles the
+/// split version at -O1 and above - it returns nullopt for "239.69.1.2",
+/// bailing inside the octet helper on the SECOND octet, while the same
+/// function evaluated as a constant expression by the same compiler returns
+/// the right answer. UBSan is clean, clang is right at every -O, and four
+/// reformulations of the split version made no difference. This form is
+/// correct on both compilers at every optimisation level, and it reads one
+/// character once.
 /// @param text The text to parse
-[[nodiscard]] constexpr auto parse_ipv4(std::string_view text) noexcept -> std::optional<IPv4Address>
+[[nodiscard]] constexpr auto parse_ipv4(std::string_view const text) noexcept -> std::optional<IPv4Address>
 {
     std::array<uint8_t, IPv4Address::LENGTH> octets{};
-    for (size_t i = 0; i < octets.size(); ++i) {
-        bool const last = (i + 1) == octets.size();
-        auto const dot = text.find('.');
-        // Three dots, and the fourth octet runs to the end of the text.
-        if ((dot == std::string_view::npos) != last) {
+    size_t index = 0;   // which octet is being read
+    size_t digits = 0;  // digits seen so far in this one
+    unsigned value = 0;
+
+    for (char const c : text) {
+        if (c == '.') {
+            // A dot closes an octet, and there are only three of them.
+            if (digits == 0 || index + 1 == octets.size()) {
+                return std::nullopt;
+            }
+            octets[index] = static_cast<uint8_t>(value);
+            ++index;
+            digits = 0;
+            value = 0;
+            continue;
+        }
+        if (c < '0' || c > '9' || digits == 3) {
             return std::nullopt;
         }
-        auto const octet = detail::parse_ipv4_octet(text.substr(0, dot));
-        if (!octet.has_value()) {
+        // A second digit after a 0 is the ambiguous form: only a lone 0 is an
+        // octet.
+        if (digits == 1 && value == 0) {
             return std::nullopt;
         }
-        octets[i] = *octet;
-        if (!last) {
-            text.remove_prefix(dot + 1);
+        value = (value * 10) + static_cast<unsigned>(c - '0');
+        if (value > 255) {
+            return std::nullopt;
         }
+        ++digits;
     }
+
+    // Three dots seen, and the last octet has digits of its own.
+    if (index + 1 != octets.size() || digits == 0) {
+        return std::nullopt;
+    }
+    octets[index] = static_cast<uint8_t>(value);
     return IPv4Address{octets[0], octets[1], octets[2], octets[3]};
 }
 
