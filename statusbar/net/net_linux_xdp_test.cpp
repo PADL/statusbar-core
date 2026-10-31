@@ -1636,6 +1636,72 @@ TEST(xdp_integration, a_pinned_map_of_the_wrong_shape_is_replaced_and_never_writ
     ::close(foreign);
 }
 
+TEST(xdp_integration, a_program_somebody_else_attached_is_left_alone_and_open_refuses)
+{
+    if (getuid() != 0) {
+        SKIP("needs root");
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        SKIP("could not create a veth pair");
+    }
+    unsigned int const if_index = ::if_nametoindex("xdptest0");
+    auto const pin_path = XdpProgram::pin_path_for("xdptest0");
+    auto cleanup = detail::scopeguard([&] {
+        (void)bpf_xdp_detach(static_cast<int>(if_index), XDP_FLAGS_SKB_MODE, nullptr);
+        (void)XdpProgram::detach(if_index, pin_path);
+        destroy_veth_pair("xdptest0");
+    });
+
+    // Somebody else's program: two instructions that pass every frame,
+    // attached in generic mode and pinned nowhere. Our pin directory says
+    // nothing about it, and on the strength of that silence the replace
+    // path used to take it off the interface.
+    std::array<bpf_insn, 2> const pass{
+        bpf_insn{
+            .code = static_cast<__u8>(BPF_ALU64 | BPF_MOV | BPF_K),
+            .dst_reg = BPF_REG_0,
+            .src_reg = 0,
+            .off = 0,
+            .imm = static_cast<__s32>(XDP_PASS)},
+        bpf_insn{.code = static_cast<__u8>(BPF_JMP | BPF_EXIT), .dst_reg = 0, .src_reg = 0, .off = 0, .imm = 0},
+    };
+    int const foreign = bpf_prog_load(BPF_PROG_TYPE_XDP, "foreign_pass", "MIT", pass.data(), pass.size(), nullptr);
+    EXPECT_TRUE(foreign >= 0);
+    if (foreign < 0) {
+        return;
+    }
+    EXPECT_EQ(bpf_xdp_attach(static_cast<int>(if_index), foreign, XDP_FLAGS_SKB_MODE, nullptr), 0);
+    bpf_prog_info info{};
+    __u32 info_length = sizeof(info);
+    EXPECT_EQ(bpf_prog_get_info_by_fd(foreign, &info, &info_length), 0);
+
+    XdpConfig const config{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .umem_frame_count = 64,
+        .pin_path = pin_path,
+    };
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        EXPECT_FALSE(status.has_value());
+        if (!status) {
+            EXPECT_EQ(status.error(), XdpError::foreign_program);
+        }
+    }
+
+    // Still theirs, still attached, and the same program.
+    auto const attached = XdpProgram::query(if_index);
+    EXPECT_TRUE(attached.has_value() && attached->has_value());
+    if (attached && attached->has_value()) {
+        EXPECT_EQ((*attached)->program_id, info.id);
+        EXPECT_EQ((*attached)->mode, XdpAttachMode::generic);
+    }
+    ::close(foreign);
+}
+
 TEST(xdp_integration, tx_rx_loopback)
 {
     if (getuid() != 0) {

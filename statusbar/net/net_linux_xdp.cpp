@@ -762,6 +762,32 @@ namespace {
     return std::nullopt;
 }
 
+/// Whether the replace path may take what is on the interface off it:
+/// nothing is attached, or what is attached is the program our pins name.
+/// The pin directory being ours - or nobody's - says nothing about the
+/// attachment: a program somebody else attached without pinning under our
+/// path is theirs, and the ownership contract says it may not be detached.
+/// Programs in two modes at once report an id of zero, which never matches:
+/// a guess is not a claim.
+/// @param if_index The interface
+/// @param pin_path Our pin directory
+[[nodiscard]] auto attachment_replaceable(unsigned int const if_index, std::string_view const pin_path) -> StatusValue<bool>
+{
+    auto const attached = XdpProgram::query(if_index);
+    if (!attached) {
+        return failure(attached.error());
+    }
+    if (!attached->has_value()) {
+        return true;
+    }
+    OwnedFd const pinned{bpf_obj_get(XdpProgram::pin_entry(pin_path, XdpProgram::PIN_PROG).c_str())};
+    if (!pinned.valid()) {
+        return false;
+    }
+    uint32_t const ours = program_info_id(pinned.get());
+    return ours != 0 && (*attached)->program_id == ours;
+}
+
 }  // namespace
 
 auto detail::BpfState::install_tcam_rules(std::span<CompiledRule<32> const> rules) -> Status
@@ -804,7 +830,7 @@ auto detail::BpfState::install_tcam_rules(std::span<CompiledRule<32> const> rule
 }
 
 auto XdpContext::open(XdpConfig const& config) -> Status
-{
+{  // NOLINT(statusbar-block-statements) the setup sequence, one step after another, each undoing the last on failure
     close();
 
     // Step 0: Settle the bind/attach policy before touching anything. A
@@ -908,6 +934,21 @@ auto XdpContext::open(XdpConfig const& config) -> Status
             // remains of one. Its pins would collide with the ones we are
             // about to make, so both go. We never write into a map we did
             // not recognise; we replace it.
+            //
+            // "Both" is the pins and OUR program. What the interface holds
+            // is asked separately, because the pin directory does not say:
+            // a program somebody else attached and pinned elsewhere, or
+            // nowhere, is theirs, and detaching it would be the very thing
+            // the ownership check in step 1b exists to prevent.
+            auto const replaceable = attachment_replaceable(interface_.index, config.pin_path);
+            if (!replaceable) {
+                close();
+                return failure(replaceable.error());
+            }
+            if (!*replaceable) {
+                close();
+                return failure(XdpError::foreign_program);
+            }
             (void)XdpProgram::detach(interface_.index, config.pin_path);
         }
         if (auto status = bpf_.load(config.filter_rules, config.default_action); !status) {
