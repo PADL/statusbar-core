@@ -9,9 +9,12 @@
 #include "statusbar/test/test.hpp"
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cstdint>
 #include <format>
 #include <optional>
+#include <span>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -139,6 +142,96 @@ TEST(tc_launch_time, the_socket_s_queue_is_a_class_no_priority_maps_to)
     EXPECT_FALSE(launch_time_mqprio(LaunchTimeQueue{.major = MAJOR, .queue = 0, .tx_queues = 1}).has_value());
     EXPECT_FALSE(launch_time_mqprio(LaunchTimeQueue{.major = MAJOR, .queue = 4, .tx_queues = 4}).has_value());
     EXPECT_FALSE(launch_time_mqprio(LaunchTimeQueue{.major = 0, .queue = 0, .tx_queues = 4}).has_value());
+}
+
+// PTP on queue 2 of 4: the socket's queue 0 and the idle queue 1 take no priority, PTP_PRIORITY
+// alone maps to queue 2 and every other priority to queue 3.
+TEST(tc_launch_time, ptp_event_traffic_has_a_queue_of_its_own)
+{
+    auto queue = queue_zero_of_four();
+    queue.ptp_queue = 2;
+    auto const mqprio = launch_time_mqprio(queue);
+    EXPECT_TRUE(mqprio.has_value());
+    if (!mqprio) {
+        return;
+    }
+    EXPECT_EQ(mqprio->num_tc, uint8_t{4});
+    for (uint8_t tc = 0; tc < 4; ++tc) {
+        EXPECT_TRUE(mqprio->count[tc] == 1 && mqprio->offset[tc] == tc);
+    }
+    EXPECT_EQ(mqprio->prio_tc_map[PTP_PRIORITY], uint8_t{2});
+    EXPECT_EQ(std::ranges::count(mqprio->prio_tc_map, uint8_t{3}), 15);
+    queue.ptp_queue = 1;  // right after the socket's: nothing idle, the rest on queues 2-3
+    auto const adjacent = launch_time_mqprio(queue);
+    EXPECT_TRUE(adjacent && adjacent->num_tc == 3 && adjacent->count[2] == 2 && adjacent->prio_tc_map[0] == 2);
+}
+
+// The request, byte for byte (little-endian hosts): `tc qdisc replace dev <if3> root handle 9100: mqprio
+// num_tc 4 map 3 3 3 3 3 3 3 2 3 3 3 3 3 3 3 3 queues 1@0 1@1 1@2 1@3 hw 0`.
+TEST(tc_launch_time, the_ptp_layout_request_bytes)
+{
+    if constexpr (std::endian::native != std::endian::little) {
+        return;
+    }
+    auto queue = queue_zero_of_four();
+    queue.ptp_queue = 2;
+    // clang-format off
+    std::array<uint8_t, 136> const want{
+        0x88, 0x00, 0x00, 0x00,  0x24, 0x00,  0x05, 0x05,  0x07, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,  0x03, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x91,  0xff, 0xff, 0xff, 0xff,  0x00, 0x00, 0x00, 0x00,
+        0x0b, 0x00, 0x01, 0x00,  'm', 'q', 'p', 'r', 'i', 'o', 0x00,  0x00,
+        0x56, 0x00, 0x02, 0x00,
+        0x04,
+        0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x02,  0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03,
+        0x00,
+        0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00,  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00,  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+    };
+    // clang-format on
+    RequestBuffer out{};
+    auto const length =
+        launch_time_mqprio(queue).and_then([&](MqprioQdisc const& q) { return build_replace_mqprio(out, IFINDEX, q, 7); });
+    EXPECT_TRUE(length && *length == want.size());
+    EXPECT_TRUE(std::ranges::equal(std::span{out}.first(want.size()), want));
+}
+
+TEST(tc_launch_time, a_ptp_queue_needs_a_queue_past_it_for_the_rest)
+{
+    auto queue = queue_zero_of_four();
+    for (uint16_t const bad : {uint16_t{0}, uint16_t{3}, uint16_t{4}}) {
+        queue.ptp_queue = bad;
+        EXPECT_FALSE(launch_time_mqprio(queue).has_value());
+    }
+    queue.ptp_queue = 2;
+    queue.ptp_priority = 16;
+    EXPECT_FALSE(launch_time_mqprio(queue).has_value());
+}
+
+// A persistent root: off lays it alone, on adds the etf, off takes away only the etf, and a restart keeps
+// the root; unsupported still asks nothing.
+TEST(tc_launch_time, a_persistent_root_outlives_launch_time)
+{
+    RecordingTc tc;
+    tc.root = default_root();
+    auto queue = queue_zero_of_four();
+    queue.ptp_queue = 2;
+    queue.persistent_root = true;
+    auto const none = settle_launch_time_queue(tc, IFINDEX, queue, LaunchTimeMode::unsupported);
+    EXPECT_TRUE(none && *none == LaunchTimeQueueAction::none && tc.take().empty());
+    auto const alone = settle_launch_time_queue(tc, IFINDEX, queue, LaunchTimeMode::off);
+    EXPECT_TRUE(alone && *alone == LaunchTimeQueueAction::installed);
+    EXPECT_TRUE((tc.take() == std::vector<std::string>{"show root", "replace root mqprio 9100: num_tc 4", "show 9100:1"}));
+    (void)settle_launch_time_queue(tc, IFINDEX, queue, LaunchTimeMode::on);
+    EXPECT_TRUE((tc.take() == std::vector<std::string>{"show root", "show 9100:1", "replace 9100:1 etf delta 150000"}));
+    auto const off = settle_launch_time_queue(tc, IFINDEX, queue, LaunchTimeMode::off);
+    EXPECT_TRUE(off && *off == LaunchTimeQueueAction::removed);
+    EXPECT_TRUE((tc.take() == std::vector<std::string>{"show root", "show 9100:1", "del 9100:1 handle 8001:"}));
+    EXPECT_TRUE(tc.root && tc.root->kind == "mqprio" && tc.children.empty());
+    auto const again = settle_launch_time_queue(tc, IFINDEX, queue, LaunchTimeMode::off);
+    EXPECT_TRUE(again && *again == LaunchTimeQueueAction::kept);
 }
 
 // Supported: our mqprio replaces the default root and an offloaded etf goes on the socket's class;

@@ -25,7 +25,17 @@
 ///     keeping the kernel's extended-ack text for logs. It implements
 ///     TcControl, the interface a caller takes so tests can record requests.
 ///
-/// Changing qdiscs needs CAP_NET_ADMIN; reading one does not. Linux only.
+/// Changing qdiscs needs CAP_NET_ADMIN; reading one does not. Linux only, PTP_PRIORITY aside.
+
+#include <cstdint>
+
+namespace statusbar::net::tc {
+
+/// The skb priority (SO_PRIORITY; ptp4l's socket_priority) that steers PTP event traffic to a TX
+/// queue of its own: TC_PRIO_CONTROL, which the kernel also gives IGMP and MLD reports.
+inline constexpr uint8_t PTP_PRIORITY = 7;
+
+}  // namespace statusbar::net::tc
 
 #if defined(__linux__)
 
@@ -34,7 +44,6 @@
 
 #    include <array>
 #    include <cstddef>
-#    include <cstdint>
 #    include <optional>
 #    include <span>
 #    include <string>
