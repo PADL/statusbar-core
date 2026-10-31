@@ -17,6 +17,7 @@
 #include <print>
 #include <span>
 #include <string>
+#include <string_view>
 
 using namespace statusbar;
 using namespace statusbar::ip;
@@ -159,6 +160,109 @@ TEST(ipv4_address, assignment)
     IPv4Address c;
     c = std::move(a);
     EXPECT_TRUE(c == b);
+}
+
+// parse_ipv4 / to_string tests
+
+TEST(ipv4_address, parse_dotted_quad)
+{
+    auto const address = parse_ipv4("239.69.1.2");
+    EXPECT_TRUE(address.has_value());
+    EXPECT_EQ(address->to_uint32(), 0xEF450102U);
+    EXPECT_TRUE(address->is_multicast());
+
+    EXPECT_TRUE(parse_ipv4("0.0.0.0").has_value());
+    EXPECT_EQ(parse_ipv4("0.0.0.0")->to_uint32(), 0U);
+    EXPECT_TRUE(parse_ipv4("255.255.255.255").has_value());
+    EXPECT_EQ(parse_ipv4("255.255.255.255")->to_uint32(), 0xFFFFFFFFU);
+    EXPECT_TRUE(parse_ipv4("10.0.0.1").has_value());
+    EXPECT_EQ(parse_ipv4("10.0.0.1")->to_uint32(), 0x0A000001U);
+}
+
+// A leading-zero octet has two readings - octal to inet_aton(3), decimal to
+// us - so it is refused rather than guessed at. See BUG-002.
+TEST(ipv4_address, parse_refuses_leading_zero_octets)
+{
+    EXPECT_FALSE(parse_ipv4("10.10.032.5").has_value());
+    EXPECT_FALSE(parse_ipv4("010.1.1.1").has_value());
+    EXPECT_FALSE(parse_ipv4("1.010.1.1").has_value());
+    EXPECT_FALSE(parse_ipv4("1.1.010.1").has_value());
+    EXPECT_FALSE(parse_ipv4("1.1.1.010").has_value());
+    EXPECT_FALSE(parse_ipv4("00.1.1.1").has_value());
+    EXPECT_FALSE(parse_ipv4("0.0.0.00").has_value());
+
+    // The single digit 0 is not ambiguous and stays legal in every position.
+    EXPECT_TRUE(parse_ipv4("0.1.1.1").has_value());
+    EXPECT_TRUE(parse_ipv4("1.0.1.1").has_value());
+    EXPECT_TRUE(parse_ipv4("1.1.0.1").has_value());
+    EXPECT_TRUE(parse_ipv4("1.1.1.0").has_value());
+}
+
+TEST(ipv4_address, parse_rejects_malformed)
+{
+    EXPECT_FALSE(parse_ipv4("").has_value());
+    EXPECT_FALSE(parse_ipv4("239.69.1").has_value());      // too few parts
+    EXPECT_FALSE(parse_ipv4("239.69.1.2.3").has_value());  // too many parts
+    EXPECT_FALSE(parse_ipv4("239.69..2").has_value());     // empty part
+    EXPECT_FALSE(parse_ipv4(".1.2.3").has_value());        // empty leading part
+    EXPECT_FALSE(parse_ipv4("1.2.3.").has_value());        // empty trailing part
+    EXPECT_FALSE(parse_ipv4("239.69.1.256").has_value());  // octet out of range
+    EXPECT_FALSE(parse_ipv4("256.1.1.1").has_value());
+    EXPECT_FALSE(parse_ipv4("1.1.1.1000").has_value());    // more than three digits
+    EXPECT_FALSE(parse_ipv4(" 239.69.1.2").has_value());   // leading space
+    EXPECT_FALSE(parse_ipv4("239.69.1.2 ").has_value());   // trailing space
+    EXPECT_FALSE(parse_ipv4("239.69.1.2\n").has_value());  // trailing newline
+    EXPECT_FALSE(parse_ipv4("+1.2.3.4").has_value());      // signs are not digits
+    EXPECT_FALSE(parse_ipv4("-1.2.3.4").has_value());
+    EXPECT_FALSE(parse_ipv4("1.2.3.-4").has_value());
+    EXPECT_FALSE(parse_ipv4("1.2.3.4x").has_value());  // trailing text
+    EXPECT_FALSE(parse_ipv4("a.b.c.d").has_value());
+    EXPECT_FALSE(parse_ipv4("1,2,3,4").has_value());
+
+    // inet_aton(3) shorthand is not accepted: it is the other half of the
+    // same ambiguity family.
+    EXPECT_FALSE(parse_ipv4("10.1").has_value());
+    EXPECT_FALSE(parse_ipv4("0x0a000001").has_value());
+    EXPECT_FALSE(parse_ipv4("167772161").has_value());
+}
+
+// A std::string_view may carry an embedded NUL or stop short of one; the parse
+// must honour its size rather than scanning for a terminator.
+TEST(ipv4_address, parse_honours_the_view_bounds)
+{
+    using namespace std::string_view_literals;
+    EXPECT_FALSE(parse_ipv4("1.2.3.4\0"sv).has_value());
+    EXPECT_TRUE(parse_ipv4("1.2.3.4 junk"sv.substr(0, 7)).has_value());
+}
+
+TEST(ipv4_address, to_string_round_trip)
+{
+    std::array<IPv4Address, 6> const addresses{
+        IPv4Address(0, 0, 0, 0),
+        IPv4Address(255, 255, 255, 255),
+        IPv4Address(127, 0, 0, 1),
+        IPv4Address(239, 69, 1, 2),
+        IPv4Address(192, 168, 1, 1),
+        IPv4Address(10, 0, 0, 1),
+    };
+    for (auto const& addr : addresses) {
+        auto const text = to_string(addr);
+        auto const parsed = parse_ipv4(text);
+        EXPECT_TRUE(parsed.has_value());
+        EXPECT_TRUE(*parsed == addr);
+    }
+
+    EXPECT_EQ(to_string(IPv4Address(239, 69, 1, 2)), std::string("239.69.1.2"));
+    EXPECT_EQ(to_string(IPv4Address(0, 0, 0, 0)), std::string("0.0.0.0"));
+}
+
+TEST(ipv4_address, parse_is_constexpr)
+{
+    static_assert(parse_ipv4("239.69.1.2").has_value());
+    static_assert(parse_ipv4("239.69.1.2")->to_uint32() == 0xEF450102U);
+    static_assert(!parse_ipv4("10.10.032.5").has_value());
+    static_assert(!parse_ipv4("239.69.1").has_value());
+    EXPECT_TRUE(true);
 }
 
 // IPv4Header tests
