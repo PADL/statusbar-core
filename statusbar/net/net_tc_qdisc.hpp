@@ -64,6 +64,11 @@ namespace statusbar::net::tc {
 /// therefore live on the stack with no allocation.
 inline constexpr std::size_t MAX_REQUEST_SIZE = 256;
 
+/// A buffer big enough for any request this module builds. Named because
+/// another implementation of this module names it, and a caller written
+/// against that one should not have to spell the array out.
+using RequestBuffer = std::array<std::uint8_t, MAX_REQUEST_SIZE>;
+
 /// TC_H_ROOT: the parent of a root qdisc.
 inline constexpr std::uint32_t ROOT = 0xFFFFFFFFU;
 
@@ -124,6 +129,8 @@ struct MqprioQdisc
 
     /// Ask the driver to offload the map to hardware. Defaults on.
     bool offload{true};
+
+    auto operator==(MqprioQdisc const&) const noexcept -> bool = default;
 };
 
 /// A credit-based shaper hanging off one `mqprio` traffic class.
@@ -147,6 +154,8 @@ struct CbsQdisc
     /// Offload to the driver's hardware shaper. Defaults on: see the
     /// second trap in this file's header comment.
     bool offload{true};
+
+    auto operator==(CbsQdisc const&) const noexcept -> bool = default;
 };
 
 /// One qdisc as read back from the kernel.
@@ -299,6 +308,11 @@ class TcClient final : public TcControl
 
     /// Whether the socket is open.
     [[nodiscard]] auto valid() const noexcept -> bool { return fd_ >= 0; }
+
+    /// The same question as valid(), under the name another implementation
+    /// of this module gives it, so a caller written against that one compiles
+    /// against this one.
+    [[nodiscard]] auto is_open() const noexcept -> bool { return valid(); }
 
     /// The netlink socket, for a caller that multiplexes it, and so a test
     /// can confirm the receive timeout is actually installed.

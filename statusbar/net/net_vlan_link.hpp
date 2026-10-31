@@ -260,6 +260,10 @@ class VlanLinkClient final : public VlanControl
     [[nodiscard]] auto created_links() const noexcept -> std::span<std::string const> { return created_; }
 
     [[nodiscard]] auto valid() const noexcept -> bool { return fd_ >= 0; }
+
+    /// The same question as valid(), under the name another implementation
+    /// of this module gives it.
+    [[nodiscard]] auto is_open() const noexcept -> bool { return valid(); }
     [[nodiscard]] auto fd() const noexcept -> int { return fd_; }
 
   private:
