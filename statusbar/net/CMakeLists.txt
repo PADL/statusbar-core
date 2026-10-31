@@ -14,6 +14,7 @@ statusbar_add_module(
   net_message_reactor.cpp
   net_rawnet.cpp
   net_ring_buffer_base.cpp
+  net_rss.cpp
   net_tap_bridge.cpp
   net_tc_qdisc.cpp
   net_tcp_server.cpp
@@ -40,6 +41,7 @@ statusbar_add_module(
   net_linux_xdp_test.cpp
   net_interface_info_test.cpp
   net_tc_qdisc_test.cpp
+  net_rss_test.cpp
   net_tcam_classifier_test.cpp
   net_tcp_server_test.cpp
   net_test.cpp

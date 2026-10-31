@@ -82,7 +82,15 @@ constexpr std::string_view SYSFS_NET = "/sys/class/net/";
 }
 
 /// Run an SIOC* ioctl that takes an `ifreq` naming an interface.
-[[nodiscard]] auto ifreq_ioctl(std::string_view name, unsigned long request, ifreq& ifr) noexcept -> Status
+///
+/// Deliberately not net_posix_util.hpp's ifreq_ioctl, which this was merged
+/// alongside: that one reports errno in the SYSTEM category and answers
+/// no_such_device for a name that is merely too long, where this module
+/// reports generically and keeps filename_too_long distinguishable so the
+/// early return is observable. Both are tested, in opposite directions, so
+/// unifying them is a decision about which contract the module wants and not
+/// something to settle while merging.
+[[nodiscard]] auto interface_ioctl(std::string_view name, unsigned long request, ifreq& ifr) noexcept -> Status
 {
     if (auto status = validate_name(name); !status) {
         return status;
@@ -107,7 +115,7 @@ template <typename Command>
     ifreq ifr{};
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
     ifr.ifr_data = reinterpret_cast<char*>(&data);
-    return ifreq_ioctl(name, SIOCETHTOOL, ifr);
+    return interface_ioctl(name, SIOCETHTOOL, ifr);
 }
 
 /// Build "/sys/class/net/<name>/<suffix>" into a fixed buffer. Returns the
@@ -226,7 +234,7 @@ auto make_unknown_link_speed() noexcept -> std::error_code
 auto interface_index(std::string_view const interface_name) -> StatusValue<int>
 {
     ifreq ifr{};
-    if (auto status = ifreq_ioctl(interface_name, SIOCGIFINDEX, ifr); !status) {
+    if (auto status = interface_ioctl(interface_name, SIOCGIFINDEX, ifr); !status) {
         return forward_failure(status);
     }
     return success(ifr.ifr_ifindex);
@@ -235,7 +243,7 @@ auto interface_index(std::string_view const interface_name) -> StatusValue<int>
 auto interface_mtu(std::string_view const interface_name) -> StatusValue<uint32_t>
 {
     ifreq ifr{};
-    if (auto status = ifreq_ioctl(interface_name, SIOCGIFMTU, ifr); !status) {
+    if (auto status = interface_ioctl(interface_name, SIOCGIFMTU, ifr); !status) {
         return forward_failure(status);
     }
     return success(static_cast<uint32_t>(ifr.ifr_mtu));
