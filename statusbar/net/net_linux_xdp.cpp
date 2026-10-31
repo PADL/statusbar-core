@@ -11,6 +11,7 @@
 #    include <sys/vfs.h>
 #endif
 
+#include <algorithm>
 #include <utility>
 
 namespace statusbar::net {
@@ -78,6 +79,8 @@ auto XdpErrorCategory::message(int ev) const -> std::string
             return "An XDP program that is not ours is pinned at this path; it has been left alone";
         case XdpError::pin_not_adoptable:
             return "The pinned XDP program is not the one this build attaches, so it cannot be adopted";
+        case XdpError::stats_read_failed:
+            return "Reading the kernel's socket statistics failed";
         default:
             return "Unknown XDP error";
     }
@@ -445,6 +448,52 @@ auto XdpProgram::detach([[maybe_unused]] unsigned int const if_index, [[maybe_un
 }
 
 #if defined(__linux__) && defined(HAVE_XDP)
+
+namespace {
+
+// One counter per uint64_t in the kernel's struct. The kernel reports how
+// many it filled as a byte count, and refuses an option length shorter than
+// its oldest three.
+constexpr size_t KERNEL_STAT_COUNT = 6;
+
+static_assert(
+    sizeof(struct xdp_statistics) == KERNEL_STAT_COUNT * sizeof(uint64_t),
+    "struct xdp_statistics has grown: add the new counters to XdpKernelStats and raise KERNEL_STAT_COUNT");
+
+}  // namespace
+
+auto detail::kernel_stats_from(struct xdp_statistics const& raw, socklen_t reported_length) -> XdpKernelStats
+{
+    // Clamped: a kernel newer than this header answers with a longer struct,
+    // and claiming counters we have no fields for would be a lie.
+    auto const reported = std::min(static_cast<size_t>(reported_length) / sizeof(uint64_t), KERNEL_STAT_COUNT);
+    return XdpKernelStats{
+        .rx_dropped = raw.rx_dropped,
+        .rx_invalid_descs = raw.rx_invalid_descs,
+        .tx_invalid_descs = raw.tx_invalid_descs,
+        .rx_ring_full = raw.rx_ring_full,
+        .rx_fill_ring_empty_descs = raw.rx_fill_ring_empty_descs,
+        .tx_ring_empty_descs = raw.tx_ring_empty_descs,
+        .counters_reported = reported,
+    };
+}
+
+auto detail::read_xdp_kernel_stats(int fd) -> StatusValue<XdpKernelStats>
+{
+    // Zeroed, so a counter the kernel does not fill is a deterministic zero
+    // rather than stack litter. counters_reported is what says which of them
+    // the kernel actually wrote.
+    //
+    // No test can reach this: a kernel since 5.9 fills all six, so there is
+    // nothing left unwritten for the garbage to show through. It stays
+    // because the one kernel that would expose it is the one we cannot test.
+    struct xdp_statistics raw{};
+    socklen_t length = sizeof(raw);
+    if (::getsockopt(fd, SOL_XDP, XDP_STATISTICS, &raw, &length) < 0) {
+        return failure(XdpError::stats_read_failed);
+    }
+    return kernel_stats_from(raw, length);
+}
 
 auto detail::UmemRegion::allocate(
     size_t frame_count, size_t frame_size, size_t headroom, size_t fill_ring_size, size_t comp_ring_size, RingSet& rings)

@@ -97,6 +97,7 @@ enum class XdpError
     queue_busy,
     foreign_program,
     pin_not_adoptable,
+    stats_read_failed,
 };
 
 class XdpErrorCategory : public std::error_category
@@ -311,6 +312,46 @@ struct XdpConfig
     /// Zero gives the old behaviour: receive may take everything, and a
     /// receive-only context loses nothing by it.
     size_t tx_frame_reserve{xdp_default_tx_frame_reserve};
+};
+
+// ──────────────────────────────────────────────
+// Kernel-side socket statistics
+// ──────────────────────────────────────────────
+
+/// The kernel's own per-socket AF_XDP counters, as of the moment they were
+/// read. These are frames the kernel threw away after we handed them over,
+/// which is a thing XdpContext::Stats cannot see: it counts what we did.
+///
+/// Deliberately not folded into that struct. It is written by the TX/RX path
+/// on one thread and may be read torn by another; this one comes from a
+/// getsockopt that can fail, which is a different contract.
+struct XdpKernelStats
+{
+    /// Frames dropped for want of a fill-ring buffer.
+    uint64_t rx_dropped{0};
+    /// A fill-ring descriptor the kernel refused.
+    uint64_t rx_invalid_descs{0};
+    /// A TX descriptor the kernel refused. The send that carried it still
+    /// reported success, so this counter is the only sign the frame was lost.
+    uint64_t tx_invalid_descs{0};
+    /// Frames dropped because the RX ring was full.
+    uint64_t rx_ring_full{0};
+    /// Times the kernel wanted a fill-ring entry and found none.
+    uint64_t rx_fill_ring_empty_descs{0};
+    /// Times the kernel looked in the TX ring and found it empty. NOT a
+    /// fault: a kick that drains the ring leaves it empty, so this ticks
+    /// during ordinary transmission.
+    uint64_t tx_ring_empty_descs{0};
+
+    /// How many of the counters above the kernel actually filled, as it
+    /// reported in the option length. A kernel from before the last three
+    /// were added (Linux 5.9) answers with only the first three, and the
+    /// rest read zero because we zeroed them -- not because nothing
+    /// happened. Check before believing a zero.
+    size_t counters_reported{0};
+
+    [[nodiscard]] auto has_rx_ring_full() const noexcept -> bool { return counters_reported >= 4; }
+    [[nodiscard]] auto has_ring_empty_counters() const noexcept -> bool { return counters_reported >= 6; }
 };
 
 }  // namespace statusbar::net
@@ -1289,6 +1330,27 @@ class BpfState
     bool adopted_{false};
 };
 
+/// Turn the kernel's reply into XdpKernelStats.
+///
+/// Pure, and separate from the syscall, so that the field-by-field mapping
+/// and the meaning of the reported length can be tested without a socket,
+/// a NIC or a privilege.
+///
+/// @param raw The struct the kernel filled
+/// @param reported_length The option length the kernel wrote back, in bytes
+[[nodiscard]] auto kernel_stats_from(struct xdp_statistics const& raw, socklen_t reported_length) -> XdpKernelStats;
+
+/// Read the kernel's counters off an AF_XDP socket descriptor.
+///
+/// Takes a descriptor rather than hanging off XdpContext so it can be read
+/// from any AF_XDP socket -- which is what lets the counters be tested
+/// against a real kernel socket with no privilege, since binding a
+/// transmit-only socket needs no BPF program and a user namespace grants
+/// CAP_NET_RAW over its own network namespace while never granting CAP_BPF.
+///
+/// @param fd An open AF_XDP socket descriptor
+[[nodiscard]] auto read_xdp_kernel_stats(int fd) -> StatusValue<XdpKernelStats>;
+
 }  // namespace detail
 
 class XdpContext
@@ -1466,6 +1528,26 @@ class XdpContext
     [[nodiscard]] auto socket_stats() const noexcept -> XdpSocketStats const& { return stats_; }
     [[nodiscard]] auto stats() const noexcept -> Stats const& { return stats_; }
 
+    /// The kernel's own view of this socket, as of now: four counters of
+    /// frames it discarded after we handed them over, plus two ring-empty
+    /// ones. Read through rather than mirrored -- a getsockopt is cheap, and
+    /// copying them in on a timer would only add a staleness question the
+    /// caller is better placed to answer.
+    ///
+    /// Only the failure branch below is tested without privilege. Reaching
+    /// the delegation needs an open context, and opening one loads the BPF
+    /// filter, which wants CAP_BPF -- not a capability any user namespace
+    /// grants. The success path is covered by
+    /// xdp_integration.kernel_stats_on_an_open_context, under root, on a
+    /// kernel built with CONFIG_XDP_SOCKETS.
+    [[nodiscard]] auto kernel_stats() const -> StatusValue<XdpKernelStats>
+    {
+        if (!valid()) {
+            return failure(XdpError::not_open);
+        }
+        return detail::read_xdp_kernel_stats(xsk_socket__fd(xsk_));
+    }
+
   private:
     void swap(XdpContext& other) noexcept
     {
@@ -1587,6 +1669,8 @@ class XdpContext
 
     [[nodiscard]] auto socket_stats() const noexcept -> XdpSocketStats const& { return stats_; }
     [[nodiscard]] auto stats() const noexcept -> Stats const& { return stats_; }
+
+    [[nodiscard]] auto kernel_stats() const -> StatusValue<XdpKernelStats> { return failure(XdpError::not_supported_on_platform); }
 
   private:
     void swap(XdpContext& other) noexcept
