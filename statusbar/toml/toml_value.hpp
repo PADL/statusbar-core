@@ -15,6 +15,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -97,15 +98,31 @@ class Table
     /// @param key The key to look up
     [[nodiscard]] auto get(std::string_view key) const -> Value const*;
 
-    /// Get value by dotted key path (e.g., "server.host")
+    /// Get value by dotted key path (e.g., "server.host").
+    /// Every dot is a separator, so this cannot address a key that
+    /// contains one — `[port."eth0.100"]` names a single key `eth0.100`,
+    /// and only the span overload below can reach it.
     /// @param path Dotted key path to look up
     [[nodiscard]] auto get_path(std::string_view path) -> Value*;
     /// @param path Dotted key path to look up
     [[nodiscard]] auto get_path(std::string_view path) const -> Value const*;
 
+    /// Get value by an already-split key path, one segment per level.
+    /// A segment is a key in full, dots and all, which is what the parser
+    /// produces for a quoted key.
+    /// @param segments One key per level; an empty span finds nothing
+    [[nodiscard]] auto get_path(std::span<std::string const> segments) -> Value*;
+    /// @param segments One key per level
+    [[nodiscard]] auto get_path(std::span<std::string const> segments) const -> Value const*;
+
     /// Get or create nested table for key path
     /// @param path Dotted key path to navigate or create
     [[nodiscard]] auto get_or_create_table(std::string_view path) -> Table*;
+
+    /// Get or create a nested table from an already-split key path.
+    /// @param segments One key per level; an empty span is this table
+    /// @return The table, or nullptr if a segment exists and is not a table
+    [[nodiscard]] auto get_or_create_table(std::span<std::string const> segments) -> Table*;
 
     [[nodiscard]] auto size() const noexcept -> size_t { return values_.size(); }
     [[nodiscard]] auto empty() const noexcept -> bool { return values_.empty(); }

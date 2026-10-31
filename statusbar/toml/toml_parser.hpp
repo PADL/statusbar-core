@@ -16,9 +16,11 @@
 #include <cstdlib>
 #include <fstream>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace statusbar::toml {
 
@@ -66,11 +68,23 @@ class Parser
 
     [[nodiscard]] auto parse_document() -> StatusValue<Table>;
 
-    [[nodiscard]] auto get_or_create_array_of_tables(Table& root, std::string_view path) -> Array*;
+    [[nodiscard]] auto get_or_create_array_of_tables(Table& root, std::span<std::string const> path) -> Array*;
 
-    [[nodiscard]] auto parse_key_value() -> StatusValue<std::pair<std::string, Value>>;
+    /// Walk (creating as needed) the table a `[header]` path names.
+    /// Where a segment is already an array of tables, this descends into
+    /// its LAST element, which is what `[s.x]` after `[[s]]` means.
+    /// Only table headers work this way: a dotted key may not extend an
+    /// array, so insert_key_value() keeps using Table::get_or_create_table.
+    /// @return The table, or nullptr if a segment is a non-table value or
+    ///         an empty array (nothing for the header to attach to)
+    [[nodiscard]] static auto resolve_table_path(Table& root, std::span<std::string const> path) -> Table*;
 
-    [[nodiscard]] auto parse_key_path() -> StatusValue<std::string>;
+    [[nodiscard]] auto parse_key_value() -> StatusValue<std::pair<std::vector<std::string>, Value>>;
+
+    /// Parse a key path into one string per segment. Segments, not a joined
+    /// dotted string: a quoted segment may contain a dot of its own, and
+    /// joining would make `["a.b"]` and `[a.b]` the same key path.
+    [[nodiscard]] auto parse_key_path() -> StatusValue<std::vector<std::string>>;
 
     [[nodiscard]] auto parse_key() -> StatusValue<std::string>;
 

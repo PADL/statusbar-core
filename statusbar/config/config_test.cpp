@@ -954,6 +954,101 @@ TEST(config_set, set_eui64)
     EXPECT_TRUE(*result == eui);
 }
 
+//
+// Quoted keys that contain a dot (BUG-004)
+//
+
+TEST(config_quoted_dotted_key, a_quoted_table_survives_a_save_and_a_reload)
+{
+    // The round trip is where the writer used to undo the parser: it emitted
+    // `[port.eth0.100]` with no quotes, so reloading built three tables.
+    Config first;
+    EXPECT_TRUE(first.load_string("[port.\"eth0.100\"]\nvlan = 100\n").has_value());
+
+    auto const text = first.to_toml_string();
+    // The header has to carry the quotes to mean what it meant on the way in.
+    EXPECT_TRUE(text.find("[port.\"eth0.100\"]") != std::string::npos);
+
+    Config second;
+    EXPECT_TRUE(second.load_string(text).has_value());
+    auto const* port = second.get_table("port");
+    EXPECT_TRUE(port != nullptr);
+    if (port != nullptr) {
+        EXPECT_EQ(port->size(), size_t{1});
+        EXPECT_TRUE(port->contains("eth0.100"));
+        EXPECT_FALSE(port->contains("eth0"));
+    }
+}
+
+TEST(config_quoted_dotted_key, a_value_key_that_needs_quoting_is_quoted)
+{
+    // Not only table headers: a bare key may hold only A-Za-z0-9_- , so a
+    // value key with a dot or a space needs the same treatment or the file
+    // does not read back.
+    Config config;
+    config.root().set("eth0.100", toml::Value{int64_t{100}});
+    config.root().set("key with spaces", toml::Value{int64_t{1}});
+    config.root().set("plain_key-2", toml::Value{int64_t{2}});
+
+    auto const text = config.to_toml_string();
+    EXPECT_TRUE(text.find("\"eth0.100\" = 100") != std::string::npos);
+    EXPECT_TRUE(text.find("\"key with spaces\" = 1") != std::string::npos);
+    // A key that can be bare stays bare, so ordinary files look unchanged.
+    EXPECT_TRUE(text.find("plain_key-2 = 2") != std::string::npos);
+
+    Config reloaded;
+    EXPECT_TRUE(reloaded.load_string(text).has_value());
+    EXPECT_EQ(reloaded.root().get("eth0.100")->as_integer().value(), 100);
+    EXPECT_EQ(reloaded.root().get("key with spaces")->as_integer().value(), 1);
+}
+
+TEST(config_quoted_dotted_key, an_inline_table_key_is_quoted_too)
+{
+    Config config;
+    EXPECT_TRUE(config.load_string("x = { \"a.b\" = 1 }\n").has_value());
+    auto const text = config.to_toml_string();
+
+    Config reloaded;
+    EXPECT_TRUE(reloaded.load_string(text).has_value());
+    auto const* x = reloaded.get_table("x");
+    EXPECT_TRUE(x != nullptr);
+    if (x != nullptr) {
+        EXPECT_TRUE(x->contains("a.b"));
+        EXPECT_FALSE(x->contains("a"));
+    }
+}
+
+TEST(config_quoted_dotted_key, the_dotted_string_api_is_unchanged)
+{
+    // set() and get() split on dots by design -- that is the config API, not
+    // the TOML document model. A caller wanting a literal dot reaches for
+    // root() and the segmented lookup, as the test above does.
+    Config config;
+    config.set("port.eth0.100", int64_t{7});
+
+    // Three levels from one dotted string: a table `port`, a table `eth0`,
+    // and a value key `100` -- which is bare-safe, so it needs no quotes.
+    auto const text = config.to_toml_string();
+    EXPECT_TRUE(text.find("[port.eth0]") != std::string::npos);
+    EXPECT_TRUE(text.find("100 = 7") != std::string::npos);
+    EXPECT_EQ(config.get_integer("port.eth0.100", 0), 7);
+}
+
+TEST(config_quoted_dotted_key, the_interface_as_a_value_form_round_trips)
+{
+    // The shape to prefer in a schema: the interface name is a value.
+    Config config;
+    EXPECT_TRUE(config.load_string("[[stream]]\ninterface = \"eth0.100\"\n").has_value());
+
+    Config reloaded;
+    EXPECT_TRUE(reloaded.load_string(config.to_toml_string()).has_value());
+    auto const* arr = reloaded.get_array("stream");
+    EXPECT_TRUE(arr != nullptr);
+    if (arr != nullptr && arr->size() == 1) {
+        EXPECT_EQ(*(*arr)[0].as_table()->get("interface")->as_string(), "eth0.100");
+    }
+}
+
 TEST(config_set, apply_cli_overrides_span)
 {
     Config cfg;

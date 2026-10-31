@@ -13,8 +13,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <span>
 #include <string>
 #include <system_error>
+#include <vector>
 
 using namespace statusbar::toml;
 
@@ -447,6 +449,387 @@ TEST(toml_parser, array_of_tables)
 
     EXPECT_EQ(*(*arr)[0].as_table()->get("name")->as_string(), "first");
     EXPECT_EQ(*(*arr)[1].as_table()->get("name")->as_string(), "second");
+}
+
+//
+// Quoted keys that contain a dot (BUG-004)
+//
+// `[port."eth0.100"]` names ONE table called `eth0.100` inside `port`.
+// The quoting is what makes the dot a character rather than a separator,
+// so a key path has to stay segmented from the parser down to the table
+// walk -- joining it into a dotted string loses the distinction, and
+// `eth0.100` is how every VLAN subinterface on Linux is named.
+//
+
+TEST(toml_quoted_dotted_key, a_quoted_table_name_is_one_table)
+{
+    auto result = parse("[port.\"eth0.100\"]\n"
+                        "vlan = 100\n");
+    EXPECT_TRUE(result.has_value());
+    if (!result) {
+        return;
+    }
+
+    auto const* port = result->get("port");
+    EXPECT_TRUE(port != nullptr);
+    if (port == nullptr || port->as_table() == nullptr) {
+        return;
+    }
+    // Exactly one key, spelled with its dot, and no phantom "eth0" level.
+    EXPECT_EQ(port->as_table()->size(), 1U);
+    EXPECT_TRUE(port->as_table()->contains("eth0.100"));
+    EXPECT_FALSE(port->as_table()->contains("eth0"));
+
+    auto const* iface = port->as_table()->get("eth0.100");
+    EXPECT_TRUE(iface != nullptr);
+    if (iface != nullptr && iface->as_table() != nullptr) {
+        EXPECT_EQ(*iface->as_table()->get("vlan")->as_integer(), 100);
+    }
+}
+
+TEST(toml_quoted_dotted_key, the_dotted_string_lookup_cannot_reach_it)
+{
+    // get_path() splits on every dot, so it addresses the three-level path
+    // `port` -> `eth0` -> `100`, which this document does not contain. That
+    // is the price of the string API and the reason for the span overload
+    // below; it is asserted here so the semantics cannot drift back.
+    auto result = parse("[port.\"eth0.100\"]\n"
+                        "vlan = 100\n");
+    EXPECT_TRUE(result.has_value());
+    if (result) {
+        EXPECT_TRUE(result->get_path("port.eth0.100.vlan") == nullptr);
+    }
+}
+
+TEST(toml_quoted_dotted_key, a_segmented_lookup_reaches_a_literal_dot)
+{
+    auto result = parse("[port.\"eth0.100\"]\n"
+                        "vlan = 100\n"
+                        "[port]\n"
+                        "\"mtu.bytes\" = 1500\n");
+    EXPECT_TRUE(result.has_value());
+    if (!result) {
+        return;
+    }
+
+    // A dotted segment in the middle of the path.
+    std::vector<std::string> const through{"port", "eth0.100", "vlan"};
+    auto const* v = result->get_path(std::span<std::string const>{through});
+    EXPECT_TRUE(v != nullptr);
+    if (v != nullptr) {
+        EXPECT_EQ(*v->as_integer(), 100);
+    }
+
+    // And one at the end, which is the step a dotted-string lookup of the
+    // final key would quietly split apart.
+    std::vector<std::string> const leaf{"port", "mtu.bytes"};
+    auto const* mtu = result->get_path(std::span<std::string const>{leaf});
+    EXPECT_TRUE(mtu != nullptr);
+    if (mtu != nullptr) {
+        EXPECT_EQ(*mtu->as_integer(), 1500);
+    }
+}
+
+TEST(toml_quoted_dotted_key, quoting_makes_a_different_document)
+{
+    // These two were indistinguishable before: both became three tables.
+    auto quoted = parse("[port.\"eth0.100\"]\nvlan = 100\n");
+    auto bare = parse("[port.eth0.100]\nvlan = 100\n");
+    EXPECT_TRUE(quoted.has_value());
+    EXPECT_TRUE(bare.has_value());
+    if (!quoted || !bare) {
+        return;
+    }
+
+    EXPECT_TRUE(quoted->get("port")->as_table()->contains("eth0.100"));
+    EXPECT_FALSE(quoted->get("port")->as_table()->contains("eth0"));
+
+    EXPECT_FALSE(bare->get("port")->as_table()->contains("eth0.100"));
+    EXPECT_TRUE(bare->get("port")->as_table()->contains("eth0"));
+    EXPECT_EQ(*bare->get_path("port.eth0.100.vlan")->as_integer(), 100);
+}
+
+TEST(toml_quoted_dotted_key, a_bare_and_a_quoted_segment_mix_in_one_header)
+{
+    auto result = parse("[a.\"b.c\".d]\n"
+                        "v = 1\n");
+    EXPECT_TRUE(result.has_value());
+    if (!result) {
+        return;
+    }
+    auto const* a = result->get("a");
+    EXPECT_TRUE(a != nullptr && a->as_table() != nullptr);
+    if (a == nullptr || a->as_table() == nullptr) {
+        return;
+    }
+    auto const* bc = a->as_table()->get("b.c");
+    EXPECT_TRUE(bc != nullptr && bc->as_table() != nullptr);
+    if (bc != nullptr && bc->as_table() != nullptr) {
+        auto const* d = bc->as_table()->get("d");
+        EXPECT_TRUE(d != nullptr && d->as_table() != nullptr);
+        if (d != nullptr && d->as_table() != nullptr) {
+            EXPECT_EQ(*d->as_table()->get("v")->as_integer(), 1);
+        }
+    }
+}
+
+TEST(toml_quoted_dotted_key, a_quoted_dotted_key_value_pair_stays_one_key)
+{
+    auto result = parse("\"eth0.100\" = 5\n");
+    EXPECT_TRUE(result.has_value());
+    if (result) {
+        EXPECT_TRUE(result->contains("eth0.100"));
+        EXPECT_FALSE(result->contains("eth0"));
+        EXPECT_EQ(*result->get("eth0.100")->as_integer(), 5);
+    }
+}
+
+TEST(toml_quoted_dotted_key, a_quoted_dotted_key_in_an_inline_table_stays_one_key)
+{
+    auto result = parse("x = { \"a.b\" = 1 }\n");
+    EXPECT_TRUE(result.has_value());
+    if (result) {
+        auto const* x = result->get("x");
+        EXPECT_TRUE(x != nullptr && x->as_table() != nullptr);
+        if (x != nullptr && x->as_table() != nullptr) {
+            EXPECT_TRUE(x->as_table()->contains("a.b"));
+            EXPECT_FALSE(x->as_table()->contains("a"));
+        }
+    }
+}
+
+TEST(toml_quoted_dotted_key, an_array_of_tables_can_be_named_with_a_dot)
+{
+    auto result = parse("[[\"eth0.100\"]]\n"
+                        "x = 1\n"
+                        "[[\"eth0.100\"]]\n"
+                        "x = 2\n");
+    EXPECT_TRUE(result.has_value());
+    if (result) {
+        auto const* v = result->get("eth0.100");
+        EXPECT_TRUE(v != nullptr);
+        if (v != nullptr && v->as_array() != nullptr) {
+            EXPECT_EQ(v->as_array()->size(), 2U);
+            EXPECT_EQ(*(*v->as_array())[1].as_table()->get("x")->as_integer(), 2);
+        }
+    }
+}
+
+TEST(toml_quoted_dotted_key, a_sub_table_under_an_array_of_tables_parses_either_way)
+{
+    // This test used to assert that both spellings FAILED -- the limitation
+    // it pinned became BUG-006, and BUG-006 is fixed, so it now pins the
+    // behaviour instead. Kept here as well as in the BUG-006 group because
+    // the quoted spelling is what makes it this group's business.
+    auto bare = parse("[[s]]\nx = 1\n[s.a]\nv = 7\n");
+    auto quoted = parse("[[s]]\nx = 1\n[s.\"a.b\"]\nv = 7\n");
+    EXPECT_TRUE(bare.has_value());
+    EXPECT_TRUE(quoted.has_value());
+    if (bare && quoted) {
+        EXPECT_EQ(*(*bare->get("s")->as_array())[0].as_table()->get("a")->as_table()->get("v")->as_integer(), 7);
+        EXPECT_EQ(*(*quoted->get("s")->as_array())[0].as_table()->get("a.b")->as_table()->get("v")->as_integer(), 7);
+    }
+}
+
+//
+// Table headers under an array of tables (BUG-006)
+//
+// `[s.x]` after `[[s]]` belongs to the element `[[s]]` last appended. We
+// used to reject the document: `s` is an Array where the walk wanted a
+// Table. Only table headers work this way -- TOML does not let a dotted key
+// extend an array -- so the descent lives in the parser, not in
+// Table::get_or_create_table().
+//
+
+TEST(toml_array_subtable, a_sub_table_attaches_to_the_last_element)
+{
+    auto result = parse("[[s]]\n"
+                        "x = 1\n"
+                        "[[s]]\n"
+                        "x = 2\n"
+                        "[s.extra]\n"
+                        "v = 9\n");
+    EXPECT_TRUE(result.has_value());
+    if (!result) {
+        return;
+    }
+    auto const* arr = result->get("s")->as_array();
+    EXPECT_TRUE(arr != nullptr);
+    if (arr == nullptr) {
+        return;
+    }
+    EXPECT_EQ(arr->size(), 2U);
+
+    // The second element, the one `[[s]]` appended last.
+    auto const* second = (*arr)[1].as_table();
+    EXPECT_TRUE(second != nullptr);
+    if (second != nullptr) {
+        EXPECT_EQ(*second->get("x")->as_integer(), 2);
+        auto const* extra = second->get("extra");
+        EXPECT_TRUE(extra != nullptr && extra->as_table() != nullptr);
+        if (extra != nullptr && extra->as_table() != nullptr) {
+            EXPECT_EQ(*extra->as_table()->get("v")->as_integer(), 9);
+        }
+    }
+
+    // And not the first, which is the part a "descend into the array"
+    // shortcut would get wrong.
+    auto const* first = (*arr)[0].as_table();
+    EXPECT_TRUE(first != nullptr);
+    if (first != nullptr) {
+        EXPECT_FALSE(first->contains("extra"));
+    }
+}
+
+TEST(toml_array_subtable, values_after_the_sub_table_header_land_in_the_sub_table)
+{
+    // The header also changes where following key-values go -- it returns the
+    // table the document is now writing into.
+    auto result = parse("[[s]]\n"
+                        "[s.a]\n"
+                        "one = 1\n"
+                        "two = 2\n");
+    EXPECT_TRUE(result.has_value());
+    if (result) {
+        auto const* a = (*result->get("s")->as_array())[0].as_table()->get("a");
+        EXPECT_TRUE(a != nullptr && a->as_table() != nullptr);
+        if (a != nullptr && a->as_table() != nullptr) {
+            EXPECT_EQ(a->as_table()->size(), 2U);
+            EXPECT_EQ(*a->as_table()->get("two")->as_integer(), 2);
+        }
+    }
+}
+
+TEST(toml_array_subtable, an_array_of_tables_nests_under_an_array_of_tables)
+{
+    // `[[s.t]]` has to resolve `s` the same way before appending to `t`.
+    auto result = parse("[[s]]\n"
+                        "x = 1\n"
+                        "[[s.t]]\n"
+                        "v = 1\n"
+                        "[[s.t]]\n"
+                        "v = 2\n");
+    EXPECT_TRUE(result.has_value());
+    if (!result) {
+        return;
+    }
+    auto const* outer = result->get("s")->as_array();
+    EXPECT_TRUE(outer != nullptr);
+    if (outer == nullptr || outer->size() != 1) {
+        return;
+    }
+    auto const* inner = (*outer)[0].as_table()->get("t");
+    EXPECT_TRUE(inner != nullptr && inner->as_array() != nullptr);
+    if (inner != nullptr && inner->as_array() != nullptr) {
+        EXPECT_EQ(inner->as_array()->size(), 2U);
+        EXPECT_EQ(*(*inner->as_array())[1].as_table()->get("v")->as_integer(), 2);
+    }
+}
+
+TEST(toml_array_subtable, a_deeper_path_descends_through_two_arrays)
+{
+    auto result = parse("[[s]]\n"
+                        "[[s.t]]\n"
+                        "[s.t.leaf]\n"
+                        "v = 5\n");
+    EXPECT_TRUE(result.has_value());
+    if (result) {
+        auto const* s = result->get("s")->as_array();
+        EXPECT_TRUE(s != nullptr);
+        if (s != nullptr && s->size() == 1) {
+            auto const* t = (*s)[0].as_table()->get("t")->as_array();
+            EXPECT_TRUE(t != nullptr);
+            if (t != nullptr && t->size() == 1) {
+                auto const* leaf = (*t)[0].as_table()->get("leaf");
+                EXPECT_TRUE(leaf != nullptr && leaf->as_table() != nullptr);
+                if (leaf != nullptr && leaf->as_table() != nullptr) {
+                    EXPECT_EQ(*leaf->as_table()->get("v")->as_integer(), 5);
+                }
+            }
+        }
+    }
+}
+
+TEST(toml_array_subtable, an_empty_array_has_no_element_to_attach_to)
+{
+    // `s = []` then `[s.x]`: the array exists and has no last element, so
+    // there is nothing the header could belong to. Still a failure, and the
+    // line number locates it.
+    Parser parser{"s = []\n[s.x]\nv = 1\n"};
+    auto result = parser.parse_document_public();
+    EXPECT_FALSE(result.has_value());
+    if (!result) {
+        EXPECT_EQ(result.error(), make_error_code(TomlError::type_mismatch));
+        EXPECT_EQ(parser.error_line(), 2U);
+    }
+}
+
+TEST(toml_array_subtable, an_array_of_plain_values_is_not_a_table_path)
+{
+    auto result = parse("s = [1, 2]\n[s.x]\nv = 1\n");
+    EXPECT_FALSE(result.has_value());
+    if (!result) {
+        EXPECT_EQ(result.error(), make_error_code(TomlError::type_mismatch));
+    }
+}
+
+TEST(toml_array_subtable, a_plain_value_in_the_path_still_fails)
+{
+    // The pre-existing guard, unchanged: a segment that holds an integer is
+    // not a table and not an array.
+    auto result = parse("s = 1\n[s.x]\nv = 1\n");
+    EXPECT_FALSE(result.has_value());
+    if (!result) {
+        EXPECT_EQ(result.error(), make_error_code(TomlError::type_mismatch));
+    }
+}
+
+TEST(toml_array_subtable, a_dotted_key_may_not_extend_an_array)
+{
+    // The other half of the rule, and why the descent is not in
+    // Table::get_or_create_table(): TOML allows a table HEADER to reach into
+    // an array's last element, but a dotted key may not. `s.y = 2` with `s`
+    // an array stays an error.
+    auto result = parse("s = [{ x = 1 }]\ns.y = 2\n");
+    EXPECT_FALSE(result.has_value());
+    if (!result) {
+        EXPECT_EQ(result.error(), make_error_code(TomlError::type_mismatch));
+    }
+}
+
+TEST(toml_quoted_dotted_key, the_interface_as_a_value_form_keeps_its_dots)
+{
+    // The shape to prefer in a schema, and the documented workaround while
+    // this was broken: the name is a value, not a key.
+    auto result = parse("[[stream]]\n"
+                        "interface = \"eth0.100\"\n"
+                        "[[stream]]\n"
+                        "interface = \"eth1.200\"\n");
+    EXPECT_TRUE(result.has_value());
+    if (result) {
+        auto const* arr = result->get("stream")->as_array();
+        EXPECT_TRUE(arr != nullptr);
+        if (arr != nullptr) {
+            EXPECT_EQ(arr->size(), 2U);
+            EXPECT_EQ(*(*arr)[0].as_table()->get("interface")->as_string(), "eth0.100");
+            EXPECT_EQ(*(*arr)[1].as_table()->get("interface")->as_string(), "eth1.200");
+        }
+    }
+}
+
+TEST(toml_quoted_dotted_key, an_unquoted_dotted_path_still_nests)
+{
+    // The other half of the contract: nothing about ordinary dotted keys
+    // changes, including a dotted key-value pair.
+    auto result = parse("[server]\n"
+                        "a.b.c = 1\n"
+                        "[x.y.z]\n"
+                        "v = 2\n");
+    EXPECT_TRUE(result.has_value());
+    if (result) {
+        EXPECT_EQ(*result->get_path("server.a.b.c")->as_integer(), 1);
+        EXPECT_EQ(*result->get_path("x.y.z.v")->as_integer(), 2);
+    }
 }
 
 //

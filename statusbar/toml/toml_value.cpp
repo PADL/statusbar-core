@@ -145,6 +145,30 @@ auto Table::get_path(std::string_view path) const -> Value const*
     return const_cast<Table*>(this)->get_path(path);
 }
 
+auto Table::get_path(std::span<std::string const> segments) -> Value*
+{
+    if (segments.empty()) {
+        return nullptr;
+    }
+    Table* current = this;
+    for (auto const& segment : segments.first(segments.size() - 1)) {
+        Value* v = current->get(segment);
+        if (v == nullptr) {
+            return nullptr;
+        }
+        current = v->as_table();
+        if (current == nullptr) {
+            return nullptr;
+        }
+    }
+    return current->get(segments.back());
+}
+
+auto Table::get_path(std::span<std::string const> segments) const -> Value const*
+{
+    return const_cast<Table*>(this)->get_path(segments);
+}
+
 auto Table::get_or_create_table(std::string_view path) -> Table*
 {
     // Iterative walk over dotted segments. The previous implementation
@@ -173,6 +197,27 @@ auto Table::get_or_create_table(std::string_view path) -> Table*
         current = t;
         path = path.substr(dot + 1);
     }
+}
+
+auto Table::get_or_create_table(std::span<std::string const> segments) -> Table*
+{
+    // The segmented form of the walk above. The parser uses this one, so a
+    // segment keeps whatever characters it was quoted with -- a dot in a
+    // segment is part of the key, not another level.
+    Table* current = this;
+    for (auto const& segment : segments) {
+        Value* v = current->get(segment);
+        if (v == nullptr) {
+            current->set(segment, Table{});
+            v = current->get(segment);
+        }
+        Table* t = v->as_table();
+        if (t == nullptr) {
+            return nullptr;  // Key exists but is not a table
+        }
+        current = t;
+    }
+    return current;
 }
 
 //
