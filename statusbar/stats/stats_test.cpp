@@ -469,6 +469,98 @@ TEST(stats_atomic_time, exact_below_clamp_threshold)
 // stats_atomic_wake - AtomicWakeStats tests
 // ---------------------------------------------------------------------------
 
+TEST(stats_atomic_wake, update_duration_adds_a_duration_without_inventing_an_error)
+{
+    // The reason this exists. A loop that learns its duration only after the
+    // work is done has, until now, had to call update_with_duration(0, d),
+    // which files a wake error of zero that never occurred.
+    AtomicWakeStats two_step;
+    two_step.update(-500);
+    two_step.update_duration(2'000);
+
+    AtomicWakeStats faked_error;
+    faked_error.update(-500);
+    faked_error.update_with_duration(0, 2'000);
+
+    // Same duration either way.
+    EXPECT_EQ(two_step.snapshot().duration.count, 1);
+    EXPECT_EQ(two_step.snapshot().duration.max_ns, 2'000);
+    EXPECT_EQ(faked_error.snapshot().duration.count, 1);
+
+    // The error statistics are not the same, and that is the bug being
+    // avoided: one wake error was recorded, not two, and the spread is the
+    // spread of the single real sample.
+    EXPECT_EQ(two_step.count(), 1);
+    EXPECT_EQ(two_step.min_ns(), -500);
+    EXPECT_EQ(two_step.max_ns(), -500);
+    EXPECT_TRUE(near(two_step.snapshot().stddev_ns(), 0.0));
+
+    EXPECT_EQ(faked_error.count(), 2);
+    EXPECT_EQ(faked_error.max_ns(), 0);
+    EXPECT_TRUE(near(faked_error.snapshot().average_ns(), -250.0));
+}
+
+TEST(stats_atomic_wake, update_then_update_duration_matches_the_single_call)
+{
+    // The two-step form must agree with update_with_duration() on every
+    // number it touches, or a caller switching between them sees the stats
+    // move for no reason.
+    AtomicWakeStats split;
+    split.update(500, 2);
+    split.update_duration(3'000);
+
+    AtomicWakeStats together;
+    together.update_with_duration(500, 3'000, 2);
+
+    auto const a = split.snapshot();
+    auto const b = together.snapshot();
+    EXPECT_EQ(a.error.count, b.error.count);
+    EXPECT_EQ(a.error.sum_ns, b.error.sum_ns);
+    EXPECT_EQ(a.error.min_ns, b.error.min_ns);
+    EXPECT_EQ(a.error.max_ns, b.error.max_ns);
+    EXPECT_EQ(a.duration.count, b.duration.count);
+    EXPECT_EQ(a.duration.sum_ns, b.duration.sum_ns);
+    EXPECT_EQ(a.duration.min_ns, b.duration.min_ns);
+    EXPECT_EQ(a.duration.max_ns, b.duration.max_ns);
+    EXPECT_EQ(a.skipped_counts, b.skipped_counts);
+    EXPECT_EQ(a.duration_histogram.total_count(), b.duration_histogram.total_count());
+    EXPECT_EQ(a.error_histogram.total_count(), b.error_histogram.total_count());
+}
+
+TEST(stats_atomic_wake, update_duration_with_skips_counts_both)
+{
+    AtomicWakeStats stats;
+    stats.update(250, 1);             // the wake: late, one tick already missed
+    stats.update_duration(1'500, 2);  // the work: and two more went by
+
+    EXPECT_EQ(stats.skipped_counts(), 3);
+    EXPECT_EQ(stats.count(), 1);  // still one wake error
+    auto const snap = stats.snapshot();
+    EXPECT_EQ(snap.duration.count, 1);
+    EXPECT_EQ(snap.duration.sum_ns, 1'500);
+    EXPECT_EQ(snap.duration_histogram.total_count(), 1);
+}
+
+TEST(stats_atomic_wake, update_duration_defaults_to_no_skips)
+{
+    AtomicWakeStats stats;
+    stats.update(0, 7);
+    stats.update_duration(900);  // default argument: adds nothing to skipped
+    EXPECT_EQ(stats.skipped_counts(), 7);
+    EXPECT_EQ(stats.snapshot().duration.count, 1);
+}
+
+TEST(stats_atomic_wake, update_duration_is_cleared_by_reset)
+{
+    AtomicWakeStats stats;
+    stats.update_duration(1'000, 4);
+    EXPECT_EQ(stats.skipped_counts(), 4);
+    stats.reset();
+    EXPECT_EQ(stats.skipped_counts(), 0);
+    EXPECT_EQ(stats.snapshot().duration.count, 0);
+    EXPECT_EQ(stats.snapshot().duration_histogram.total_count(), 0);
+}
+
 TEST(stats_atomic_wake, tracks_error_duration_and_skips)
 {
     AtomicWakeStats stats;
