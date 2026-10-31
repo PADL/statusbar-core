@@ -288,6 +288,42 @@ TEST(tc_launch_time, unsupported_asks_nothing_and_off_removes_only_ours)
     EXPECT_TRUE(tc.children.empty());
 }
 
+// Another mqprio or taprio root (a shaper's 9000:) is deleted before ours goes on: replaced in place, its
+// destroy would reset our TC map. A root that sets no traffic classes (fq) is replaced as before.
+TEST(tc_launch_time, another_mqprio_or_taprio_root_is_deleted_before_ours_is_laid)
+{
+    RecordingTc tc;
+    tc.root = QdiscInfo{.handle = make_handle(0x9000, 0), .parent = ROOT, .kind = "mqprio"};
+    auto queue = queue_zero_of_four();
+    queue.persistent_root = true;
+    auto const laid = settle_launch_time_queue(tc, IFINDEX, queue, LaunchTimeMode::off);
+    EXPECT_TRUE(laid && *laid == LaunchTimeQueueAction::installed);
+    EXPECT_TRUE((
+        tc.take() == std::vector<std::string>{"show root", "del root 9000:", "replace root mqprio 9100: num_tc 2", "show 9100:1"}));
+    tc.root = QdiscInfo{.handle = make_handle(0x8000, 0), .parent = ROOT, .kind = "taprio"};
+    (void)settle_launch_time_queue(tc, IFINDEX, queue, LaunchTimeMode::off);
+    EXPECT_TRUE((
+        tc.take() == std::vector<std::string>{"show root", "del root 8000:", "replace root mqprio 9100: num_tc 2", "show 9100:1"}));
+    tc.root = QdiscInfo{.handle = make_handle(0x8000, 0), .parent = ROOT, .kind = "fq"};
+    (void)settle_launch_time_queue(tc, IFINDEX, queue, LaunchTimeMode::off);
+    EXPECT_TRUE((tc.take() == std::vector<std::string>{"show root", "replace root mqprio 9100: num_tc 2", "show 9100:1"}));
+}
+
+TEST(tc_own_root, only_another_handle_s_mqprio_or_taprio_is_removed_before_ours)
+{
+    RecordingTc tc;
+    auto const other = QdiscInfo{.handle = make_handle(0x9100, 0), .parent = ROOT, .kind = "mqprio"};
+    auto const taprio = QdiscInfo{.handle = make_handle(0x8000, 0), .parent = ROOT, .kind = "taprio"};
+    auto const fq = QdiscInfo{.handle = make_handle(0x8000, 0), .parent = ROOT, .kind = "fq"};
+    EXPECT_TRUE(remove_other_tc_root(tc, IFINDEX, other, 0x9100) == StatusValue<bool>{false});
+    EXPECT_TRUE(remove_other_tc_root(tc, IFINDEX, default_root(), 0x9000) == StatusValue<bool>{false});
+    EXPECT_TRUE(remove_other_tc_root(tc, IFINDEX, fq, 0x9000) == StatusValue<bool>{false});
+    EXPECT_TRUE(tc.take().empty());
+    EXPECT_TRUE(remove_other_tc_root(tc, IFINDEX, other, 0x9000) == StatusValue<bool>{true});
+    EXPECT_TRUE(remove_other_tc_root(tc, IFINDEX, taprio, 0x9000) == StatusValue<bool>{true});
+    EXPECT_TRUE((tc.take() == std::vector<std::string>{"del root 9100:", "del root 8000:"}));
+}
+
 // remove_own_mqprio_root: an mqprio under another handle, or another kind under ours, is left alone
 TEST(tc_own_root, only_an_mqprio_with_our_handle_is_removed)
 {

@@ -211,6 +211,10 @@ class TcControl
 /// whether it was deleted. Errors: the delete's netlink errno.
 [[nodiscard]] auto remove_own_mqprio_root(TcControl& tc, int ifindex, uint16_t major) -> StatusValue<bool>;
 
+/// Delete @p root, @p ifindex's root, if it is an mqprio or taprio under another handle than @p major:0, before
+/// an mqprio of ours replaces it: replaced in place, its destroy would reset our TC map. Any other root stays.
+[[nodiscard]] auto remove_other_tc_root(TcControl& tc, int ifindex, QdiscInfo const& root, uint16_t major) -> StatusValue<bool>;
+
 /// A blocking NETLINK_ROUTE socket for qdisc requests. Each call sends one
 /// request and waits (at most about a second) for its acknowledgement. Not
 /// thread-safe; meant for the reactor thread, where a request is rare

@@ -399,6 +399,15 @@ auto remove_own_mqprio_root(TcControl& tc, int const ifindex, uint16_t const maj
     return tc.remove(ifindex, handle, ROOT).transform([] { return true; });
 }
 
+auto remove_other_tc_root(TcControl& tc, int const ifindex, QdiscInfo const& root, uint16_t const major) -> StatusValue<bool>
+{
+    bool const sets_tcs = root.kind == "mqprio" || root.kind == "taprio";  // both reset the TCs in their destroy
+    if (!sets_tcs || root.handle == 0 || root.handle == make_handle(major, 0)) {
+        return false;
+    }
+    return tc.remove(ifindex, root.handle, ROOT).transform([] { return true; });
+}
+
 auto TcClient::replace_kind(int const ifindex, uint32_t const parent, std::string_view const kind) -> Status
 {
     return send([&](std::span<uint8_t> out, uint32_t seq) { return build_replace_kind(out, ifindex, parent, kind, seq); });

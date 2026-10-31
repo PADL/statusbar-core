@@ -88,19 +88,28 @@ auto is_ours(StatusValue<QdiscInfo> const& root, MqprioQdisc const& mqprio) noex
     return root && root->handle == make_handle(mqprio.major, 0) && root->mqprio == mqprio;
 }
 
-/// @p mqprio as @p ifindex's root, kept when it already is: whether it was kept.
-auto put_root(TcControl& tc, int const ifindex, MqprioQdisc const& mqprio) -> StatusValue<bool>
+/// @p mqprio as @p ifindex's root over what is there.
+auto lay_root(TcControl& tc, int const ifindex, MqprioQdisc const& mqprio) -> Status
 {
-    if (is_ours(tc.get(ifindex, ROOT), mqprio)) {
-        return true;
-    }
     auto replaced = tc.replace_mqprio(ifindex, mqprio);
     if (!replaced && replaced.error() == std::errc::invalid_argument) {
         // Our handle with another layout, which mqprio refuses to change: deleted, and laid once more.
         (void)tc.remove(ifindex, make_handle(mqprio.major, 0), ROOT);
         replaced = tc.replace_mqprio(ifindex, mqprio);
     }
-    return replaced.transform([] { return false; });
+    return replaced;
+}
+
+/// @p mqprio as @p ifindex's root, kept when it already is: whether it was kept. Another mqprio or
+/// taprio root goes first (remove_other_tc_root).
+auto put_root(TcControl& tc, int const ifindex, MqprioQdisc const& mqprio) -> StatusValue<bool>
+{
+    auto const root = tc.get(ifindex, ROOT);
+    if (is_ours(root, mqprio)) {
+        return true;
+    }
+    auto const other = root ? remove_other_tc_root(tc, ifindex, *root, mqprio.major) : StatusValue<bool>{false};
+    return other.and_then([&](bool) { return lay_root(tc, ifindex, mqprio); }).transform([] { return false; });
 }
 
 /// @p etf on its parent, kept when it is already there: whether it was kept.

@@ -48,11 +48,9 @@ struct LaunchTimeQueue
     bool persistent_root{false};
 };
 
-/// The mqprio root for @p queue, not offloaded (hw 0): the socket's queue a traffic class that no skb
-/// priority maps to, as the kernel's frames would be dropped untimed by an etf. With ptp_queue, PTP has
-/// that queue's class, every other priority the queues past it, and any queue left stays idle;
-/// without, every priority goes to the other queues. Errors: invalid_argument for major 0, under 2 TX
-/// queues, a queue past them, or a ptp_queue not past the socket's with a queue past it.
+/// The mqprio root for @p queue (hw 0): no priority maps to the socket's queue; with ptp_queue, PTP has
+/// its class, the rest the queues past it, any other idle (docs/NET_MODULE.md). Errors: invalid_argument
+/// for major 0, under 2 TX queues, a queue past them, or a ptp_queue not past the socket's with one past it.
 [[nodiscard]] auto launch_time_mqprio(LaunchTimeQueue const& queue) noexcept -> StatusValue<MqprioQdisc>;
 
 /// The class the socket's queue hangs on: major:(queue + 1).
@@ -73,10 +71,9 @@ enum class LaunchTimeQueueAction : uint8_t
     removed,    ///< our root deleted, its etf with it (persistent_root: only our etf)
 };
 
-/// Bring @p ifindex's qdiscs to @p mode for @p queue. on: our mqprio root (kept when already so) and
-/// our etf on the queue's class (kept when already there); off: our root, if there, deleted with its
-/// etf; unsupported: no request. With persistent_root, off lays or keeps the root and deletes only an etf
-/// on the queue's class. Errors: the first refused request (TcControl::last_message()).
+/// Bring @p ifindex's qdiscs to @p mode for @p queue. on: our root and etf, each kept when there; off: our
+/// root deleted with its etf (persistent_root: the root laid or kept, only the etf deleted); unsupported:
+/// no request. Errors: the first refused request (TcControl::last_message()).
 [[nodiscard]] auto settle_launch_time_queue(TcControl& tc, int ifindex, LaunchTimeQueue const& queue, LaunchTimeMode mode)
     -> StatusValue<LaunchTimeQueueAction>;
 
