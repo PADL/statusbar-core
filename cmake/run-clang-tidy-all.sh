@@ -9,11 +9,12 @@
 # -P, and combines per-file findings into a single output file.
 #
 # Usage: run-clang-tidy-all.sh <clang_tidy> <build_dir> <jobs> <output_file>
+#        [plugin.so]
 
 set -e
 
-if [ $# -ne 4 ]; then
-    echo "Usage: $0 <clang_tidy> <build_dir> <jobs> <output_file>" >&2
+if [ $# -lt 4 ] || [ $# -gt 5 ]; then
+    echo "Usage: $0 <clang_tidy> <build_dir> <jobs> <output_file> [plugin.so]" >&2
     exit 1
 fi
 
@@ -21,6 +22,7 @@ CLANG_TIDY="$1"
 BUILD_DIR="$2"
 JOBS="$3"
 OUTPUT_FILE="$4"
+PLUGIN="$5"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TMPDIR="$BUILD_DIR/.clang-tidy-tmp"
@@ -60,7 +62,7 @@ if [ -z "$files" ]; then
 fi
 printf '%s\n' "$files" \
     | xargs -P "$JOBS" -I {} \
-    sh "$SCRIPT_DIR/run-clang-tidy.sh" "$CLANG_TIDY" "$BUILD_DIR" "$TMPDIR" {}
+    sh "$SCRIPT_DIR/run-clang-tidy.sh" "$CLANG_TIDY" "$BUILD_DIR" "$TMPDIR" {} "$PLUGIN"
 
 echo "Combining results into $OUTPUT_FILE..."
 cat "$TMPDIR"/*.txt 2>/dev/null | grep -v '^$' > "$OUTPUT_FILE" || true

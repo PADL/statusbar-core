@@ -49,8 +49,11 @@ else
     ruff_args=""
 fi
 
-# C/C++ sources
-find statusbar \
+# C/C++ sources. tidy/ joins them so the clang-tidy plugin is held to the same
+# style as everything else; tidy/tests/ carries its own .clang-format with
+# DisableFormat, because those fixtures are asserted by line number and a
+# reflow would silently move the lines the tests expect.
+find statusbar tidy \
     \( -name '*.cpp' -or -name '*.cppm' -or -name '*.hpp' -or -name '*.c' -or -name '*.h' \) \
     -print0 | xargs -0 "$CLANG_FORMAT" $clang_args
 

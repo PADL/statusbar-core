@@ -13,14 +13,25 @@
 # findings output.
 #
 # Usage: run-clang-tidy.sh <clang-tidy> <build-dir> <output-dir> <source-file>
+#        [plugin.so]
+#
+# The optional plugin is loaded with -load, which is how the house checks
+# (statusbar-*) reach clang-tidy at all. Omitted or missing, the run is the
+# stock check set.
 
 CLANG_TIDY="$1"
 BUILD_DIR="$2"
 OUTPUT_DIR="$3"
 SOURCE_FILE="$4"
+PLUGIN="$5"
 
 outfile="$OUTPUT_DIR/$(echo "$SOURCE_FILE" | tr '/' '_').txt"
 
-"$CLANG_TIDY" -p "$BUILD_DIR" "$SOURCE_FILE" 2>&1 \
+set --
+if [ -n "$PLUGIN" ] && [ -f "$PLUGIN" ]; then
+    set -- -load="$PLUGIN"
+fi
+
+"$CLANG_TIDY" "$@" -p "$BUILD_DIR" "$SOURCE_FILE" 2>&1 \
     | grep -v 'warnings generated\|errors generated\|Error while processing' \
     > "$outfile" || true

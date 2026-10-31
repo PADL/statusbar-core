@@ -1,0 +1,5 @@
+# These are clang-tidy fixtures, asserted by line number in
+# tidy/run-tidy-tests.sh. Reformatting them moves the lines the tests expect,
+# so they are left exactly as written.
+DisableFormat: true
+SortIncludes: Never
