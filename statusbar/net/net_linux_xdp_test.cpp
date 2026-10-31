@@ -549,10 +549,20 @@ TEST(xdp_raii, open_throws_on_failure)
 
 TEST(xdp_stub, open_fails)
 {
+    // An interface no host has. With real XDP support and root this test
+    // used to open "eth0" for real - attaching a program to the node's
+    // production link and taking it off again - and then fail because the
+    // open succeeded. The stub refuses any name; the real path refuses
+    // this one before it touches anything.
     XdpContext ctx;
-    XdpConfig config{.interface_name = "eth0"};
+    XdpConfig config{.interface_name = "statusbar-nosuch0"};
     auto status = ctx.open(config);
     EXPECT_FALSE(status.has_value());
+#    if !(defined(__linux__) && defined(HAVE_XDP))
+    if (!status) {
+        EXPECT_EQ(status.error(), XdpError::not_supported_on_platform);
+    }
+#    endif
 }
 
 TEST(xdp_stub, not_valid_by_default)
