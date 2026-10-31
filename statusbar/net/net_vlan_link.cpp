@@ -23,6 +23,10 @@
 #    include <linux/if_vlan.h>
 #    include <linux/netlink.h>
 #    include <linux/rtnetlink.h>
+// SIOCGIFVLAN is kernel UAPI and belongs to this header. Fedora's
+// glibc happens to reach it through <sys/ioctl.h>; Debian's does not,
+// so leaving it implicit compiles here and fails on the target.
+#    include <linux/sockios.h>
 #    include <net/if.h>
 #    include <sys/ioctl.h>
 #    include <sys/socket.h>
