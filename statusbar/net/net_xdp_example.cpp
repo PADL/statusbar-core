@@ -205,6 +205,12 @@ auto parse_toml_filter_tables(statusbar::config::Config const& toml_config, std:
     }
 
     // Build rules from typed UDP port vector
+    if (!config.udp_ports.empty()) {
+        std::println(
+            stderr,
+            "Note: --udp-port matches every IPv4/UDP frame; the port lies past the {}-byte TCAM window",
+            static_cast<int>(TCAM_WINDOW_BYTES));
+    }
     for (auto val : config.udp_ports) {
         rules.push_back(make_udp_port_rule(static_cast<std::uint16_t>(val), XdpAction::redirect_xsk));
     }
@@ -435,6 +441,18 @@ auto main(int argc, char** argv) -> int
         config.interface_name,
         statusbar::ieee::to_string(xdp.hardware_address()).view());
     std::println(stderr, "Mode: {}", config.bridge_mode ? "bridge" : "monitor");
+    // What the open actually got, which on a NIC without native XDP (the
+    // Pi 5's macb, say) is generic attach and a copy-mode bind.
+    std::println(
+        stderr,
+        "Attach: {}, bind: {}{}, bind retries: {}, program: {}",
+        xdp.attach_mode() == XdpAttachMode::native ? "native" : "generic",
+        xdp.zero_copy() ? "zero-copy" : "copy",
+        xdp.bind_mode() == XdpBindMode::copy ? " (requested copy)" : "",
+        xdp.bind_retries(),
+        xdp.adopted()      ? "adopted"
+            : xdp.pinned() ? "pinned"
+                           : "attached");
     if (tap.valid()) {
         std::println(stderr, "TAP device: {}", config.tap_name);
     }
@@ -476,6 +494,17 @@ auto main(int argc, char** argv) -> int
 
     std::println(stderr, "\nShutting down...");
     print_stats(xdp.stats());
+    if (auto const kernel = xdp.kernel_stats(); kernel) {
+        std::println(
+            stderr,
+            "Kernel: rx_dropped={} rx_invalid_descs={} tx_invalid_descs={} rx_ring_full={} rx_fill_ring_empty={} tx_ring_empty={}",
+            kernel->rx_dropped,
+            kernel->rx_invalid_descs,
+            kernel->tx_invalid_descs,
+            kernel->rx_ring_full,
+            kernel->rx_fill_ring_empty_descs,
+            kernel->tx_ring_empty_descs);
+    }
 
     return 0;
 }
