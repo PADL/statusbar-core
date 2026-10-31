@@ -49,7 +49,9 @@ class FileWriter
     //
 
     /// Write a complete Ethernet frame with current timestamp (zero-allocation).
-    /// @param packet The complete Ethernet frame as a span (must be > 14 bytes).
+    /// @param packet The frame as a span. Any length is written as-is,
+    ///        including one too short for an Ethernet header: a capture
+    ///        records what happened, and a runt is part of that.
     [[nodiscard]] auto write_packet(std::span<uint8_t const> packet) -> Status
     {
         return write_packet(get_current_time_in_microseconds(), packet);
@@ -57,8 +59,24 @@ class FileWriter
 
     /// Write a complete Ethernet frame with specified timestamp (zero-allocation).
     /// @param timestamp_us Timestamp in microseconds since epoch.
-    /// @param packet The complete Ethernet frame as a span (must be > 14 bytes).
+    /// @param packet The frame as a span. Any length is written as-is; see
+    ///        the overload above. Read such a record back with the raw
+    ///        read_packet(), since the Ethernet-parsing one reports zeroed
+    ///        addresses for a frame shorter than 14 bytes.
     [[nodiscard]] auto write_packet(uint64_t timestamp_us, std::span<uint8_t const> packet) -> Status;
+
+    /// Write a snapped (truncated) capture: the bytes kept, plus the length
+    /// the frame had on the wire. A reader needs the second number to know
+    /// it is looking at a fragment; without it a snapped capture claims
+    /// every frame was exactly as long as the part that was kept.
+    /// @param timestamp_us Timestamp in microseconds since epoch.
+    /// @param packet The captured bytes.
+    /// @param original_len The frame's length on the wire. Equal to
+    ///        packet.size() for a complete frame — which is what the
+    ///        overload above passes, so the two agree byte for byte.
+    /// @return PcapError::invalid_original_length if @p original_len is
+    ///         smaller than @p packet, which no reader could make sense of.
+    [[nodiscard]] auto write_packet(uint64_t timestamp_us, std::span<uint8_t const> packet, uint32_t original_len) -> Status;
 
     /// Write an Ethernet frame from components with current timestamp (zero-allocation).
     [[nodiscard]] auto write_packet(

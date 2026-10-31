@@ -40,6 +40,11 @@ auto FileReader::open(std::string const& filename) -> StatusValue<FileReader>
 
 auto FileReader::read_packet(uint64_t* timestamp_us, Packet& packet) -> StatusValue<bool>
 {
+    return read_packet(timestamp_us, packet, nullptr);
+}
+
+auto FileReader::read_packet(uint64_t* timestamp_us, Packet& packet, uint32_t* original_len) -> StatusValue<bool>
+{
     if (std::feof(file_.get()) != 0) {
         return success(false);
     }
@@ -59,9 +64,20 @@ auto FileReader::read_packet(uint64_t* timestamp_us, Packet& packet) -> StatusVa
     if (rec_header.incl_len > 32768 || rec_header.incl_len < 0) {
         return failure(PcapError::record_too_large);
     }
+    // A negative orig_len is the same class of nonsense as a negative
+    // incl_len: a 32-bit field read as signed, from a file we did not write.
+    if (rec_header.orig_len < 0) {
+        return failure(PcapError::invalid_record_header);
+    }
+    if (original_len != nullptr) {
+        *original_len = static_cast<uint32_t>(rec_header.orig_len);
+    }
     uint64_t const timestamp = (static_cast<uint64_t>(rec_header.ts_sec) * 1000000) + rec_header.ts_usec;
     packet.resize(static_cast<size_t>(rec_header.incl_len));
-    if (std::fread(packet.data(), packet.size(), 1, file_.get()) != 1) {
+    // fread(ptr, 0, 1) returns 0 and would read as a failure, so a
+    // zero-length record -- ours or another tool's -- is a record with no
+    // bytes, not a broken file. PcapngReader already guards this way.
+    if (!packet.empty() && std::fread(packet.data(), packet.size(), 1, file_.get()) != 1) {
         return failure(PcapError::file_read_failed);
     }
     if (!seen_first_timestamp_) {

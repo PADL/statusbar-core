@@ -11,6 +11,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <span>
 #include <string>
@@ -537,53 +538,11 @@ TEST(pcap_file_rw, write_and_read_with_ethernet_components)
     std::remove(filename.c_str());
 }
 
-TEST(pcap_file_rw, write_too_small_ignored)
-{
-    std::string const filename = "/tmp/statusbar_pcap_test_small.pcap";
-    std::remove(filename.c_str());
-
-    // Packet smaller than 14 bytes should be silently ignored
-    Packet small_frame;
-    for (int i = 0; i < 10; ++i) {
-        small_frame.push_back(static_cast<uint8_t>(i));
-    }
-
-    // Write a small frame (should be ignored) and a valid frame
-    {
-        auto wtr = FileWriter::open(filename);
-        EXPECT_TRUE(wtr.has_value());
-        auto& writer = *wtr;
-        (void)writer.write_packet(1000000ULL, small_frame);  // Should be ignored
-
-        Packet valid_frame;
-        for (int i = 0; i < 15; ++i) {
-            valid_frame.push_back(static_cast<uint8_t>(i));
-        }
-        (void)writer.write_packet(2000000ULL, valid_frame);  // Should be written
-        writer.flush();
-    }
-
-    // Read back - should only get the valid frame
-    {
-        auto rdr = FileReader::open(filename);
-        EXPECT_TRUE(rdr.has_value());
-        auto& reader = *rdr;
-        uint64_t timestamp = 0;
-        Packet read_frame;
-        auto step = reader.read_packet(&timestamp, read_frame);
-        EXPECT_TRUE(step.has_value());
-        bool got_packet = *step;
-        EXPECT_TRUE(got_packet);
-        EXPECT_EQ(read_frame.size(), 15U);
-
-        // No more packets
-        auto eof = reader.read_packet(&timestamp, read_frame);
-        EXPECT_TRUE(eof.has_value());
-        EXPECT_FALSE(*eof);
-    }
-
-    std::remove(filename.c_str());
-}
+// `write_too_small_ignored` lived here. It wrote a 10-byte frame and a
+// 15-byte frame and asserted the file held only the 15-byte one, which
+// pinned BUG-003 as intended behaviour. Its replacement is
+// `pcap_short_frame a_runt_between_two_frames_displaces_neither`, which
+// writes the same shape and asserts every frame survives.
 
 TEST(pcap_file_rw, open_nonexistent_throws)
 {
@@ -695,7 +654,9 @@ TEST(pcap_file_rw, read_short_frame_handled)
     std::string const filename = "/tmp/statusbar_pcap_test_short.pcap";
     std::remove(filename.c_str());
 
-    // Write a frame that's exactly 14 bytes (minimum for Ethernet)
+    // 15 bytes: an Ethernet header plus a single payload byte, which is
+    // what the payload-size assertion below reads. Exactly 14, and shorter,
+    // are covered by the pcap_short_frame group.
     Packet min_frame;
     for (int i = 0; i < 15; ++i) {
         min_frame.push_back(static_cast<uint8_t>(i));
@@ -1744,6 +1705,671 @@ TEST(pcap_writer_vector, write_packet_components_vector_with_ts)
     EXPECT_EQ(out[12], uint8_t{0x22});
     EXPECT_EQ(out[13], uint8_t{0xF0});
     EXPECT_EQ(out[14], uint8_t{0x55});
+
+    std::remove(path.c_str());
+}
+
+//
+// Original (wire) length tests (BUG-005)
+//
+// A snapped capture keeps part of a frame. incl_len is what is in the file;
+// orig_len is what was on the wire, and it is the only way a reader knows it
+// is looking at a fragment. Both writers used to set them equal with no way
+// to say otherwise, so every snapped capture claimed the frames were as
+// short as the bytes kept.
+//
+
+namespace {
+
+/// Fills a frame with a recognisable ramp so a byte assertion says which
+/// byte, not just that something differed.
+auto ramp_frame(size_t size) -> Packet
+{
+    Packet frame;
+    for (size_t i = 0; i < size; ++i) {
+        frame.push_back(static_cast<uint8_t>(i));
+    }
+    return frame;
+}
+
+/// Read a whole file, for comparing two writers' output byte for byte.
+auto slurp(std::string const& path) -> std::vector<uint8_t>
+{
+    std::vector<uint8_t> bytes;
+    // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        return bytes;
+    }
+    std::array<uint8_t, 512> chunk{};
+    size_t got = 0;
+    while ((got = std::fread(chunk.data(), 1, chunk.size(), f)) > 0) {
+        bytes.insert(bytes.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(got));
+    }
+    (void)std::fclose(f);
+    return bytes;
+}
+
+}  // namespace
+
+TEST(pcap_original_length, a_snapped_record_reports_the_wire_length)
+{
+    std::string const filename = "/tmp/statusbar_pcap_test_snapped.pcap";
+    std::remove(filename.c_str());
+    Packet const kept = ramp_frame(16);
+
+    {
+        auto wtr = FileWriter::open(filename);
+        EXPECT_TRUE(wtr.has_value());
+        if (wtr) {
+            // 16 bytes kept out of a 200-byte frame, as `tcpdump -s 16` would.
+            EXPECT_TRUE(wtr->write_packet(1000000ULL, kept, 200U).has_value());
+            wtr->flush();
+        }
+    }
+
+    auto rdr = FileReader::open(filename);
+    EXPECT_TRUE(rdr.has_value());
+    if (rdr) {
+        uint64_t ts = 0;
+        Packet read_back;
+        uint32_t original = 0;
+        auto step = rdr->read_packet(&ts, read_back, &original);
+        EXPECT_TRUE(step.has_value());
+        EXPECT_TRUE(*step);
+        EXPECT_EQ(read_back.size(), size_t{16});
+        EXPECT_EQ(original, uint32_t{200});
+    }
+
+    std::remove(filename.c_str());
+}
+
+TEST(pcap_original_length, a_complete_frame_reports_its_own_length)
+{
+    std::string const filename = "/tmp/statusbar_pcap_test_complete.pcap";
+    std::remove(filename.c_str());
+    Packet const frame = ramp_frame(20);
+
+    {
+        auto wtr = FileWriter::open(filename);
+        EXPECT_TRUE(wtr.has_value());
+        if (wtr) {
+            EXPECT_TRUE(wtr->write_packet(1000000ULL, frame).has_value());
+            wtr->flush();
+        }
+    }
+
+    auto rdr = FileReader::open(filename);
+    EXPECT_TRUE(rdr.has_value());
+    if (rdr) {
+        uint64_t ts = 0;
+        Packet read_back;
+        uint32_t original = 0;
+        auto step = rdr->read_packet(&ts, read_back, &original);
+        EXPECT_TRUE(step.has_value());
+        EXPECT_TRUE(*step);
+        EXPECT_EQ(original, uint32_t{20});
+    }
+
+    std::remove(filename.c_str());
+}
+
+TEST(pcap_original_length, matching_lengths_write_exactly_what_the_plain_overload_writes)
+{
+    // The plain overload routes through this one, so this asserts the
+    // routing rather than hoping the two stay in step.
+    std::string const plain_path = "/tmp/statusbar_pcap_test_eq_plain.pcap";
+    std::string const explicit_path = "/tmp/statusbar_pcap_test_eq_explicit.pcap";
+    std::remove(plain_path.c_str());
+    std::remove(explicit_path.c_str());
+    Packet const frame = ramp_frame(20);
+
+    {
+        auto plain = FileWriter::open(plain_path);
+        auto with_len = FileWriter::open(explicit_path);
+        EXPECT_TRUE(plain.has_value());
+        EXPECT_TRUE(with_len.has_value());
+        if (plain && with_len) {
+            EXPECT_TRUE(plain->write_packet(1000000ULL, frame).has_value());
+            EXPECT_TRUE(with_len->write_packet(1000000ULL, frame, 20U).has_value());
+            plain->flush();
+            with_len->flush();
+        }
+    }
+
+    auto const plain_bytes = slurp(plain_path);
+    EXPECT_FALSE(plain_bytes.empty());
+    EXPECT_TRUE(plain_bytes == slurp(explicit_path));
+
+    std::remove(plain_path.c_str());
+    std::remove(explicit_path.c_str());
+}
+
+TEST(pcap_original_length, a_wire_length_below_the_capture_is_refused)
+{
+    std::string const filename = "/tmp/statusbar_pcap_test_bad_origlen.pcap";
+    std::remove(filename.c_str());
+    Packet const kept = ramp_frame(16);
+
+    {
+        auto wtr = FileWriter::open(filename);
+        EXPECT_TRUE(wtr.has_value());
+        if (wtr) {
+            // A frame shorter than its own capture describes nothing.
+            auto status = wtr->write_packet(1000000ULL, kept, 10U);
+            EXPECT_FALSE(status.has_value());
+            EXPECT_EQ(status.error(), make_error_code(PcapError::invalid_original_length));
+            wtr->flush();
+        }
+    }
+
+    // Refused means nothing was written, not a half-written record: the file
+    // holds its header and no records.
+    auto rdr = FileReader::open(filename);
+    EXPECT_TRUE(rdr.has_value());
+    if (rdr) {
+        uint64_t ts = 0;
+        Packet read_back;
+        auto eof = rdr->read_packet(&ts, read_back);
+        EXPECT_TRUE(eof.has_value());
+        EXPECT_FALSE(*eof);
+    }
+
+    std::remove(filename.c_str());
+}
+
+TEST(pcap_original_length, a_negative_wire_length_in_a_file_is_refused)
+{
+    // orig_len is a signed 32-bit field in the record header. We never write
+    // a negative one; a file from elsewhere can carry one, and it must not
+    // reach a caller as a four-billion-byte frame.
+    std::string const filename = "/tmp/statusbar_pcap_test_neg_origlen.pcap";
+    std::remove(filename.c_str());
+
+    {
+        auto wtr = FileWriter::open(filename);
+        EXPECT_TRUE(wtr.has_value());
+        if (wtr) {
+            EXPECT_TRUE(wtr->write_packet(1000000ULL, ramp_frame(20)).has_value());
+            wtr->flush();
+        }
+    }
+
+    // Patch orig_len in place: 24-byte file header, then ts_sec, ts_usec and
+    // incl_len ahead of it.
+    {
+        // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
+        std::FILE* f = std::fopen(filename.c_str(), "r+b");
+        EXPECT_TRUE(f != nullptr);
+        if (f != nullptr) {
+            EXPECT_EQ(std::fseek(f, 24 + 12, SEEK_SET), 0);
+            std::array<uint8_t, 4> const negative{0xFF, 0xFF, 0xFF, 0xFF};
+            EXPECT_EQ(std::fwrite(negative.data(), negative.size(), 1, f), size_t{1});
+            (void)std::fclose(f);
+        }
+    }
+
+    auto rdr = FileReader::open(filename);
+    EXPECT_TRUE(rdr.has_value());
+    if (rdr) {
+        uint64_t ts = 0;
+        Packet read_back;
+        uint32_t original = 0;
+        auto step = rdr->read_packet(&ts, read_back, &original);
+        EXPECT_FALSE(step.has_value());
+        EXPECT_EQ(step.error(), make_error_code(PcapError::invalid_record_header));
+    }
+
+    std::remove(filename.c_str());
+}
+
+TEST(pcapng_original_length, a_snapped_block_reports_the_wire_length)
+{
+    std::string const path = "/tmp/statusbar_pcapng_test_snapped.pcapng";
+    std::remove(path.c_str());
+    Packet const kept = ramp_frame(16);
+
+    {
+        auto wtr = PcapngFileWriter::open(path);
+        EXPECT_TRUE(wtr.has_value());
+        if (wtr) {
+            EXPECT_TRUE(wtr->write_packet(uint64_t{1000000}, std::span<uint8_t const>{kept}, 200U).has_value());
+            wtr->flush();
+        }
+    }
+
+    auto rdr = PcapngReader::open(path);
+    EXPECT_TRUE(rdr.has_value());
+    if (rdr) {
+        uint64_t ts = 0;
+        Packet read_back;
+        uint32_t original = 0;
+        auto step = rdr->read_packet(&ts, read_back, &original);
+        EXPECT_TRUE(step.has_value());
+        EXPECT_TRUE(*step);
+        EXPECT_EQ(read_back.size(), size_t{16});
+        EXPECT_EQ(original, uint32_t{200});
+    }
+
+    std::remove(path.c_str());
+}
+
+TEST(pcapng_original_length, matching_lengths_write_exactly_what_the_plain_overload_writes)
+{
+    std::string const plain_path = "/tmp/statusbar_pcapng_test_eq_plain.pcapng";
+    std::string const explicit_path = "/tmp/statusbar_pcapng_test_eq_explicit.pcapng";
+    std::remove(plain_path.c_str());
+    std::remove(explicit_path.c_str());
+    Packet const frame = ramp_frame(20);
+
+    {
+        auto plain = PcapngFileWriter::open(plain_path);
+        auto with_len = PcapngFileWriter::open(explicit_path);
+        EXPECT_TRUE(plain.has_value());
+        EXPECT_TRUE(with_len.has_value());
+        if (plain && with_len) {
+            EXPECT_TRUE(plain->write_packet(uint64_t{1000000}, std::span<uint8_t const>{frame}).has_value());
+            EXPECT_TRUE(with_len->write_packet(uint64_t{1000000}, std::span<uint8_t const>{frame}, 20U).has_value());
+            plain->flush();
+            with_len->flush();
+        }
+    }
+
+    auto const plain_bytes = slurp(plain_path);
+    EXPECT_FALSE(plain_bytes.empty());
+    EXPECT_TRUE(plain_bytes == slurp(explicit_path));
+
+    std::remove(plain_path.c_str());
+    std::remove(explicit_path.c_str());
+}
+
+TEST(pcapng_original_length, a_wire_length_below_the_capture_is_refused)
+{
+    std::string const path = "/tmp/statusbar_pcapng_test_bad_origlen.pcapng";
+    std::remove(path.c_str());
+
+    auto wtr = PcapngFileWriter::open(path);
+    EXPECT_TRUE(wtr.has_value());
+    if (wtr) {
+        auto status = wtr->write_packet(uint64_t{1000000}, std::span<uint8_t const>{ramp_frame(16)}, 10U);
+        EXPECT_FALSE(status.has_value());
+        EXPECT_EQ(status.error(), make_error_code(PcapError::invalid_original_length));
+    }
+
+    std::remove(path.c_str());
+}
+
+TEST(pcapng_original_length, a_simple_packet_block_reports_its_wire_length)
+{
+    // An SPB carries only the wire length -- the captured length is whatever
+    // the block has room for. The reader already computed this number and
+    // threw it away.
+    std::string const path = "/tmp/statusbar_pcapng_test_spb_origlen.pcapng";
+    std::remove(path.c_str());
+
+    std::vector<uint8_t> data;
+    auto write_u32 = [&](uint32_t v) {
+        data.push_back(static_cast<uint8_t>(v & 0xFF));
+        data.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+        data.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+        data.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
+    };
+    auto write_u16 = [&](uint16_t v) {
+        data.push_back(static_cast<uint8_t>(v & 0xFF));
+        data.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+    };
+
+    // SHB: 8 header + 16 body + 4 options pad + 4 trailer
+    write_u32(0x0a0d0d0a);
+    write_u32(32);
+    write_u32(0x1a2b3c4d);
+    write_u16(1);
+    write_u16(0);
+    write_u32(0xFFFFFFFF);
+    write_u32(0xFFFFFFFF);
+    write_u32(0);
+    write_u32(32);
+
+    // IDB: snap length 16, so the reader keeps the captured bytes as they are
+    write_u32(1);
+    write_u32(24);
+    write_u16(1);
+    write_u16(0);
+    write_u32(16);
+    write_u32(0);
+    write_u32(24);
+
+    // SPB: 8 header + 4 body (original_length) + 16 data + 4 trailer = 32
+    write_u32(3);
+    write_u32(32);
+    write_u32(200);  // the frame was 200 bytes on the wire
+    for (uint8_t i = 0; i < 16; ++i) {
+        data.push_back(i);
+    }
+    write_u32(32);
+
+    {
+        // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
+        std::FILE* f = std::fopen(path.c_str(), "wb");
+        EXPECT_TRUE(f != nullptr);
+        if (f != nullptr) {
+            EXPECT_EQ(std::fwrite(data.data(), data.size(), 1, f), size_t{1});
+            (void)std::fclose(f);
+        }
+    }
+
+    auto rdr = PcapngReader::open(path);
+    EXPECT_TRUE(rdr.has_value());
+    if (rdr) {
+        uint64_t ts = 0;
+        Packet read_back;
+        uint32_t original = 0;
+        auto step = rdr->read_packet(&ts, read_back, &original);
+        EXPECT_TRUE(step.has_value());
+        EXPECT_TRUE(*step);
+        EXPECT_EQ(read_back.size(), size_t{16});
+        EXPECT_EQ(original, uint32_t{200});
+    }
+
+    std::remove(path.c_str());
+}
+
+TEST(pcapng_original_length, the_two_argument_read_still_works_on_a_snapped_block)
+{
+    // The nullptr path: a caller that does not care must not have to care.
+    std::string const path = "/tmp/statusbar_pcapng_test_snapped_nullptr.pcapng";
+    std::remove(path.c_str());
+
+    {
+        auto wtr = PcapngFileWriter::open(path);
+        EXPECT_TRUE(wtr.has_value());
+        if (wtr) {
+            EXPECT_TRUE(wtr->write_packet(uint64_t{1000000}, std::span<uint8_t const>{ramp_frame(16)}, 200U).has_value());
+            wtr->flush();
+        }
+    }
+
+    auto rdr = PcapngReader::open(path);
+    EXPECT_TRUE(rdr.has_value());
+    if (rdr) {
+        uint64_t ts = 0;
+        Packet read_back;
+        auto step = rdr->read_packet(&ts, read_back);
+        EXPECT_TRUE(step.has_value());
+        EXPECT_TRUE(*step);
+        EXPECT_EQ(read_back.size(), size_t{16});
+    }
+
+    std::remove(path.c_str());
+}
+
+//
+// Short-frame tests (BUG-003)
+//
+// A capture is a record of what happened. A frame shorter than an Ethernet
+// header is a runt or a truncation -- a wire event, and usually the very
+// thing someone opened a capture to look at -- so the writers carry it
+// instead of discarding it. The raw-span overloads write what they are
+// given; only the (da, sa, ethertype, payload) overloads impose a header,
+// and they cannot produce anything shorter than one.
+//
+
+TEST(pcap_short_frame, a_fourteen_byte_frame_round_trips)
+{
+    // Exactly 14 bytes is a complete Ethernet header with an empty payload:
+    // a frame, not a runt. The old `<= 14` guard destroyed it, and no test
+    // covered the boundary.
+    std::string const filename = "/tmp/statusbar_pcap_test_exactly_14.pcap";
+    std::remove(filename.c_str());
+    Packet const frame = ramp_frame(14);
+
+    {
+        auto wtr = FileWriter::open(filename);
+        EXPECT_TRUE(wtr.has_value());
+        if (wtr) {
+            EXPECT_TRUE(wtr->write_packet(1000000ULL, frame).has_value());
+            wtr->flush();
+        }
+    }
+
+    auto rdr = FileReader::open(filename);
+    EXPECT_TRUE(rdr.has_value());
+    if (rdr) {
+        uint64_t ts = 0;
+        Packet read_back;
+        auto step = rdr->read_packet(&ts, read_back);
+        EXPECT_TRUE(step.has_value());
+        EXPECT_TRUE(*step);
+        EXPECT_EQ(read_back.size(), size_t{14});
+        EXPECT_EQ(read_back[0], uint8_t{0});
+        EXPECT_EQ(read_back[13], uint8_t{13});
+    }
+
+    std::remove(filename.c_str());
+}
+
+TEST(pcap_short_frame, a_runt_frame_round_trips)
+{
+    std::string const filename = "/tmp/statusbar_pcap_test_runt.pcap";
+    std::remove(filename.c_str());
+    Packet const runt = ramp_frame(10);
+
+    {
+        auto wtr = FileWriter::open(filename);
+        EXPECT_TRUE(wtr.has_value());
+        if (wtr) {
+            EXPECT_TRUE(wtr->write_packet(1000000ULL, runt).has_value());
+            wtr->flush();
+        }
+    }
+
+    auto rdr = FileReader::open(filename);
+    EXPECT_TRUE(rdr.has_value());
+    if (rdr) {
+        uint64_t ts = 0;
+        Packet read_back;
+        auto step = rdr->read_packet(&ts, read_back);
+        EXPECT_TRUE(step.has_value());
+        EXPECT_TRUE(*step);
+        EXPECT_EQ(read_back.size(), size_t{10});
+        EXPECT_EQ(read_back[9], uint8_t{9});
+    }
+
+    std::remove(filename.c_str());
+}
+
+TEST(pcap_short_frame, a_runt_between_two_frames_displaces_neither)
+{
+    // The failure this replaces: the capture came back with two frames and
+    // read as complete, so nothing said the middle one had been dropped.
+    // This is what `write_too_small_ignored` used to assert as correct.
+    std::string const filename = "/tmp/statusbar_pcap_test_runt_middle.pcap";
+    std::remove(filename.c_str());
+    Packet const first = ramp_frame(15);
+    Packet const runt = ramp_frame(10);
+    Packet const last = ramp_frame(20);
+
+    {
+        auto wtr = FileWriter::open(filename);
+        EXPECT_TRUE(wtr.has_value());
+        if (wtr) {
+            EXPECT_TRUE(wtr->write_packet(1000000ULL, first).has_value());
+            EXPECT_TRUE(wtr->write_packet(2000000ULL, runt).has_value());
+            EXPECT_TRUE(wtr->write_packet(3000000ULL, last).has_value());
+            wtr->flush();
+        }
+    }
+
+    auto rdr = FileReader::open(filename);
+    EXPECT_TRUE(rdr.has_value());
+    if (rdr) {
+        std::array<size_t, 3> const want{15, 10, 20};
+        for (size_t const expected : want) {
+            uint64_t ts = 0;
+            Packet read_back;
+            auto step = rdr->read_packet(&ts, read_back);
+            EXPECT_TRUE(step.has_value());
+            EXPECT_TRUE(*step);
+            EXPECT_EQ(read_back.size(), expected);
+        }
+        uint64_t ts = 0;
+        Packet read_back;
+        auto eof = rdr->read_packet(&ts, read_back);
+        EXPECT_TRUE(eof.has_value());
+        EXPECT_FALSE(*eof);
+    }
+
+    std::remove(filename.c_str());
+}
+
+TEST(pcap_short_frame, a_runt_read_through_the_ethernet_overload_reports_no_addresses)
+{
+    // The record is kept, but it cannot be split into header and payload.
+    // The reader answers with zeroed addresses and an empty payload rather
+    // than refusing the record, so iteration continues; a caller that needs
+    // to tell this apart from a frame of zeroes must use the raw overload.
+    std::string const filename = "/tmp/statusbar_pcap_test_runt_eth.pcap";
+    std::remove(filename.c_str());
+    Packet const runt = ramp_frame(10);
+
+    {
+        auto wtr = FileWriter::open(filename);
+        EXPECT_TRUE(wtr.has_value());
+        if (wtr) {
+            EXPECT_TRUE(wtr->write_packet(1000000ULL, runt).has_value());
+            wtr->flush();
+        }
+    }
+
+    auto rdr = FileReader::open(filename);
+    EXPECT_TRUE(rdr.has_value());
+    if (rdr) {
+        uint64_t ts = 0;
+        statusbar::ieee::Eui48 da{};
+        statusbar::ieee::Eui48 sa{};
+        da.value = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        sa.value = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        uint16_t ethertype = 0xFFFF;
+        Packet payload;
+
+        auto step = rdr->read_packet(&ts, da, sa, &ethertype, payload);
+        EXPECT_TRUE(step.has_value());
+        EXPECT_TRUE(*step);
+        EXPECT_EQ(da.value[0], uint8_t{0});
+        EXPECT_EQ(sa.value[0], uint8_t{0});
+        EXPECT_EQ(ethertype, uint16_t{0});
+        EXPECT_TRUE(payload.empty());
+    }
+
+    std::remove(filename.c_str());
+}
+
+TEST(pcap_short_frame, an_empty_record_round_trips)
+{
+    // Not a frame anyone wants, but the writer no longer has a length it
+    // refuses, so an empty span has to go somewhere defined. It writes a
+    // zero-length record, and the reader reads one back instead of
+    // reporting file_read_failed on a zero-byte fread.
+    std::string const filename = "/tmp/statusbar_pcap_test_empty_record.pcap";
+    std::remove(filename.c_str());
+
+    {
+        auto wtr = FileWriter::open(filename);
+        EXPECT_TRUE(wtr.has_value());
+        if (wtr) {
+            EXPECT_TRUE(wtr->write_packet(1000000ULL, std::span<uint8_t const>{}).has_value());
+            EXPECT_TRUE(wtr->write_packet(2000000ULL, ramp_frame(20)).has_value());
+            wtr->flush();
+        }
+    }
+
+    auto rdr = FileReader::open(filename);
+    EXPECT_TRUE(rdr.has_value());
+    if (rdr) {
+        uint64_t ts = 0;
+        Packet read_back;
+        auto first = rdr->read_packet(&ts, read_back);
+        EXPECT_TRUE(first.has_value());
+        EXPECT_TRUE(*first);
+        EXPECT_TRUE(read_back.empty());
+        // The record that follows is still found, which is the part that
+        // matters: a zero-length record must not desynchronise the file.
+        auto second = rdr->read_packet(&ts, read_back);
+        EXPECT_TRUE(second.has_value());
+        EXPECT_TRUE(*second);
+        EXPECT_EQ(read_back.size(), size_t{20});
+    }
+
+    std::remove(filename.c_str());
+}
+
+TEST(pcapng_short_frame, a_fourteen_byte_frame_round_trips)
+{
+    std::string const path = "/tmp/statusbar_pcapng_test_exactly_14.pcapng";
+    std::remove(path.c_str());
+    Packet const frame = ramp_frame(14);
+
+    {
+        auto wtr = PcapngFileWriter::open(path);
+        EXPECT_TRUE(wtr.has_value());
+        if (wtr) {
+            EXPECT_TRUE(wtr->write_packet(uint64_t{1000000}, std::span<uint8_t const>{frame}).has_value());
+            wtr->flush();
+        }
+    }
+
+    auto rdr = PcapngReader::open(path);
+    EXPECT_TRUE(rdr.has_value());
+    if (rdr) {
+        uint64_t ts = 0;
+        Packet read_back;
+        auto step = rdr->read_packet(&ts, read_back);
+        EXPECT_TRUE(step.has_value());
+        EXPECT_TRUE(*step);
+        EXPECT_EQ(read_back.size(), size_t{14});
+        EXPECT_EQ(read_back[13], uint8_t{13});
+    }
+
+    std::remove(path.c_str());
+}
+
+TEST(pcapng_short_frame, a_runt_frame_round_trips_and_keeps_the_block_aligned)
+{
+    // 10 bytes pads to 12 in the block body. Getting that wrong does not
+    // corrupt the runt itself -- it desynchronises everything after it, so
+    // the frame that follows is the real assertion.
+    std::string const path = "/tmp/statusbar_pcapng_test_runt.pcapng";
+    std::remove(path.c_str());
+    Packet const runt = ramp_frame(10);
+    Packet const after = ramp_frame(21);
+
+    {
+        auto wtr = PcapngFileWriter::open(path);
+        EXPECT_TRUE(wtr.has_value());
+        if (wtr) {
+            EXPECT_TRUE(wtr->write_packet(uint64_t{1000000}, std::span<uint8_t const>{runt}).has_value());
+            EXPECT_TRUE(wtr->write_packet(uint64_t{2000000}, std::span<uint8_t const>{after}).has_value());
+            wtr->flush();
+        }
+    }
+
+    auto rdr = PcapngReader::open(path);
+    EXPECT_TRUE(rdr.has_value());
+    if (rdr) {
+        uint64_t ts = 0;
+        Packet read_back;
+        auto step = rdr->read_packet(&ts, read_back);
+        EXPECT_TRUE(step.has_value());
+        EXPECT_TRUE(*step);
+        EXPECT_EQ(read_back.size(), size_t{10});
+        EXPECT_EQ(read_back[9], uint8_t{9});
+
+        auto next = rdr->read_packet(&ts, read_back);
+        EXPECT_TRUE(next.has_value());
+        EXPECT_TRUE(*next);
+        EXPECT_EQ(read_back.size(), size_t{21});
+        EXPECT_EQ(read_back[20], uint8_t{20});
+    }
 
     std::remove(path.c_str());
 }

@@ -90,18 +90,31 @@ auto FileWriter::open(std::string const& filename) -> StatusValue<FileWriter>
 
 auto FileWriter::write_packet(uint64_t timestamp_us, std::span<uint8_t const> packet) -> Status
 {
-    if (packet.size() <= 14) {
-        return success();
+    // A complete frame: what was captured is what was on the wire. Routed
+    // through the snapped overload so the two cannot disagree on anything
+    // but orig_len.
+    return write_packet(timestamp_us, packet, static_cast<uint32_t>(packet.size()));
+}
+
+auto FileWriter::write_packet(uint64_t timestamp_us, std::span<uint8_t const> packet, uint32_t original_len) -> Status
+{
+    if (original_len < packet.size()) {
+        return failure(PcapError::invalid_original_length);
     }
+    // Any length is written, including one too short to hold an Ethernet
+    // header. A runt or a truncated frame is a wire event, and usually the
+    // reason someone opened a capture; pcap has no minimum record length.
     RecordHeader rec_header{};
     rec_header.ts_sec = static_cast<uint32_t>(timestamp_us / 1000000);
     rec_header.ts_usec = static_cast<uint32_t>(timestamp_us % 1000000);
     rec_header.incl_len = static_cast<int32_t>(packet.size());
-    rec_header.orig_len = rec_header.incl_len;
+    rec_header.orig_len = static_cast<int32_t>(original_len);
     if (std::fwrite(&rec_header, sizeof(rec_header), 1, file_.get()) != 1) {
         return failure(PcapError::file_write_failed);
     }
-    if (std::fwrite(packet.data(), packet.size(), 1, file_.get()) != 1) {
+    // fwrite(ptr, 0, 1) returns 0, which is indistinguishable from a write
+    // error, so an empty packet writes its header and nothing else.
+    if (!packet.empty() && std::fwrite(packet.data(), packet.size(), 1, file_.get()) != 1) {
         return failure(PcapError::file_write_failed);
     }
     return success();

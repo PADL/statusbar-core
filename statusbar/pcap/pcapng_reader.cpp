@@ -53,6 +53,11 @@ auto PcapngReader::open(std::string const& filename, std::pmr::memory_resource* 
 
 auto PcapngReader::read_packet(uint64_t* timestamp_us, Packet& packet) -> StatusValue<bool>
 {
+    return read_packet(timestamp_us, packet, nullptr);
+}
+
+auto PcapngReader::read_packet(uint64_t* timestamp_us, Packet& packet, uint32_t* original_len) -> StatusValue<bool>
+{
     while (true) {
         if (std::feof(file_.get()) != 0) {
             return success(false);
@@ -77,13 +82,13 @@ auto PcapngReader::read_packet(uint64_t* timestamp_us, Packet& packet) -> Status
             continue;
         }
         if (block_type == static_cast<uint32_t>(PcapngBlockType::EnhancedPacket)) {
-            if (!read_enhanced_packet(body_length, timestamp_us, packet)) {
+            if (!read_enhanced_packet(body_length, timestamp_us, packet, original_len)) {
                 return failure(PcapError::invalid_enhanced_packet);
             }
             return success(true);
         }
         if (block_type == static_cast<uint32_t>(PcapngBlockType::SimplePacket)) {
-            if (!read_simple_packet(body_length, timestamp_us, packet)) {
+            if (!read_simple_packet(body_length, timestamp_us, packet, original_len)) {
                 return failure(PcapError::invalid_simple_packet);
             }
             return success(true);
@@ -153,7 +158,7 @@ auto PcapngReader::read_interface_description(size_t body_length) -> bool
     return true;
 }
 
-auto PcapngReader::read_enhanced_packet(size_t body_length, uint64_t* timestamp_us, Packet& packet) -> bool
+auto PcapngReader::read_enhanced_packet(size_t body_length, uint64_t* timestamp_us, Packet& packet, uint32_t* original_len) -> bool
 {
     if (body_length < sizeof(PcapngEnhancedPacketBody)) {
         return false;
@@ -165,6 +170,9 @@ auto PcapngReader::read_enhanced_packet(size_t body_length, uint64_t* timestamp_
     uint32_t const ts_high = swap_ ? swap_bytes32(epb.timestamp_high) : epb.timestamp_high;
     uint32_t const ts_low = swap_ ? swap_bytes32(epb.timestamp_low) : epb.timestamp_low;
     uint32_t const captured_len = swap_ ? swap_bytes32(epb.captured_length) : epb.captured_length;
+    if (original_len != nullptr) {
+        *original_len = swap_ ? swap_bytes32(epb.original_length) : epb.original_length;
+    }
     uint64_t const ts_resol_default = 1000000;
     uint32_t const iface_id = swap_ ? swap_bytes32(epb.interface_id) : epb.interface_id;
     uint64_t const ts_resol = (iface_id < interfaces_.size()) ? interfaces_[iface_id].ts_resol : ts_resol_default;
@@ -198,7 +206,7 @@ auto PcapngReader::read_enhanced_packet(size_t body_length, uint64_t* timestamp_
     return true;
 }
 
-auto PcapngReader::read_simple_packet(size_t body_length, uint64_t* timestamp_us, Packet& packet) -> bool
+auto PcapngReader::read_simple_packet(size_t body_length, uint64_t* timestamp_us, Packet& packet, uint32_t* original_len) -> bool
 {
     if (body_length < sizeof(PcapngSimplePacketBody)) {
         return false;
@@ -207,13 +215,16 @@ auto PcapngReader::read_simple_packet(size_t body_length, uint64_t* timestamp_us
     if (std::fread(&spb, sizeof(spb), 1, file_.get()) != 1) {
         return false;
     }
-    uint32_t const original_len = swap_ ? swap_bytes32(spb.original_length) : spb.original_length;
+    uint32_t const wire_len = swap_ ? swap_bytes32(spb.original_length) : spb.original_length;
+    if (original_len != nullptr) {
+        *original_len = wire_len;
+    }
     uint32_t captured_len = static_cast<uint32_t>(body_length - sizeof(spb));
     if (!interfaces_.empty() && captured_len > interfaces_[0].snap_length) {
         captured_len = interfaces_[0].snap_length;
     }
-    if (captured_len > original_len) {
-        captured_len = original_len;
+    if (captured_len > wire_len) {
+        captured_len = wire_len;
     }
     if (captured_len > 65535) {
         return false;
