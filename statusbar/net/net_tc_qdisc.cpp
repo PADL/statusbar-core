@@ -551,6 +551,27 @@ constexpr int MAX_DUMP_READS = 256;
 /// better than one that stops.
 constexpr time_t REPLY_TIMEOUT_SECONDS = 2;
 
+/// A bound on how many datagrams read_ack() drains looking for its own
+/// acknowledgement, so a socket somebody keeps feeding cannot hold it.
+constexpr int MAX_ACK_READS = 16;
+
+/// What NLMSG_DONE says about the dump. Its payload is the dump's own
+/// return value, so a dump the kernel abandoned part way (-ENOBUFS, say)
+/// is the failure it names, not a success with the qdisc "not found".
+/// @param message The NLMSG_DONE, header included
+[[nodiscard]] auto dump_outcome(std::span<std::uint8_t const> message) noexcept -> StatusValue<bool>
+{
+    int value = 0;
+    if (message.size() < NLMSGHDR_SIZE + sizeof(value)) {
+        return true;  // a bare NLMSG_DONE, as older kernels send
+    }
+    std::memcpy(&value, message.data() + NLMSGHDR_SIZE, sizeof(value));
+    if (value < 0) {
+        return failure(std::error_code{-value, std::generic_category()});
+    }
+    return true;
+}
+
 /// Translate a failed recv(). A timeout is reported distinguishably so a
 /// caller can tell "the kernel did not answer" from "the socket broke".
 [[nodiscard]] auto recv_failure() noexcept -> std::error_code
@@ -662,31 +683,40 @@ auto TcClient::record_ack(std::span<std::uint8_t const> message) -> Status
     return success();
 }
 
-auto TcClient::apply_ack(std::span<std::uint8_t const> reply, std::uint32_t seq) -> Status
+auto TcClient::find_ack(std::span<std::uint8_t const> reply, std::uint32_t seq) noexcept
+    -> std::optional<std::span<std::uint8_t const>>
 {
     std::size_t at = 0;
     while (at + NLMSGHDR_SIZE <= reply.size()) {
         nlmsghdr header{};
         std::memcpy(&header, reply.data() + at, NLMSGHDR_SIZE);
         if (header.nlmsg_len < NLMSGHDR_SIZE || at + header.nlmsg_len > reply.size()) {
-            return failure(NetError::receive_failed);
+            return std::nullopt;
         }
         if (header.nlmsg_seq == seq && header.nlmsg_type == NLMSG_ERROR) {
-            return record_ack(reply.subspan(at, header.nlmsg_len));
+            return reply.subspan(at, header.nlmsg_len);
         }
         at += align4(header.nlmsg_len);
     }
-    return failure(NetError::receive_failed);
+    return std::nullopt;
 }
 
 auto TcClient::read_ack(std::uint32_t seq) -> Status
 {
     std::array<std::uint8_t, REPLY_BUFFER_SIZE> buffer{};
-    ssize_t const received = ::recv(fd_, buffer.data(), buffer.size(), 0);
-    if (received < 0) {
-        return failure(recv_failure());
+    for (int reads = 0; reads < MAX_ACK_READS; ++reads) {
+        ssize_t const received = ::recv(fd_, buffer.data(), buffer.size(), 0);
+        if (received < 0) {
+            return failure(recv_failure());
+        }
+        if (auto const ack = find_ack({buffer.data(), static_cast<std::size_t>(received)}, seq); ack) {
+            return record_ack(*ack);
+        }
+        // Not ours: the late answer to a request that already timed out,
+        // which taken as this one's would have put every call after it
+        // one acknowledgement behind.
     }
-    return apply_ack({buffer.data(), static_cast<std::size_t>(received)}, seq);
+    return failure(NetError::receive_failed);
 }
 
 auto TcClient::transact(std::span<std::uint8_t const> request) -> Status
@@ -766,7 +796,29 @@ auto TcClient::consider_reply(std::span<std::uint8_t const> message, DumpFilter 
     match = DumpMatch{.info = *info, .matched = true};
 }
 
-auto TcClient::scan_dump_chunk(std::span<std::uint8_t const> chunk, DumpFilter const& filter, DumpMatch& match) noexcept -> bool
+auto TcClient::scan_dump_message(std::span<std::uint8_t const> message, DumpFilter const& filter, DumpMatch& match)
+    -> StatusValue<bool>
+{
+    nlmsghdr header{};
+    std::memcpy(&header, message.data(), NLMSGHDR_SIZE);
+    if (header.nlmsg_seq == filter.seq && header.nlmsg_type == NLMSG_ERROR) {
+        // The kernel refused the dump. Skipped as "another message type"
+        // this would leave the read waiting out SO_RCVTIMEO for an
+        // NLMSG_DONE that never comes, and the caller told timed_out for
+        // what was an errno with a message attached.
+        if (auto status = record_ack(message); !status) {
+            return forward_failure(status);
+        }
+        return true;
+    }
+    if (header.nlmsg_type == NLMSG_DONE) {
+        return dump_outcome(message);
+    }
+    consider_reply(message, filter, match);
+    return false;
+}
+
+auto TcClient::scan_dump_chunk(std::span<std::uint8_t const> chunk, DumpFilter const& filter, DumpMatch& match) -> StatusValue<bool>
 {
     std::size_t at = 0;
     while (at + NLMSGHDR_SIZE <= chunk.size()) {
@@ -775,10 +827,10 @@ auto TcClient::scan_dump_chunk(std::span<std::uint8_t const> chunk, DumpFilter c
         if (header.nlmsg_len < NLMSGHDR_SIZE || at + header.nlmsg_len > chunk.size()) {
             return false;
         }
-        if (header.nlmsg_type == NLMSG_DONE) {
-            return true;
+        auto const done = scan_dump_message(chunk.subspan(at, header.nlmsg_len), filter, match);
+        if (!done || *done) {
+            return done;
         }
-        consider_reply(chunk.subspan(at, header.nlmsg_len), filter, match);
         at += align4(header.nlmsg_len);
     }
     return false;
@@ -792,7 +844,11 @@ auto TcClient::read_dump_stream(DumpFilter const& filter, DumpMatch& match) -> S
         if (received < 0) {
             return failure(recv_failure());
         }
-        if (scan_dump_chunk({buffer.data(), static_cast<std::size_t>(received)}, filter, match)) {
+        auto const done = scan_dump_chunk({buffer.data(), static_cast<std::size_t>(received)}, filter, match);
+        if (!done) {
+            return forward_failure(done);
+        }
+        if (*done) {
             return success();
         }
     }

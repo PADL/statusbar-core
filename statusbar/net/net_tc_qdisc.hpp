@@ -50,6 +50,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -369,11 +370,16 @@ class TcClient final : public TcControl
     /// Send a built request and read its acknowledgement.
     [[nodiscard]] auto transact(std::span<std::uint8_t const> request) -> Status;
 
-    /// Read the acknowledgement for sequence `seq`.
+    /// Read acknowledgements until the one for sequence `seq` arrives. The
+    /// answer to an earlier request that timed out can still be queued, and
+    /// reading exactly one datagram would take it for this request's and
+    /// leave the real one to poison the next; anything with another
+    /// sequence is drained and dropped instead.
     [[nodiscard]] auto read_ack(std::uint32_t seq) -> Status;
 
-    /// Find the ack for `seq` in a reply buffer and apply it.
-    [[nodiscard]] auto apply_ack(std::span<std::uint8_t const> reply, std::uint32_t seq) -> Status;
+    /// The NLMSG_ERROR for `seq` inside one reply buffer, if it holds one.
+    [[nodiscard]] static auto find_ack(std::span<std::uint8_t const> reply, std::uint32_t seq) noexcept
+        -> std::optional<std::span<std::uint8_t const>>;
 
     /// Record an NLMSG_ERROR's text and turn its errno into a Status.
     [[nodiscard]] auto record_ack(std::span<std::uint8_t const> message) -> Status;
@@ -385,9 +391,16 @@ class TcClient final : public TcControl
     /// Read the dump stream to NLMSG_DONE, keeping any match.
     [[nodiscard]] auto read_dump_stream(DumpFilter const& filter, DumpMatch& match) -> Status;
 
-    /// Walk one recv()'s worth of dump replies. True on NLMSG_DONE.
-    [[nodiscard]] static auto scan_dump_chunk(
-        std::span<std::uint8_t const> chunk, DumpFilter const& filter, DumpMatch& match) noexcept -> bool;
+    /// Walk one recv()'s worth of dump replies. True when the stream is
+    /// over; a dump the kernel refused or abandoned is the failure it names.
+    [[nodiscard]] auto scan_dump_chunk(std::span<std::uint8_t const> chunk, DumpFilter const& filter, DumpMatch& match)
+        -> StatusValue<bool>;
+
+    /// One message of a dump stream. True when it ends the stream: an
+    /// NLMSG_DONE, or the kernel's refusal of our dump (an NLMSG_ERROR for
+    /// our sequence), the latter reported as the errno it carries.
+    [[nodiscard]] auto scan_dump_message(std::span<std::uint8_t const> message, DumpFilter const& filter, DumpMatch& match)
+        -> StatusValue<bool>;
 
     /// Keep one reply if it is ours and is the qdisc we asked about.
     static auto consider_reply(std::span<std::uint8_t const> message, DumpFilter const& filter, DumpMatch& match) noexcept -> void;

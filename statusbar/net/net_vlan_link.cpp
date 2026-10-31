@@ -528,6 +528,10 @@ constexpr std::size_t REPLY_BUFFER_SIZE = 8192;
 /// better than one that stops.
 constexpr time_t REPLY_TIMEOUT_SECONDS = 2;
 
+/// A bound on how many datagrams read_ack() drains looking for its own
+/// acknowledgement, so a socket somebody keeps feeding cannot hold it.
+constexpr int MAX_ACK_READS = 16;
+
 /// Translate a failed recv(). A timeout is reported distinguishably so a
 /// caller can tell "the kernel did not answer" from "the socket broke".
 [[nodiscard]] auto recv_failure() noexcept -> std::error_code
@@ -661,36 +665,41 @@ auto VlanLinkClient::record_ack(std::span<std::uint8_t const> message) -> Status
     return success();
 }
 
-auto VlanLinkClient::apply_ack(std::span<std::uint8_t const> reply, std::uint32_t seq) -> Status
+auto VlanLinkClient::find_ack(std::span<std::uint8_t const> reply, std::uint32_t seq) noexcept
+    -> std::optional<std::span<std::uint8_t const>>
 {
     std::size_t at = 0;
     while (at + NLMSGHDR_SIZE <= reply.size()) {
         nlmsghdr header{};
         std::memcpy(&header, reply.data() + at, NLMSGHDR_SIZE);
         if (header.nlmsg_len < NLMSGHDR_SIZE || at + header.nlmsg_len > reply.size()) {
-            return failure(NetError::receive_failed);
+            return std::nullopt;
         }
         // One reply buffer can hold several messages, so the sequence is
-        // how our acknowledgement is told from any other. With one
-        // request outstanding at a time nothing else can be in here, but
-        // walking a buffer and taking the first NLMSG_ERROR found is the
-        // habit that breaks the day something else can be.
+        // how our acknowledgement is told from any other: a late answer to
+        // a request that timed out is the one that is actually seen.
         if (header.nlmsg_seq == seq && header.nlmsg_type == NLMSG_ERROR) {
-            return record_ack(reply.subspan(at, header.nlmsg_len));
+            return reply.subspan(at, header.nlmsg_len);
         }
         at += align4(header.nlmsg_len);
     }
-    return failure(NetError::receive_failed);
+    return std::nullopt;
 }
 
 auto VlanLinkClient::read_ack(std::uint32_t seq) -> Status
 {
     std::array<std::uint8_t, REPLY_BUFFER_SIZE> buffer{};
-    ssize_t const received = ::recv(fd_, buffer.data(), buffer.size(), 0);
-    if (received < 0) {
-        return failure(recv_failure());
+    for (int reads = 0; reads < MAX_ACK_READS; ++reads) {
+        ssize_t const received = ::recv(fd_, buffer.data(), buffer.size(), 0);
+        if (received < 0) {
+            return failure(recv_failure());
+        }
+        if (auto const ack = find_ack({buffer.data(), static_cast<std::size_t>(received)}, seq); ack) {
+            return record_ack(*ack);
+        }
+        // Not ours: drained, so it cannot be taken for the next request's.
     }
-    return apply_ack({buffer.data(), static_cast<std::size_t>(received)}, seq);
+    return failure(NetError::receive_failed);
 }
 
 auto VlanLinkClient::transact(std::span<std::uint8_t const> request) -> Status

@@ -40,6 +40,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -280,8 +281,13 @@ class VlanLinkClient final : public VlanControl
     /// Whether this client created `name` and still has it.
     [[nodiscard]] auto holds(std::string_view name) const noexcept -> bool;
 
+    /// Read acknowledgements until the one for sequence `seq` arrives,
+    /// draining any late answer to a request that already timed out, which
+    /// taken as this one's would put every call after it one ack behind.
     [[nodiscard]] auto read_ack(std::uint32_t seq) -> Status;
-    [[nodiscard]] auto apply_ack(std::span<std::uint8_t const> reply, std::uint32_t seq) -> Status;
+    /// The NLMSG_ERROR for `seq` inside one reply buffer, if it holds one.
+    [[nodiscard]] static auto find_ack(std::span<std::uint8_t const> reply, std::uint32_t seq) noexcept
+        -> std::optional<std::span<std::uint8_t const>>;
     [[nodiscard]] auto record_ack(std::span<std::uint8_t const> message) -> Status;
 
     int fd_{-1};
