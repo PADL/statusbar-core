@@ -161,6 +161,9 @@ TEST(net_rss, loopback_has_no_indirection_table)
 
 TEST(net_rss, an_unknown_interface_is_not_operation_not_supported)
 {
+#if !defined(__linux__)
+    SKIP("RSS steering is Linux-only; the stub answers operation_not_supported for every name");
+#endif
     // A name no host has must be told apart from a NIC without RSS, or a
     // typo looks like "nothing to steer".
     auto const steered = set_rss_indirection_all("statusbar-no-such-if", 0);
@@ -172,6 +175,9 @@ TEST(net_rss, an_unknown_interface_is_not_operation_not_supported)
 
 TEST(net_rss, an_oversize_interface_name_is_refused)
 {
+#if !defined(__linux__)
+    SKIP("RSS steering is Linux-only; the stub answers operation_not_supported for every name");
+#endif
     std::string const too_long(64, 'e');
     auto const steered = set_rss_indirection_all(too_long, 0);
     EXPECT_FALSE(steered.has_value());
@@ -407,6 +413,9 @@ TEST(net_rss, reading_loopbacks_table_reports_no_rss)
 
 TEST(net_rss, reading_an_unknown_interface_is_told_apart_from_no_rss)
 {
+#if !defined(__linux__)
+    SKIP("RSS steering is Linux-only; the stub answers operation_not_supported for every name");
+#endif
     auto const table = rss_indirection("statusbar-no-such-if");
     EXPECT_FALSE(table.has_value());
     if (!table) {

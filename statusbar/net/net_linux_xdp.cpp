@@ -90,6 +90,7 @@ auto XdpErrorCategory::message(int ev) const -> std::string
 // XdpProgram
 // ──────────────────────────────────────────────
 
+#if defined(__linux__) && defined(HAVE_XDP)
 namespace {
 
 /// The kernel's id for whatever the descriptor refers to, 0 if it will not
@@ -267,6 +268,7 @@ constexpr uint32_t IdentityEntries = 1;
 }
 
 }  // namespace
+#endif  // __linux__ && HAVE_XDP
 
 auto XdpProgram::pin_path_for(std::string_view const interface_name) -> std::string
 {

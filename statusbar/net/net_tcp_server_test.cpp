@@ -425,6 +425,9 @@ TEST(net_tcp_server_local, the_local_address_reports_the_socket_path)
 
 TEST(net_tcp_server_local, a_seqpacket_listener_keeps_message_boundaries)
 {
+#if !defined(__linux__)
+    SKIP("AF_UNIX SOCK_SEQPACKET is Linux-only");
+#endif
     // Two writes in, two whole messages out. On a stream the two could
     // arrive as one read; seqpacket is the reason this mode exists.
     LocalPath const path{"seq"};

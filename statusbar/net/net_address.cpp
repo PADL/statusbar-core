@@ -167,10 +167,12 @@ namespace {
 /// it cannot be mistaken for a nameless failure.
 auto local_nameless_to_string(sockaddr_un const& sun, socklen_t length) -> std::string
 {
-    // extent 0 is family-only, what accept() reports for a peer that never
-    // bound; extent 1 is a lone NUL, bound to nothing a name is made of.
+    // extent 0 is family-only, what Linux's accept() reports for a peer
+    // that never bound; extent 1 is a lone NUL, bound to nothing a name is
+    // made of; and Darwin reports that unbound peer as a sun_path of zeros
+    // at full length. Nothing but NULs is no name on any of them.
     size_t const extent = sun_path_extent(sun, length);
-    if (extent <= 1) {
+    if (std::string_view{sun.sun_path, extent}.find_first_not_of('\0') == std::string_view::npos) {
         return "<unnamed>";
     }
     // An abstract name is a byte string, not a C string: it may hold NULs
