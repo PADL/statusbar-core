@@ -16,7 +16,9 @@
 
 #include <cerrno>
 #include <cstdint>
+#include <cstring>
 #include <expected>
+#include <optional>
 #include <string_view>
 #include <system_error>
 
@@ -25,6 +27,10 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <sys/socket.h>
+
+#if !defined(__linux__)
+#    include <ifaddrs.h>
+#endif
 
 namespace statusbar::net {
 
@@ -233,13 +239,51 @@ using FileDescriptor = ::statusbar::FileDescriptor;
     return fd;
 }
 
+#if !defined(__linux__)
+/// The first IPv4 address in an interface list that belongs to the interface
+/// with index `interface_index`, in network order.
+[[nodiscard]] inline auto first_ipv4_of(ifaddrs const* list, unsigned int const interface_index) noexcept -> std::optional<uint32_t>
+{
+    for (ifaddrs const* ifa = list; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == nullptr || ifa->ifa_addr->sa_family != AF_INET || ::if_nametoindex(ifa->ifa_name) != interface_index) {
+            continue;
+        }
+        sockaddr_in address{};
+        std::memcpy(&address, ifa->ifa_addr, sizeof(address));
+        return address.sin_addr.s_addr;
+    }
+    return std::nullopt;
+}
+
+/// The IPv4 address of the interface with index `interface_index`, in network
+/// order, for the BSD socket options that can only name an interface by
+/// address. 0 is "any". nullopt for an index no interface has, or one with no
+/// IPv4 address - which, to a multicast join, are the same thing.
+[[nodiscard]] inline auto ipv4_of_interface(unsigned int const interface_index) noexcept -> std::optional<uint32_t>
+{
+    if (interface_index == 0) {
+        return htonl(INADDR_ANY);
+    }
+    ifaddrs* list = nullptr;
+    if (::getifaddrs(&list) != 0) {
+        return std::nullopt;
+    }
+    auto const found = first_ipv4_of(list, interface_index);
+    ::freeifaddrs(list);
+    return found;
+}
+#endif
+
 /// Join IPv4 multicast `group` on the interface with index `interface_index`
 /// (0: the kernel's choice by routing table).
 ///
 /// The interface is an index rather than a name because the caller has already
 /// resolved it; taking a name here would mean a second if_nametoindex() per
-/// join. On platforms without ip_mreqn the index cannot be expressed and the
-/// kernel chooses regardless of what is passed.
+/// join. Linux takes the index through ip_mreqn. Darwin accepts an ip_mreqn
+/// but reads only the ip_mreq it begins with and ignores the index - a join by
+/// lo0's index landed on the default route's interface, checked - so there and
+/// on the BSDs the interface is named by its IPv4 address, looked up from the
+/// index. An index no interface has fails as ENODEV, as it does on Linux.
 /// @param fd An IPv4 datagram socket
 /// @param group The multicast group to join (224.0.0.0/4)
 /// @param interface_index Index of the interface to join on, or 0 for any
@@ -255,11 +299,14 @@ using FileDescriptor = ::statusbar::FileDescriptor;
     ip_mreqn request{};
     request.imr_ifindex = static_cast<int>(interface_index);
 #else
-    (void)interface_index;
     ip_mreq request{};
-    request.imr_interface.s_addr = ::htonl(INADDR_ANY);
+    if (auto const address = ipv4_of_interface(interface_index); address) {
+        request.imr_interface.s_addr = *address;
+    } else {
+        return failure(std::error_code{ENODEV, std::system_category()});
+    }
 #endif
-    request.imr_multiaddr.s_addr = ::htonl(group.to_uint32());
+    request.imr_multiaddr.s_addr = htonl(group.to_uint32());
     if (::setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &request, sizeof(request)) != 0) {
         return failure(errno_code());
     }
@@ -274,13 +321,16 @@ using FileDescriptor = ::statusbar::FileDescriptor;
 /// needed. An RTCP session on a group has to hear its own reports to recognise
 /// and skip its own SSRC; a talker that only sends does not, and the copy is
 /// wasted work on every packet.
+/// Unlike the join, IP_MULTICAST_IF does take the index through ip_mreqn on
+/// Darwin and FreeBSD as well as Linux: reading the option back after setting
+/// it by index names that interface's address, checked on a Mac.
 /// @param fd An IPv4 datagram socket
 /// @param interface_index Index of the egress interface, or 0 for the route
 /// @param ttl Multicast TTL - 1 keeps traffic on the local link
 /// @param loop Whether sends are looped back to listeners on this host
 [[nodiscard]] inline auto set_multicast_send(int fd, unsigned int interface_index, uint8_t ttl, bool loop) noexcept -> Status
 {
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
     if (interface_index != 0) {
         ip_mreqn request{};
         request.imr_ifindex = static_cast<int>(interface_index);
