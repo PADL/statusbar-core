@@ -19,7 +19,9 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace statusbar::net {
@@ -27,6 +29,18 @@ namespace statusbar::net {
 /// A NIC's RSS indirection table: entry i is the RX queue that hash bucket i
 /// is steered to.
 using RssIndirection = std::vector<uint32_t>;
+
+/// The interface's RSS indirection table as the NIC reports it.
+///
+/// Needs no privilege, which is what makes it usable as a startup check: read
+/// the table, and if rss_steered_to() says it is single-queue when we did not
+/// put it there, it is a leftover from a run that died before restoring.
+///
+/// An interface with no indirection table - `lo`, a veth, most virtual
+/// interfaces - fails with `std::errc::operation_not_supported`,
+/// distinguishably from a name that does not exist.
+/// @param interface_name The interface to read, 1 to IFNAMSIZ-1 bytes
+[[nodiscard]] auto rss_indirection(std::string_view interface_name) -> StatusValue<RssIndirection>;
 
 /// Point every RSS hash bucket of `interface_name` at `queue_id`, and return
 /// the table as it was.
@@ -57,6 +71,22 @@ using RssIndirection = std::vector<uint32_t>;
 /// @param table One RX queue index per hash bucket
 [[nodiscard]] auto set_rss_indirection(std::string_view interface_name, std::span<uint32_t const> table) -> Status;
 
+/// A table of `entries` buckets, every one of them `queue_id`. Public because
+/// a caller restoring or auditing a table needs to build the one we would
+/// have written.
+/// @param entries How many hash buckets the table has
+/// @param queue_id The RX queue every bucket should land on
+[[nodiscard]] auto rss_indirection_all(size_t entries, uint32_t queue_id) -> RssIndirection;
+
+/// Whether every bucket of a non-empty table already goes to `queue_id`.
+///
+/// With rss_indirection() this is the startup check: a table that is
+/// single-queue when we did not put it there is the previous run's leftover,
+/// not a configuration. An empty table is not steered anywhere.
+/// @param table The table to examine
+/// @param queue_id The RX queue to test for
+[[nodiscard]] auto rss_steered_to(std::span<uint32_t const> table, uint32_t queue_id) noexcept -> bool;
+
 namespace detail {
 
 /// What set_rss_indirection_all decides once it has the current table. Split
@@ -82,16 +112,142 @@ struct RssSteerPlan
 [[nodiscard]] auto plan_rss_steer(std::span<uint32_t const> current, uint32_t rx_queues, uint32_t queue_id)
     -> StatusValue<RssSteerPlan>;
 
-/// Whether every bucket of a non-empty table already goes to `queue_id`.
-/// @param table The table to examine
-/// @param queue_id The RX queue to test for
-[[nodiscard]] auto is_steered_to(std::span<uint32_t const> table, uint32_t queue_id) noexcept -> bool;
-
-/// A table of `entries` buckets, every one of them `queue_id`.
-/// @param entries How many hash buckets the table has
-/// @param queue_id The RX queue every bucket should land on
-[[nodiscard]] auto make_steered_table(size_t entries, uint32_t queue_id) -> RssIndirection;
-
 }  // namespace detail
+
+// ---------------------------------------------------------------------------
+// Who owns putting the table back
+// ---------------------------------------------------------------------------
+//
+// The answer is RssSteering, and it is an RAII guard rather than a documented
+// duty, because the documented duty is what the caller this module was
+// modelled on already failed to do: it steered, dropped the previous table on
+// the floor, and left every other user of that NIC - the host's own TCP
+// included - on a single-queue table until an administrator ran
+// `ethtool -X <if> default`. A return value nobody reads is not a restore
+// mechanism.
+//
+// It is best-effort and nothing can make it more than that. A crash or a
+// SIGKILL leaks the change whatever user space intended, so a caller that
+// needs the table to always be right must ALSO check at startup, with
+// rss_indirection() and rss_steered_to(): a single-queue table we did not
+// write is the previous run's leftover. Say so out loud rather than trusting
+// the destructor.
+
+/// The two writes and one read a steerer needs of a NIC.
+///
+/// An interface rather than free calls so that the restore protocol can be
+/// tested at all: a real steer needs a multi-queue NIC and CAP_NET_ADMIN,
+/// which no test host here has, and "the table came back byte for byte" is
+/// the whole point of this module. RssEthtool is the real one; RssRecorder in
+/// net_rss_recorder.hpp is the double.
+class RssControl
+{
+  public:
+    RssControl() = default;
+    virtual ~RssControl() = default;
+    RssControl(RssControl const&) = delete;
+    auto operator=(RssControl const&) -> RssControl& = delete;
+    RssControl(RssControl&&) = delete;
+    auto operator=(RssControl&&) -> RssControl& = delete;
+
+    /// The table as the NIC reports it.
+    [[nodiscard]] virtual auto indirection(std::string_view interface_name) -> StatusValue<RssIndirection> = 0;
+
+    /// Write a table as given.
+    [[nodiscard]] virtual auto set_indirection(std::string_view interface_name, std::span<uint32_t const> table) -> Status = 0;
+
+    /// Steer every bucket to one queue, returning the table as it was.
+    [[nodiscard]] virtual auto steer_all(std::string_view interface_name, uint32_t queue_id) -> StatusValue<RssIndirection> = 0;
+};
+
+/// The RssControl that talks to a NIC, through ethtool's ioctls.
+class RssEthtool final : public RssControl
+{
+  public:
+    [[nodiscard]] auto indirection(std::string_view interface_name) -> StatusValue<RssIndirection> override
+    {
+        return rss_indirection(interface_name);
+    }
+
+    [[nodiscard]] auto set_indirection(std::string_view interface_name, std::span<uint32_t const> table) -> Status override
+    {
+        return set_rss_indirection(interface_name, table);
+    }
+
+    [[nodiscard]] auto steer_all(std::string_view interface_name, uint32_t queue_id) -> StatusValue<RssIndirection> override
+    {
+        return set_rss_indirection_all(interface_name, queue_id);
+    }
+};
+
+/// Holds an interface steered to one RX queue, and puts the table back.
+///
+/// Make one with steer() and keep it for as long as the socket holds the
+/// queue. Destruction restores; restore() does the same thing where the
+/// caller wants to see the error, since a destructor has nobody to report to.
+/// release() gives up the restore on purpose, for a dedicated appliance NIC
+/// where the single-queue table IS the configuration.
+///
+/// Nothing is owed when the NIC was already steered where we wanted it: there
+/// was no write, so there is nothing to undo, and the guard will not issue one
+/// - a write can cost a link reset on some drivers.
+class RssSteering
+{
+  public:
+    /// A guard that owes nothing.
+    RssSteering() = default;
+
+    ~RssSteering();
+
+    RssSteering(RssSteering&& other) noexcept;
+    auto operator=(RssSteering&& other) noexcept -> RssSteering&;
+
+    RssSteering(RssSteering const&) = delete;
+    auto operator=(RssSteering const&) -> RssSteering& = delete;
+
+    /// Steer `interface_name` to `queue_id` and remember the table as it was.
+    ///
+    /// Fails with whatever set_rss_indirection_all() fails with, and in
+    /// particular `operation_not_supported` for a NIC with no RSS, which a
+    /// caller reads as "nothing to steer" rather than as a fault.
+    /// @param control The NIC to steer; must outlive the guard
+    /// @param interface_name The interface to steer
+    /// @param queue_id The RX queue every bucket should land on
+    [[nodiscard]] static auto steer(RssControl& control, std::string_view interface_name, uint32_t queue_id)
+        -> StatusValue<RssSteering>;
+
+    /// Put the remembered table back. Success when there was nothing owed, so
+    /// it is safe to call twice; on failure the guard keeps owing the restore
+    /// and the destructor will try once more.
+    ///
+    /// Refuses with `std::errc::state_not_recoverable` when the NIC's table is
+    /// no longer the size we read - its channel count changed underneath us,
+    /// and the table we hold no longer describes it. Writing it anyway would
+    /// be a guess at the new layout.
+    [[nodiscard]] auto restore() -> Status;
+
+    /// Give up the restore deliberately, leaving the NIC steered.
+    auto release() noexcept -> void;
+
+    /// Whether a restore is still owed.
+    [[nodiscard]] auto holds_table() const noexcept -> bool { return control_ != nullptr; }
+
+    /// The table as it was before the steer, while one is owed.
+    [[nodiscard]] auto previous() const noexcept -> std::span<uint32_t const> { return previous_; }
+
+    /// The interface this guard owes a restore on.
+    [[nodiscard]] auto interface_name() const noexcept -> std::string_view { return interface_; }
+
+  private:
+    RssSteering(RssControl& control, std::string_view interface_name, RssIndirection previous);
+
+    /// Whether the table we remember can still be written: success, or the
+    /// reason not. Reads the NIC, so it is the first half of restore().
+    [[nodiscard]] auto restorable() const -> Status;
+
+    RssControl* control_{nullptr};
+    std::string interface_;
+    RssIndirection previous_;
+};
 
 }  // namespace statusbar::net

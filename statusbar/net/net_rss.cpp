@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <system_error>
+#include <utility>
 
 #if defined(__linux__)
 #    include "statusbar/net/net_posix_util.hpp"
@@ -16,17 +17,17 @@
 
 namespace statusbar::net {
 
-namespace detail {
-
-auto make_steered_table(size_t const entries, uint32_t const queue_id) -> RssIndirection
+auto rss_indirection_all(size_t const entries, uint32_t const queue_id) -> RssIndirection
 {
     return RssIndirection(entries, queue_id);
 }
 
-auto is_steered_to(std::span<uint32_t const> const table, uint32_t const queue_id) noexcept -> bool
+auto rss_steered_to(std::span<uint32_t const> const table, uint32_t const queue_id) noexcept -> bool
 {
     return !table.empty() && std::ranges::all_of(table, [queue_id](uint32_t const queue) { return queue == queue_id; });
 }
+
+namespace detail {
 
 auto plan_rss_steer(std::span<uint32_t const> const current, uint32_t const rx_queues, uint32_t const queue_id)
     -> StatusValue<RssSteerPlan>
@@ -40,8 +41,8 @@ auto plan_rss_steer(std::span<uint32_t const> const current, uint32_t const rx_q
         return failure(std::make_error_code(std::errc::invalid_argument));
     }
     RssSteerPlan plan{.previous = RssIndirection(current.begin(), current.end()), .wanted = std::nullopt};
-    if (!is_steered_to(current, queue_id)) {
-        plan.wanted = make_steered_table(current.size(), queue_id);
+    if (!rss_steered_to(current, queue_id)) {
+        plan.wanted = rss_indirection_all(current.size(), queue_id);
     }
     return plan;
 }
@@ -66,9 +67,9 @@ constexpr size_t IndirHeaderWords = 2;
     return ifreq_ioctl(interface_name, SIOCETHTOOL, request);
 }
 
-/// The interface's RSS indirection table, or operation_not_supported when it
-/// has none.
-[[nodiscard]] auto read_rss_indirection(std::string_view const interface_name) -> StatusValue<RssIndirection>
+}  // namespace
+
+auto rss_indirection(std::string_view const interface_name) -> StatusValue<RssIndirection>
 {
     // A size of 0 asks only how large the table is; then it is asked for again
     // with room to hold it.
@@ -89,6 +90,8 @@ constexpr size_t IndirHeaderWords = 2;
     }
     return RssIndirection(words.begin() + IndirHeaderWords, words.end());
 }
+
+namespace {
 
 /// How many RX queues the interface has, or 0 if it would not say. Not an
 /// error: the count is only used to refuse a queue that cannot exist, and a
@@ -120,7 +123,7 @@ auto set_rss_indirection(std::string_view const interface_name, std::span<uint32
 
 auto set_rss_indirection_all(std::string_view const interface_name, uint32_t const queue_id) -> StatusValue<RssIndirection>
 {
-    auto current = read_rss_indirection(interface_name);
+    auto current = rss_indirection(interface_name);
     if (!current) {
         return failure(current.error());
     }
@@ -138,6 +141,11 @@ auto set_rss_indirection_all(std::string_view const interface_name, uint32_t con
 
 #else  // !__linux__
 
+auto rss_indirection(std::string_view const) -> StatusValue<RssIndirection>
+{
+    return failure(std::make_error_code(std::errc::operation_not_supported));
+}
+
 auto set_rss_indirection(std::string_view const, std::span<uint32_t const>) -> Status
 {
     // ethtool's indirection table is a Linux interface; no BSD equivalent is
@@ -151,5 +159,99 @@ auto set_rss_indirection_all(std::string_view const, uint32_t const) -> StatusVa
 }
 
 #endif  // __linux__
+
+// ---------------------------------------------------------------------------
+// RssSteering
+// ---------------------------------------------------------------------------
+
+RssSteering::RssSteering(RssControl& control, std::string_view const interface_name, RssIndirection previous)
+    : control_{&control}
+    , interface_{interface_name}
+    , previous_{std::move(previous)}
+{}
+
+RssSteering::RssSteering(RssSteering&& other) noexcept
+    : control_{other.control_}
+    , interface_{std::move(other.interface_)}
+    , previous_{std::move(other.previous_)}
+{
+    other.release();
+}
+
+auto RssSteering::operator=(RssSteering&& other) noexcept -> RssSteering&
+{
+    if (this != &other) {
+        // Whatever this guard still owed is owed on the way out, before it
+        // takes on another interface's debt.
+        (void)restore();
+        control_ = other.control_;
+        interface_ = std::move(other.interface_);
+        previous_ = std::move(other.previous_);
+        other.release();
+    }
+    return *this;
+}
+
+RssSteering::~RssSteering()
+{
+    try {
+        (void)restore();
+    } catch (...) {  // NOLINT(bugprone-empty-catch) a destructor has nobody to report to
+    }
+}
+
+auto RssSteering::release() noexcept -> void
+{
+    control_ = nullptr;
+    previous_.clear();
+}
+
+auto RssSteering::restorable() const -> Status
+{
+    auto const current = control_->indirection(interface_);
+    if (!current) {
+        return failure(current.error());
+    }
+    if (current->size() != previous_.size()) {
+        // The NIC's channel count changed under us. The table we hold no
+        // longer describes this NIC, and padding or truncating it to fit
+        // would be inventing a layout.
+        return failure(std::make_error_code(std::errc::state_not_recoverable));
+    }
+    return success();
+}
+
+auto RssSteering::restore() -> Status
+{
+    if (control_ == nullptr) {
+        return success();
+    }
+    if (auto const check = restorable(); !check) {
+        return failure(check.error());
+    }
+    if (auto const status = control_->set_indirection(interface_, previous_); !status) {
+        // Still owed: a caller who can fix whatever refused the write may try
+        // again, and the destructor will.
+        return failure(status.error());
+    }
+    release();
+    return success();
+}
+
+auto RssSteering::steer(RssControl& control, std::string_view const interface_name, uint32_t const queue_id)
+    -> StatusValue<RssSteering>
+{
+    auto previous = control.steer_all(interface_name, queue_id);
+    if (!previous) {
+        return failure(previous.error());
+    }
+    if (rss_steered_to(*previous, queue_id)) {
+        // Nothing was written, so nothing is owed. Holding this table would
+        // only buy a pointless write - and on some drivers a link reset - at
+        // the end of the socket's life.
+        return RssSteering{};
+    }
+    return RssSteering{control, interface_name, std::move(*previous)};
+}
 
 }  // namespace statusbar::net
