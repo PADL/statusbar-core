@@ -45,7 +45,15 @@ enum
 
     /* Maximum number of rules the BPF program evaluates per frame.
      * Matches statusbar::net::tcam_default_capacity. */
-    TCAM_MAX_RULES = 16
+    TCAM_MAX_RULES = 16,
+
+    /* xsk_map's capacity: one slot per NIC receive queue, keyed by
+     * rx_queue_index. Part of the ABI because a pinned map is adopted
+     * only when its declared capacity still matches. */
+    TCAM_XSK_MAP_ENTRIES = 64,
+
+    /* devmap's capacity. One entry, at key 0. */
+    TCAM_DEVMAP_ENTRIES = 1
 };
 
 /* One slot in the BPF rules_map. Byte-for-byte identical to
@@ -67,7 +75,12 @@ struct tcam_rule
 /* Action bits inspected by the BPF program. Must stay aligned with
  * statusbar::net::flag::process/forward_tap/drop — kept as macros
  * because an enum can't portably hold the 1ULL suffix needed for
- * 64-bit bit-flag arithmetic in C. */
+ * 64-bit bit-flag arithmetic in C.
+ *
+ * Mutually exclusive, and evaluated in the order DROP, FORWARD_TAP,
+ * PROCESS: a rule carrying several gets the first one only. So
+ * PROCESS|FORWARD_TAP diverts to the tap and the AF_XDP socket never
+ * sees the frame — see verdict_for() in xdp_filter.bpf.c. */
 
 /* NOLINTBEGIN(cppcoreguidelines-macro-usage) */
 #define TCAM_FLAG_PROCESS (1ULL << 0)

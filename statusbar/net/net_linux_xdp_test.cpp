@@ -7,13 +7,26 @@
 
 #ifdef __linux__
 
+// XdpSocketStats has to be a plain struct at namespace scope - a caller
+// forward-declares it in its own header, so an alias or a nested type would
+// not do. Declared and used here *before* net.hpp is included: if it ever
+// became either of those, this stops compiling, which is the only way to
+// hold that property down.
+namespace statusbar::net {
+struct XdpSocketStats;
+}
+static auto stats_through_an_incomplete_type(statusbar::net::XdpSocketStats const& stats) -> statusbar::net::XdpSocketStats const&;
+
 #    include "statusbar/ieee/ieee.hpp"
 #    include "statusbar/net/net.hpp"
 #    include "statusbar/status/status.hpp"
 
 #    include <array>
+#    include <cerrno>
+#    include <cstddef>
 #    include <cstdint>
 #    include <expected>
+#    include <limits>
 #    include <optional>
 #    include <span>
 #    include <string>
@@ -22,6 +35,11 @@
 
 using namespace statusbar;
 using namespace statusbar::net;
+
+static auto stats_through_an_incomplete_type(XdpSocketStats const& stats) -> XdpSocketStats const&
+{
+    return stats;
+}
 
 //
 // XdpError tests
@@ -76,6 +94,34 @@ TEST(xdp_error, all_errors_have_messages)
     check(XdpError::not_supported_on_platform);
     check(XdpError::invalid_bpf_program);
     check(XdpError::too_many_filter_rules);
+    check(XdpError::zero_copy_needs_native_attach);
+    check(XdpError::zero_copy_unavailable);
+    check(XdpError::bpffs_not_mounted);
+    check(XdpError::invalid_pin_path);
+    check(XdpError::pin_failed);
+    check(XdpError::queue_busy);
+    check(XdpError::foreign_program);
+    check(XdpError::pin_not_adoptable);
+}
+
+TEST(xdp_error, a_busy_queue_says_so)
+{
+    // An operator reading this goes looking for the process holding the
+    // queue, which is the right next move; "XSK socket creation failed"
+    // would send them nowhere.
+    std::error_code const ec = XdpError::queue_busy;
+    EXPECT_TRUE(ec.message().find("busy") != std::string::npos);
+}
+
+TEST(xdp_error, the_two_ways_a_pin_is_not_adopted_read_differently)
+{
+    // One of these says "left alone", the other says "replaced", and an
+    // operator has to be able to tell which happened from the message.
+    std::error_code const foreign = XdpError::foreign_program;
+    std::error_code const stale = XdpError::pin_not_adoptable;
+    EXPECT_TRUE(foreign.message() != stale.message());
+    EXPECT_TRUE(foreign.message().find("not ours") != std::string::npos);
+    EXPECT_TRUE(foreign.message().find("left alone") != std::string::npos);
 }
 
 TEST(xdp_error, category_name)
@@ -103,6 +149,141 @@ TEST(xdp_config, default_values)
     EXPECT_EQ(config.umem_headroom, 0u);
     EXPECT_EQ(config.tap_ifindex, 0u);
     EXPECT_EQ(config.rx_drain_max, 32u);
+    EXPECT_TRUE(config.bind_mode == XdpBindMode::auto_);
+    EXPECT_TRUE(config.attach_mode == XdpAttachMode::native);
+    // Empty pin path: no pinning, which is the behaviour from before pinning
+    // existed. `adopt` only has a say once a pin path is given.
+    EXPECT_TRUE(config.pin_path.empty());
+    EXPECT_TRUE(config.adopt);
+}
+
+//
+// Bind / attach mode policy
+//
+// The whole table is constexpr, so the policy is checked at compile time as
+// well as run time. What cannot be checked without hardware is whether a
+// given driver actually grants zero-copy or a native attach; that is what
+// XdpContext::bind_mode() and attach_mode() report back at run time.
+//
+
+TEST(xdp_attach_plan, zero_copy_demands_native_and_does_not_fall_back)
+{
+    constexpr auto plan = detail::attach_plan(XdpAttachMode::native, XdpBindMode::zero_copy);
+    static_assert(plan.has_value());
+    static_assert(plan->first == XdpAttachMode::native);
+    // Falling back to generic here would quietly deliver copy mode, which is
+    // the one thing the caller said it did not want.
+    static_assert(!plan->fallback.has_value());
+    EXPECT_TRUE(plan.has_value());
+}
+
+TEST(xdp_attach_plan, zero_copy_with_generic_attach_is_impossible)
+{
+    constexpr auto plan = detail::attach_plan(XdpAttachMode::generic, XdpBindMode::zero_copy);
+    // Generic XDP runs in the stack, where there is no driver to hand a frame
+    // to, so there is nothing to try.
+    static_assert(!plan.has_value());
+    EXPECT_FALSE(plan.has_value());
+}
+
+TEST(xdp_attach_plan, auto_and_copy_try_native_then_generic)
+{
+    for (auto const bind : {XdpBindMode::auto_, XdpBindMode::copy}) {
+        auto const plan = detail::attach_plan(XdpAttachMode::native, bind);
+        EXPECT_TRUE(plan.has_value());
+        if (plan) {
+            EXPECT_TRUE(plan->first == XdpAttachMode::native);
+            EXPECT_TRUE(plan->fallback.has_value());
+            if (plan->fallback) {
+                EXPECT_TRUE(*plan->fallback == XdpAttachMode::generic);
+            }
+        }
+    }
+
+    static_assert(detail::attach_plan(XdpAttachMode::native, XdpBindMode::auto_)->fallback == XdpAttachMode::generic);
+    static_assert(detail::attach_plan(XdpAttachMode::native, XdpBindMode::copy)->fallback == XdpAttachMode::generic);
+}
+
+TEST(xdp_attach_plan, generic_attach_stays_generic)
+{
+    for (auto const bind : {XdpBindMode::auto_, XdpBindMode::copy}) {
+        auto const plan = detail::attach_plan(XdpAttachMode::generic, bind);
+        EXPECT_TRUE(plan.has_value());
+        if (plan) {
+            EXPECT_TRUE(plan->first == XdpAttachMode::generic);
+            // Nothing to fall back to: generic is the mode that works
+            // everywhere, so there is nowhere further down to go.
+            EXPECT_FALSE(plan->fallback.has_value());
+        }
+    }
+}
+
+TEST(xdp_attach_plan, the_defaults_mean_try_native_fall_back_to_generic)
+{
+    // A caller that leaves XdpConfig's fields alone gets the forgiving plan.
+    constexpr auto plan = detail::attach_plan(XdpAttachMode{}, XdpBindMode{});
+    static_assert(plan.has_value());
+    static_assert(plan->first == XdpAttachMode::native);
+    static_assert(plan->fallback == XdpAttachMode::generic);
+    EXPECT_TRUE(plan.has_value());
+}
+
+//
+// Program pinning: the pure parts
+//
+// pin_path_for() touches no filesystem, so the convention itself - one
+// directory per interface, under a mounted bpffs, with fixed entry names - is
+// checked here. What needs a kernel is further down.
+//
+
+TEST(xdp_pin_path, each_interface_gets_its_own_directory)
+{
+    EXPECT_TRUE(XdpProgram::pin_path_for("eth0") == "/sys/fs/bpf/statusbar/eth0");
+    EXPECT_TRUE(XdpProgram::pin_path_for("eth1") == "/sys/fs/bpf/statusbar/eth1");
+    EXPECT_TRUE(XdpProgram::pin_path_for("eth0") != XdpProgram::pin_path_for("eth1"));
+    // Under the bpffs mount, which is the only place a pin can live.
+    EXPECT_TRUE(XdpProgram::pin_path_for("eno1").starts_with(XdpProgram::BPFFS_ROOT));
+}
+
+TEST(xdp_pin_path, a_name_the_kernel_would_refuse_yields_no_path)
+{
+    // An empty result means "do not pin". Returning a path built from a name
+    // with a '/' in it would be the dangerous answer: pin() creates that
+    // directory and detach() unlinks inside it, so a name that can climb out
+    // of the pin directory must never reach either.
+    for (auto const* const name : {"", "/", "..", ".", "eth0/../../etc", "a b", "eth:0", "with\tTab", "sixteen-chars-xx"}) {
+        EXPECT_TRUE(XdpProgram::pin_path_for(name).empty());
+    }
+    // Fifteen characters is the longest an interface name can be.
+    EXPECT_FALSE(XdpProgram::pin_path_for("fifteen-chars-x").empty());
+}
+
+TEST(xdp_pin_path, interface_name_validity_is_constexpr)
+{
+    static_assert(detail::valid_interface_name("eth0"));
+    static_assert(detail::valid_interface_name("fifteen-chars-x"));
+    static_assert(!detail::valid_interface_name("sixteen-chars-xx"));
+    static_assert(!detail::valid_interface_name(""));
+    static_assert(!detail::valid_interface_name("."));
+    static_assert(!detail::valid_interface_name(".."));
+    static_assert(!detail::valid_interface_name("a/b"));
+    static_assert(!detail::valid_interface_name("a:b"));
+    static_assert(!detail::valid_interface_name("a b"));
+    EXPECT_TRUE(detail::valid_interface_name("lo"));
+}
+
+TEST(xdp_pin_path, the_entry_names_are_fixed)
+{
+    auto const dir = XdpProgram::pin_path_for("eth0");
+    EXPECT_TRUE(XdpProgram::pin_entry(dir, XdpProgram::PIN_PROG) == "/sys/fs/bpf/statusbar/eth0/prog");
+    EXPECT_TRUE(XdpProgram::pin_entry(dir, XdpProgram::PIN_RULES_MAP) == "/sys/fs/bpf/statusbar/eth0/rules_map");
+    EXPECT_TRUE(XdpProgram::pin_entry(dir, XdpProgram::PIN_XSK_MAP) == "/sys/fs/bpf/statusbar/eth0/xsk_map");
+    EXPECT_TRUE(XdpProgram::pin_entry(dir, XdpProgram::PIN_DEVMAP) == "/sys/fs/bpf/statusbar/eth0/devmap");
+    // A trailing slash on the directory does not double up.
+    EXPECT_TRUE(XdpProgram::pin_entry("/sys/fs/bpf/statusbar/eth0/", XdpProgram::PIN_PROG) == "/sys/fs/bpf/statusbar/eth0/prog");
+    // No directory, no entry: the "do not pin" answer propagates.
+    EXPECT_TRUE(XdpProgram::pin_entry("", XdpProgram::PIN_PROG).empty());
+    EXPECT_TRUE(XdpProgram::pin_entry(XdpProgram::pin_path_for("bad/name"), XdpProgram::PIN_PROG).empty());
 }
 
 TEST(xdp_config, compiled_rule_defaults)
@@ -196,6 +377,130 @@ TEST(xdp_freelist, default_constructed_is_empty)
 }
 
 //
+// fill_reserve_count tests
+//
+// xsk_ring_prod__reserve is all-or-nothing, so the replenish path must ask for
+// no more than the ring reports free. Asking for every free UMEM frame
+// reserves nothing whenever the UMEM is the larger of the two, which stalls
+// receive silently.
+//
+
+TEST(xdp_fill_reserve, ring_is_the_limit)
+{
+    // The stalling case before the fix: 64 frames free, room for 8.
+    EXPECT_EQ(detail::fill_reserve_count(64, 8), 8u);
+}
+
+TEST(xdp_fill_reserve, umem_is_the_limit)
+{
+    EXPECT_EQ(detail::fill_reserve_count(8, 64), 8u);
+}
+
+TEST(xdp_fill_reserve, equal_takes_all)
+{
+    EXPECT_EQ(detail::fill_reserve_count(32, 32), 32u);
+}
+
+TEST(xdp_fill_reserve, no_frames_free)
+{
+    EXPECT_EQ(detail::fill_reserve_count(0, 64), 0u);
+}
+
+TEST(xdp_fill_reserve, no_ring_space)
+{
+    EXPECT_EQ(detail::fill_reserve_count(64, 0), 0u);
+}
+
+TEST(xdp_fill_reserve, both_zero)
+{
+    EXPECT_EQ(detail::fill_reserve_count(0, 0), 0u);
+}
+
+TEST(xdp_fill_reserve, available_above_uint32_clamps_to_ring)
+{
+    // available is a size_t frame count; the reserve argument is a uint32_t.
+    // The ring free count bounds the result, so the narrowing cast is only
+    // ever applied to a value the ring already admitted.
+    constexpr size_t huge = static_cast<size_t>(std::numeric_limits<uint32_t>::max()) + 1;
+    EXPECT_EQ(detail::fill_reserve_count(huge, 16), 16u);
+}
+
+TEST(xdp_fill_reserve, is_constexpr)
+{
+    static_assert(detail::fill_reserve_count(64, 8) == 8u);
+    static_assert(detail::fill_reserve_count(8, 64) == 8u);
+    static_assert(detail::fill_reserve_count(0, 0) == 0u);
+}
+
+//
+// Transmit reserve: RX and TX share one UMEM free list, and the fill ring
+// will take every frame in it unless something holds some back.
+//
+
+TEST(xdp_tx_reserve, the_reserve_is_what_the_fill_ring_does_not_get)
+{
+    EXPECT_EQ(detail::fillable_frames(1024, 256), size_t{768});
+    EXPECT_EQ(detail::fillable_frames(64, 32), size_t{32});
+    // No reserve is the old behaviour, and is right for a receive-only
+    // context: receive may have the lot.
+    EXPECT_EQ(detail::fillable_frames(64, 0), size_t{64});
+}
+
+TEST(xdp_tx_reserve, a_reserve_as_big_as_what_is_free_leaves_the_ring_nothing)
+{
+    // Not an error: the frames are out with transmit, and the next cycle
+    // fills whatever completion has handed back.
+    EXPECT_EQ(detail::fillable_frames(32, 32), size_t{0});
+    EXPECT_EQ(detail::fillable_frames(10, 32), size_t{0});
+    EXPECT_EQ(detail::fillable_frames(0, 32), size_t{0});
+}
+
+TEST(xdp_tx_reserve, the_reserve_is_capped_at_half_the_umem)
+{
+    // The shipped default against the shipped UMEM: taken as asked.
+    EXPECT_EQ(detail::effective_tx_reserve(xdp_default_tx_frame_reserve, 1024), size_t{256});
+    // ...and against a UMEM smaller than the default reserve, capped - which
+    // is the case that would otherwise starve receive instead of transmit.
+    EXPECT_EQ(detail::effective_tx_reserve(xdp_default_tx_frame_reserve, 64), size_t{32});
+    EXPECT_EQ(detail::effective_tx_reserve(xdp_default_tx_frame_reserve, 8), size_t{4});
+    EXPECT_EQ(detail::effective_tx_reserve(1024, 1024), size_t{512});
+    EXPECT_EQ(detail::effective_tx_reserve(0, 1024), size_t{0});
+}
+
+TEST(xdp_tx_reserve, neither_side_is_starved_at_any_umem_size)
+{
+    // The bug this reserve exists for: with a 64-frame UMEM and a 512-entry
+    // fill ring, the first fill_replenish() took all 64 frames and tx_start()
+    // never saw another one. Checked across sizes rather than at the one that
+    // happened to fail.
+    for (size_t frames = 2; frames <= 4096; frames *= 2) {
+        auto const reserve = detail::effective_tx_reserve(xdp_default_tx_frame_reserve, frames);
+        auto const fillable = detail::fillable_frames(frames, reserve);
+        EXPECT_TRUE(reserve > 0);   // transmit can always get a frame
+        EXPECT_TRUE(fillable > 0);  // and receive is never shut out for it
+        EXPECT_TRUE(reserve + fillable == frames);
+    }
+}
+
+TEST(xdp_tx_reserve, is_constexpr)
+{
+    static_assert(detail::fillable_frames(64, 32) == 32);
+    static_assert(detail::fillable_frames(32, 64) == 0);
+    static_assert(detail::effective_tx_reserve(256, 64) == 32);
+    static_assert(detail::effective_tx_reserve(256, 1024) == 256);
+    // The default config, resolved at compile time: a context opened with it
+    // can both send and receive.
+    static_assert(detail::effective_tx_reserve(xdp_default_tx_frame_reserve, 1024) > 0);
+    static_assert(detail::fillable_frames(1024, detail::effective_tx_reserve(xdp_default_tx_frame_reserve, 1024)) > 0);
+}
+
+TEST(xdp_tx_reserve, a_fresh_context_reserves_nothing_until_it_is_open)
+{
+    XdpContext ctx;
+    EXPECT_EQ(ctx.tx_frame_reserve(), size_t{0});
+}
+
+//
 // ScopeGuard tests
 //
 
@@ -268,12 +573,635 @@ TEST(xdp_stub, stats_zero_by_default)
 }
 
 //
-// Integration tests (require root, veth pairs, Linux with XDP)
+// Socket statistics
 //
+// Each counter has one home, and the tests below sit in two groups: the
+// conditions a plain XdpContext can be put into without a NIC or a
+// capability, and the ones that need a bound socket and live in
+// xdp_integration further down.
+//
+
+TEST(xdp_stats, every_counter_starts_at_zero)
+{
+    XdpContext ctx;
+    auto const& s = ctx.socket_stats();
+    EXPECT_EQ(s.rx_count, 0u);
+    EXPECT_EQ(s.tx_count, 0u);
+    EXPECT_EQ(s.tx_ring_full_count, 0u);
+    EXPECT_EQ(s.umem_exhausted_count, 0u);
+    EXPECT_EQ(s.rx_budget_hit_count, 0u);
+    EXPECT_EQ(s.tx_flush_count, 0u);
+    EXPECT_EQ(s.tx_flush_skipped, 0u);
+    EXPECT_EQ(s.tx_flush_failed, 0u);
+    EXPECT_EQ(s.tx_flush_transient, 0u);
+    EXPECT_EQ(s.tx_flush_errno, 0);
+    EXPECT_EQ(s.rx_wakeup_count, 0u);
+
+    // stats() is the same object under its older name, and the reference is
+    // the live one rather than a copy - which is what lets a caller publish a
+    // snapshot of it from its own tick.
+    EXPECT_TRUE(&ctx.stats() == &ctx.socket_stats());
+    EXPECT_TRUE(&stats_through_an_incomplete_type(ctx.socket_stats()) == &ctx.socket_stats());
+}
+
+TEST(xdp_stats, a_send_with_no_umem_frame_left_is_counted)
+{
+    // The hardest counter to get right and the one that matters most, along
+    // with tx_ring_full_count below. A context with no UMEM takes the same
+    // branch an exhausted pool takes - the free list is empty either way -
+    // so the increment is reachable without a NIC. Exhausting a real pool
+    // under load is in xdp_integration.
+    XdpContext ctx;
+    EXPECT_EQ(ctx.socket_stats().umem_exhausted_count, 0u);
+    auto const slot = ctx.tx_start();
+    EXPECT_FALSE(slot.has_value());
+    if (!slot) {
+        EXPECT_TRUE(slot.error() == XdpError::free_list_empty);
+    }
+    EXPECT_EQ(ctx.socket_stats().umem_exhausted_count, 1u);
+    EXPECT_FALSE(ctx.tx_start().has_value());
+    EXPECT_EQ(ctx.socket_stats().umem_exhausted_count, 2u);
+    // And nothing was sent, so the send counters stay put.
+    EXPECT_EQ(ctx.socket_stats().tx_count, 0u);
+}
+
+TEST(xdp_stats, a_kick_with_nothing_waiting_is_skipped_rather_than_made)
+{
+    // A sender ticking faster than it sends spends most ticks with nothing in
+    // the TX ring. Those kicks are skipped, and the skip is counted: a *low*
+    // skip ratio means a sender kicking the kernel for nothing.
+    XdpContext ctx;
+    EXPECT_TRUE(ctx.tx_flush().has_value());
+    EXPECT_TRUE(ctx.tx_flush().has_value());
+    EXPECT_EQ(ctx.socket_stats().tx_flush_skipped, 2u);
+    EXPECT_EQ(ctx.socket_stats().tx_flush_count, 0u);
+    EXPECT_EQ(ctx.socket_stats().tx_flush_failed, 0u);
+    EXPECT_EQ(ctx.socket_stats().tx_flush_transient, 0u);
+}
+
+TEST(xdp_stats, closing_puts_every_counter_back)
+{
+    XdpContext ctx;
+    EXPECT_FALSE(ctx.tx_start().has_value());
+    EXPECT_TRUE(ctx.tx_flush().has_value());
+    EXPECT_TRUE(ctx.socket_stats().umem_exhausted_count > 0);
+    EXPECT_TRUE(ctx.socket_stats().tx_flush_skipped > 0);
+    ctx.close();
+    EXPECT_EQ(ctx.socket_stats().umem_exhausted_count, 0u);
+    EXPECT_EQ(ctx.socket_stats().tx_flush_skipped, 0u);
+}
+
+//
+// Which refused kicks pass by themselves. The classification is pure, so the
+// arms a developer host will never produce are still checked - and checked at
+// compile time.
+//
+
+TEST(xdp_stats, transient_kick_errnos_are_the_ones_that_pass)
+{
+    static_assert(detail::transient_kick_errno(EAGAIN));
+    static_assert(detail::transient_kick_errno(EWOULDBLOCK));
+    static_assert(detail::transient_kick_errno(EBUSY));
+    static_assert(detail::transient_kick_errno(ENOBUFS));
+    static_assert(detail::transient_kick_errno(ENETDOWN));
+    // Anything else means something is actually wrong, and a caller should
+    // escalate instead of sending into it again.
+    static_assert(!detail::transient_kick_errno(EINVAL));
+    static_assert(!detail::transient_kick_errno(EPERM));
+    static_assert(!detail::transient_kick_errno(ENODEV));
+    static_assert(!detail::transient_kick_errno(EBADF));
+    static_assert(!detail::transient_kick_errno(0));
+    EXPECT_TRUE(detail::transient_kick_errno(EAGAIN));
+    EXPECT_FALSE(detail::transient_kick_errno(EINVAL));
+}
+
+TEST(xdp_stub, modes_before_open)
+{
+    XdpContext ctx;
+    // Nothing is bound, so nothing got zero-copy. bind_mode() answers copy
+    // rather than auto_ because it reports what is in force, and auto_ is
+    // only ever a request.
+    EXPECT_FALSE(ctx.zero_copy());
+    EXPECT_TRUE(ctx.bind_mode() == XdpBindMode::copy);
+    EXPECT_TRUE(ctx.attach_mode() == XdpAttachMode::native);
+}
+
+TEST(xdp_stub, no_program_before_open)
+{
+    XdpContext ctx;
+    EXPECT_FALSE(ctx.pinned());
+    EXPECT_FALSE(ctx.adopted());
+    EXPECT_FALSE(ctx.program().pinned());
+    EXPECT_FALSE(ctx.program().adopted());
+    EXPECT_TRUE(ctx.program().pin_path().empty());
+    EXPECT_EQ(ctx.program().id(), 0u);
+}
+
+// Needs no privilege and no NIC: the combination is refused before open()
+// looks up the interface, so the failure arrives the same way everywhere.
+TEST(xdp_open, zero_copy_with_generic_attach_is_refused_before_any_syscall)
+{
+    XdpContext ctx;
+    XdpConfig const config{
+        .interface_name = "lo",
+        .bind_mode = XdpBindMode::zero_copy,
+        .attach_mode = XdpAttachMode::generic,
+    };
+    auto const status = ctx.open(config);
+    EXPECT_FALSE(status.has_value());
+    if (!status) {
+        EXPECT_TRUE(status.error() == XdpError::zero_copy_needs_native_attach);
+    }
+    EXPECT_FALSE(ctx.valid());
+
+    // The name is never even looked at, so a nonexistent interface gives the
+    // same answer rather than interface_not_found.
+    XdpContext other;
+    XdpConfig const elsewhere{
+        .interface_name = "statusbar-no-such-if",
+        .bind_mode = XdpBindMode::zero_copy,
+        .attach_mode = XdpAttachMode::generic,
+    };
+    auto const same = other.open(elsewhere);
+    EXPECT_FALSE(same.has_value());
+    if (!same) {
+        EXPECT_TRUE(same.error() == XdpError::zero_copy_needs_native_attach);
+    }
+}
+
+//
+// Program identity: the pure parts
+//
+// What makes a pinned program adoptable is that it is the program this
+// build would have attached. Structure cannot answer that - a recompiled
+// filter declares exactly the same maps - so the answer is written into the
+// pin directory and read back. The fingerprint and the identity it goes
+// into need no kernel, so they are checked here.
+//
+
+TEST(xdp_identity, the_fingerprint_is_fnv1a)
+{
+    // Against the published vectors, so the function is the hash it says it
+    // is rather than merely some hash. constexpr, so a build that got this
+    // wrong does not compile. Spelled as byte arrays because a string
+    // literal can only be reinterpret_cast to bytes at run time.
+    constexpr std::array<unsigned char, 0> nothing{};
+    constexpr std::array<unsigned char, 1> letter_a{'a'};
+    constexpr std::array<unsigned char, 6> foobar{'f', 'o', 'o', 'b', 'a', 'r'};
+    static_assert(detail::fnv1a64(nothing) == 0xcbf2'9ce4'8422'2325ULL);
+    static_assert(detail::fnv1a64(letter_a) == 0xaf63'dc4c'8601'ec8cULL);
+    static_assert(detail::fnv1a64(foobar) == 0x8594'4171'f739'67e8ULL);
+    constexpr std::array<unsigned char, 9> name{'s', 't', 'a', 't', 'u', 's', 'b', 'a', 'r'};
+    EXPECT_EQ(detail::fnv1a64(name), 0x8745'ebff'7c18'9690ULL);
+}
+
+TEST(xdp_identity, one_byte_is_enough_to_tell_two_programs_apart)
+{
+    // The property the whole scheme rests on: a filter that was recompiled
+    // must not fingerprint the same as the one before it. A single flipped
+    // byte standing in for a code change.
+    std::array<unsigned char, 64> bytes{};
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        bytes[i] = static_cast<unsigned char>(i);
+    }
+    auto const before = detail::fnv1a64(bytes);
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        auto flipped = bytes;
+        flipped[i] = static_cast<unsigned char>(flipped[i] ^ 0x01U);
+        EXPECT_TRUE(detail::fnv1a64(flipped) != before);
+    }
+    // And length matters, so a truncated object is not the whole one.
+    EXPECT_TRUE(detail::fnv1a64(std::span{bytes}.first(63)) != before);
+}
+
+TEST(xdp_identity, this_build_knows_what_it_is)
+{
+    auto const self = XdpProgram::identity();
+    EXPECT_EQ(self.magic, xdp_pin_magic);
+    // The embedded object is real, so its fingerprint is not the empty one.
+    EXPECT_TRUE(self.program_hash != 0);
+    EXPECT_TRUE(self.program_hash != 0xcbf2'9ce4'8422'2325ULL);
+    EXPECT_EQ(self.window_bytes, static_cast<uint32_t>(TCAM_WINDOW_BYTES));
+    EXPECT_EQ(self.max_rules, static_cast<uint32_t>(TCAM_MAX_RULES));
+}
+
+TEST(xdp_identity, the_answer_does_not_move_within_a_build)
+{
+    // A restart has to compute the same fingerprint the previous run pinned,
+    // or nothing is ever adopted.
+    auto const first = XdpProgram::identity();
+    auto const second = XdpProgram::identity();
+    EXPECT_EQ(first.program_hash, second.program_hash);
+    EXPECT_EQ(first.magic, second.magic);
+}
+
+TEST(xdp_identity, the_magic_spells_something_on_purpose)
+{
+    // Readable in a hex dump of the pinned map, which is the point of
+    // choosing bytes over a random constant.
+    std::array<char, 8> text{};
+    for (size_t i = 0; i < text.size(); ++i) {
+        text[i] = static_cast<char>((xdp_pin_magic >> (56U - (8U * i))) & 0xFFU);
+    }
+    EXPECT_EQ(std::string(text.data(), text.size()), std::string("STATUSBR"));
+}
+
+TEST(xdp_identity, the_pinned_layout_is_fixed)
+{
+    // An older build reads this struct out of bpffs, so its layout is an
+    // ABI between releases and not an implementation detail.
+    static_assert(std::is_trivially_copyable_v<XdpPinIdentity>);
+    static_assert(sizeof(XdpPinIdentity) == 24);
+    static_assert(offsetof(XdpPinIdentity, magic) == 0);
+    static_assert(offsetof(XdpPinIdentity, program_hash) == 8);
+    static_assert(offsetof(XdpPinIdentity, window_bytes) == 16);
+    static_assert(offsetof(XdpPinIdentity, max_rules) == 20);
+    // Default-constructed must not look like ours, since that is what a
+    // failed read leaves behind.
+    XdpPinIdentity const empty{};
+    EXPECT_TRUE(empty.magic != xdp_pin_magic);
+}
+
+TEST(xdp_identity, the_entry_name_is_fixed_like_the_others)
+{
+    auto const dir = XdpProgram::pin_path_for("eth0");
+    EXPECT_TRUE(XdpProgram::pin_entry(dir, XdpProgram::PIN_IDENTITY) == "/sys/fs/bpf/statusbar/eth0/identity");
+}
+
+//
+// Bind retry: the policy
+//
+// A bind refused with EBUSY is a queue whose previous owner has not finished
+// handing it back, which is what every restart runs into. The window is
+// microseconds to milliseconds wide and cannot be opened on demand, so the
+// policy is tested against a counted attempt and a counted clock instead of
+// a socket: that is the only way to see the arms a developer host will not
+// produce, and it needs no privilege.
+//
+
+namespace {
+
+/// A bind that reports EBUSY the first `busy_for` times it is called and
+/// then succeeds, counting both the attempts and the pauses taken between
+/// them. Stands in for xsk_socket__create(), which reports a negative errno.
+struct CountedBind
+{
+    size_t busy_for{0};
+    int final_errno{0};
+    size_t attempts{0};
+    size_t pauses{0};
+
+    auto attempt() -> int
+    {
+        ++attempts;
+        return attempts <= busy_for ? -EBUSY : final_errno;
+    }
+
+    void pause() { ++pauses; }
+};
+
+}  // namespace
+
+TEST(xdp_bind_retry, a_queue_that_is_free_is_bound_once)
+{
+    CountedBind bind{.busy_for = 0};
+    auto const result =
+        detail::retry_while_busy(xdp_bind_busy_retries, [&bind] { return bind.attempt(); }, [&bind] { bind.pause(); });
+    EXPECT_EQ(result, 0);
+    EXPECT_EQ(bind.attempts, 1u);
+    // Nothing was waited for, so the common case costs no latency at all.
+    EXPECT_EQ(bind.pauses, 0u);
+}
+
+TEST(xdp_bind_retry, a_queue_still_being_released_is_waited_out)
+{
+    CountedBind bind{.busy_for = 3};
+    auto const result =
+        detail::retry_while_busy(xdp_bind_busy_retries, [&bind] { return bind.attempt(); }, [&bind] { bind.pause(); });
+    EXPECT_EQ(result, 0);
+    EXPECT_EQ(bind.attempts, 4u);
+    EXPECT_EQ(bind.pauses, 3u);
+}
+
+TEST(xdp_bind_retry, the_last_retry_still_counts)
+{
+    // The boundary from below: refused on every attempt but the last one the
+    // budget allows, and the open succeeds.
+    CountedBind bind{.busy_for = xdp_bind_busy_retries};
+    auto const result =
+        detail::retry_while_busy(xdp_bind_busy_retries, [&bind] { return bind.attempt(); }, [&bind] { bind.pause(); });
+    EXPECT_EQ(result, 0);
+    EXPECT_EQ(bind.attempts, xdp_bind_busy_retries + 1);
+    EXPECT_EQ(bind.pauses, xdp_bind_busy_retries);
+}
+
+TEST(xdp_bind_retry, a_queue_that_stays_busy_gives_up_as_busy)
+{
+    // The boundary from above. What comes back is the EBUSY itself, so the
+    // caller can say "busy" rather than "bind failed".
+    CountedBind bind{.busy_for = xdp_bind_busy_retries + 1};
+    auto const result =
+        detail::retry_while_busy(xdp_bind_busy_retries, [&bind] { return bind.attempt(); }, [&bind] { bind.pause(); });
+    EXPECT_EQ(result, -EBUSY);
+    EXPECT_EQ(bind.attempts, xdp_bind_busy_retries + 1);
+    EXPECT_EQ(bind.pauses, xdp_bind_busy_retries);
+}
+
+TEST(xdp_bind_retry, the_whole_wait_is_bounded)
+{
+    // The bound the comment on xdp_bind_busy_retries claims: one pause per
+    // retry and no more, so the worst case is the pause times the count.
+    // Counted in nanoseconds rather than measured, so this says what the
+    // policy costs without anybody waiting for it.
+    CountedBind bind{.busy_for = 1000};
+    auto const result =
+        detail::retry_while_busy(xdp_bind_busy_retries, [&bind] { return bind.attempt(); }, [&bind] { bind.pause(); });
+    EXPECT_EQ(result, -EBUSY);
+    auto const waited_ns = static_cast<long long>(bind.pauses) * xdp_bind_busy_pause_ns;
+    EXPECT_EQ(waited_ns, 500'000'000LL);
+}
+
+TEST(xdp_bind_retry, an_errno_that_is_not_ebusy_is_never_retried)
+{
+    // Asserted by the attempt count, not by timing: a real fault must come
+    // straight back instead of stalling half a second first and failing the
+    // same way. ENODEV is a wrong interface, EOPNOTSUPP a driver without
+    // zero-copy, EPERM a missing capability - none of them improve by
+    // waiting, and retrying them would hide them behind the busy message.
+    for (int const err : {ENODEV, EOPNOTSUPP, EINVAL, EPERM, ENOMEM, EFAULT}) {
+        CountedBind bind{.busy_for = 0, .final_errno = -err};
+        auto const result =
+            detail::retry_while_busy(xdp_bind_busy_retries, [&bind] { return bind.attempt(); }, [&bind] { bind.pause(); });
+        EXPECT_EQ(result, -err);
+        EXPECT_EQ(bind.attempts, 1u);
+        EXPECT_EQ(bind.pauses, 0u);
+    }
+}
+
+TEST(xdp_bind_retry, an_errno_that_is_not_ebusy_ends_a_retry_too)
+{
+    // A queue that is busy and then fails for another reason: the retry
+    // stops at the real error rather than carrying on to the bound.
+    CountedBind bind{.busy_for = 2, .final_errno = -ENODEV};
+    auto const result =
+        detail::retry_while_busy(xdp_bind_busy_retries, [&bind] { return bind.attempt(); }, [&bind] { bind.pause(); });
+    EXPECT_EQ(result, -ENODEV);
+    EXPECT_EQ(bind.attempts, 3u);
+    EXPECT_EQ(bind.pauses, 2u);
+}
+
+TEST(xdp_bind_retry, no_retries_means_the_refusal_is_seen_raw)
+{
+    // The seam a caller uses to fail fast, and the one a test uses to
+    // observe an EBUSY that the default would have waited out.
+    CountedBind bind{.busy_for = 1};
+    auto const result = detail::retry_while_busy(0, [&bind] { return bind.attempt(); }, [&bind] { bind.pause(); });
+    EXPECT_EQ(result, -EBUSY);
+    EXPECT_EQ(bind.attempts, 1u);
+    EXPECT_EQ(bind.pauses, 0u);
+}
+
+TEST(xdp_bind_retry, the_default_config_waits_the_window_out)
+{
+    // No caller wants the un-retried behaviour, so it is on without being
+    // asked for; a caller that names no retry count gets it.
+    XdpConfig const config{.interface_name = "lo"};
+    EXPECT_EQ(config.bind_busy_retries, xdp_bind_busy_retries);
+    EXPECT_EQ(config.bind_busy_retries, 50u);
+    EXPECT_EQ(xdp_bind_busy_pause_ns, 10'000'000L);
+}
+
+TEST(xdp_bind_retry, a_fresh_context_has_waited_for_nothing)
+{
+    XdpContext ctx;
+    EXPECT_EQ(ctx.bind_retries(), 0u);
+}
 
 #    if defined(__linux__) && defined(HAVE_XDP)
 
+//
+// Pinning against the real kernel, without privilege
+//
+// Querying what is attached to an interface goes over netlink and needs no
+// capability, so these run everywhere. Pinning itself needs CAP_BPF and a
+// writable /sys/fs/bpf, so what is checked here is that each way of being
+// unable to pin reports itself as itself.
+//
+
 #        include <unistd.h>
+
+#        include <net/if.h>
+
+TEST(xdp_query, nothing_is_attached_to_loopback)
+{
+    auto const index = ::if_nametoindex("lo");
+    EXPECT_TRUE(index != 0);
+    auto const attached = XdpProgram::query(index);
+    EXPECT_TRUE(attached.has_value());
+    if (attached) {
+        // An answer, and the answer is "nothing" - told apart from the query
+        // having failed, which is the distinction a caller deciding whether
+        // to adopt depends on.
+        EXPECT_FALSE(attached->has_value());
+    }
+}
+
+TEST(xdp_query, an_unknown_interface_is_reported_as_one)
+{
+    constexpr unsigned int NoSuchInterface = 0x7FFFFFFF;
+    auto const attached = XdpProgram::query(NoSuchInterface);
+    EXPECT_FALSE(attached.has_value());
+    if (!attached) {
+        EXPECT_TRUE(attached.error() == std::errc::no_such_device);
+    }
+}
+
+TEST(xdp_detach, succeeds_when_there_is_nothing_to_detach)
+{
+    // An empty pin path means "detach only", so this reaches nothing but the
+    // interface - and loopback has no program on it. Nothing attached is not
+    // an error: detach() is idempotent, so a daemon can call it on the way in
+    // without first working out what the last run left behind.
+    auto const index = ::if_nametoindex("lo");
+    EXPECT_TRUE(index != 0);
+    EXPECT_TRUE(XdpProgram::detach(index, "").has_value());
+    EXPECT_TRUE(XdpProgram::detach(index, "").has_value());
+}
+
+TEST(xdp_detach, an_unreadable_pin_directory_is_reported_rather_than_assumed_empty)
+{
+    // /sys/fs/bpf is mode 700, so without privilege we cannot tell "the pin
+    // is not there" from "we cannot look". Reporting the permission error is
+    // the honest answer; silently treating it as "nothing to remove" would
+    // tell a daemon it had cleaned up when it had not.
+    auto const index = ::if_nametoindex("lo");
+    auto const absent = XdpProgram::pin_path_for("statusbar-no-if");
+    auto const status = XdpProgram::detach(index, absent);
+    if (getuid() == 0) {
+        EXPECT_TRUE(status.has_value());  // root can look, and there is nothing there
+    } else {
+        EXPECT_FALSE(status.has_value());
+        if (!status) {
+            EXPECT_TRUE(status.error() == std::errc::permission_denied);
+        }
+    }
+}
+
+//
+// pinnable(): the three ways pinning can be unavailable, told apart
+//
+
+TEST(xdp_pinnable, a_path_outside_the_bpf_filesystem_is_refused)
+{
+    // "" is what pin_path_for() returns for a name it refused; BPFFS_ROOT
+    // itself names no interface; and a path that merely starts with the same
+    // letters is not the mount point.
+    for (auto const* const path :
+         {"/tmp/statusbar-not-bpffs/lo", "/var/lib/statusbar/lo", "", "/sys/fs/bpf", "/sys/fs/bpfs-elsewhere/lo"}) {
+        auto const status = XdpProgram::pinnable(path);
+        EXPECT_FALSE(status.has_value());
+        if (!status) {
+            EXPECT_TRUE(status.error() == XdpError::invalid_pin_path);
+        }
+    }
+}
+
+TEST(xdp_pinnable, a_path_in_a_mounted_bpffs_is_accepted_without_privilege)
+{
+    // Needs no capability and creates nothing: it is the question a daemon
+    // asks of its own config at startup.
+    auto const path = XdpProgram::pin_path_for("lo");
+    auto const status = XdpProgram::pinnable(path);
+    if (status) {
+        EXPECT_TRUE(status.has_value());
+    } else {
+        // A host with no bpffs mounted says so, and says it distinctly from
+        // the bad-path answer above.
+        EXPECT_TRUE(status.error() == XdpError::bpffs_not_mounted);
+    }
+    // Nothing was created on the way through.
+    EXPECT_TRUE(::access(path.c_str(), F_OK) != 0 || getuid() == 0);
+}
+
+TEST(xdp_detach, a_pin_path_it_could_not_have_made_is_refused)
+{
+    // detach() unlinks inside the directory and then removes it, so a path
+    // that is not somewhere a pin could be must not be followed. Nothing
+    // outside bpffs is touched, and the interface is left alone too.
+    auto const index = ::if_nametoindex("lo");
+    for (auto const* const path : {"/tmp/statusbar-elsewhere/lo", "/sys/fs/bpf", "/etc"}) {
+        auto const status = XdpProgram::detach(index, path);
+        EXPECT_FALSE(status.has_value());
+        if (!status) {
+            EXPECT_TRUE(status.error() == XdpError::invalid_pin_path);
+        }
+    }
+}
+
+TEST(xdp_detach, an_unknown_interface_is_reported_as_one)
+{
+    constexpr unsigned int NoSuchInterface = 0x7FFFFFFF;
+    auto const status = XdpProgram::detach(NoSuchInterface, "");
+    EXPECT_FALSE(status.has_value());
+    if (!status) {
+        EXPECT_TRUE(status.error() == std::errc::no_such_device);
+    }
+}
+
+TEST(xdp_owner, a_path_that_could_not_hold_a_pin_is_refused)
+{
+    // Same gate as pinnable(), and for the same reason: this call opens
+    // things by path, so the path has to be one of ours first.
+    for (auto const* const path : {"/tmp/statusbar-elsewhere/lo", "/sys/fs/bpf", "/etc", ""}) {
+        auto const owner = XdpProgram::owner(path);
+        EXPECT_FALSE(owner.has_value());
+        if (!owner) {
+            EXPECT_TRUE(owner.error() == XdpError::invalid_pin_path);
+        }
+    }
+}
+
+TEST(xdp_owner, an_empty_pin_directory_is_claimed_by_nobody)
+{
+    // Nothing of ours has ever been pinned for this made-up interface, so
+    // there is no identity to find and the directory is ours to use.
+    //
+    // Unprivileged, /sys/fs/bpf cannot be opened at all, and then the call
+    // reports that errno rather than answering "nobody" - which is the
+    // distinction that matters, since "I cannot tell" must never be acted
+    // on as "unclaimed".
+    auto const path = XdpProgram::pin_path_for("statusbar-none");
+    EXPECT_FALSE(path.empty());
+    auto const owner = XdpProgram::owner(path);
+    if (getuid() == 0) {
+        EXPECT_TRUE(owner.has_value());
+        if (owner) {
+            EXPECT_TRUE(*owner == XdpPinOwner::none);
+        }
+    } else if (!owner) {
+        // Whatever stopped us, it is not a verdict about the directory.
+        EXPECT_TRUE(owner.error() != XdpError::foreign_program);
+        EXPECT_TRUE(owner.error() != XdpError::invalid_pin_path);
+    }
+}
+
+TEST(xdp_open, a_pin_path_outside_bpffs_is_refused_before_any_syscall)
+{
+    // Pinning only works inside a bpf filesystem. A path somewhere else is a
+    // configuration mistake, and open() says so before it looks the
+    // interface up or allocates anything - which is also why this test needs
+    // no privilege and no NIC.
+    XdpContext ctx;
+    XdpConfig const config{
+        .interface_name = "lo",
+        .umem_frame_count = 16,
+        .pin_path = "/tmp/statusbar-not-bpffs/lo",
+    };
+    auto const status = ctx.open(config);
+    EXPECT_FALSE(status.has_value());
+    if (!status) {
+        EXPECT_TRUE(status.error() == XdpError::invalid_pin_path);
+    }
+    EXPECT_FALSE(ctx.valid());
+    EXPECT_FALSE(ctx.pinned());
+
+    // Not created on the way past, either.
+    EXPECT_TRUE(::access("/tmp/statusbar-not-bpffs", F_OK) != 0);
+
+    // The name is never looked up, so a nonexistent interface gives the same
+    // answer rather than interface_not_found.
+    XdpContext other;
+    XdpConfig elsewhere = config;
+    elsewhere.interface_name = "statusbar-no-such-if";
+    auto const same = other.open(elsewhere);
+    EXPECT_FALSE(same.has_value());
+    if (!same) {
+        EXPECT_TRUE(same.error() == XdpError::invalid_pin_path);
+    }
+}
+
+TEST(xdp_open, an_empty_pin_path_changes_nothing)
+{
+    // The opt-in has to be exactly that: with no pin path, open() takes the
+    // path it took before pinning existed. Here that means it gets as far as
+    // the UMEM and fails there for want of privilege - never on anything to
+    // do with pinning.
+    XdpContext ctx;
+    XdpConfig const config{.interface_name = "lo", .umem_frame_count = 16};
+    EXPECT_TRUE(config.pin_path.empty());
+    auto const status = ctx.open(config);
+    if (!status) {
+        EXPECT_TRUE(status.error() != XdpError::invalid_pin_path);
+        EXPECT_TRUE(status.error() != XdpError::bpffs_not_mounted);
+        EXPECT_TRUE(status.error() != XdpError::pin_failed);
+    }
+    EXPECT_FALSE(ctx.pinned());
+    EXPECT_FALSE(ctx.adopted());
+}
+
+//
+// Integration tests (require root, veth pairs, Linux with XDP)
+//
 
 #        include <cstdlib>
 
@@ -302,14 +1230,13 @@ static void destroy_veth_pair(char const* name_a)
 
 TEST(xdp_integration, open_close_lifecycle)
 {
-    // Skip if not root
     if (getuid() != 0) {
-        return;
+        SKIP("needs root");
     }
 
     destroy_veth_pair("xdptest0");
     if (!create_veth_pair("xdptest0", "xdptest1")) {
-        return;
+        SKIP("could not create a veth pair");
     }
     auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
 
@@ -333,15 +1260,277 @@ TEST(xdp_integration, open_close_lifecycle)
     EXPECT_FALSE(ctx.valid());
 }
 
-TEST(xdp_integration, tx_rx_loopback)
+// A veth takes a native attach - it has had ndo_bpf since Linux 4.14 - and
+// has no zero-copy. So it is the right place to prove the *bind* refusal and
+// that the mode is reported truthfully, and the wrong place to prove the
+// attach fallback: there is nothing here for native to fall back from.
+//
+// This test previously asserted the fallback and was never run, because it
+// skipped silently off root. The first root run said attach_mode() was not
+// generic, which on a successful open leaves only native.
+//
+// Proving the fallback needs an interface whose driver has no XDP at all.
+// detail::attach_plan covers the policy without one; what is missing is a
+// test that the plan is carried out, and that needs hardware this host has
+// not got.
+TEST(xdp_integration, a_veth_attaches_natively_and_still_refuses_zero_copy)
 {
     if (getuid() != 0) {
-        return;
+        SKIP("needs root");
     }
 
     destroy_veth_pair("xdptest0");
     if (!create_veth_pair("xdptest0", "xdptest1")) {
+        SKIP("could not create a veth pair");
+    }
+    auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
+
+    XdpConfig config{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .umem_frame_count = 64,
+    };
+
+    XdpContext ctx;
+    auto const status = ctx.open(config);
+    EXPECT_TRUE(status.has_value());
+    if (status) {
+        // The default config asks for native and gets it, so the fallback is
+        // never reached. What a veth does refuse is zero-copy, and the bind
+        // mode has to come back as the copy it settled for rather than the
+        // auto_ that was asked for.
+        EXPECT_TRUE(ctx.attach_mode() == XdpAttachMode::native);
+        EXPECT_FALSE(ctx.zero_copy());
+        EXPECT_TRUE(ctx.bind_mode() == XdpBindMode::copy);
+    }
+    ctx.close();
+
+    // Asking for generic outright gets generic: the mode is honoured, not
+    // upgraded to the native the driver would have allowed.
+    config.attach_mode = XdpAttachMode::generic;
+    auto const generic = ctx.open(config);
+    EXPECT_TRUE(generic.has_value());
+    if (generic) {
+        EXPECT_TRUE(ctx.attach_mode() == XdpAttachMode::generic);
+    }
+    ctx.close();
+
+    // And insisting on zero-copy fails cleanly, with the reason named and no
+    // program left behind on the interface.
+    config.attach_mode = XdpAttachMode::native;
+    config.bind_mode = XdpBindMode::zero_copy;
+    auto const refused = ctx.open(config);
+    EXPECT_FALSE(refused.has_value());
+    if (!refused) {
+        EXPECT_TRUE(refused.error() == XdpError::zero_copy_unavailable);
+    }
+    EXPECT_FALSE(ctx.valid());
+}
+
+// The feature in one test: a pinned program outlives the context that made
+// it, the next open adopts it instead of attaching another, and detach() is
+// the only thing that takes it away.
+//
+// Root-only, and so does not run on a developer host. Run it with
+//   sudo ./statusbar_test statusbar/net/net_linux_xdp_test
+TEST(xdp_integration, a_pinned_program_outlives_the_context_and_is_adopted)
+{
+    if (getuid() != 0) {
+        SKIP("needs root");
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        SKIP("could not create a veth pair");
+    }
+    auto const pin_path = XdpProgram::pin_path_for("xdptest0");
+    EXPECT_FALSE(pin_path.empty());
+    auto cleanup = detail::scopeguard([&] {
+        (void)XdpProgram::detach(::if_nametoindex("xdptest0"), pin_path);
+        destroy_veth_pair("xdptest0");
+    });
+
+    XdpConfig config{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .umem_frame_count = 64,
+        .pin_path = pin_path,
+    };
+
+    unsigned int if_index = 0;
+    uint32_t first_id = 0;
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        EXPECT_TRUE(status.has_value());
+        if (!status) {
+            return;
+        }
+        EXPECT_TRUE(ctx.pinned());
+        EXPECT_FALSE(ctx.adopted());  // nothing was there to adopt
+        EXPECT_TRUE(ctx.program().pin_path() == pin_path);
+        EXPECT_TRUE(ctx.program().id() != 0);
+        if_index = ctx.interface_index();
+        first_id = ctx.program().id();
+    }
+
+    // The context is gone and the program is still steering. This is the
+    // whole point: an unpinned context would have detached here.
+    auto const after = XdpProgram::query(if_index);
+    EXPECT_TRUE(after.has_value());
+    if (after) {
+        EXPECT_TRUE(after->has_value());
+        if (*after) {
+            EXPECT_EQ((*after)->program_id, first_id);
+        }
+    }
+    for (auto const entry : {XdpProgram::PIN_PROG, XdpProgram::PIN_RULES_MAP, XdpProgram::PIN_XSK_MAP, XdpProgram::PIN_DEVMAP}) {
+        EXPECT_EQ(::access(XdpProgram::pin_entry(pin_path, entry).c_str(), F_OK), 0);
+    }
+
+    // Second open: the same program, adopted, not attached again.
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            EXPECT_TRUE(ctx.adopted());
+            EXPECT_TRUE(ctx.pinned());
+            EXPECT_EQ(ctx.program().id(), first_id);
+            auto const during = XdpProgram::query(if_index);
+            EXPECT_TRUE(during.has_value());
+            if (during && *during) {
+                // Not a second attach, and not a replacement: the program on
+                // the interface never changed.
+                EXPECT_EQ((*during)->program_id, first_id);
+            }
+        }
+    }
+
+    // A pin whose program is no longer attached is stale, not adoptable. The
+    // usual way to get here is a crash that took the attachment with it.
+    EXPECT_TRUE(XdpProgram::detach(if_index, "").has_value());  // detach only; pins stay
+    EXPECT_EQ(::access(XdpProgram::pin_entry(pin_path, XdpProgram::PIN_PROG).c_str(), F_OK), 0);
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            EXPECT_FALSE(ctx.adopted());
+            EXPECT_TRUE(ctx.pinned());
+            EXPECT_TRUE(ctx.program().id() != first_id);  // a fresh program, freshly pinned
+        }
+    }
+
+    // adopt = false forces a fresh attach even when the pin is good.
+    uint32_t replaced_id = 0;
+    {
+        XdpConfig fresh = config;
+        fresh.adopt = false;
+        XdpContext ctx;
+        auto const status = ctx.open(fresh);
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            EXPECT_FALSE(ctx.adopted());
+            EXPECT_TRUE(ctx.pinned());
+            replaced_id = ctx.program().id();
+        }
+    }
+
+    // detach() removes both the attachment and the pins, and the process
+    // that made them is already gone by now.
+    EXPECT_TRUE(XdpProgram::detach(if_index, pin_path).has_value());
+    auto const gone = XdpProgram::query(if_index);
+    EXPECT_TRUE(gone.has_value());
+    if (gone) {
+        EXPECT_FALSE(gone->has_value());
+    }
+    for (auto const entry : {XdpProgram::PIN_PROG, XdpProgram::PIN_RULES_MAP, XdpProgram::PIN_XSK_MAP, XdpProgram::PIN_DEVMAP}) {
+        EXPECT_TRUE(::access(XdpProgram::pin_entry(pin_path, entry).c_str(), F_OK) != 0);
+    }
+    EXPECT_TRUE(replaced_id != 0);
+
+    // And calling it a second time, with nothing left, still succeeds.
+    EXPECT_TRUE(XdpProgram::detach(if_index, pin_path).has_value());
+}
+
+// Adopting a map that is not the one this build declares would mean writing
+// rules into someone else's memory. A pin with a wrong-shaped rules_map must
+// be replaced, and must come out of it untouched.
+TEST(xdp_integration, a_pinned_map_of_the_wrong_shape_is_replaced_and_never_written_to)
+{
+    if (getuid() != 0) {
+        SKIP("needs root");
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        SKIP("could not create a veth pair");
+    }
+    auto const pin_path = XdpProgram::pin_path_for("xdptest0");
+    auto cleanup = detail::scopeguard([&] {
+        (void)XdpProgram::detach(::if_nametoindex("xdptest0"), pin_path);
+        destroy_veth_pair("xdptest0");
+    });
+
+    XdpConfig const config{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .umem_frame_count = 64,
+        .pin_path = pin_path,
+    };
+
+    unsigned int if_index = 0;
+    {
+        XdpContext ctx;
+        if (!ctx.open(config)) {
+            return;
+        }
+        if_index = ctx.interface_index();
+    }
+
+    // Swap the pinned rules_map for one with a different capacity - the shape
+    // an older build of the program would have left behind. The identity is
+    // left alone, so the directory is still recognisably ours: what is being
+    // tested here is the structural check, not the ownership one.
+    auto const rules_pin = XdpProgram::pin_entry(pin_path, XdpProgram::PIN_RULES_MAP);
+    EXPECT_EQ(::unlink(rules_pin.c_str()), 0);
+    int const foreign = bpf_map_create(BPF_MAP_TYPE_ARRAY, "rules_map", sizeof(uint32_t), sizeof(uint32_t), 4, nullptr);
+    EXPECT_TRUE(foreign >= 0);
+    if (foreign < 0) {
         return;
+    }
+    EXPECT_EQ(bpf_obj_pin(foreign, rules_pin.c_str()), 0);
+
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            // Not adopted - and so the foreign map was never written into.
+            EXPECT_FALSE(ctx.adopted());
+            EXPECT_TRUE(ctx.pinned());
+        }
+    }
+
+    // Every slot of the map we did not recognise is still zero.
+    for (uint32_t key = 0; key < 4; ++key) {
+        uint32_t value = 0xFFFFFFFF;
+        EXPECT_EQ(bpf_map_lookup_elem(foreign, &key, &value), 0);
+        EXPECT_EQ(value, 0u);
+    }
+    ::close(foreign);
+}
+
+TEST(xdp_integration, tx_rx_loopback)
+{
+    if (getuid() != 0) {
+        SKIP("needs root");
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        SKIP("could not create a veth pair");
     }
     auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
 
@@ -422,12 +1611,12 @@ TEST(xdp_integration, tx_rx_loopback)
 TEST(xdp_integration, rx_drain_budget)
 {
     if (getuid() != 0) {
-        return;
+        SKIP("needs root");
     }
 
     destroy_veth_pair("xdptest0");
     if (!create_veth_pair("xdptest0", "xdptest1")) {
-        return;
+        SKIP("could not create a veth pair");
     }
     auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
 
@@ -452,17 +1641,28 @@ TEST(xdp_integration, rx_drain_budget)
     auto r1 = ctx.rx_start();
     EXPECT_TRUE(r1.has_value());    // Success (no error)
     EXPECT_FALSE(r1->has_value());  // Empty optional (no frames)
+
+    // An empty ring is not the budget: rx_budget_hit_count must stay put, or
+    // it would read as a budget problem on every idle tick.
+    EXPECT_EQ(ctx.socket_stats().rx_budget_hit_count, 0u);
+    EXPECT_EQ(ctx.socket_stats().rx_count, 0u);
+
+    // The budget itself: the counter moves once the cycle has taken its
+    // allowance, which is the signal that a tick is cutting a drain short.
+    // rx_cycle_count only advances on a frame received, so this is the arm
+    // live traffic reaches; checked here against the configured limit.
+    EXPECT_EQ(config.rx_drain_max, 2u);
 }
 
 TEST(xdp_integration, multiple_inflight_tx)
 {
     if (getuid() != 0) {
-        return;
+        SKIP("needs root");
     }
 
     destroy_veth_pair("xdptest0");
     if (!create_veth_pair("xdptest0", "xdptest1")) {
-        return;
+        SKIP("could not create a veth pair");
     }
     auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
 
@@ -494,22 +1694,176 @@ TEST(xdp_integration, multiple_inflight_tx)
     (void)ctx.tx_commit(slot1->handle, 64);
     (void)ctx.tx_commit(slot2->handle, 64);
     (void)ctx.tx_commit(slot3->handle, 64);
+    EXPECT_EQ(ctx.socket_stats().tx_count, 3u);
     (void)ctx.tx_flush();
+    // Three frames, one kick: that is the whole point of batching, and the
+    // counters are what show it is happening.
+    EXPECT_EQ(ctx.socket_stats().tx_flush_count, 1u);
+    EXPECT_EQ(ctx.socket_stats().tx_flush_failed, 0u);
 
     // Reclaim via tx_complete
     usleep(10000);
     (void)ctx.tx_complete();
 }
 
-TEST(xdp_integration, set_rules)
+// The counters that need a bound socket. Root-only, so this does not run on a
+// developer host; the branches reachable without one are in xdp_stats above.
+//   sudo ./statusbar_test statusbar/net/net_linux_xdp_test
+TEST(xdp_integration, the_tx_ring_filling_and_the_umem_emptying_are_counted)
 {
     if (getuid() != 0) {
-        return;
+        SKIP("needs root");
     }
 
     destroy_veth_pair("xdptest0");
     if (!create_veth_pair("xdptest0", "xdptest1")) {
+        SKIP("could not create a veth pair");
+    }
+    auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
+
+    // A TX ring smaller than the UMEM, so the ring fills first and the pool
+    // empties second: the two conditions are told apart rather than being
+    // whichever happened to come first.
+    XdpConfig const config{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .tx_ring_size = 8,
+        .umem_frame_count = 64,
+    };
+
+    XdpContext ctx;
+    auto const opened = ctx.open(config);
+    EXPECT_TRUE(opened.has_value());
+    if (!opened) {
         return;
+    }
+
+    // Fill the TX ring without ever kicking, so nothing drains out of it.
+    size_t committed = 0;
+    for (size_t i = 0; i < 64; ++i) {
+        auto slot = ctx.tx_start();
+        if (!slot) {
+            break;
+        }
+        if (ctx.tx_commit(slot->handle, 64)) {
+            ++committed;
+        }
+    }
+    EXPECT_TRUE(committed > 0);
+    EXPECT_EQ(ctx.socket_stats().tx_count, committed);
+    // Past the ring's capacity every commit is refused and counted, and the
+    // frame goes back to the pool rather than leaking.
+    EXPECT_TRUE(ctx.socket_stats().tx_ring_full_count > 0);
+
+    // Now empty the pool. fill_replenish() at open() already offered most of
+    // it to the kernel, so what is left goes quickly.
+    uint64_t exhausted_before = ctx.socket_stats().umem_exhausted_count;
+    for (size_t i = 0; i < 4096; ++i) {
+        auto slot = ctx.tx_start();
+        if (!slot) {
+            break;
+        }
+    }
+    EXPECT_TRUE(ctx.socket_stats().umem_exhausted_count > exhausted_before);
+
+    // And the kick that was owed is made exactly once; the next finds nothing
+    // waiting and skips.
+    auto const kicks_before = ctx.socket_stats().tx_flush_count;
+    (void)ctx.tx_flush();
+    EXPECT_EQ(ctx.socket_stats().tx_flush_count, kicks_before + 1);
+    auto const skipped_before = ctx.socket_stats().tx_flush_skipped;
+    (void)ctx.tx_flush();
+    EXPECT_EQ(ctx.socket_stats().tx_flush_skipped, skipped_before + 1);
+    EXPECT_EQ(ctx.socket_stats().tx_flush_count, kicks_before + 1);
+}
+
+// A descriptor the kernel will not accept is the one way to make it refuse a
+// kick on demand, which is what gives tx_flush_failed and tx_flush_errno a
+// test at all.
+TEST(xdp_integration, a_kick_the_kernel_refuses_is_counted_and_keeps_its_errno)
+{
+    if (getuid() != 0) {
+        SKIP("needs root");
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        SKIP("could not create a veth pair");
+    }
+    auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
+
+    XdpConfig const config{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .umem_frame_count = 64,
+    };
+
+    XdpContext ctx;
+    auto const opened = ctx.open(config);
+    EXPECT_TRUE(opened.has_value());
+    if (!opened) {
+        return;
+    }
+
+    // A real frame, from a real UMEM slot, so the only thing wrong with the
+    // kick is the state of the link.
+    auto slot = ctx.tx_start();
+    EXPECT_TRUE(slot.has_value());
+    if (!slot) {
+        return;
+    }
+    EXPECT_TRUE(ctx.tx_commit(slot->handle, 64).has_value());
+
+    // Take the link down under the socket. This is the one refusal that can
+    // be produced to order: the earlier version of this test submitted a
+    // descriptor pointing past the end of the UMEM and expected the kick to
+    // fail, but the kernel does not refuse that - xsk_generic_xmit validates
+    // the descriptor, counts it in XDP_STATISTICS tx_invalid_descs and drops
+    // the frame, and sendto still returns success. Surfacing that counter is
+    // its own piece of work; it is not reachable from here.
+    EXPECT_EQ(system("ip link set xdptest0 down"), 0);
+
+    auto const status = ctx.tx_flush();
+    auto const& stats = ctx.socket_stats();
+    EXPECT_EQ(stats.tx_flush_count, 1u);
+
+    if (stats.tx_flush_errno == 0) {
+        // Some kernels take the frame anyway and drop it further down. There
+        // is then no refusal to classify, and asserting on one would be
+        // asserting on this kernel rather than on our bookkeeping.
+        SKIP("this kernel accepted a kick on a down link");
+    }
+
+    // Whichever errno it gave, the counters have to agree with the
+    // classification: that agreement is the thing under test, not the
+    // identity of the errno, which is the kernel's business and varies.
+    bool const transient = detail::transient_kick_errno(stats.tx_flush_errno);
+    EXPECT_EQ(stats.tx_flush_transient, transient ? 1u : 0u);
+    EXPECT_EQ(stats.tx_flush_failed, transient ? 0u : 1u);
+    // A transient refusal reads as success so the caller does not escalate on
+    // a hiccup; a hard one is reported.
+    EXPECT_EQ(status.has_value(), transient);
+    if (!status) {
+        EXPECT_TRUE(status.error() == XdpError::tx_flush_failed);
+    }
+
+    // Either way the frames stayed pending, because the kernel never took
+    // them: the next kick tries again rather than counting them as delivered,
+    // and so is a kick and not a skip.
+    (void)ctx.tx_flush();
+    EXPECT_EQ(ctx.socket_stats().tx_flush_count, 2u);
+    EXPECT_EQ(ctx.socket_stats().tx_flush_skipped, 0u);
+}
+
+TEST(xdp_integration, set_rules)
+{
+    if (getuid() != 0) {
+        SKIP("needs root");
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        SKIP("could not create a veth pair");
     }
     auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
 
@@ -535,6 +1889,323 @@ TEST(xdp_integration, set_rules)
 
     auto update_status = ctx.set_rules(rules2);
     EXPECT_TRUE(update_status.has_value());
+}
+
+// Overwrite what a pin directory claims about itself. Needed because the
+// interesting cases - somebody else's program, and our own from a different
+// build - cannot otherwise be produced without a second build to hand.
+static bool rewrite_pinned_identity(std::string_view pin_path, XdpPinIdentity const& identity)
+{
+    int const fd = bpf_obj_get(XdpProgram::pin_entry(pin_path, XdpProgram::PIN_IDENTITY).c_str());
+    if (fd < 0) {
+        return false;
+    }
+    uint32_t const key = 0;
+    bool const written = bpf_map_update_elem(fd, &key, &identity, BPF_ANY) == 0;
+    ::close(fd);
+    return written;
+}
+
+TEST(xdp_integration, a_pin_that_belongs_to_somebody_else_is_left_strictly_alone)
+{
+    // The dangerous case, and the one the identity exists for. A directory
+    // claiming an owner that is not us must not be adopted - that would
+    // write our rules into a stranger's map - and must not be replaced
+    // either, because replacing means unlinking their pins and taking their
+    // program off the interface. Open fails, and nothing moves.
+    if (getuid() != 0) {
+        SKIP("needs root");
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        SKIP("could not create a veth pair");
+    }
+    auto const pin_path = XdpProgram::pin_path_for("xdptest0");
+    auto cleanup = detail::scopeguard([&] {
+        (void)XdpProgram::detach(::if_nametoindex("xdptest0"), pin_path);
+        destroy_veth_pair("xdptest0");
+    });
+
+    XdpConfig const config{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .umem_frame_count = 64,
+        .pin_path = pin_path,
+    };
+
+    unsigned int if_index = 0;
+    uint32_t attached_id = 0;
+    {
+        XdpContext ctx;
+        if (!ctx.open(config)) {
+            return;
+        }
+        EXPECT_TRUE(ctx.pinned());
+        if_index = ctx.interface_index();
+        attached_id = ctx.program().id();
+    }
+    EXPECT_TRUE(attached_id != 0);
+
+    // Someone else's magic in our directory. Contrived here; in the field it
+    // would be a pin path pointed somewhere it should not have been.
+    XdpPinIdentity theirs = XdpProgram::identity();
+    theirs.magic = 0x0102'0304'0506'0708ULL;
+    EXPECT_TRUE(rewrite_pinned_identity(pin_path, theirs));
+
+    auto const owner = XdpProgram::owner(pin_path);
+    EXPECT_TRUE(owner.has_value());
+    if (owner) {
+        EXPECT_TRUE(*owner == XdpPinOwner::foreign);
+    }
+
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        EXPECT_FALSE(status.has_value());
+        if (!status) {
+            EXPECT_TRUE(status.error() == XdpError::foreign_program);
+        }
+        EXPECT_FALSE(ctx.valid());
+        EXPECT_FALSE(ctx.adopted());
+        EXPECT_FALSE(ctx.pinned());
+    }
+
+    // Untouched: the program is the same one, still on the interface, and
+    // the pins are all still there.
+    auto const still = XdpProgram::query(if_index);
+    EXPECT_TRUE(still.has_value());
+    if (still && still->has_value()) {
+        EXPECT_EQ((*still)->program_id, attached_id);
+    } else {
+        EXPECT_TRUE(false);  // the attachment was removed, which is the bug
+    }
+    for (auto const entry :
+         {XdpProgram::PIN_IDENTITY,
+          XdpProgram::PIN_PROG,
+          XdpProgram::PIN_RULES_MAP,
+          XdpProgram::PIN_XSK_MAP,
+          XdpProgram::PIN_DEVMAP}) {
+        EXPECT_EQ(::access(XdpProgram::pin_entry(pin_path, entry).c_str(), F_OK), 0);
+    }
+
+    // And the claim still reads as theirs: we did not quietly restamp it.
+    auto const after = XdpProgram::owner(pin_path);
+    EXPECT_TRUE(after.has_value());
+    if (after) {
+        EXPECT_TRUE(*after == XdpPinOwner::foreign);
+    }
+}
+
+TEST(xdp_integration, a_pin_from_a_different_build_of_ours_is_replaced)
+{
+    // The common case, and the one a structural check cannot catch: same
+    // maps, same names, same capacities, different code. A redeploy. It has
+    // to be detected - adopting it would run the old filter while believing
+    // the new one is in force - and it has to be replaced rather than
+    // refused, or no upgrade could ever restart.
+    if (getuid() != 0) {
+        SKIP("needs root");
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        SKIP("could not create a veth pair");
+    }
+    auto const pin_path = XdpProgram::pin_path_for("xdptest0");
+    auto cleanup = detail::scopeguard([&] {
+        (void)XdpProgram::detach(::if_nametoindex("xdptest0"), pin_path);
+        destroy_veth_pair("xdptest0");
+    });
+
+    XdpConfig const config{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .umem_frame_count = 64,
+        .pin_path = pin_path,
+    };
+
+    uint32_t first_id = 0;
+    {
+        XdpContext ctx;
+        if (!ctx.open(config)) {
+            return;
+        }
+        first_id = ctx.program().id();
+    }
+
+    // Our magic, a different program. One bit of the fingerprint is all it
+    // takes, which is the point of fingerprinting the object at all.
+    XdpPinIdentity older = XdpProgram::identity();
+    older.program_hash ^= 1ULL;
+    EXPECT_TRUE(rewrite_pinned_identity(pin_path, older));
+
+    // Still ours, so the directory may be replaced.
+    auto const owner = XdpProgram::owner(pin_path);
+    EXPECT_TRUE(owner.has_value());
+    if (owner) {
+        EXPECT_TRUE(*owner == XdpPinOwner::ours);
+    }
+
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        EXPECT_TRUE(status.has_value());
+        if (!status) {
+            return;
+        }
+        EXPECT_FALSE(ctx.adopted());
+        EXPECT_TRUE(ctx.pinned());
+        // A fresh program, not the one that was there.
+        EXPECT_TRUE(ctx.program().id() != 0);
+        EXPECT_TRUE(ctx.program().id() != first_id);
+    }
+
+    // And the directory now claims this build again, so the *next* restart
+    // adopts instead of replacing.
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            EXPECT_TRUE(ctx.adopted());
+            EXPECT_TRUE(ctx.pinned());
+        }
+    }
+}
+
+TEST(xdp_integration, pinned_and_adopted_report_every_combination_truthfully)
+{
+    if (getuid() != 0) {
+        SKIP("needs root");
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        SKIP("could not create a veth pair");
+    }
+    auto const pin_path = XdpProgram::pin_path_for("xdptest0");
+    auto cleanup = detail::scopeguard([&] {
+        (void)XdpProgram::detach(::if_nametoindex("xdptest0"), pin_path);
+        destroy_veth_pair("xdptest0");
+    });
+
+    // Neither: no pin path, so nothing outlives the context.
+    unsigned int if_index = 0;
+    {
+        XdpContext ctx;
+        XdpConfig const unpinned{
+            .interface_name = "xdptest0",
+            .default_action = XdpAction::pass_kernel,
+            .umem_frame_count = 64,
+        };
+        if (!ctx.open(unpinned)) {
+            return;
+        }
+        EXPECT_FALSE(ctx.pinned());
+        EXPECT_FALSE(ctx.adopted());
+        if_index = ctx.interface_index();
+        ctx.close();
+
+        // The other half of the close policy: a program we attached and did
+        // *not* pin comes off the interface with us.
+        auto const gone = XdpProgram::query(if_index);
+        EXPECT_TRUE(gone.has_value());
+        if (gone) {
+            EXPECT_FALSE(gone->has_value());
+        }
+    }
+
+    XdpConfig const config{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .umem_frame_count = 64,
+        .pin_path = pin_path,
+    };
+
+    // Pinned, not adopted: the first run.
+    {
+        XdpContext ctx;
+        if (!ctx.open(config)) {
+            return;
+        }
+        EXPECT_TRUE(ctx.pinned());
+        EXPECT_FALSE(ctx.adopted());
+    }
+
+    // Pinned and adopted: every run after it.
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            EXPECT_TRUE(ctx.pinned());
+            EXPECT_TRUE(ctx.adopted());
+        }
+    }
+
+    // Adopted but not pinned is the fourth combination, and it cannot
+    // happen: adoption reads a pin, so it implies one. Asked for
+    // explicitly rather than left to be obvious.
+    {
+        XdpContext ctx;
+        XdpConfig fresh = config;
+        fresh.adopt = false;
+        auto const status = ctx.open(fresh);
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            EXPECT_FALSE(ctx.adopted());
+            EXPECT_TRUE(ctx.pinned());
+        }
+        EXPECT_TRUE(!ctx.adopted() || ctx.pinned());
+    }
+}
+
+// The failure FEAT-007 exists for, reproduced: close a queue and bind it
+// again immediately. Without the retry this fails - not every iteration,
+// which is what makes the bug so unpleasant to chase, but often enough that
+// twenty turns round the loop find it.
+TEST(xdp_integration, a_queue_rebound_the_instant_it_is_closed_still_opens)
+{
+    if (getuid() != 0) {
+        SKIP("needs root");
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        SKIP("could not create a veth pair");
+    }
+    auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
+
+    XdpConfig const config{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .umem_frame_count = 64,
+    };
+
+    size_t waited = 0;
+    for (int i = 0; i < 20; ++i) {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        // The whole point: no iteration may come back queue_busy. The
+        // previous iteration's socket was closed microseconds ago.
+        EXPECT_TRUE(status.has_value());
+        if (!status) {
+            EXPECT_TRUE(status.error() != XdpError::queue_busy);
+            return;
+        }
+        waited += ctx.bind_retries();
+        ctx.close();
+    }
+
+    // Not asserted: whether any iteration actually caught the queue still
+    // registered depends on how fast this kernel's teardown happens to run,
+    // and a test that insists on seeing the race would be the flaky kind.
+    // It is reported instead, because a non-zero count is the evidence that
+    // the window is real on this machine rather than a story about RCU.
+    if (waited != 0) {
+        printf("    (the queue was still busy on %zu of 20 re-opens)\n", waited);
+    }
 }
 
 #    endif  // __linux__ && HAVE_XDP
