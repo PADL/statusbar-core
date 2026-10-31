@@ -11,6 +11,7 @@
 #include "statusbar/net/net_ring_queue_base.hpp"
 #include "statusbar/test/test.hpp"
 
+#include <poll.h>
 #include <unistd.h>
 
 #include <array>
@@ -19,6 +20,7 @@
 #include <expected>
 #include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -381,6 +383,191 @@ TEST(net_socket_create, set_nonblocking_valid)
     if (result) {
         auto status = set_nonblocking(result->get());
         EXPECT_TRUE(status);
+    }
+}
+
+//
+// UDP multicast helpers (create real sockets)
+//
+// The positive path runs over `lo`, which is enough to prove a join, a send
+// and a receive. It is not enough to prove the negative: when the egress
+// interface is the loopback device, the device returns the frame whatever
+// IP_MULTICAST_LOOP says, so a datagram sent with loop = false still arrives
+// here. That half of the option is checked by reading the socket option back
+// instead, and a true off-host test needs a second machine.
+//
+
+namespace {
+
+/// Bind `fd` to an ephemeral port on every address and report the port the
+/// kernel chose, or 0 if the bind failed.
+[[nodiscard]] auto bind_ephemeral(int fd) noexcept -> uint16_t
+{
+    sockaddr_in wanted{};
+    wanted.sin_family = AF_INET;
+    wanted.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (::bind(fd, reinterpret_cast<sockaddr const*>(&wanted), sizeof(wanted)) != 0) {
+        return 0;
+    }
+    sockaddr_in bound{};
+    socklen_t length = sizeof(bound);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &length) != 0) {
+        return 0;
+    }
+    return ntohs(bound.sin_port);
+}
+
+/// An interface index no host has, for checking that the index argument is
+/// really passed to the kernel rather than quietly dropped.
+constexpr unsigned int NoSuchInterface = 0x7FFFFFFF;
+
+}  // namespace
+
+TEST(net_multicast, errno_code_round_trip)
+{
+    errno = EACCES;
+    EXPECT_TRUE(errno_code() == std::error_code(EACCES, std::system_category()));
+    errno = ENODEV;
+    EXPECT_TRUE(errno_code() == std::error_code(ENODEV, std::system_category()));
+    EXPECT_EQ(errno_code().value(), ENODEV);
+    errno = 0;
+}
+
+TEST(net_multicast, make_udp_socket_is_cloexec_and_nonblocking)
+{
+    auto socket = make_udp_socket();
+    EXPECT_TRUE(socket.has_value());
+    if (socket) {
+        EXPECT_TRUE(socket->valid());
+
+        // Asked of the kernel rather than assumed: a descriptor that leaks
+        // across exec into a child is a real fault in a daemon that spawns.
+        int const descriptor_flags = ::fcntl(socket->get(), F_GETFD);
+        EXPECT_TRUE(descriptor_flags >= 0);
+        EXPECT_NE(descriptor_flags & FD_CLOEXEC, 0);
+
+        int const status_flags = ::fcntl(socket->get(), F_GETFL);
+        EXPECT_TRUE(status_flags >= 0);
+        EXPECT_NE(status_flags & O_NONBLOCK, 0);
+    }
+}
+
+TEST(net_multicast, join_group_rejects_a_non_multicast_address)
+{
+    auto socket = make_udp_socket();
+    EXPECT_TRUE(socket.has_value());
+    if (socket) {
+        auto const unicast = join_group(socket->get(), statusbar::ip::IPv4Address(10, 0, 0, 1), 0);
+        EXPECT_FALSE(unicast.has_value());
+        EXPECT_TRUE(unicast.error() == std::make_error_code(std::errc::invalid_argument));
+
+        auto const broadcast = join_group(socket->get(), statusbar::ip::IPv4Address(255, 255, 255, 255), 0);
+        EXPECT_FALSE(broadcast.has_value());
+
+        auto const unspecified = join_group(socket->get(), statusbar::ip::IPv4Address(0, 0, 0, 0), 0);
+        EXPECT_FALSE(unspecified.has_value());
+
+        // The boundaries of 224.0.0.0/4 are in the group, not out of it.
+        EXPECT_TRUE(join_group(socket->get(), statusbar::ip::IPv4Address(224, 0, 0, 1), 0).has_value());
+        EXPECT_TRUE(join_group(socket->get(), statusbar::ip::IPv4Address(239, 255, 255, 255), 0).has_value());
+    }
+}
+
+TEST(net_multicast, join_group_reports_an_unknown_interface)
+{
+    auto socket = make_udp_socket();
+    EXPECT_TRUE(socket.has_value());
+    if (socket) {
+        auto const joined = join_group(socket->get(), statusbar::ip::IPv4Address(239, 69, 1, 2), NoSuchInterface);
+        EXPECT_FALSE(joined.has_value());
+    }
+}
+
+TEST(net_multicast, set_multicast_send_sets_ttl_and_loop)
+{
+    auto socket = make_udp_socket();
+    EXPECT_TRUE(socket.has_value());
+    if (socket) {
+        for (bool const loop : {true, false}) {
+            auto const prepared = set_multicast_send(socket->get(), 0, 7, loop);
+            EXPECT_TRUE(prepared.has_value());
+
+            int ttl = -1;
+            socklen_t ttl_length = sizeof(ttl);
+            EXPECT_EQ(::getsockopt(socket->get(), IPPROTO_IP, IP_MULTICAST_TTL, &ttl, &ttl_length), 0);
+            EXPECT_EQ(ttl, 7);
+
+            int looped = -1;
+            socklen_t loop_length = sizeof(looped);
+            EXPECT_EQ(::getsockopt(socket->get(), IPPROTO_IP, IP_MULTICAST_LOOP, &looped, &loop_length), 0);
+            EXPECT_EQ(looped, loop ? 1 : 0);
+        }
+    }
+}
+
+TEST(net_multicast, set_multicast_send_reports_an_unknown_interface)
+{
+#if defined(__linux__)
+    auto socket = make_udp_socket();
+    EXPECT_TRUE(socket.has_value());
+    if (socket) {
+        auto const prepared = set_multicast_send(socket->get(), NoSuchInterface, 1, true);
+        EXPECT_FALSE(prepared.has_value());
+    }
+#else
+    // Elsewhere the index cannot be expressed, so there is nothing to reject.
+    EXPECT_TRUE(true);
+#endif
+}
+
+TEST(net_multicast, a_datagram_sent_to_a_joined_group_arrives)
+{
+    statusbar::ip::IPv4Address const group(239, 69, 1, 2);
+    auto const loopback_index = ::if_nametoindex("lo");
+
+    auto receiver = make_udp_socket();
+    auto sender = make_udp_socket();
+    EXPECT_TRUE(receiver.has_value());
+    EXPECT_TRUE(sender.has_value());
+    if (!receiver || !sender || loopback_index == 0) {
+        return;
+    }
+
+    EXPECT_TRUE(set_reuse_addr(receiver->get()).has_value());
+    auto const port = bind_ephemeral(receiver->get());
+    EXPECT_NE(port, 0);
+    if (port == 0) {
+        return;
+    }
+
+    // A host whose loopback is not multicast-capable cannot run the rest; the
+    // join is the thing that tells us, so the remainder hangs off it.
+    auto const joined = join_group(receiver->get(), group, loopback_index);
+    if (!joined) {
+        return;
+    }
+    EXPECT_TRUE(set_multicast_send(sender->get(), loopback_index, 1, true).has_value());
+
+    sockaddr_in destination{};
+    destination.sin_family = AF_INET;
+    destination.sin_addr.s_addr = htonl(group.to_uint32());
+    destination.sin_port = htons(port);
+
+    constexpr std::string_view payload{"probe"};
+    auto const sent = ::sendto(
+        sender->get(), payload.data(), payload.size(), 0, reinterpret_cast<sockaddr const*>(&destination), sizeof(destination));
+    EXPECT_EQ(static_cast<size_t>(sent), payload.size());
+
+    // The socket is non-blocking by construction, so wait for it rather than
+    // racing the kernel's delivery.
+    pollfd waiting{.fd = receiver->get(), .events = POLLIN, .revents = 0};
+    EXPECT_EQ(::poll(&waiting, 1, 2000), 1);
+
+    std::array<char, 64> received{};
+    auto const got = ::recv(receiver->get(), received.data(), received.size(), 0);
+    EXPECT_EQ(static_cast<size_t>(got), payload.size());
+    if (got > 0) {
+        EXPECT_TRUE(std::string_view(received.data(), static_cast<size_t>(got)) == payload);
     }
 }
 

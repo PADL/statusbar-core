@@ -7,6 +7,7 @@
 /// Provides FileDescriptor RAII wrapper and socket configuration functions
 
 #include "statusbar/buffer/file_descriptor.hpp"
+#include "statusbar/ip/ip_ipv4_address.hpp"
 #include "statusbar/net/net_error.hpp"
 #include "statusbar/status/status.hpp"
 
@@ -19,6 +20,7 @@
 #include <string_view>
 #include <system_error>
 
+#include <arpa/inet.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -193,6 +195,112 @@ using FileDescriptor = ::statusbar::FileDescriptor;
         }
     }
 
+    return success();
+}
+
+/// The current errno as a std::error_code, for the many call sites that would
+/// otherwise spell out `{errno, std::system_category()}`.
+[[nodiscard]] inline auto errno_code() noexcept -> std::error_code
+{
+    return {errno, std::system_category()};
+}
+
+/// An IPv4 UDP socket, close-on-exec and non-blocking from birth.
+///
+/// Both flags are set at creation where the platform allows it. A descriptor
+/// that is briefly inheritable is a descriptor a concurrent fork/exec in
+/// another thread can leak into a child, and a daemon that spawns anything at
+/// all has that thread.
+[[nodiscard]] inline auto make_udp_socket() noexcept -> StatusValue<FileDescriptor>
+{
+#if defined(SOCK_CLOEXEC) && defined(SOCK_NONBLOCK)
+    FileDescriptor fd{::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)};
+    if (!fd.valid()) {
+        return failure(errno_code());
+    }
+#else
+    FileDescriptor fd{::socket(AF_INET, SOCK_DGRAM, 0)};
+    if (!fd.valid()) {
+        return failure(errno_code());
+    }
+    if (::fcntl(fd.get(), F_SETFD, FD_CLOEXEC) != 0) {
+        return failure(errno_code());
+    }
+    if (auto const nonblocking = set_nonblocking(fd.get()); !nonblocking) {
+        return failure(errno_code());
+    }
+#endif
+    return fd;
+}
+
+/// Join IPv4 multicast `group` on the interface with index `interface_index`
+/// (0: the kernel's choice by routing table).
+///
+/// The interface is an index rather than a name because the caller has already
+/// resolved it; taking a name here would mean a second if_nametoindex() per
+/// join. On platforms without ip_mreqn the index cannot be expressed and the
+/// kernel chooses regardless of what is passed.
+/// @param fd An IPv4 datagram socket
+/// @param group The multicast group to join (224.0.0.0/4)
+/// @param interface_index Index of the interface to join on, or 0 for any
+[[nodiscard]] inline auto join_group(int fd, ip::IPv4Address const& group, unsigned int interface_index) noexcept -> Status
+{
+    // Checked here rather than left to the kernel: Linux answers EINVAL but
+    // not every stack does, and a membership that was never joined fails
+    // later as silence on the socket, a long way from the mistake.
+    if (!group.is_multicast()) {
+        return failure(std::errc::invalid_argument);
+    }
+#if defined(__linux__)
+    ip_mreqn request{};
+    request.imr_ifindex = static_cast<int>(interface_index);
+#else
+    (void)interface_index;
+    ip_mreq request{};
+    request.imr_interface.s_addr = ::htonl(INADDR_ANY);
+#endif
+    request.imr_multiaddr.s_addr = ::htonl(group.to_uint32());
+    if (::setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &request, sizeof(request)) != 0) {
+        return failure(errno_code());
+    }
+    return success();
+}
+
+/// Prepare an IPv4 socket to send multicast: out of the interface with index
+/// `interface_index` (0: the routing table's choice), with TTL `ttl`, and
+/// looped back to local listeners when `loop`.
+///
+/// Loopback is a parameter rather than a default because both answers are
+/// needed. An RTCP session on a group has to hear its own reports to recognise
+/// and skip its own SSRC; a talker that only sends does not, and the copy is
+/// wasted work on every packet.
+/// @param fd An IPv4 datagram socket
+/// @param interface_index Index of the egress interface, or 0 for the route
+/// @param ttl Multicast TTL - 1 keeps traffic on the local link
+/// @param loop Whether sends are looped back to listeners on this host
+[[nodiscard]] inline auto set_multicast_send(int fd, unsigned int interface_index, uint8_t ttl, bool loop) noexcept -> Status
+{
+#if defined(__linux__)
+    if (interface_index != 0) {
+        ip_mreqn request{};
+        request.imr_ifindex = static_cast<int>(interface_index);
+        if (::setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &request, sizeof(request)) != 0) {
+            return failure(errno_code());
+        }
+    }
+#else
+    (void)interface_index;
+#endif
+    // IP_MULTICAST_TTL and IP_MULTICAST_LOOP take a byte on BSD and macOS and
+    // an int on Linux, where a byte is also accepted; a byte works on both.
+    unsigned char const hops = ttl;
+    unsigned char const looped = loop ? 1 : 0;
+    if (::setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &hops, sizeof(hops)) != 0) {
+        return failure(errno_code());
+    }
+    if (::setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &looped, sizeof(looped)) != 0) {
+        return failure(errno_code());
+    }
     return success();
 }
 
