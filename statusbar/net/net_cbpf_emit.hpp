@@ -51,6 +51,7 @@ static_assert(sizeof(Instruction) == 8, "Instruction must match Linux struct soc
 namespace op {
 inline constexpr std::uint16_t LD_B_ABS = 0x30;   // BPF_LD | BPF_B | BPF_ABS
 inline constexpr std::uint16_t LD_W_ABS = 0x20;   // BPF_LD | BPF_W | BPF_ABS
+inline constexpr std::uint16_t LD_H_ABS = 0x28;   // BPF_LD | BPF_H | BPF_ABS
 inline constexpr std::uint16_t ALU_AND_K = 0x54;  // BPF_ALU | BPF_AND | BPF_K
 inline constexpr std::uint16_t JMP_JEQ_K = 0x15;  // BPF_JMP | BPF_JEQ | BPF_K
 inline constexpr std::uint16_t JMP_JA = 0x05;     // BPF_JMP | BPF_JA
@@ -142,6 +143,18 @@ auto compile(
                     return 0;
                 }
                 acc = packet[k];
+                ++pc;
+                break;
+            }
+            case op::LD_H_ABS: {
+                // Bound check in size_t arithmetic that cannot wrap, for the
+                // same reason as LD_W_ABS below: `ins.k + 2` in uint32 wraps
+                // when ins.k is near UINT32_MAX and the read goes wild.
+                std::size_t const k = ins.k;
+                if (k > packet.size() || packet.size() - k < 2) {
+                    return 0;
+                }
+                acc = (static_cast<std::uint32_t>(packet[k]) << 8) | static_cast<std::uint32_t>(packet[k + 1]);
                 ++pc;
                 break;
             }

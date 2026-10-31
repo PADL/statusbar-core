@@ -163,4 +163,54 @@ TEST(cbpf_emit, agrees_with_tcam_classifier_on_multi_rule_set)
     check(miss);
 }
 
+TEST(cbpf_emit, ld_h_abs_loads_big_endian_halfword)
+{
+    // The ethertype at offset 12 is the reason this opcode exists: a
+    // halfword load is how a socket filter reads it in one instruction
+    // instead of two byte loads and a shift.
+    std::array<cbpf::Instruction, 3> const program{
+        cbpf::Instruction{.code = cbpf::op::LD_H_ABS, .jt = 0, .jf = 0, .k = 12},
+        cbpf::Instruction{.code = cbpf::op::JMP_JEQ_K, .jt = 0, .jf = 1, .k = 0x22F0},
+        cbpf::Instruction{.code = cbpf::op::RET_K, .jt = 0, .jf = 0, .k = 0xFFFF},
+    };
+
+    std::array<std::uint8_t, 16> frame{};
+    frame[12] = 0x22;
+    frame[13] = 0xF0;
+    EXPECT_EQ(cbpf::interpret(program, frame), 0xFFFFu);
+
+    // Byte-swapped ethertype must not match: the load is network order.
+    frame[12] = 0xF0;
+    frame[13] = 0x22;
+    EXPECT_EQ(cbpf::interpret(program, frame), 0u);
+}
+
+TEST(cbpf_emit, ld_h_abs_refuses_read_past_end)
+{
+    // Offset 13 needs bytes 13 and 14; a 14-byte frame has only 13.
+    std::array<cbpf::Instruction, 2> const program{
+        cbpf::Instruction{.code = cbpf::op::LD_H_ABS, .jt = 0, .jf = 0, .k = 13},
+        cbpf::Instruction{.code = cbpf::op::RET_K, .jt = 0, .jf = 0, .k = 0xFFFF},
+    };
+
+    std::array<std::uint8_t, 15> const long_enough{};
+    EXPECT_EQ(cbpf::interpret(program, long_enough), 0xFFFFu);
+
+    std::array<std::uint8_t, 14> const one_byte_short{};
+    EXPECT_EQ(cbpf::interpret(program, one_byte_short), 0u);
+}
+
+TEST(cbpf_emit, ld_h_abs_bound_check_does_not_wrap)
+{
+    // k + 2 computed in uint32 arithmetic wraps to 1 here and would pass
+    // a naive `k + 2 <= size` check, then read at offset 0xFFFFFFFF.
+    std::array<cbpf::Instruction, 2> const program{
+        cbpf::Instruction{.code = cbpf::op::LD_H_ABS, .jt = 0, .jf = 0, .k = 0xFFFFFFFFU},
+        cbpf::Instruction{.code = cbpf::op::RET_K, .jt = 0, .jf = 0, .k = 0xFFFF},
+    };
+
+    std::array<std::uint8_t, 64> const frame{};
+    EXPECT_EQ(cbpf::interpret(program, frame), 0u);
+}
+
 TEST_MAIN(statusbar_net, net_cbpf_emit_test)
