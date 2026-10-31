@@ -10,7 +10,10 @@
 /// `readability-function-size` already bounds the latter, per function.
 ///
 /// The diagnostic is attached to the opening brace, which is what makes
-/// `// NOLINT(statusbar-block-statements)` on the brace's line suppress it.
+/// `// NOLINT(statusbar-block-statements)` on the brace's line suppress it. A
+/// note on the closing brace follows it, so a reader of the output -- the
+/// check-block-statements.sh gate -- knows the block's whole extent and can
+/// match a change against the lines inside it, not only the brace.
 ///
 /// Three exemptions, each of which was a false positive before it was one:
 ///
@@ -82,27 +85,30 @@ class BlockStatementsCheck : public clang::tidy::ClangTidyCheck
     void check(MatchFinder::MatchResult const& result) override
     {
         auto const* block = result.Nodes.getNodeAs<clang::CompoundStmt>("block");
-        if (block == nullptr) {
+        if (block == nullptr || !is_reportable(*block, result)) {
             return;
         }
-        clang::SourceLocation const brace = block->getLBracLoc();
-        if (brace.isInvalid() || result.SourceManager == nullptr) {
-            return;
-        }
-        if (is_exempt_file(result.SourceManager->getFilename(brace))) {
-            return;
-        }
-
-        // Direct children only: a nested block, a lambda body, an `if`'s
-        // own braces each count once, whatever they contain.
-        auto const statements = static_cast<unsigned>(block->size());
-        if (statements <= max_statements_) {
-            return;
-        }
-        diag(brace, "block contains %0 statements; at most %1 belong at one level") << statements << max_statements_;
+        diag(block->getLBracLoc(), "block contains %0 statements; at most %1 belong at one level")
+            << static_cast<unsigned>(block->size()) << max_statements_;
+        diag(block->getRBracLoc(), "the block ends here", clang::DiagnosticIDs::Note);
     }
 
   private:
+    /// A block in a file this check reads, holding more than the bound.
+    /// Direct children only: a nested block, a lambda body, an `if`'s own
+    /// braces each count once, whatever they contain.
+    [[nodiscard]] auto is_reportable(clang::CompoundStmt const& block, MatchFinder::MatchResult const& result) const -> bool
+    {
+        clang::SourceLocation const brace = block.getLBracLoc();
+        if (brace.isInvalid() || result.SourceManager == nullptr) {
+            return false;
+        }
+        if (is_exempt_file(result.SourceManager->getFilename(brace))) {
+            return false;
+        }
+        return block.size() > max_statements_;
+    }
+
     static constexpr unsigned default_max_statements = 4;
 
     unsigned max_statements_;

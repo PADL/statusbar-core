@@ -74,15 +74,19 @@ function(statusbar_build_tidy_plugin clang_tidy_exe out_plugin)
     target_link_options(statusbar-tidy-block-statements PRIVATE
                         -stdlib=libstdc++)
   endif()
+  # Undefined symbols are resolved out of the clang-tidy binary at load time, as
+  # for any LLVM plugin. GNU ld allows that in a shared object by default; ld64
+  # has to be told.
+  if(APPLE)
+    target_link_options(statusbar-tidy-block-statements PRIVATE
+                        -Wl,-undefined,dynamic_lookup)
+  endif()
   set_target_properties(
     statusbar-tidy-block-statements
     PROPERTIES CXX_STANDARD 20
                CXX_STANDARD_REQUIRED ON
                POSITION_INDEPENDENT_CODE ON
-               PREFIX ""
-               # Undefined symbols are resolved out of the clang-tidy binary
-               # at load time, as for any LLVM plugin.
-               LINK_FLAGS "")
+               PREFIX "")
   set(${out_plugin}
       "$<TARGET_FILE:statusbar-tidy-block-statements>"
       PARENT_SCOPE)
