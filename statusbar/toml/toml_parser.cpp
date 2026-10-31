@@ -27,7 +27,7 @@ auto Parser::parse_file(std::string_view path) -> StatusValue<Table>
 }
 
 auto Parser::parse_table_header(Table& root) -> StatusValue<Table*>
-{
+{               // NOLINT(statusbar-block-statements) one header, read token by token
     advance();  // skip '['
     bool is_array_table = false;
 
@@ -71,11 +71,26 @@ auto Parser::parse_table_header(Table& root) -> StatusValue<Table*>
         return success(arr->operator[](arr->size() - 1).as_table());
     }
 
-    Table* tbl = resolve_table_path(root, std::span<std::string const>{*key_result});
-    if (tbl == nullptr) {
+    return open_table(root, std::span<std::string const>{*key_result});
+}
+
+auto Parser::open_table(Table& root, std::span<std::string const> path) -> StatusValue<Table*>
+{
+    Table* parent = resolve_table_path(root, path.first(path.size() - 1));
+    if (parent == nullptr) {
         return failure(TomlError::type_mismatch);
     }
-    return success(tbl);
+    if (!parent->contains(path.back())) {
+        parent->set(path.back(), Table{});
+    }
+    // An array here is `[s]` after `[[s]]`: the header names the array
+    // itself, not an element of it, and the keys under it would have been
+    // merged into the last element in silence.
+    Table* table = parent->get(path.back())->as_table();
+    if (table == nullptr) {
+        return failure(TomlError::type_mismatch);
+    }
+    return success(table);
 }
 
 auto Parser::insert_key_value(Table* current_table) -> Status

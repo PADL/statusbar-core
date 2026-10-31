@@ -70,6 +70,13 @@ class Parser
 
     [[nodiscard]] auto get_or_create_array_of_tables(Table& root, std::span<std::string const> path) -> Array*;
 
+    /// The table a `[header]` names, created if need be. The segments before
+    /// the last go through resolve_table_path(), so `[s.x]` after `[[s]]`
+    /// attaches to the last `[[s]]`; the last segment itself must be a
+    /// table, so `[s]` after `[[s]]` - which names the array - is refused,
+    /// as TOML requires and as this parser did before that descent existed.
+    [[nodiscard]] static auto open_table(Table& root, std::span<std::string const> path) -> StatusValue<Table*>;
+
     /// Walk (creating as needed) the table a `[header]` path names.
     /// Where a segment is already an array of tables, this descends into
     /// its LAST element, which is what `[s.x]` after `[[s]]` means.

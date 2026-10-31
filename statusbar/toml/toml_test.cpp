@@ -784,6 +784,22 @@ TEST(toml_array_subtable, a_plain_value_in_the_path_still_fails)
     }
 }
 
+TEST(toml_array_subtable, a_table_header_may_not_name_an_array_of_tables)
+{
+    // `[s]` after `[[s]]` names the array itself, which TOML calls an error.
+    // The descent into an array's last element is for the segments BEFORE
+    // the last: `[s.x]` attaches to the last `[[s]]`, `[s]` attaches to
+    // nothing. Before this test the keys under `[s]` were merged into the
+    // last element in silence, where the earlier parser had refused them.
+    Parser parser{"[[s]]\nname = \"a\"\n[s]\nport = 1\n"};
+    auto result = parser.parse_document_public();
+    EXPECT_FALSE(result.has_value());
+    if (!result) {
+        EXPECT_EQ(result.error(), make_error_code(TomlError::type_mismatch));
+        EXPECT_EQ(parser.error_line(), 3U);
+    }
+}
+
 TEST(toml_array_subtable, a_dotted_key_may_not_extend_an_array)
 {
     // The other half of the rule, and why the descent is not in
