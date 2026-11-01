@@ -75,9 +75,13 @@ class LaunchOrder
     /// frame that missed its slot.
     static constexpr std::uint64_t PACKET_NS = 125'000;
 
-    /// A wanted time this far behind the last one is a clock step, not a late
-    /// frame. One second is far longer than any queue this holds and far
-    /// shorter than a PTP lock acquiring or a domain change.
+    /// The last time handed out standing this far ahead of `now` is the
+    /// clock having stepped back under the ordering, not a late frame. One
+    /// second is far longer than any queue this holds and far shorter than a
+    /// PTP lock acquiring or a domain change. A wanted time that far behind
+    /// with `now` where it was is a stale frame - a talker that stalled and
+    /// then committed the departures it had queued - and is held like any
+    /// other, or the FIFO would stall behind every one of them.
     static constexpr std::uint64_t STEP_NS = 1'000'000'000;
 
     /// The time to give a frame whose departure is @p wanted_ns, or `now()`
@@ -85,12 +89,15 @@ class LaunchOrder
     /// before the time last handed out, unless the clock stepped back.
     ///
     /// @param now Callable returning the current TAI nanosecond count, e.g.
-    ///        `tai_now_ns`. Taken as a parameter so a test can drive it.
+    ///        `tai_now_ns`. Taken as a parameter so a test can drive it, and
+    ///        read on every call: it is what tells a stale frame from a clock
+    ///        that stepped.
     template <typename Now>
     [[nodiscard]] auto next(std::uint64_t const wanted_ns, Now const& now) noexcept -> std::uint64_t
     {
-        std::uint64_t const asked = wanted_ns == 0 ? now() : wanted_ns;
-        std::uint64_t const given = ordered(asked);
+        std::uint64_t const now_ns = now();
+        std::uint64_t const asked = wanted_ns == 0 ? now_ns : wanted_ns;
+        std::uint64_t const given = ordered(asked, now_ns);
         last_ns_ = given;
         return given;
     }
@@ -116,16 +123,17 @@ class LaunchOrder
   private:
     /// @p asked, held at the last time handed out where it must be, with the
     /// counters moved on.
-    [[nodiscard]] auto ordered(std::uint64_t const asked) noexcept -> std::uint64_t
+    [[nodiscard]] auto ordered(std::uint64_t const asked, std::uint64_t const now_ns) noexcept -> std::uint64_t
     {
         if (asked >= last_ns_) {
             return asked;
         }
-        std::uint64_t const behind = last_ns_ - asked;
-        if (behind >= STEP_NS) {
+        if (last_ns_ >= now_ns + STEP_NS) {
+            // The clock, not the frame, went back: follow it.
             steps_.fetch_add(1, std::memory_order_relaxed);
             return asked;
         }
+        std::uint64_t const behind = last_ns_ - asked;
         if (behind > PACKET_NS) {
             count_clamp(behind);
         }

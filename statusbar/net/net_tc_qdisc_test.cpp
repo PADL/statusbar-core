@@ -535,6 +535,16 @@ TEST(tc_qdisc, parse_qdisc_round_trips_the_mqprio_builder)
     EXPECT_EQ(info->parent, tc::ROOT);
     EXPECT_EQ(info->kind_name(), "mqprio");
     EXPECT_FALSE(info->has_cbs_params);
+    // And the layout comes back as it went: what tells our root from one
+    // that merely carries our handle.
+    EXPECT_TRUE(info->has_mqprio_params);
+    auto const sample = sample_mqprio();
+    EXPECT_EQ(info->mqprio.major, sample.major);
+    EXPECT_EQ(info->mqprio.num_tc, sample.num_tc);
+    EXPECT_TRUE(info->mqprio.prio_tc_map == sample.prio_tc_map);
+    EXPECT_TRUE(info->mqprio.count == sample.count);
+    EXPECT_TRUE(info->mqprio.offset == sample.offset);
+    EXPECT_EQ(info->mqprio.offload, sample.offload);
 }
 
 TEST(tc_qdisc, parse_qdisc_round_trips_the_cbs_builder_including_its_slopes)

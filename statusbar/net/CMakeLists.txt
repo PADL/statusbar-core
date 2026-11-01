@@ -138,10 +138,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_compile_definitions(statusbar-net PUBLIC HAVE_XDP=1)
 
     # AF_XDP TX metadata - the UMEM option that carries a per-frame launch time
-    # - needs both a kernel UAPI with struct xsk_tx_metadata (6.8) and a libxdp
-    # with the opts-style umem create that can set tx_metadata_len (1.5). Probed
-    # rather than assumed: Debian trixie has both, older distributions have
-    # neither, and the gated code must not be compiled where it would not link.
+    # - needs a kernel UAPI with struct xsk_tx_metadata and its launch-time flag
+    # (Linux 6.15) and a libxdp with the opts-style umem create that can set
+    # tx_metadata_len (1.5). Probed rather than assumed: Debian trixie's
+    # linux-libc-dev is 6.12 and lacks the flag, so the native deb builds
+    # compile the feature out, and the gated code must not be compiled where it
+    # would not link.
     include(CheckCXXSourceCompiles)
     set(CMAKE_REQUIRED_INCLUDES ${LIBXDP_INCLUDE_DIRS} ${LIBBPF_INCLUDE_DIRS})
     set(CMAKE_REQUIRED_LIBRARIES ${LIBXDP_LIBRARIES})

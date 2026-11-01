@@ -4,11 +4,17 @@
 #include "statusbar/net/net_linux_xdp.hpp"
 
 #include "statusbar/net/net_posix_util.hpp"
+#include "statusbar/net/net_socket.hpp"
 
 #if defined(__linux__) && defined(HAVE_XDP)
+#    include <linux/genetlink.h>
 #    include <linux/magic.h>
+#    include <linux/netlink.h>
 #    include <sys/stat.h>
 #    include <sys/vfs.h>
+#    if __has_include(<linux/netdev.h>)
+#        include <linux/netdev.h>
+#    endif
 #endif
 
 #include <algorithm>
@@ -82,7 +88,9 @@ auto XdpErrorCategory::message(int ev) const -> std::string
         case XdpError::stats_read_failed:
             return "Reading the kernel's socket statistics failed";
         case XdpError::tx_metadata_not_supported:
-            return "This build or kernel cannot put a launch time on an AF_XDP frame";
+            return "This build or kernel cannot put TX metadata on an AF_XDP frame";
+        case XdpError::launch_time_not_supported:
+            return "The kernel or this NIC does not time AF_XDP frames: Linux 6.15 and a driver with the feature are needed";
         case XdpError::invalid_umem_geometry:
             return "The UMEM frame size or headroom is not one the kernel will register";
         default:
@@ -687,8 +695,9 @@ auto detail::UmemRegion::allocate(
 
     tx_metadata_len_ = tx_metadata_len;
     if (!create_umem(total_size, frame_size, headroom, fill_ring_size, comp_ring_size, rings)) {
+        XdpError const refusal = create_refusal();
         close();
-        return failure(XdpError::umem_creation_failed);
+        return failure(refusal);
     }
 
     free_list_ = UmemFreeList(frame_count, frame_size);
@@ -697,6 +706,17 @@ auto detail::UmemRegion::allocate(
 }
 
 auto detail::UmemRegion::create_umem(
+    size_t total_size, size_t frame_size, size_t headroom, size_t fill_ring_size, size_t comp_ring_size, RingSet& rings) noexcept
+    -> bool
+{
+    bool const created = create_umem_as_asked(total_size, frame_size, headroom, fill_ring_size, comp_ring_size, rings);
+    // Read here, straight after the libxdp call: allocate() closes on failure,
+    // and the munmap in that close would overwrite it.
+    create_errno_ = created ? 0 : errno;
+    return created;
+}
+
+auto detail::UmemRegion::create_umem_as_asked(
     size_t total_size, size_t frame_size, size_t headroom, size_t fill_ring_size, size_t comp_ring_size, RingSet& rings) noexcept
     -> bool
 {
@@ -709,6 +729,15 @@ auto detail::UmemRegion::create_umem(
     // A caller that asked for metadata on a build without it never gets here:
     // open() refuses before allocating.
     return create_plain_umem(&umem_, area_, total_size, frame_size, headroom, fill_ring_size, comp_ring_size, rings);
+}
+
+auto detail::UmemRegion::create_refusal() const noexcept -> XdpError
+{
+    // xsk_umem__create reports every reason as one EINVAL. The geometry was
+    // checked before this, so with metadata asked for, EINVAL (or a kernel
+    // saying so in as many words) is the kernel not having TX metadata.
+    bool const no_metadata = create_errno_ == EINVAL || create_errno_ == ENOTSUP || create_errno_ == EOPNOTSUPP;
+    return tx_metadata_len_ != 0 && no_metadata ? XdpError::tx_metadata_not_supported : XdpError::umem_creation_failed;
 }
 
 void detail::UmemRegion::close() noexcept
@@ -724,6 +753,7 @@ void detail::UmemRegion::close() noexcept
     }
     frame_size_ = 0;
     headroom_ = 0;
+    tx_metadata_len_ = 0;
     free_list_ = {};
 }
 
@@ -1079,7 +1109,16 @@ auto XdpContext::open(XdpConfig const& config) -> Status
     size_t tx_metadata_len = 0;
     size_t headroom = config.umem_headroom;
     if (config.tx_launch_time) {
-        if (auto const probed = probe_tx_metadata(); !probed) {
+        // Two questions, in order: can this build and kernel carry TX
+        // metadata at all (a compile-time fact here; the UMEM registration
+        // below asks the kernel), and will this NIC act on a launch time in
+        // it. A kernel from 6.8 to 6.14 answers yes to the first and
+        // discards the time, which is why the second is asked of the NIC.
+        if (!detail::xdp_tx_metadata_built) {
+            close();
+            return failure(XdpError::tx_metadata_not_supported);
+        }
+        if (auto const probed = probe_tx_launch_time(interface_.index); !probed) {
             close();
             return failure(probed.error());
         }
@@ -1275,26 +1314,16 @@ void XdpContext::close() noexcept
 
 namespace {
 
-/// Register the smallest UMEM that carries TX metadata, and say whether the
-/// kernel took it. Nothing is ever sent through it.
-[[nodiscard]] auto tx_metadata_umem_registers() -> bool
+/// Register the smallest UMEM that carries TX metadata. Nothing is ever sent
+/// through it.
+[[nodiscard]] auto register_probe_umem(detail::UmemRegion& umem, detail::RingSet& rings) -> Status
 {
     constexpr size_t PROBE_FRAMES = 2;
     constexpr size_t PROBE_RING = 8;
     constexpr size_t PROBE_FRAME_SIZE = 2048;
-    detail::RingSet rings{};
-    detail::UmemRegion umem;
-    return umem
-        .allocate(
-            PROBE_FRAMES, PROBE_FRAME_SIZE, detail::xdp_tx_metadata_len, PROBE_RING, PROBE_RING, rings, detail::xdp_tx_metadata_len)
-        .has_value();
-}
-
-/// Whether an errno from that registration means the kernel will not have TX
-/// metadata at all, as opposed to the caller not being allowed to ask.
-[[nodiscard]] auto errno_means_unsupported(int const failed_with) noexcept -> bool
-{
-    return failed_with == EINVAL || failed_with == ENOTSUP || failed_with == EOPNOTSUPP;
+    auto const registered = umem.allocate(
+        PROBE_FRAMES, PROBE_FRAME_SIZE, detail::xdp_tx_metadata_len, PROBE_RING, PROBE_RING, rings, detail::xdp_tx_metadata_len);
+    return registered ? success() : failure(registered.error());
 }
 
 }  // namespace
@@ -1307,18 +1336,211 @@ auto probe_tx_metadata() -> Status
     // No kernel UAPI for it, or a libxdp that cannot register the length.
     return failure(XdpError::tx_metadata_not_supported);
 #    else
-    if (tx_metadata_umem_registers()) {
-        return success();
+    detail::RingSet rings{};
+    detail::UmemRegion umem;
+    auto const registered = register_probe_umem(umem, rings);
+    if (registered || registered.error() == XdpError::tx_metadata_not_supported) {
+        return registered;
     }
-    // allocate() flattens every reason to umem_creation_failed, so the errno
-    // the libxdp call left is what distinguishes "the kernel will not have
-    // it" from "you may not ask".
-    int const failed_with = errno;
-    if (errno_means_unsupported(failed_with)) {
-        return failure(XdpError::tx_metadata_not_supported);
-    }
-    return failure(std::error_code{failed_with, std::system_category()});
+    // Some other refusal - EPERM for a caller without CAP_NET_RAW - as the
+    // kernel gave it, which allocate() kept from under its own close().
+    return failure(std::error_code{umem.create_errno(), std::system_category()});
 #    endif
+}
+
+// ──────────────────────────────────────────────
+// Launch time: what the kernel says this NIC can do
+// ──────────────────────────────────────────────
+
+namespace {
+
+/// The generic-netlink "netdev" family (Linux 6.6) and the parts of its
+/// dev-get this file reads. Spelled out rather than taken from
+/// <linux/netdev.h> because the launch-time bit is a 6.15 addition and a
+/// build against older headers must still be able to ask a newer kernel.
+/// The UAPI values are checked against the header where it is present.
+constexpr std::array<uint8_t, 7> NETDEV_GENL_FAMILY_NAME{'n', 'e', 't', 'd', 'e', 'v', 0};
+constexpr uint8_t NETDEV_GENL_CMD_DEV_GET = 1;
+constexpr uint16_t NETDEV_GENL_A_DEV_IFINDEX = 1;
+constexpr uint16_t NETDEV_GENL_A_DEV_XSK_FEATURES = 6;
+constexpr uint64_t NETDEV_XSK_TX_LAUNCH_TIME_FIFO = uint64_t{1} << 2;
+#    if __has_include(<linux/netdev.h>)
+static_assert(NETDEV_GENL_CMD_DEV_GET == NETDEV_CMD_DEV_GET);
+static_assert(NETDEV_GENL_A_DEV_IFINDEX == NETDEV_A_DEV_IFINDEX);
+static_assert(NETDEV_GENL_A_DEV_XSK_FEATURES == NETDEV_A_DEV_XSK_FEATURES);
+#    endif
+
+/// A copy of a T out of a byte span, if the span holds one at `at`.
+template <typename T>
+[[nodiscard]] auto read_at(std::span<uint8_t const> const bytes, size_t const at) noexcept -> std::optional<T>
+{
+    if (at + sizeof(T) > bytes.size()) {
+        return std::nullopt;
+    }
+    T value{};
+    std::memcpy(&value, bytes.data() + at, sizeof(T));
+    return value;
+}
+
+/// A generic-netlink request of one command and one attribute, as the bytes
+/// to send. Fixed size: the two this file makes carry a family name or an
+/// interface index.
+struct GenlRequest
+{
+    std::array<uint8_t, 64> bytes{};
+    size_t length{0};
+
+    auto append(void const* data, size_t const size) noexcept -> GenlRequest&
+    {
+        std::memcpy(bytes.data() + length, data, size);
+        length += size;
+        return *this;
+    }
+};
+
+[[nodiscard]] auto genl_request(
+    uint16_t const family, uint8_t const cmd, uint16_t const attribute, std::span<uint8_t const> const value) noexcept
+    -> GenlRequest
+{
+    GenlRequest out{};
+    nlattr const attr{.nla_len = static_cast<uint16_t>(NLA_HDRLEN + value.size()), .nla_type = attribute};
+    nlmsghdr const nlh{
+        .nlmsg_len = static_cast<uint32_t>(NLMSG_HDRLEN + GENL_HDRLEN + NLA_ALIGN(attr.nla_len)),
+        .nlmsg_type = family,
+        .nlmsg_flags = NLM_F_REQUEST,
+        .nlmsg_seq = 1,
+        .nlmsg_pid = 0};
+    genlmsghdr const genl{.cmd = cmd, .version = 1, .reserved = 0};
+    out.append(&nlh, sizeof(nlh)).append(&genl, sizeof(genl)).append(&attr, sizeof(attr)).append(value.data(), value.size());
+    // The attribute is padded to four bytes and the header's length counts
+    // the padding: a message shorter than its own length is dropped by the
+    // kernel without a word, and the reply never comes. The pad is zero.
+    out.length = nlh.nlmsg_len;
+    return out;
+}
+
+/// The errno a reply carries when it is the kernel's refusal, else 0.
+[[nodiscard]] auto genl_error_in(std::span<uint8_t const> const reply) noexcept -> int
+{
+    auto const header = read_at<nlmsghdr>(reply, 0);
+    if (!header || header->nlmsg_type != NLMSG_ERROR) {
+        return 0;
+    }
+    auto const error = read_at<nlmsgerr>(reply, NLMSG_HDRLEN);
+    return error ? -error->error : 0;
+}
+
+/// The payload of the first attribute of `type` in a reply's first message,
+/// when it holds at least `size` bytes.
+[[nodiscard]] auto genl_attribute_in(std::span<uint8_t const> const reply, uint16_t const type, size_t const size) noexcept
+    -> std::optional<std::span<uint8_t const>>
+{
+    auto const header = read_at<nlmsghdr>(reply, 0);
+    if (!header || header->nlmsg_len > reply.size() || header->nlmsg_len < NLMSG_HDRLEN + GENL_HDRLEN) {
+        return std::nullopt;
+    }
+    auto attributes = reply.subspan(NLMSG_HDRLEN + GENL_HDRLEN, header->nlmsg_len - NLMSG_HDRLEN - GENL_HDRLEN);
+    while (auto const attr = read_at<nlattr>(attributes, 0)) {
+        if (attr->nla_len < NLA_HDRLEN || attr->nla_len > attributes.size()) {
+            return std::nullopt;
+        }
+        if ((attr->nla_type & NLA_TYPE_MASK) == type && attr->nla_len - NLA_HDRLEN >= size) {
+            return attributes.subspan(NLA_HDRLEN, size);
+        }
+        attributes = attributes.subspan(std::min<size_t>(NLA_ALIGN(attr->nla_len), attributes.size()));
+    }
+    return std::nullopt;
+}
+
+/// Send one request and take one reply, which is the kernel's refusal or
+/// the message asked for.
+[[nodiscard]] auto genl_exchange(int const fd, GenlRequest const& request, std::span<uint8_t> const reply) noexcept
+    -> StatusValue<std::span<uint8_t const>>
+{
+    if (::send(fd, request.bytes.data(), request.length, 0) < 0) {
+        return failure(errno_code());
+    }
+    ssize_t const received = ::recv(fd, reply.data(), reply.size(), 0);
+    if (received < 0) {
+        return failure(errno_code());
+    }
+    std::span<uint8_t const> const message = reply.first(static_cast<size_t>(received));
+    if (int const refused = genl_error_in(message); refused != 0) {
+        return failure(std::error_code{refused, std::system_category()});
+    }
+    return message;
+}
+
+/// The id the kernel gave the netdev family, or launch_time_not_supported on
+/// a kernel that has no such family - before 6.6 - which cannot time a frame
+/// either.
+[[nodiscard]] auto netdev_family_id(int const fd) -> StatusValue<uint16_t>
+{
+    auto const request = genl_request(GENL_ID_CTRL, CTRL_CMD_GETFAMILY, CTRL_ATTR_FAMILY_NAME, NETDEV_GENL_FAMILY_NAME);
+    std::array<uint8_t, 4096> reply{};
+    auto const answer = genl_exchange(fd, request, reply);
+    if (!answer) {
+        bool const no_such_family = answer.error() == std::error_code{ENOENT, std::system_category()};
+        return failure(no_such_family ? make_error_code(XdpError::launch_time_not_supported) : answer.error());
+    }
+    auto const id = detail::genl_family_id_in(*answer);
+    return id ? StatusValue<uint16_t>{*id} : failure(XdpError::launch_time_not_supported);
+}
+
+[[nodiscard]] auto dev_get_request(uint16_t const family, unsigned int const if_index) noexcept -> GenlRequest
+{
+    uint32_t const index = if_index;
+    std::array<uint8_t, sizeof(index)> bytes{};
+    std::memcpy(bytes.data(), &index, sizeof(index));
+    return genl_request(family, NETDEV_GENL_CMD_DEV_GET, NETDEV_GENL_A_DEV_IFINDEX, bytes);
+}
+
+/// The interface's xsk-features word. A kernel that has the family but not
+/// the attribute (6.6, 6.7) reports no features, which is also the truth.
+[[nodiscard]] auto xsk_features_of(int const fd, uint16_t const family, unsigned int const if_index) -> StatusValue<uint64_t>
+{
+    auto const request = dev_get_request(family, if_index);
+    std::array<uint8_t, 4096> reply{};
+    auto const answer = genl_exchange(fd, request, reply);
+    if (!answer) {
+        return failure(answer.error());
+    }
+    return detail::xsk_features_in(*answer).value_or(0);
+}
+
+}  // namespace
+
+auto detail::genl_family_id_in(std::span<uint8_t const> const reply) noexcept -> std::optional<uint16_t>
+{
+    auto const value = genl_attribute_in(reply, CTRL_ATTR_FAMILY_ID, sizeof(uint16_t));
+    return value ? read_at<uint16_t>(*value, 0) : std::nullopt;
+}
+
+auto detail::xsk_features_in(std::span<uint8_t const> const reply) noexcept -> std::optional<uint64_t>
+{
+    auto const value = genl_attribute_in(reply, NETDEV_GENL_A_DEV_XSK_FEATURES, sizeof(uint64_t));
+    return value ? read_at<uint64_t>(*value, 0) : std::nullopt;
+}
+
+auto probe_tx_launch_time(unsigned int const if_index) -> Status
+{
+    OwnedFd const sock{::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_GENERIC)};
+    if (!sock.valid()) {
+        return failure(errno_code());
+    }
+    // A reply that never comes - a request the kernel dropped unread - is a
+    // refusal to report, not a probe to hang on. Netlink answers at once.
+    timeval const patience{.tv_sec = 2, .tv_usec = 0};
+    (void)::setsockopt(sock.get(), SOL_SOCKET, SO_RCVTIMEO, &patience, sizeof(patience));
+    auto const family = netdev_family_id(sock.get());
+    if (!family) {
+        return failure(family.error());
+    }
+    auto const features = xsk_features_of(sock.get(), *family, if_index);
+    if (!features) {
+        return failure(features.error());
+    }
+    return (*features & NETDEV_XSK_TX_LAUNCH_TIME_FIFO) != 0 ? success() : failure(XdpError::launch_time_not_supported);
 }
 
 auto XdpContext::tx_commit(uint64_t handle, size_t frame_length) -> Status

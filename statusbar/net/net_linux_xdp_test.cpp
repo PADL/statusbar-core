@@ -2085,6 +2085,37 @@ TEST(xdp_integration, an_adopted_program_with_no_tap_asked_for_forwards_to_no_ta
     }
 }
 
+TEST(xdp_integration, a_launch_time_the_nic_cannot_honour_is_refused_at_open)
+{
+    if (getuid() != 0) {
+        SKIP("needs root");
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        SKIP("could not create a veth pair");
+    }
+    auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
+
+    // veth times nothing on any kernel. A build without TX metadata refuses
+    // for that reason first; one with it asks the kernel about the NIC and
+    // is refused there. Either way no socket is opened whose times the NIC
+    // would discard, and the context says it has no launch time.
+    XdpContext ctx;
+    auto const status = ctx.open(XdpConfig{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .umem_frame_count = 64,
+        .tx_launch_time = true,
+    });
+    EXPECT_FALSE(status.has_value());
+    if (!status) {
+        EXPECT_TRUE(status.error() == XdpError::launch_time_not_supported || status.error() == XdpError::tx_metadata_not_supported);
+    }
+    EXPECT_FALSE(ctx.valid());
+    EXPECT_FALSE(ctx.tx_launch_time());
+}
+
 TEST(xdp_integration, tx_rx_loopback)
 {
     if (getuid() != 0) {

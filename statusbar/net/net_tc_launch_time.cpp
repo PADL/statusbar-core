@@ -27,9 +27,10 @@ namespace {
 
 /// Traffic class 0 is the socket's queue, 1 is PTP's where it has one, and the
 /// last is everything else. Named so the layout below reads as the thing it
-/// describes.
+/// describes. Without a PTP queue there are two classes, and 1 is the rest.
 constexpr std::uint8_t SOCKET_CLASS = 0;
 constexpr std::uint8_t PTP_CLASS = 1;
+constexpr std::uint8_t SHARED_REST_CLASS = 1;
 
 /// Whether @p queue describes a layout that exists on the interface.
 [[nodiscard]] auto layout_is_possible(LaunchTimeQueue const& queue) noexcept -> bool
@@ -97,10 +98,10 @@ auto lay_out_with_ptp(MqprioQdisc& root, LaunchTimeQueue const& queue) noexcept 
 auto lay_out_shared(MqprioQdisc& root, LaunchTimeQueue const& queue) noexcept -> void
 {
     auto const rest = static_cast<std::uint16_t>(queue.queue + 1);
-    root.num_tc = PTP_CLASS + 1;
+    root.num_tc = SHARED_REST_CLASS + 1;
     place(root, SOCKET_CLASS, queue.queue, 1);
-    place(root, PTP_CLASS, rest, static_cast<std::uint16_t>(queue.tx_queues - rest));
-    root.prio_tc_map.fill(PTP_CLASS);
+    place(root, SHARED_REST_CLASS, rest, static_cast<std::uint16_t>(queue.tx_queues - rest));
+    root.prio_tc_map.fill(SHARED_REST_CLASS);
 }
 
 }  // namespace
@@ -163,16 +164,33 @@ namespace {
 /// Whether the interface's root is the mqprio *we* lay, identified by its
 /// handle major. Another talker's root, or a shaper somebody configured by
 /// hand, is not ours to keep or to delete.
-[[nodiscard]] auto root_is_ours(TcControl& tc, int const ifindex, std::uint16_t const major) -> StatusValue<bool>
+/// Whether a root the kernel reported lays the queues out as @p wanted
+/// does: the same classes, the same queues in each, the same priority map.
+[[nodiscard]] auto same_layout(MqprioQdisc const& reported, MqprioQdisc const& wanted) noexcept -> bool
+{
+    if (reported.num_tc != wanted.num_tc || reported.prio_tc_map != wanted.prio_tc_map) {
+        return false;
+    }
+    auto const classes = static_cast<std::ptrdiff_t>(wanted.num_tc);
+    return std::equal(reported.count.begin(), reported.count.begin() + classes, wanted.count.begin()) &&
+        std::equal(reported.offset.begin(), reported.offset.begin() + classes, wanted.offset.begin());
+}
+
+/// Ours: an mqprio under our handle whose layout is the one this run wants.
+/// The handle alone is not enough - a config that moved the socket's queue
+/// or its PTP queue between runs leaves our handle on a root whose class
+/// numbers no longer mean what the etf below assumes - so the layout the
+/// kernel reports is compared, and a root that reports none is not ours.
+[[nodiscard]] auto root_is_ours(TcControl& tc, int const ifindex, MqprioQdisc const& wanted) -> StatusValue<bool>
 {
     auto const root = qdisc_at(tc, ifindex, ROOT);
     if (!root) {
         return forward_failure(root);
     }
-    if (!root->has_value()) {
+    if (!root->has_value() || (*root)->kind_name() != "mqprio" || handle_major((*root)->handle) != wanted.major) {
         return false;
     }
-    return (*root)->kind_name() == "mqprio" && handle_major((*root)->handle) == major;
+    return (*root)->has_mqprio_params && same_layout((*root)->mqprio, wanted);
 }
 
 /// The handle of the etf on @p parent, or nullopt if what is there is not an
@@ -220,7 +238,7 @@ namespace {
 [[nodiscard]] auto settle_on(TcControl& tc, int const ifindex, LaunchTimeQueue const& queue, MqprioQdisc const& root)
     -> StatusValue<LaunchTimeQueueAction>
 {
-    auto const ours = root_is_ours(tc, ifindex, queue.major);
+    auto const ours = root_is_ours(tc, ifindex, root);
     if (!ours) {
         return forward_failure(ours);
     }
@@ -247,8 +265,6 @@ namespace {
     return LaunchTimeQueueAction::removed;
 }
 
-/// `off` where the root stays: the layout is wanted for its own sake, so it is
-/// laid or kept and only the etf is taken away.
 /// Take the etf off @p parent where there is one. Nothing there is not a
 /// failure: `off` asked for it to be gone, and it is.
 [[nodiscard]] auto remove_etf_if_there(TcControl& tc, int const ifindex, std::uint32_t const parent) -> StatusValue<bool>
@@ -266,6 +282,8 @@ namespace {
     return true;
 }
 
+/// `off` where the root stays: the layout is wanted for its own sake, so it is
+/// laid or kept and only the etf is taken away.
 [[nodiscard]] auto settle_off_keeping_root(
     TcControl& tc, int const ifindex, LaunchTimeQueue const& queue, MqprioQdisc const& root, bool const ours)
     -> StatusValue<LaunchTimeQueueAction>
@@ -287,7 +305,7 @@ namespace {
 [[nodiscard]] auto settle_off(TcControl& tc, int const ifindex, LaunchTimeQueue const& queue, MqprioQdisc const& root)
     -> StatusValue<LaunchTimeQueueAction>
 {
-    auto const ours = root_is_ours(tc, ifindex, queue.major);
+    auto const ours = root_is_ours(tc, ifindex, root);
     if (!ours) {
         return forward_failure(ours);
     }

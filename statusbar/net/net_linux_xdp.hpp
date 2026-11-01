@@ -100,6 +100,7 @@ enum class XdpError
     pin_not_adoptable,
     stats_read_failed,
     tx_metadata_not_supported,
+    launch_time_not_supported,
     invalid_umem_geometry,
 };
 
@@ -299,9 +300,13 @@ struct XdpConfig
     /// carry a launch time (XdpContext::tx_set_launch_time). The NIC must be
     /// in launch-time mode for the time to mean anything - an offloaded `etf`
     /// on this queue, which net_tc_launch_time.hpp lays - and the driver must
-    /// honour it; probe_tx_metadata() says whether this build and kernel can
-    /// ask at all. open() fails with XdpError::tx_metadata_not_supported
-    /// rather than opening a socket whose times would be ignored.
+    /// honour it. open() asks the kernel, through probe_tx_launch_time(),
+    /// whether this NIC does, and fails with
+    /// XdpError::launch_time_not_supported when it does not - a kernel before
+    /// 6.15 takes the metadata and discards the time - or with
+    /// XdpError::tx_metadata_not_supported when this build or kernel cannot
+    /// carry the metadata at all, rather than opening a socket whose times
+    /// would be ignored.
     ///
     /// Costs sizeof(xsk_tx_metadata) bytes of every frame's headroom: the
     /// headroom is raised to that where a caller asked for less.
@@ -1059,6 +1064,11 @@ class UmemRegion
 
     [[nodiscard]] auto tx_metadata_len() const noexcept -> size_t { return tx_metadata_len_; }
 
+    /// The errno the last UMEM registration left, 0 when it succeeded. Kept
+    /// here because allocate() closes on failure, and a close() runs
+    /// syscalls of its own that would overwrite the one worth reporting.
+    [[nodiscard]] auto create_errno() const noexcept -> int { return create_errno_; }
+
     /// Create the umem itself, with or without TX metadata. Separated so the
     /// two libxdp entry points - only one of which can set tx_metadata_len -
     /// are chosen in one place.
@@ -1069,6 +1079,17 @@ class UmemRegion
         size_t fill_ring_size,
         size_t comp_ring_size,
         RingSet& rings) noexcept -> bool;
+    /// The registration itself, with or without metadata as tx_metadata_len_ says.
+    [[nodiscard]] auto create_umem_as_asked(
+        size_t total_size,
+        size_t frame_size,
+        size_t headroom,
+        size_t fill_ring_size,
+        size_t comp_ring_size,
+        RingSet& rings) noexcept -> bool;
+
+    /// What a failed registration is reported as, from the errno it left.
+    [[nodiscard]] auto create_refusal() const noexcept -> XdpError;
 
     void close() noexcept;
 
@@ -1105,6 +1126,7 @@ class UmemRegion
         std::swap(frame_size_, other.frame_size_);
         std::swap(headroom_, other.headroom_);
         std::swap(tx_metadata_len_, other.tx_metadata_len_);
+        std::swap(create_errno_, other.create_errno_);
         std::swap(free_list_, other.free_list_);
     }
 
@@ -1114,6 +1136,7 @@ class UmemRegion
     size_t frame_size_{0};
     size_t headroom_{0};
     size_t tx_metadata_len_{0};
+    int create_errno_{0};
     UmemFreeList free_list_;
 };
 
@@ -1608,7 +1631,6 @@ class XdpContext
         return fill_status ? comp_status : fill_status;
     }
 
-    /// @param launch_time_ns TSN/AVB launch time in nanoseconds (currently unused, reserved)
     /// @param launch_time_ns CLOCK_TAI nanoseconds to send the frame at, or 0
     ///        for as soon as possible. Needs XdpConfig::tx_launch_time;
     ///        without it a non-zero time is ignored, as it always was.
@@ -1817,19 +1839,52 @@ class XdpContext
 /// Three things have to line up, and only the first two can be answered
 /// without a NIC: the build needs a kernel UAPI with `struct xsk_tx_metadata`
 /// and a libxdp that can register `tx_metadata_len`; the running kernel needs
-/// to accept such a UMEM. Whether the *driver* then honours the time is a
-/// property of the NIC, and the only way to know is to send a frame and watch
-/// when it leaves.
+/// to accept such a UMEM. Whether the NIC then acts on a launch time in that
+/// metadata is a different question, with a different answer on 6.8 to 6.14
+/// kernels, and probe_tx_launch_time() is the one that asks it.
 ///
 /// Registering a UMEM needs an AF_XDP socket, which needs CAP_NET_RAW, so an
-/// unprivileged caller gets that refusal rather than a false negative. open()
-/// consults this before creating anything, so a kernel that cannot time
-/// frames is a refusal and not a socket whose times are discarded.
+/// unprivileged caller gets that refusal rather than a false negative. A
+/// standalone query: open() asks its own UMEM registration the same thing.
 ///
 /// @return success if a launch time can be asked for,
 ///         `XdpError::tx_metadata_not_supported` if it cannot, or the
 ///         kernel's own refusal.
 [[nodiscard]] auto probe_tx_metadata() -> Status;
+
+/// Whether the NIC at @p if_index will act on a launch time in an AF_XDP
+/// frame's TX metadata, as the kernel reports it: the netdev family's
+/// xsk-features, bit NETDEV_XSK_FLAGS_TX_LAUNCH_TIME_FIFO, which Linux 6.15
+/// added together with the feature and a driver sets for the queues that
+/// take a launch time (igc, so far).
+///
+/// This is the question open() asks for XdpConfig::tx_launch_time, and not
+/// probe_tx_metadata(): a kernel from 6.8 to 6.14 registers a UMEM with TX
+/// metadata and then discards the launch-time flag inside it, which from the
+/// outside looks exactly like a NIC that works. Needs no privilege.
+///
+/// @return success, `XdpError::launch_time_not_supported` when the kernel
+///         or the NIC has no such thing, or the kernel's own refusal.
+[[nodiscard]] auto probe_tx_launch_time(unsigned int if_index) -> Status;
+
+namespace detail {
+
+/// Whether this build can register a UMEM that carries TX metadata at all.
+#    if defined(HAVE_XDP_TX_METADATA)
+inline constexpr bool xdp_tx_metadata_built = true;
+#    else
+inline constexpr bool xdp_tx_metadata_built = false;
+#    endif
+
+/// The CTRL_ATTR_FAMILY_ID a generic-netlink family lookup answered with, if
+/// the reply holds one. Pure; here for the tests.
+[[nodiscard]] auto genl_family_id_in(std::span<uint8_t const> reply) noexcept -> std::optional<uint16_t>;
+
+/// The NETDEV_A_DEV_XSK_FEATURES a netdev dev-get answered with, if the reply
+/// holds one.
+[[nodiscard]] auto xsk_features_in(std::span<uint8_t const> reply) noexcept -> std::optional<uint64_t>;
+
+}  // namespace detail
 
 #else  // !(__linux__ && HAVE_XDP)
 
@@ -1941,6 +1996,12 @@ class XdpContext
 /// Without the build's XDP support there is nothing to probe: a launch time
 /// cannot be asked for at all.
 [[nodiscard]] inline auto probe_tx_metadata() -> Status
+{
+    return failure(XdpError::not_supported_on_platform);
+}
+
+/// Nor a NIC to ask about one.
+[[nodiscard]] inline auto probe_tx_launch_time(unsigned int) -> Status
 {
     return failure(XdpError::not_supported_on_platform);
 }

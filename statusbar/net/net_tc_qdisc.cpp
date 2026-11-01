@@ -205,6 +205,14 @@ auto write_tcmsg(std::span<std::uint8_t> at, int ifindex, std::uint32_t handle, 
 
 /// Copy the three fixed-size arrays. Separate from to_qopt only because
 /// the kernel struct's arrays cannot be written as an initializer.
+/// The layout out of a tc_mqprio_qopt, the inverse of copy_mqprio_queues().
+auto copy_mqprio_layout(tc_mqprio_qopt const& qopt, MqprioQdisc& qdisc) noexcept -> void
+{
+    std::ranges::copy(qopt.prio_tc_map, qdisc.prio_tc_map.begin());
+    std::ranges::copy(qopt.count, qdisc.count.begin());
+    std::ranges::copy(qopt.offset, qdisc.offset.begin());
+}
+
 auto copy_mqprio_queues(MqprioQdisc const& qdisc, tc_mqprio_qopt& qopt) noexcept -> void
 {
     std::ranges::copy(qdisc.prio_tc_map, std::begin(qopt.prio_tc_map));
@@ -456,6 +464,20 @@ auto parse_cbs_options(std::span<std::uint8_t const> nest, QdiscInfo& info) noex
     }
 }
 
+/// The kernel reports an mqprio's TCA_OPTIONS as a bare tc_mqprio_qopt; the
+/// nested attributes that may follow it describe offload modes and are not
+/// read.
+auto store_mqprio_params(std::span<std::uint8_t const> payload, QdiscInfo& info) noexcept -> void
+{
+    tc_mqprio_qopt qopt{};
+    std::memcpy(&qopt, payload.data(), sizeof(qopt));
+    info.mqprio.major = handle_major(info.handle);
+    info.mqprio.num_tc = qopt.num_tc;
+    info.mqprio.offload = qopt.hw != 0;
+    copy_mqprio_layout(qopt, info.mqprio);
+    info.has_mqprio_params = true;
+}
+
 auto apply_attribute(std::uint16_t type, std::span<std::uint8_t const> payload, QdiscInfo& info) noexcept -> void
 {
     if (type == TCA_KIND) {
@@ -464,6 +486,9 @@ auto apply_attribute(std::uint16_t type, std::span<std::uint8_t const> payload, 
     }
     if (type == TCA_OPTIONS && info.kind_name() == "cbs") {
         parse_cbs_options(payload, info);
+    }
+    if (type == TCA_OPTIONS && info.kind_name() == "mqprio" && payload.size() >= sizeof(tc_mqprio_qopt)) {
+        store_mqprio_params(payload, info);
     }
 }
 

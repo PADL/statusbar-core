@@ -60,6 +60,16 @@ constexpr std::uint16_t MAJOR = 0x9100;
     return info;
 }
 
+/// Our own root as the kernel reports it back: our handle, and the very
+/// layout launch_time_mqprio() lays for `queue`.
+[[nodiscard]] auto our_root(tc::LaunchTimeQueue const& queue) -> tc::QdiscInfo
+{
+    auto info = installed("mqprio", tc::make_handle(queue.major, 0), tc::ROOT);
+    info.has_mqprio_params = true;
+    info.mqprio = *tc::launch_time_mqprio(queue);
+    return info;
+}
+
 }  // namespace
 
 TEST(tc_launch_time, the_etf_hangs_on_the_class_of_the_sockets_own_queue)
@@ -220,7 +230,7 @@ TEST(tc_launch_time, on_lays_the_root_and_the_etf_when_neither_is_there)
 TEST(tc_launch_time, on_keeps_a_root_and_etf_an_earlier_run_left)
 {
     tc::TcRecorder recorder;
-    recorder.set_get_result_for(tc::ROOT, installed("mqprio", tc::make_handle(MAJOR, 0), tc::ROOT));
+    recorder.set_get_result_for(tc::ROOT, our_root(four_queues()));
     recorder.set_get_result_for(tc::make_handle(MAJOR, 1), installed("etf", 0, tc::make_handle(MAJOR, 1)));
     auto const action = tc::settle_launch_time_queue(recorder, IFINDEX, four_queues(), tc::LaunchTimeMode::on);
     EXPECT_TRUE(action.has_value());
@@ -229,6 +239,41 @@ TEST(tc_launch_time, on_keeps_a_root_and_etf_an_earlier_run_left)
     }
     for (auto const& request : recorder.requests()) {
         EXPECT_TRUE(request.operation == tc::TcRecorder::Operation::get);
+    }
+}
+
+// Our handle on a root laid for another queue layout - the config moved the
+// PTP queue between runs - is not ours to keep either: class 2, where the etf
+// would hang, was "everything else" in the old layout. It is replaced.
+TEST(tc_launch_time, on_replaces_our_root_when_its_layout_is_not_the_one_wanted)
+{
+    tc::TcRecorder recorder;
+    recorder.set_get_result_for(tc::ROOT, our_root(three_queues()));
+    auto const action = tc::settle_launch_time_queue(recorder, IFINDEX, four_queues(), tc::LaunchTimeMode::on);
+    EXPECT_TRUE(action.has_value());
+    if (action) {
+        EXPECT_TRUE(*action == tc::LaunchTimeQueueAction::installed);
+    }
+    bool replaced = false;
+    for (auto const& request : recorder.requests()) {
+        if (request.operation == tc::TcRecorder::Operation::replace_mqprio) {
+            replaced = true;
+            EXPECT_EQ(request.mqprio.num_tc, 3);
+        }
+    }
+    EXPECT_TRUE(replaced);
+}
+
+// And a root that merely carries our handle, reporting no layout at all, is
+// not ours: there is nothing to say what its classes mean.
+TEST(tc_launch_time, a_root_with_our_handle_but_no_layout_is_replaced)
+{
+    tc::TcRecorder recorder;
+    recorder.set_get_result_for(tc::ROOT, installed("mqprio", tc::make_handle(MAJOR, 0), tc::ROOT));
+    auto const action = tc::settle_launch_time_queue(recorder, IFINDEX, four_queues(), tc::LaunchTimeMode::on);
+    EXPECT_TRUE(action.has_value());
+    if (action) {
+        EXPECT_TRUE(*action == tc::LaunchTimeQueueAction::installed);
     }
 }
 
@@ -248,7 +293,7 @@ TEST(tc_launch_time, on_replaces_a_root_that_is_not_ours)
 TEST(tc_launch_time, on_lays_only_the_etf_when_the_root_is_already_ours)
 {
     tc::TcRecorder recorder;
-    recorder.set_get_result_for(tc::ROOT, installed("mqprio", tc::make_handle(MAJOR, 0), tc::ROOT));
+    recorder.set_get_result_for(tc::ROOT, our_root(four_queues()));
     auto const action = tc::settle_launch_time_queue(recorder, IFINDEX, four_queues(), tc::LaunchTimeMode::on);
     EXPECT_TRUE(action.has_value());
     if (action) {
@@ -266,7 +311,7 @@ TEST(tc_launch_time, on_lays_only_the_etf_when_the_root_is_already_ours)
 TEST(tc_launch_time, off_deletes_our_root_and_the_etf_goes_with_it)
 {
     tc::TcRecorder recorder;
-    recorder.set_get_result_for(tc::ROOT, installed("mqprio", tc::make_handle(MAJOR, 0), tc::ROOT));
+    recorder.set_get_result_for(tc::ROOT, our_root(four_queues()));
     auto queue = four_queues();
     queue.persistent_root = false;
     auto const action = tc::settle_launch_time_queue(recorder, IFINDEX, queue, tc::LaunchTimeMode::off);
@@ -306,7 +351,7 @@ TEST(tc_launch_time, off_leaves_a_root_that_is_not_ours_alone)
 TEST(tc_launch_time, off_with_a_persistent_root_removes_only_the_etf)
 {
     tc::TcRecorder recorder;
-    recorder.set_get_result_for(tc::ROOT, installed("mqprio", tc::make_handle(MAJOR, 0), tc::ROOT));
+    recorder.set_get_result_for(tc::ROOT, our_root(four_queues()));
     recorder.set_get_result_for(tc::make_handle(MAJOR, 1), installed("etf", tc::make_handle(0x8003, 0), tc::make_handle(MAJOR, 1)));
     auto const action = tc::settle_launch_time_queue(recorder, IFINDEX, four_queues(), tc::LaunchTimeMode::off);
     EXPECT_TRUE(action.has_value());

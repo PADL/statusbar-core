@@ -250,6 +250,12 @@ struct QdiscInfo
     bool has_cbs_params{false};
     CbsQdisc cbs{};
 
+    /// Set when the qdisc is an mqprio and the kernel's TCA_OPTIONS carried
+    /// its tc_mqprio_qopt: the queue layout, which is what tells a root of
+    /// ours from one that merely has our handle.
+    bool has_mqprio_params{false};
+    MqprioQdisc mqprio{};
+
     [[nodiscard]] auto kind_name() const noexcept -> std::string_view { return std::string_view{kind.data()}; }
 };
 
