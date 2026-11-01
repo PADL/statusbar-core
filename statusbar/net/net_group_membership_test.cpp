@@ -13,7 +13,11 @@ using namespace statusbar::net;
 // socket, setsockopt, the ip_mreqn the platform wants - is exercised here.
 TEST(group_membership, a_group_is_joined_on_the_named_interface_and_held)
 {
+#if defined(__linux__)
     auto const lo = ::if_nametoindex("lo");
+#else
+    auto const lo = ::if_nametoindex("lo0");  // what Darwin and the BSDs call it
+#endif
     EXPECT_TRUE(lo > 0);
     if (lo == 0) {
         return;

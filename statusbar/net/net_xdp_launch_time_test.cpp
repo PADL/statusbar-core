@@ -42,7 +42,12 @@ TEST(xdp_launch_time, a_closed_context_refuses_to_set_a_launch_time)
     auto const set = context.tx_set_launch_time(0, 1'000);
     EXPECT_FALSE(set.has_value());
     if (!set) {
+#if defined(__linux__) && defined(HAVE_XDP)
         EXPECT_EQ(set.error(), make_error_code(XdpError::not_open));
+#else
+        // The stub has no socket to be closed; it says so in its own words.
+        EXPECT_EQ(set.error(), make_error_code(XdpError::not_supported_on_platform));
+#endif
     }
 }
 

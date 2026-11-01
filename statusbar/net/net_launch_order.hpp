@@ -42,12 +42,25 @@ namespace statusbar::net {
 /// `CLOCK_REALTIME`, which is wrong by the current 37 seconds — that is a
 /// configuration fault (`adjtimex`, or a PTP daemon that sets it), and it is
 /// visible as every frame being refused by the NIC as too far in the past.
+///
+/// A host with no TAI clock at all - Darwin - answers CLOCK_REALTIME plus the
+/// TAI-UTC offset, 37 s since 2017 and unchanged by any leap second since.
+/// No NIC takes a launch time from such a host; the value is for the
+/// LaunchOrder logic and its tests, which build everywhere.
 [[nodiscard]] inline auto tai_now_ns() noexcept -> std::uint64_t
 {
     timespec now{};
+#if defined(CLOCK_TAI)
     if (::clock_gettime(CLOCK_TAI, &now) != 0) {
         return 0;
     }
+#else
+    constexpr std::int64_t TaiMinusUtcSeconds = 37;
+    if (::clock_gettime(CLOCK_REALTIME, &now) != 0) {
+        return 0;
+    }
+    now.tv_sec += TaiMinusUtcSeconds;
+#endif
     return (static_cast<std::uint64_t>(now.tv_sec) * 1'000'000'000ULL) + static_cast<std::uint64_t>(now.tv_nsec);
 }
 
