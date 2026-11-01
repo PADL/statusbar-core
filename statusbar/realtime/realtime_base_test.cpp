@@ -254,9 +254,17 @@ TEST(realtime_base_shutdown, setup_signal_handlers_installs_them)
 // detail helpers
 //
 
-TEST(realtime_detail, file_exists_on_this_cpp)
+// The positive case must be a file that exists wherever the binary runs,
+// not where it was built: a cross-built test is copied off the build
+// host, and __FILE__ names a path on the build host. Linux gives every
+// process /proc/self/exe; macOS has no procfs, so /dev/null stands in.
+TEST(realtime_detail, file_exists_on_a_file_every_process_has)
 {
-    EXPECT_TRUE(realtime::detail::file_exists(__FILE__));
+#if defined(__linux__)
+    EXPECT_TRUE(realtime::detail::file_exists("/proc/self/exe"));
+#else
+    EXPECT_TRUE(realtime::detail::file_exists("/dev/null"));
+#endif
 }
 
 TEST(realtime_detail, file_exists_on_missing_path)
