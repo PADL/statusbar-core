@@ -103,6 +103,18 @@ constexpr std::size_t PAYLOAD_START = NLMSGHDR_SIZE + TCMSG_SIZE;  // 36
     return qdisc;
 }
 
+[[nodiscard]] auto sample_etf() -> tc::EtfQdisc
+{
+    return tc::EtfQdisc{
+        .parent = tc::make_handle(0x8001, 1),
+        .clockid = tc::ETF_CLOCK_TAI,
+        .delta_ns = 150'000,
+        .offload = true,
+        .deadline_mode = false,
+        .skip_sock_check = true,
+    };
+}
+
 }  // namespace
 
 TEST(tc_qdisc, delete_request_is_byte_for_byte_as_expected)
@@ -1123,6 +1135,111 @@ TEST(tc_qdisc, the_client_installs_a_receive_timeout)
     socklen_t length = sizeof(timeout);
     EXPECT_EQ(::getsockopt(client.fd(), SOL_SOCKET, SO_RCVTIMEO, &timeout, &length), 0);
     EXPECT_TRUE(timeout.tv_sec > 0 || timeout.tv_usec > 0);
+}
+
+// ---------------------------------------------------------------------------
+// etf
+// ---------------------------------------------------------------------------
+
+TEST(tc_qdisc, etf_request_is_byte_for_byte_as_expected)
+{
+    std::array<std::uint8_t, tc::MAX_REQUEST_SIZE> out{};
+    auto const length = tc::build_replace_etf(out, IFINDEX, sample_etf(), SEQ);
+    EXPECT_TRUE(length.has_value());
+    if (!length) {
+        return;
+    }
+
+    // 16 + 20 + TCA_KIND("etf\0" = 8) + TCA_OPTIONS(4 + TCA_ETF_PARMS(4 + 12)) = 64.
+    std::array<std::uint8_t, 64> const expected{
+        0x40, 0x00, 0x00, 0x00,  // nlmsg_len = 64
+        0x24, 0x00,              // nlmsg_type = RTM_NEWQDISC
+        0x05, 0x05,              // nlmsg_flags = REQUEST|ACK|REPLACE|CREATE
+        0x44, 0x33, 0x22, 0x11,  // nlmsg_seq
+        0x00, 0x00, 0x00, 0x00,  // nlmsg_pid
+        0x00, 0x00, 0x00, 0x00,  // tcm_family + pads
+        0x07, 0x00, 0x00, 0x00,  // tcm_ifindex = 7
+        0x00, 0x00, 0x00, 0x00,  // tcm_handle = 0: nothing hangs off an etf
+        0x01, 0x00, 0x01, 0x80,  // tcm_parent = 0x80010001 (mqprio class 1)
+        0x00, 0x00, 0x00, 0x00,  // tcm_info = 0
+        0x08, 0x00,              // rta_len = 8
+        0x01, 0x00,              // rta_type = TCA_KIND
+        'e',  't',  'f',  0x00,  // "etf\0", already a multiple of 4
+        0x14, 0x00,              // rta_len = 20
+        0x02, 0x00,              // rta_type = TCA_OPTIONS
+        0x10, 0x00,              // rta_len = 16
+        0x01, 0x00,              // rta_type = TCA_ETF_PARMS
+        0xF0, 0x49, 0x02, 0x00,  // delta = 150000
+        0x0B, 0x00, 0x00, 0x00,  // clockid = CLOCK_TAI
+        0x06, 0x00, 0x00, 0x00,  // flags = OFFLOAD_ON | SKIP_SOCK_CHECK
+    };
+
+    EXPECT_EQ(*length, expected.size());
+    if (*length != expected.size()) {
+        return;
+    }
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        EXPECT_EQ(out[i], expected[i]);
+    }
+}
+
+// Each flag is its own bit, and nothing sets a bit the caller did not ask for:
+// a frame released early, or taken from a socket with no SO_TXTIME, is a
+// different qdisc from the one that was asked for.
+TEST(tc_qdisc, each_etf_flag_is_its_own_bit)
+{
+    constexpr std::size_t FLAGS_AT = 60;
+    auto flags_of = [](tc::EtfQdisc const& qdisc) -> std::uint32_t {
+        std::array<std::uint8_t, tc::MAX_REQUEST_SIZE> out{};
+        auto const length = tc::build_replace_etf(out, IFINDEX, qdisc, SEQ);
+        return length ? read_u32(out, FLAGS_AT) : 0xFFFFFFFFU;
+    };
+    tc::EtfQdisc plain{.parent = tc::make_handle(0x8001, 1), .offload = false};
+    EXPECT_EQ(flags_of(plain), std::uint32_t{0});
+    plain.deadline_mode = true;
+    EXPECT_EQ(flags_of(plain), std::uint32_t{1});  // TC_ETF_DEADLINE_MODE_ON
+    plain.deadline_mode = false;
+    plain.offload = true;
+    EXPECT_EQ(flags_of(plain), std::uint32_t{2});  // TC_ETF_OFFLOAD_ON
+    plain.offload = false;
+    plain.skip_sock_check = true;
+    EXPECT_EQ(flags_of(plain), std::uint32_t{4});  // TC_ETF_SKIP_SOCK_CHECK
+}
+
+// An etf hangs on a class. Parent 0 is TC_H_UNSPEC, which names nothing;
+// `root` is TC_H_ROOT and is a different value, so refusing 0 does not refuse
+// a root etf.
+TEST(tc_qdisc, an_etf_with_no_parent_is_refused)
+{
+    std::array<std::uint8_t, tc::MAX_REQUEST_SIZE> out{};
+    auto qdisc = sample_etf();
+    qdisc.parent = 0;
+    auto const length = tc::build_replace_etf(out, IFINDEX, qdisc, SEQ);
+    EXPECT_FALSE(length.has_value());
+    if (!length) {
+        EXPECT_EQ(length.error(), make_error_code(NetError::invalid_argument));
+    }
+    qdisc.parent = tc::ROOT;
+    EXPECT_TRUE(tc::build_replace_etf(out, IFINDEX, qdisc, SEQ).has_value());
+}
+
+// sch_etf's validate_input_params refuses a negative delta outright, so the
+// builder refuses it too rather than spend a syscall learning that.
+TEST(tc_qdisc, an_etf_delta_below_zero_is_refused)
+{
+    std::array<std::uint8_t, tc::MAX_REQUEST_SIZE> out{};
+    auto qdisc = sample_etf();
+    qdisc.delta_ns = -1;
+    EXPECT_FALSE(tc::build_replace_etf(out, IFINDEX, qdisc, SEQ).has_value());
+    qdisc.delta_ns = 0;
+    EXPECT_TRUE(tc::build_replace_etf(out, IFINDEX, qdisc, SEQ).has_value());
+}
+
+TEST(tc_qdisc, ptp_event_traffic_is_priority_seven)
+{
+    // IEEE 802.1Q Table 8-5: network control is the highest priority, and gPTP
+    // event messages are what the AVB profile puts there.
+    EXPECT_EQ(tc::PTP_PRIORITY, std::uint8_t{7});
 }
 
 #endif  // __linux__

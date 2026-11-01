@@ -354,4 +354,35 @@ using FileDescriptor = ::statusbar::FileDescriptor;
     return success();
 }
 
+/// A UDP socket that exists only to hold an IGMP membership for `group` on the
+/// interface with index `interface_index`, for as long as the returned
+/// descriptor lives.
+///
+/// An AF_XDP receiver takes frames before the kernel's IP stack sees them, so
+/// nothing in that path ever sends an IGMP report - and a switch doing
+/// multicast snooping stops forwarding the group, or never starts. A plain
+/// socket joined to the group is what keeps the traffic arriving; it is never
+/// read from, and the frames it would receive are the ones XDP already took.
+///
+/// Closing it leaves the group, so the value must be held for as long as the
+/// receiver wants the traffic. That is why the membership is a descriptor
+/// rather than a one-shot call.
+///
+/// @param group The multicast group to join
+/// @param interface_index Interface to join on, from `if_nametoindex()`
+/// @return The socket holding the membership, or the kernel's refusal: an
+///         address that is not a group, or an interface that is not there.
+[[nodiscard]] inline auto open_group_membership(ip::IPv4Address const& group, unsigned int interface_index) noexcept
+    -> StatusValue<FileDescriptor>
+{
+    auto socket = make_udp_socket();
+    if (!socket) {
+        return failure(socket.error());
+    }
+    if (auto const joined = join_group(socket->get(), group, interface_index); !joined) {
+        return failure(joined.error());
+    }
+    return socket;
+}
+
 }  // namespace statusbar::net

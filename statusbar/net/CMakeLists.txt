@@ -16,6 +16,7 @@ statusbar_add_module(
   net_ring_buffer_base.cpp
   net_rss.cpp
   net_tap_bridge.cpp
+  net_tc_launch_time.cpp
   net_tc_qdisc.cpp
   net_tcp_server.cpp
   net_util.cpp
@@ -37,9 +38,12 @@ statusbar_add_module(
   net_zephyr_eth_concept_test.cpp
   net_compiled_rule_test.cpp
   net_ethernet_port_test.cpp
+  net_group_membership_test.cpp
   net_link_monitor_test.cpp
   net_linux_xdp_test.cpp
   net_interface_info_test.cpp
+  net_launch_order_test.cpp
+  net_tc_launch_time_test.cpp
   net_tc_qdisc_test.cpp
   net_rss_test.cpp
   net_tcam_classifier_test.cpp
@@ -47,6 +51,7 @@ statusbar_add_module(
   net_test.cpp
   net_vlan_link_test.cpp
   net_xdp_abi_test.cpp
+  net_xdp_launch_time_test.cpp
   net_xdp_avtp_rules_test.cpp
   net_xdp_equiv_test.cpp)
 
@@ -131,6 +136,35 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # HAVE_XDP must be visible to consumers so the gated parts of
     # net_linux_xdp.hpp compile in their TUs too.
     target_compile_definitions(statusbar-net PUBLIC HAVE_XDP=1)
+
+    # AF_XDP TX metadata - the UMEM option that carries a per-frame launch time
+    # - needs both a kernel UAPI with struct xsk_tx_metadata (6.8) and a libxdp
+    # with the opts-style umem create that can set tx_metadata_len (1.5). Probed
+    # rather than assumed: Debian trixie has both, older distributions have
+    # neither, and the gated code must not be compiled where it would not link.
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_INCLUDES ${LIBXDP_INCLUDE_DIRS} ${LIBBPF_INCLUDE_DIRS})
+    set(CMAKE_REQUIRED_LIBRARIES ${LIBXDP_LIBRARIES})
+    check_cxx_source_compiles(
+      "
+      #include <linux/if_xdp.h>
+      #include <xdp/xsk.h>
+      int main() {
+        struct xsk_tx_metadata meta{};
+        meta.flags = XDP_TXMD_FLAGS_LAUNCH_TIME;
+        meta.request.launch_time = 1;
+        struct xsk_umem_opts opts{};
+        opts.tx_metadata_len = sizeof(meta);
+        (void)xsk_umem__create_opts(nullptr, nullptr, nullptr, &opts);
+        return XDP_TX_METADATA;
+      }
+      "
+      HAVE_XDP_TX_METADATA_SUPPORT)
+    unset(CMAKE_REQUIRED_INCLUDES)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+    if(HAVE_XDP_TX_METADATA_SUPPORT)
+      target_compile_definitions(statusbar-net PUBLIC HAVE_XDP_TX_METADATA=1)
+    endif()
     # The --embed-dir flag is only needed when compiling
     # xdp_filter_bpf_embed.cpp, which is the only TU using #embed. Scope it to
     # that source rather than the whole library.

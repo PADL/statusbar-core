@@ -99,6 +99,8 @@ enum class XdpError
     foreign_program,
     pin_not_adoptable,
     stats_read_failed,
+    tx_metadata_not_supported,
+    invalid_umem_geometry,
 };
 
 class XdpErrorCategory : public std::error_category
@@ -275,7 +277,13 @@ struct XdpConfig
     size_t tx_ring_size{256};
     size_t fill_ring_size{512};
     size_t completion_ring_size{512};
-    size_t umem_frame_size{2048};
+    /// Bytes per UMEM frame. 4096 and not 2048: the kernel takes 256 octets
+    /// of XDP headroom from the front, and igb and igc then allocate the RX
+    /// buffer in whole 1 KiB units of what is left. 2048 leaves 1792, which
+    /// rounds down to one 1 KiB buffer, and a 1522-octet frame arrives cut to
+    /// 1024 - counted as received, with no error anywhere. 4096 leaves 3840,
+    /// which rounds to 3 KiB.
+    size_t umem_frame_size{4096};
     size_t umem_frame_count{1024};
     size_t umem_headroom{0};
     /// Interface the devmap points at, for rules whose action is
@@ -287,6 +295,17 @@ struct XdpConfig
     size_t rx_drain_max{32};
     size_t completion_drain_max{64};
     int rx_clock_id{CLOCK_MONOTONIC_RAW};
+    /// Register the UMEM with room for AF_XDP TX metadata, so each frame can
+    /// carry a launch time (XdpContext::tx_set_launch_time). The NIC must be
+    /// in launch-time mode for the time to mean anything - an offloaded `etf`
+    /// on this queue, which net_tc_launch_time.hpp lays - and the driver must
+    /// honour it; probe_tx_metadata() says whether this build and kernel can
+    /// ask at all. open() fails with XdpError::tx_metadata_not_supported
+    /// rather than opening a socket whose times would be ignored.
+    ///
+    /// Costs sizeof(xsk_tx_metadata) bytes of every frame's headroom: the
+    /// headroom is raised to that where a caller asked for less.
+    bool tx_launch_time{false};
     XdpBindMode bind_mode{XdpBindMode::auto_};
     XdpAttachMode attach_mode{XdpAttachMode::native};
     /// Where to pin the program and its maps, from XdpProgram::pin_path_for().
@@ -893,6 +912,100 @@ struct RingSet
 
 /// Owns the mmap'd UMEM region, frame config, and free list.
 /// RAII — destructor calls close().
+#    if defined(HAVE_XDP_TX_METADATA)
+
+/// XDP_TX_METADATA, under a name the TX path can use unguarded. A kernel
+/// header that predates TX metadata defines neither, and then no frame ever
+/// asks for any.
+inline constexpr uint32_t xdp_desc_tx_metadata = XDP_TX_METADATA;
+
+/// Write a launch time into a frame's TX metadata, or clear it for 0.
+///
+/// The metadata is a kernel struct in the UMEM, so it is written through a
+/// typed pointer rather than byte by byte; the span's length has already been
+/// checked to be sizeof(xsk_tx_metadata).
+inline auto write_launch_time(std::span<uint8_t> metadata, int64_t launch_time_ns) noexcept -> void
+{
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) - the UMEM holds the kernel's struct
+    auto* meta = reinterpret_cast<struct xsk_tx_metadata*>(metadata.data());
+    *meta = xsk_tx_metadata{};
+    if (launch_time_ns <= 0) {
+        // No flag, so tx_commit() leaves XDP_TX_METADATA off and the frame
+        // goes as soon as the NIC can send it.
+        return;
+    }
+    meta->flags = XDP_TXMD_FLAGS_LAUNCH_TIME;
+    meta->request.launch_time = static_cast<__u64>(launch_time_ns);
+}
+
+/// Whether a frame's metadata asks for anything, read back from the frame
+/// itself. Keeping the answer in the UMEM rather than beside it is what makes
+/// a batch of frames between tx_start() and tx_commit() safe.
+[[nodiscard]] inline auto frame_wants_metadata(std::span<uint8_t const> metadata) noexcept -> bool
+{
+    if (metadata.size() < sizeof(struct xsk_tx_metadata)) {
+        return false;
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) - as above
+    auto const* meta = reinterpret_cast<struct xsk_tx_metadata const*>(metadata.data());
+    return meta->flags != 0;
+}
+
+#    else  // !HAVE_XDP_TX_METADATA
+
+inline constexpr uint32_t xdp_desc_tx_metadata = 0;
+
+inline auto write_launch_time(std::span<uint8_t>, int64_t) noexcept -> void
+{}
+
+[[nodiscard]] inline auto frame_wants_metadata(std::span<uint8_t const>) noexcept -> bool
+{
+    return false;
+}
+
+#    endif  // HAVE_XDP_TX_METADATA
+
+/// XDP_PACKET_HEADROOM: what the kernel takes off the front of every frame
+/// for its own use, before the caller's headroom.
+inline constexpr size_t xdp_packet_headroom = 256;
+
+/// The kernel's smallest UMEM chunk (XDP_UMEM_MIN_CHUNK_SIZE).
+inline constexpr size_t xdp_min_frame_size = 2048;
+
+/// Whether the kernel will register a UMEM of this geometry, by its own rules
+/// in net/xdp/xdp_umem.c (xdp_umem_reg) for aligned chunks - the only mode
+/// this module uses.
+///
+/// Pure, and takes the page size rather than reading it, because the answer
+/// differs by host: a frame size above 4096 is legal where pages are 16 KiB
+/// (Asahi, the Pi 5) and refused where they are 4 KiB (x86). 4096 is
+/// therefore the largest portable value.
+///
+/// @param frame_size Bytes per UMEM frame
+/// @param headroom The caller's headroom, on top of the kernel's own
+/// @param page_size The host's page size, from sysconf(_SC_PAGESIZE)
+[[nodiscard]] constexpr auto umem_geometry_is_valid(size_t frame_size, size_t headroom, size_t page_size) noexcept -> bool
+{
+    if (frame_size < xdp_min_frame_size || frame_size > page_size) {
+        return false;
+    }
+    if ((frame_size & (frame_size - 1)) != 0) {
+        return false;
+    }
+    // The kernel's own headroom comes out of the frame first, and what is left
+    // has to be able to hold something.
+    return headroom < frame_size - xdp_packet_headroom;
+}
+
+/// Bytes of per-frame UMEM metadata an AF_XDP socket needs to carry a launch
+/// time. The kernel places the metadata immediately *below* the descriptor's
+/// address, so a frame's headroom must be at least this for it to fit.
+#    if defined(HAVE_XDP_TX_METADATA)
+inline constexpr size_t xdp_tx_metadata_len = sizeof(struct xsk_tx_metadata);
+#    else
+inline constexpr size_t xdp_tx_metadata_len = 0;
+#    endif
+
 class UmemRegion
 {
   public:
@@ -920,9 +1033,42 @@ class UmemRegion
     /// @param fill_ring_size Number of entries in the fill ring
     /// @param comp_ring_size Number of entries in the completion ring
     /// @param rings Ring set to initialize with fill and completion rings
+    /// @param tx_metadata_len Bytes of per-frame TX metadata to register, or
+    ///        0 for none. Non-zero needs a libxdp that can set it; the caller
+    ///        has already checked that with probe_tx_metadata().
     [[nodiscard]] auto allocate(
-        size_t frame_count, size_t frame_size, size_t headroom, size_t fill_ring_size, size_t comp_ring_size, RingSet& rings)
-        -> StatusValue<struct xsk_umem*>;
+        size_t frame_count,
+        size_t frame_size,
+        size_t headroom,
+        size_t fill_ring_size,
+        size_t comp_ring_size,
+        RingSet& rings,
+        size_t tx_metadata_len = 0) -> StatusValue<struct xsk_umem*>;
+
+    /// Where the TX metadata of the frame at `addr` lives: the bytes
+    /// immediately below the descriptor address, which is `addr + headroom`.
+    /// Empty when the UMEM carries no metadata, or the headroom cannot hold
+    /// it.
+    [[nodiscard]] auto tx_metadata_span(uint64_t addr) noexcept -> std::span<uint8_t>
+    {
+        if (tx_metadata_len_ == 0 || headroom_ < tx_metadata_len_) {
+            return {};
+        }
+        return {area_ + addr + headroom_ - tx_metadata_len_, tx_metadata_len_};
+    }
+
+    [[nodiscard]] auto tx_metadata_len() const noexcept -> size_t { return tx_metadata_len_; }
+
+    /// Create the umem itself, with or without TX metadata. Separated so the
+    /// two libxdp entry points - only one of which can set tx_metadata_len -
+    /// are chosen in one place.
+    [[nodiscard]] auto create_umem(
+        size_t total_size,
+        size_t frame_size,
+        size_t headroom,
+        size_t fill_ring_size,
+        size_t comp_ring_size,
+        RingSet& rings) noexcept -> bool;
 
     void close() noexcept;
 
@@ -958,6 +1104,7 @@ class UmemRegion
         std::swap(area_size_, other.area_size_);
         std::swap(frame_size_, other.frame_size_);
         std::swap(headroom_, other.headroom_);
+        std::swap(tx_metadata_len_, other.tx_metadata_len_);
         std::swap(free_list_, other.free_list_);
     }
 
@@ -966,6 +1113,7 @@ class UmemRegion
     size_t area_size_{0};
     size_t frame_size_{0};
     size_t headroom_{0};
+    size_t tx_metadata_len_{0};
     UmemFreeList free_list_;
 };
 
@@ -1461,13 +1609,24 @@ class XdpContext
     }
 
     /// @param launch_time_ns TSN/AVB launch time in nanoseconds (currently unused, reserved)
+    /// @param launch_time_ns CLOCK_TAI nanoseconds to send the frame at, or 0
+    ///        for as soon as possible. Needs XdpConfig::tx_launch_time;
+    ///        without it a non-zero time is ignored, as it always was.
+    ///        tx_set_launch_time() is the same thing after the fact, and says
+    ///        so when it cannot.
     [[nodiscard]] auto tx_start(int64_t launch_time_ns = 0) -> StatusValue<EthernetTxSlot>
     {
-        (void)launch_time_ns;
         auto addr = umem_.alloc_frame();
         if (!addr) {
             ++stats_.umem_exhausted_count;
             return failure(XdpError::free_list_empty);
+        }
+        // A frame off the free list carries whatever its last use left in the
+        // metadata, and a stale launch time stalls the queue rather than
+        // being ignored. Clearing it is also how a 0 here means "now".
+        auto metadata = umem_.tx_metadata_span(*addr);
+        if (!metadata.empty()) {
+            detail::write_launch_time(metadata, launch_time_ns);
         }
         return EthernetTxSlot{
             .handle = *addr,
@@ -1577,6 +1736,44 @@ class XdpContext
         return detail::read_xdp_kernel_stats(xsk_socket__fd(xsk_));
     }
 
+    /// Whether this socket's frames can carry a launch time, i.e. the UMEM
+    /// was registered with room for TX metadata (XdpConfig::tx_launch_time).
+    [[nodiscard]] auto tx_launch_time() const noexcept -> bool { return umem_.tx_metadata_len() != 0; }
+
+    /// Send the frame at @p handle at @p launch_time_ns on CLOCK_TAI, rather
+    /// than as soon as the NIC can.
+    ///
+    /// Called between tx_start() and tx_commit() for that frame. The time is
+    /// written into the frame's own metadata, which is what makes a batch
+    /// safe: each frame carries its own, and commit reads it back.
+    ///
+    /// The NIC must be in launch-time mode for this to mean anything - an
+    /// offloaded `etf` on this queue - and a time already past is the
+    /// driver's to refuse. net::LaunchOrder is what keeps the times in the
+    /// order the queue needs.
+    ///
+    /// @param handle UMEM frame address from tx_start()
+    /// @param launch_time_ns CLOCK_TAI nanoseconds; 0 means "as soon as
+    ///        possible", and clears any time already set on the frame
+    /// @return `not_open` on a closed socket, `tx_metadata_not_supported`
+    ///         when the UMEM carries no metadata.
+    [[nodiscard]] auto tx_set_launch_time(uint64_t handle, int64_t launch_time_ns) noexcept -> Status
+    {
+        if (!valid()) {
+            return failure(XdpError::not_open);
+        }
+        auto metadata = umem_.tx_metadata_span(handle);
+        if (metadata.empty()) {
+            return failure(XdpError::tx_metadata_not_supported);
+        }
+        detail::write_launch_time(metadata, launch_time_ns);
+        return success();
+    }
+
+    /// Zero the counters, keeping the socket. A run that has been going for
+    /// days needs a fresh window without a reopen.
+    auto reset_stats() noexcept -> void { stats_ = Stats{}; }
+
   private:
     void swap(XdpContext& other) noexcept
     {
@@ -1613,6 +1810,26 @@ class XdpContext
     bool tx_pending_{false};
     bool zero_copy_{false};
 };
+
+/// Whether this build and this kernel can put a launch time on an AF_XDP
+/// frame at all.
+///
+/// Three things have to line up, and only the first two can be answered
+/// without a NIC: the build needs a kernel UAPI with `struct xsk_tx_metadata`
+/// and a libxdp that can register `tx_metadata_len`; the running kernel needs
+/// to accept such a UMEM. Whether the *driver* then honours the time is a
+/// property of the NIC, and the only way to know is to send a frame and watch
+/// when it leaves.
+///
+/// Registering a UMEM needs an AF_XDP socket, which needs CAP_NET_RAW, so an
+/// unprivileged caller gets that refusal rather than a false negative. open()
+/// consults this before creating anything, so a kernel that cannot time
+/// frames is a refusal and not a socket whose times are discarded.
+///
+/// @return success if a launch time can be asked for,
+///         `XdpError::tx_metadata_not_supported` if it cannot, or the
+///         kernel's own refusal.
+[[nodiscard]] auto probe_tx_metadata() -> Status;
 
 #else  // !(__linux__ && HAVE_XDP)
 
@@ -1700,6 +1917,15 @@ class XdpContext
     [[nodiscard]] auto socket_stats() const noexcept -> XdpSocketStats const& { return stats_; }
     [[nodiscard]] auto stats() const noexcept -> Stats const& { return stats_; }
 
+    [[nodiscard]] auto tx_launch_time() const noexcept -> bool { return false; }
+
+    [[nodiscard]] auto tx_set_launch_time(uint64_t, int64_t) noexcept -> Status
+    {
+        return failure(XdpError::not_supported_on_platform);
+    }
+
+    auto reset_stats() noexcept -> void { stats_ = Stats{}; }
+
     [[nodiscard]] auto kernel_stats() const -> StatusValue<XdpKernelStats> { return failure(XdpError::not_supported_on_platform); }
 
   private:
@@ -1711,6 +1937,13 @@ class XdpContext
     Stats stats_{};
     XdpProgram program_;
 };
+
+/// Without the build's XDP support there is nothing to probe: a launch time
+/// cannot be asked for at all.
+[[nodiscard]] inline auto probe_tx_metadata() -> Status
+{
+    return failure(XdpError::not_supported_on_platform);
+}
 
 #endif  // __linux__ && HAVE_XDP
 

@@ -136,6 +136,80 @@ TEST(xdp_error, category_name)
 // XdpConfig defaults tests
 //
 
+// A UMEM frame must leave room for a whole Ethernet frame *after* the kernel's
+// XDP headroom and after igb/igc round the RX buffer down to a 1 KiB unit.
+// 2048 leaves 1792, which rounds to 1 KiB, and a 1522-octet frame then arrives
+// truncated to its first buffer - silently, counted as received, with the
+// payload cut. 4096 leaves 3840, which rounds to 3 KiB.
+TEST(xdp_config, the_default_umem_frame_holds_a_whole_frame_after_the_kernels_headroom)
+{
+    constexpr size_t XDP_HEADROOM = 256;     // XDP_PACKET_HEADROOM
+    constexpr size_t RX_BUFFER_UNIT = 1024;  // igb/igc allocate in 1 KiB units
+    constexpr size_t LARGEST_FRAME = 1522;   // 1500-octet MTU, VLAN tagged, FCS
+    XdpConfig const config{.interface_name = "eth0"};
+    size_t const usable = config.umem_frame_size - config.umem_headroom - XDP_HEADROOM;
+    EXPECT_TRUE(usable / RX_BUFFER_UNIT * RX_BUFFER_UNIT >= LARGEST_FRAME);
+}
+
+// The kernel's own rules for a UMEM's geometry (net/xdp/xdp_umem.c,
+// xdp_umem_reg), checked here rather than discovered as a bare EINVAL that
+// open() would report as "UMEM creation failed".
+//
+// The page size is a parameter because it is not the same everywhere: x86 has
+// 4 KiB pages, this host and the Pi 5 have 16 KiB. A frame size above 4096
+// therefore works on one and is refused on the other, which is exactly the
+// kind of difference that should not need hardware to find.
+TEST(xdp_umem_geometry, the_kernels_rules_for_a_frame_size_are_checked_up_front)
+{
+    constexpr size_t PAGE_4K = 4096;
+    constexpr size_t PAGE_16K = 16384;
+    // The usual pair, valid everywhere.
+    EXPECT_TRUE(detail::umem_geometry_is_valid(2048, 0, PAGE_4K));
+    EXPECT_TRUE(detail::umem_geometry_is_valid(4096, 0, PAGE_4K));
+    // Below the kernel's minimum chunk.
+    EXPECT_FALSE(detail::umem_geometry_is_valid(1024, 0, PAGE_4K));
+    // Not a power of two: refused in aligned-chunk mode, which is the only
+    // mode this module uses.
+    EXPECT_FALSE(detail::umem_geometry_is_valid(3000, 0, PAGE_4K));
+    // Larger than a page. Legal on a 16 KiB-page host, not on a 4 KiB one.
+    EXPECT_FALSE(detail::umem_geometry_is_valid(8192, 0, PAGE_4K));
+    EXPECT_TRUE(detail::umem_geometry_is_valid(8192, 0, PAGE_16K));
+}
+
+// The headroom has to leave the kernel its own 256 octets and something for a
+// frame; a caller that asks for all of it gets a refusal, not a UMEM whose
+// frames hold nothing.
+TEST(xdp_umem_geometry, a_headroom_that_crowds_out_the_frame_is_refused)
+{
+    constexpr size_t PAGE_4K = 4096;
+    constexpr size_t XDP_HEADROOM = 256;
+    EXPECT_TRUE(detail::umem_geometry_is_valid(4096, 4096 - XDP_HEADROOM - 1, PAGE_4K));
+    EXPECT_FALSE(detail::umem_geometry_is_valid(4096, 4096 - XDP_HEADROOM, PAGE_4K));
+    EXPECT_FALSE(detail::umem_geometry_is_valid(2048, 2048, PAGE_4K));
+}
+
+// The default geometry is one the kernel takes, on either page size.
+TEST(xdp_umem_geometry, the_default_geometry_is_valid_on_every_page_size)
+{
+    XdpConfig const config{.interface_name = "eth0"};
+    EXPECT_TRUE(detail::umem_geometry_is_valid(config.umem_frame_size, config.umem_headroom, 4096));
+    EXPECT_TRUE(detail::umem_geometry_is_valid(config.umem_frame_size, config.umem_headroom, 16384));
+}
+
+// A geometry the kernel would refuse is reported as what it is, so a caller
+// that tuned the frame size learns which knob is wrong.
+TEST(xdp_umem_geometry, opening_with_an_impossible_frame_size_says_so)
+{
+    XdpContext context;
+    XdpConfig config{.interface_name = "lo"};
+    config.umem_frame_size = 3000;
+    auto const opened = context.open(config);
+    EXPECT_FALSE(opened.has_value());
+    if (!opened) {
+        EXPECT_EQ(opened.error(), make_error_code(XdpError::invalid_umem_geometry));
+    }
+}
+
 TEST(xdp_config, default_values)
 {
     XdpConfig config{.interface_name = "eth0"};
@@ -145,7 +219,7 @@ TEST(xdp_config, default_values)
     EXPECT_EQ(config.tx_ring_size, 256u);
     EXPECT_EQ(config.fill_ring_size, 512u);
     EXPECT_EQ(config.completion_ring_size, 512u);
-    EXPECT_EQ(config.umem_frame_size, 2048u);
+    EXPECT_EQ(config.umem_frame_size, 4096u);
     EXPECT_EQ(config.umem_frame_count, 1024u);
     EXPECT_EQ(config.umem_headroom, 0u);
     EXPECT_EQ(config.tap_ifindex, 0u);

@@ -81,6 +81,10 @@ auto XdpErrorCategory::message(int ev) const -> std::string
             return "The pinned XDP program is not the one this build attaches, so it cannot be adopted";
         case XdpError::stats_read_failed:
             return "Reading the kernel's socket statistics failed";
+        case XdpError::tx_metadata_not_supported:
+            return "This build or kernel cannot put a launch time on an AF_XDP frame";
+        case XdpError::invalid_umem_geometry:
+            return "The UMEM frame size or headroom is not one the kernel will register";
         default:
             return "Unknown XDP error";
     }
@@ -590,9 +594,71 @@ auto detail::read_xdp_kernel_stats(int fd) -> StatusValue<XdpKernelStats>
     return kernel_stats_from(raw, length);
 }
 
+namespace {
+
+/// The plain umem create, for a UMEM with no TX metadata.
+[[nodiscard]] auto create_plain_umem(
+    struct xsk_umem** umem,
+    uint8_t* area,
+    size_t total_size,
+    size_t frame_size,
+    size_t headroom,
+    size_t fill_ring_size,
+    size_t comp_ring_size,
+    detail::RingSet& rings) noexcept -> bool
+{
+    struct xsk_umem_config umem_cfg{
+        .fill_size = static_cast<__u32>(fill_ring_size),
+        .comp_size = static_cast<__u32>(comp_ring_size),
+        .frame_size = static_cast<__u32>(frame_size),
+        .frame_headroom = static_cast<__u32>(headroom),
+        .flags = 0,
+    };
+    return xsk_umem__create(umem, area, total_size, &rings.fill, &rings.comp, &umem_cfg) == 0;
+}
+
+#    if defined(HAVE_XDP_TX_METADATA)
+
+/// The opts-style create, the only one that can set tx_metadata_len. It
+/// returns the umem rather than an int, and sets errno on failure.
+[[nodiscard]] auto create_umem_with_metadata(
+    struct xsk_umem** umem,
+    uint8_t* area,
+    size_t total_size,
+    size_t frame_size,
+    size_t headroom,
+    size_t fill_ring_size,
+    size_t comp_ring_size,
+    size_t tx_metadata_len,
+    detail::RingSet& rings) noexcept -> bool
+{
+    // Designated, and in declaration order: xsk_umem_opts carries its own size
+    // in `sz` so libxdp can tell which fields a caller knew about.
+    struct xsk_umem_opts opts{
+        .sz = sizeof(struct xsk_umem_opts),
+        .size = total_size,
+        .fill_size = static_cast<__u32>(fill_ring_size),
+        .comp_size = static_cast<__u32>(comp_ring_size),
+        .frame_size = static_cast<__u32>(frame_size),
+        .frame_headroom = static_cast<__u32>(headroom),
+        .tx_metadata_len = static_cast<__u32>(tx_metadata_len),
+    };
+    *umem = xsk_umem__create_opts(area, &rings.fill, &rings.comp, &opts);
+    return *umem != nullptr;
+}
+
+#    endif  // HAVE_XDP_TX_METADATA
+
+}  // namespace
+
 auto detail::UmemRegion::allocate(
-    size_t frame_count, size_t frame_size, size_t headroom, size_t fill_ring_size, size_t comp_ring_size, RingSet& rings)
-    -> StatusValue<struct xsk_umem*>
+    size_t frame_count,
+    size_t frame_size,
+    size_t headroom,
+    size_t fill_ring_size,
+    size_t comp_ring_size,
+    RingSet& rings,
+    size_t tx_metadata_len) -> StatusValue<struct xsk_umem*>
 {
     close();
 
@@ -619,15 +685,8 @@ auto detail::UmemRegion::allocate(
         }
     }
 
-    struct xsk_umem_config umem_cfg{};
-    umem_cfg.fill_size = static_cast<__u32>(fill_ring_size);
-    umem_cfg.comp_size = static_cast<__u32>(comp_ring_size);
-    umem_cfg.frame_size = static_cast<__u32>(frame_size);
-    umem_cfg.frame_headroom = static_cast<__u32>(headroom);
-    umem_cfg.flags = 0;
-
-    int const ret = xsk_umem__create(&umem_, area_, total_size, &rings.fill, &rings.comp, &umem_cfg);
-    if (ret != 0) {
+    tx_metadata_len_ = tx_metadata_len;
+    if (!create_umem(total_size, frame_size, headroom, fill_ring_size, comp_ring_size, rings)) {
         close();
         return failure(XdpError::umem_creation_failed);
     }
@@ -635,6 +694,21 @@ auto detail::UmemRegion::allocate(
     free_list_ = UmemFreeList(frame_count, frame_size);
 
     return umem_;
+}
+
+auto detail::UmemRegion::create_umem(
+    size_t total_size, size_t frame_size, size_t headroom, size_t fill_ring_size, size_t comp_ring_size, RingSet& rings) noexcept
+    -> bool
+{
+#    if defined(HAVE_XDP_TX_METADATA)
+    if (tx_metadata_len_ != 0) {
+        return create_umem_with_metadata(
+            &umem_, area_, total_size, frame_size, headroom, fill_ring_size, comp_ring_size, tx_metadata_len_, rings);
+    }
+#    endif
+    // A caller that asked for metadata on a build without it never gets here:
+    // open() refuses before allocating.
+    return create_plain_umem(&umem_, area_, total_size, frame_size, headroom, fill_ring_size, comp_ring_size, rings);
 }
 
 void detail::UmemRegion::close() noexcept
@@ -997,14 +1071,39 @@ auto XdpContext::open(XdpConfig const& config) -> Status
         }
     }
 
-    // Step 2: Allocate UMEM
+    // Step 2: Allocate UMEM.
+    //
+    // Launch time is refused here rather than ignored: a socket whose times
+    // the kernel discards looks exactly like one that works, and the frames
+    // go out at the wrong moment with nothing reported.
+    size_t tx_metadata_len = 0;
+    size_t headroom = config.umem_headroom;
+    if (config.tx_launch_time) {
+        if (auto const probed = probe_tx_metadata(); !probed) {
+            close();
+            return failure(probed.error());
+        }
+        tx_metadata_len = detail::xdp_tx_metadata_len;
+        // The kernel puts the metadata below the descriptor address, so the
+        // headroom has to hold it.
+        headroom = std::max(headroom, tx_metadata_len);
+    }
+    // Checked here rather than left to the kernel: xsk_umem__create reports
+    // every reason as one EINVAL, which open() would pass on as "UMEM
+    // creation failed" and tell a caller nothing about which knob is wrong.
+    auto const page_size = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+    if (!detail::umem_geometry_is_valid(config.umem_frame_size, headroom, page_size)) {
+        close();
+        return failure(XdpError::invalid_umem_geometry);
+    }
     auto umem_result = umem_.allocate(
         config.umem_frame_count,
         config.umem_frame_size,
-        config.umem_headroom,
+        headroom,
         config.fill_ring_size,
         config.completion_ring_size,
-        rings_);
+        rings_,
+        tx_metadata_len);
     if (!umem_result) {
         close();
         return failure(umem_result.error());
@@ -1172,6 +1271,56 @@ void XdpContext::close() noexcept
     program_ = {};
 }
 
+#    if defined(HAVE_XDP_TX_METADATA)
+
+namespace {
+
+/// Register the smallest UMEM that carries TX metadata, and say whether the
+/// kernel took it. Nothing is ever sent through it.
+[[nodiscard]] auto tx_metadata_umem_registers() -> bool
+{
+    constexpr size_t PROBE_FRAMES = 2;
+    constexpr size_t PROBE_RING = 8;
+    constexpr size_t PROBE_FRAME_SIZE = 2048;
+    detail::RingSet rings{};
+    detail::UmemRegion umem;
+    return umem
+        .allocate(
+            PROBE_FRAMES, PROBE_FRAME_SIZE, detail::xdp_tx_metadata_len, PROBE_RING, PROBE_RING, rings, detail::xdp_tx_metadata_len)
+        .has_value();
+}
+
+/// Whether an errno from that registration means the kernel will not have TX
+/// metadata at all, as opposed to the caller not being allowed to ask.
+[[nodiscard]] auto errno_means_unsupported(int const failed_with) noexcept -> bool
+{
+    return failed_with == EINVAL || failed_with == ENOTSUP || failed_with == EOPNOTSUPP;
+}
+
+}  // namespace
+
+#    endif  // HAVE_XDP_TX_METADATA
+
+auto probe_tx_metadata() -> Status
+{
+#    if !defined(HAVE_XDP_TX_METADATA)
+    // No kernel UAPI for it, or a libxdp that cannot register the length.
+    return failure(XdpError::tx_metadata_not_supported);
+#    else
+    if (tx_metadata_umem_registers()) {
+        return success();
+    }
+    // allocate() flattens every reason to umem_creation_failed, so the errno
+    // the libxdp call left is what distinguishes "the kernel will not have
+    // it" from "you may not ask".
+    int const failed_with = errno;
+    if (errno_means_unsupported(failed_with)) {
+        return failure(XdpError::tx_metadata_not_supported);
+    }
+    return failure(std::error_code{failed_with, std::system_category()});
+#    endif
+}
+
 auto XdpContext::tx_commit(uint64_t handle, size_t frame_length) -> Status
 {
     uint32_t idx = 0;
@@ -1187,6 +1336,10 @@ auto XdpContext::tx_commit(uint64_t handle, size_t frame_length) -> Status
     struct xdp_desc* desc = xsk_ring_prod__tx_desc(&rings_.tx, idx);
     desc->addr = handle + umem_.headroom();
     desc->len = static_cast<uint32_t>(frame_length);
+    // The frame says for itself whether it carries a launch time. Without the
+    // option the kernel never reads the metadata, so a frame that asked for
+    // nothing costs nothing.
+    desc->options = detail::frame_wants_metadata(umem_.tx_metadata_span(handle)) ? detail::xdp_desc_tx_metadata : 0;
     xsk_ring_prod__submit(&rings_.tx, 1);
     ++stats_.tx_count;
     // The kernel does not know about it until tx_flush() kicks, and that is

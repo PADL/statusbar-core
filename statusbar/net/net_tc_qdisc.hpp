@@ -86,6 +86,12 @@ inline constexpr std::size_t PRIO_MAP_SIZE = 16;
 /// gives it, so a caller that spells the map type out compiles either way.
 inline constexpr std::size_t PRIORITY_COUNT = PRIO_MAP_SIZE;
 
+/// The skb priority PTP event traffic is sent at. IEEE 802.1Q Table 8-5 puts
+/// network control at the top of the eight priorities, and the AVB profile
+/// (IEEE 802.1BA-2021 Section 6.3) sends gPTP there. A host that gives PTP a
+/// queue of its own maps this priority to it.
+inline constexpr std::uint8_t PTP_PRIORITY = 7;
+
 /// Longest qdisc kind name we build or store. The kernel's own limit
 /// (IFNAMSIZ) is 16 including the terminator.
 inline constexpr std::size_t MAX_KIND_LENGTH = 15;
@@ -177,6 +183,56 @@ struct CbsQdisc
     auto operator==(CbsQdisc const&) const noexcept -> bool = default;
 };
 
+/// CLOCK_TAI's clockid. `sch_etf`'s validate_input_params takes no other
+/// clock, because a launch time is only meaningful on a clock the NIC also
+/// keeps, and that is TAI.
+inline constexpr std::int32_t ETF_CLOCK_TAI = 11;
+
+/// An `etf` (earliest TxTime first) qdisc hanging off one class.
+///
+/// Where `cbs` bounds how *much* a class may send, `etf` decides *when* each
+/// frame goes: the frame carries a launch time and the qdisc releases it
+/// `delta_ns` before that, or - offloaded - hands it to a NIC that holds it
+/// until the time arrives. A talker that must put a frame on the wire inside
+/// a window, rather than merely at an average rate, needs this and not a
+/// shaper.
+///
+/// The three flags are each a trap of their own, which is why they are named
+/// here rather than left to a flags word:
+///
+///   * `offload` puts the driver's queue in launch-time mode. Without it the
+///     qdisc layer does the timing in software, and an AF_XDP or
+///     `PACKET_QDISC_BYPASS` frame never enters the qdisc layer - so it is
+///     sent immediately, untimed, with nothing reported. Defaults on for the
+///     same reason `CbsQdisc::offload` does.
+///   * `deadline_mode` changes what the time *means*: the frame is sent as
+///     soon as possible and the launch time is only a deadline it must not
+///     miss. A talker that wants frames spread out must leave this off.
+///   * `skip_sock_check` takes frames from sockets that never set
+///     `SO_TXTIME`. An AF_XDP socket sets its launch time in the UMEM's TX
+///     metadata rather than through `SO_TXTIME`, so without this the qdisc
+///     drops its frames.
+struct EtfQdisc
+{
+    /// The class this hangs on: a cbs's `major:1`, or `make_handle(major,
+    /// queue + 1)` of an mqprio root. TC_H_UNSPEC (0) names nothing and is
+    /// refused; `ROOT` is a different value and is accepted.
+    std::uint32_t parent{0};
+
+    /// The clock launch times are read on. Only ETF_CLOCK_TAI works.
+    std::int32_t clockid{ETF_CLOCK_TAI};
+
+    /// How long before its launch time a queued frame is handed on, in
+    /// nanoseconds. Must not be negative.
+    std::int32_t delta_ns{0};
+
+    bool offload{true};           ///< TC_ETF_OFFLOAD_ON
+    bool deadline_mode{false};    ///< TC_ETF_DEADLINE_MODE_ON
+    bool skip_sock_check{false};  ///< TC_ETF_SKIP_SOCK_CHECK
+
+    auto operator==(EtfQdisc const&) const noexcept -> bool = default;
+};
+
 /// One qdisc as read back from the kernel.
 struct QdiscInfo
 {
@@ -216,6 +272,15 @@ struct QdiscInfo
 /// Build an `RTM_NEWQDISC` request installing or replacing a cbs.
 /// @return Bytes written, or `NetError::invalid_argument`.
 [[nodiscard]] auto build_replace_cbs(std::span<std::uint8_t> out, int ifindex, CbsQdisc const& qdisc, std::uint32_t seq)
+    -> StatusValue<std::size_t>;
+
+/// Build an `RTM_NEWQDISC` request installing or replacing an etf.
+///
+/// The request carries handle 0: nothing hangs off an etf, so the kernel may
+/// pick its handle.
+/// @return Bytes written, or `NetError::invalid_argument` for a parent of 0,
+///         a negative `delta_ns`, or a short buffer.
+[[nodiscard]] auto build_replace_etf(std::span<std::uint8_t> out, int ifindex, EtfQdisc const& qdisc, std::uint32_t seq)
     -> StatusValue<std::size_t>;
 
 /// Build an `RTM_NEWQDISC` request installing a qdisc by kind name alone,
@@ -295,6 +360,7 @@ class TcControl
 
     virtual auto replace_mqprio(int ifindex, MqprioQdisc const& qdisc) -> Status = 0;
     virtual auto replace_cbs(int ifindex, CbsQdisc const& qdisc) -> Status = 0;
+    virtual auto replace_etf(int ifindex, EtfQdisc const& qdisc) -> Status = 0;
     virtual auto replace_kind(int ifindex, std::uint32_t parent, std::string_view kind) -> Status = 0;
     virtual auto remove(int ifindex, std::uint32_t handle, std::uint32_t parent) -> Status = 0;
 
@@ -339,6 +405,7 @@ class TcClient final : public TcControl
 
     auto replace_mqprio(int ifindex, MqprioQdisc const& qdisc) -> Status override;
     auto replace_cbs(int ifindex, CbsQdisc const& qdisc) -> Status override;
+    auto replace_etf(int ifindex, EtfQdisc const& qdisc) -> Status override;
     auto replace_kind(int ifindex, std::uint32_t parent, std::string_view kind) -> Status override;
     auto remove(int ifindex, std::uint32_t handle, std::uint32_t parent) -> Status override;
     auto get(int ifindex, std::uint32_t parent) -> StatusValue<QdiscInfo> override;

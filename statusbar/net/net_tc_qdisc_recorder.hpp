@@ -23,6 +23,7 @@
 #include <span>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace statusbar::net::tc {
@@ -36,6 +37,7 @@ class TcRecorder final : public TcControl
     {
         replace_mqprio,
         replace_cbs,
+        replace_etf,
         replace_kind,
         remove,
         get,
@@ -51,6 +53,7 @@ class TcRecorder final : public TcControl
         std::string kind;
         MqprioQdisc mqprio{};
         CbsQdisc cbs{};
+        EtfQdisc etf{};
     };
 
     TcRecorder() = default;
@@ -75,10 +78,15 @@ class TcRecorder final : public TcControl
         next_write_message_ = std::move(message);
     }
 
-    /// What `get()` answers. Unset means `invalid_handle`, i.e. nothing
-    /// installed there.
+    /// What `get()` answers for any parent with no answer of its own. Unset
+    /// means `invalid_handle`, i.e. nothing installed there.
     auto set_get_result(QdiscInfo info) -> void { get_result_ = info; }
     auto clear_get_result() noexcept -> void { get_result_.reset(); }
+
+    /// What `get()` answers for `parent` alone, taking precedence over
+    /// `set_get_result`. A caller that reads a root and then a class needs the
+    /// two to differ, which one result cannot express.
+    auto set_get_result_for(std::uint32_t parent, QdiscInfo info) -> void { by_parent_.emplace_back(parent, info); }
 
     auto replace_mqprio(int ifindex, MqprioQdisc const& qdisc) -> Status override
     {
@@ -102,6 +110,19 @@ class TcRecorder final : public TcControl
             .parent = qdisc.parent,
             .kind = "cbs",
             .cbs = qdisc,
+        });
+        return take_write_result();
+    }
+
+    auto replace_etf(int ifindex, EtfQdisc const& qdisc) -> Status override
+    {
+        // Handle 0, as the request carries: nothing hangs off an etf.
+        requests_.push_back(Request{
+            .operation = Operation::replace_etf,
+            .ifindex = ifindex,
+            .parent = qdisc.parent,
+            .kind = "etf",
+            .etf = qdisc,
         });
         return take_write_result();
     }
@@ -131,15 +152,27 @@ class TcRecorder final : public TcControl
     auto get(int ifindex, std::uint32_t parent) -> StatusValue<QdiscInfo> override
     {
         requests_.push_back(Request{.operation = Operation::get, .ifindex = ifindex, .parent = parent});
+        return answer_for(parent);
+    }
+
+    [[nodiscard]] auto last_message() const noexcept -> std::string const& override { return last_message_; }
+
+  private:
+    /// The parent's own answer where it has one, else the default, else
+    /// nothing installed there.
+    [[nodiscard]] auto answer_for(std::uint32_t parent) const -> StatusValue<QdiscInfo>
+    {
+        for (auto const& [at, info] : by_parent_) {
+            if (at == parent) {
+                return success(info);
+            }
+        }
         if (!get_result_) {
             return failure(NetError::invalid_handle);
         }
         return success(*get_result_);
     }
 
-    [[nodiscard]] auto last_message() const noexcept -> std::string const& override { return last_message_; }
-
-  private:
     /// Consume any programmed failure, so `fail_next_write` affects one
     /// call rather than every call after it.
     [[nodiscard]] auto take_write_result() -> Status
@@ -156,6 +189,7 @@ class TcRecorder final : public TcControl
 
     std::vector<Request> requests_;
     std::optional<QdiscInfo> get_result_;
+    std::vector<std::pair<std::uint32_t, QdiscInfo>> by_parent_;
     std::optional<std::error_code> next_write_failure_;
     std::string next_write_message_;
     std::string last_message_;

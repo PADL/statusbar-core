@@ -35,6 +35,7 @@ static_assert(TCMSG_SIZE == 20, "tcmsg layout changed");
 static_assert(RTATTR_SIZE == 4, "rtattr layout changed");
 static_assert(sizeof(tc_mqprio_qopt) == 82, "tc_mqprio_qopt layout changed");
 static_assert(sizeof(tc_cbs_qopt) == 20, "tc_cbs_qopt layout changed");
+static_assert(sizeof(tc_etf_qopt) == 12, "tc_etf_qopt layout changed");
 static_assert(TC_QOPT_MAX_QUEUE == static_cast<int>(MAX_TRAFFIC_CLASSES), "TC_QOPT_MAX_QUEUE changed");
 static_assert(TC_QOPT_BITMASK + 1 == static_cast<int>(PRIO_MAP_SIZE), "TC_QOPT_BITMASK changed");
 
@@ -248,6 +249,36 @@ auto copy_mqprio_queues(MqprioQdisc const& qdisc, tc_mqprio_qopt& qopt) noexcept
     return true;
 }
 
+/// Fill a tc_etf_qopt from our typed struct. Each flag is a separate bit, so
+/// a caller that asked for one never gets another.
+[[nodiscard]] auto to_qopt(EtfQdisc const& qdisc) noexcept -> tc_etf_qopt
+{
+    std::uint32_t flags = 0;
+    if (qdisc.deadline_mode) {
+        flags |= TC_ETF_DEADLINE_MODE_ON;
+    }
+    if (qdisc.offload) {
+        flags |= TC_ETF_OFFLOAD_ON;
+    }
+    if (qdisc.skip_sock_check) {
+        flags |= TC_ETF_SKIP_SOCK_CHECK;
+    }
+    return tc_etf_qopt{.delta = qdisc.delta_ns, .clockid = qdisc.clockid, .flags = flags};
+}
+
+/// TCA_OPTIONS for an etf is a nest holding one TCA_ETF_PARMS.
+[[nodiscard]] auto put_etf_options(Writer& writer, tc_etf_qopt const& qopt) noexcept -> bool
+{
+    auto slot = writer.reserve((2 * RTATTR_SIZE) + sizeof(qopt));
+    if (slot.empty()) {
+        return false;
+    }
+    write_attribute_header(slot, TCA_OPTIONS, RTATTR_SIZE + sizeof(qopt));
+    write_attribute_header(slot.subspan(RTATTR_SIZE), TCA_ETF_PARMS, sizeof(qopt));
+    std::memcpy(slot.data() + (2 * RTATTR_SIZE), &qopt, sizeof(qopt));
+    return true;
+}
+
 [[nodiscard]] auto as_bytes(auto const& value) noexcept -> std::span<std::uint8_t const>
 {
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
@@ -289,6 +320,26 @@ auto build_replace_cbs(std::span<std::uint8_t> out, int ifindex, CbsQdisc const&
     // hand rather than through put_attribute.
     auto const qopt = to_qopt(qdisc);
     if (!put_cbs_options(writer, qopt)) {
+        return failure(NetError::invalid_argument);
+    }
+    return finish(writer);
+}
+
+auto build_replace_etf(std::span<std::uint8_t> out, int ifindex, EtfQdisc const& qdisc, std::uint32_t seq)
+    -> StatusValue<std::size_t>
+{
+    // TC_H_UNSPEC names no class, and sch_etf refuses a negative delta in
+    // validate_input_params. Both are caught here rather than in a syscall.
+    if (qdisc.parent == UNSPEC || qdisc.delta_ns < 0) {
+        return failure(NetError::invalid_argument);
+    }
+    Writer writer{out};
+    // Handle 0: nothing hangs off an etf, so the kernel may pick one.
+    if (!put_preamble(writer, RTM_NEWQDISC, REPLACE_FLAGS, seq, ifindex, 0, qdisc.parent) || !put_kind(writer, "etf")) {
+        return failure(NetError::invalid_argument);
+    }
+    auto const qopt = to_qopt(qdisc);
+    if (!put_etf_options(writer, qopt)) {
         return failure(NetError::invalid_argument);
     }
     return finish(writer);
@@ -745,6 +796,16 @@ auto TcClient::replace_cbs(int ifindex, CbsQdisc const& qdisc) -> Status
 {
     std::array<std::uint8_t, MAX_REQUEST_SIZE> request{};
     auto const length = build_replace_cbs(request, ifindex, qdisc, next_sequence());
+    if (!length) {
+        return forward_failure(length);
+    }
+    return transact({request.data(), *length});
+}
+
+auto TcClient::replace_etf(int ifindex, EtfQdisc const& qdisc) -> Status
+{
+    std::array<std::uint8_t, MAX_REQUEST_SIZE> request{};
+    auto const length = build_replace_etf(request, ifindex, qdisc, next_sequence());
     if (!length) {
         return forward_failure(length);
     }
