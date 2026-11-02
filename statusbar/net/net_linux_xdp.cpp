@@ -754,6 +754,20 @@ auto detail::UmemRegion::allocate(
     return umem_;
 }
 
+auto detail::UmemRegion::reregister(size_t fill_ring_size, size_t comp_ring_size, RingSet& rings) noexcept
+    -> StatusValue<struct xsk_umem*>
+{
+    if (xsk_umem__delete(umem_) != 0) {
+        return failure(XdpError::umem_creation_failed);  // still in use: kept for close()
+    }
+    umem_ = nullptr;
+    rings = {};
+    if (!create_umem(area_size_, frame_size_, headroom_, fill_ring_size, comp_ring_size, rings)) {
+        return failure(create_refusal());
+    }
+    return umem_;
+}
+
 auto detail::UmemRegion::create_umem(
     size_t total_size, size_t frame_size, size_t headroom, size_t fill_ring_size, size_t comp_ring_size, RingSet& rings) noexcept
     -> bool
@@ -1258,24 +1272,30 @@ auto XdpContext::open(XdpConfig const& config) -> Status
     xsk_cfg.bind_flags = detail::bind_flags(config.bind_mode) | XDP_USE_NEED_WAKEUP;
 
     std::string const ifname_str(config.interface_name);
-    // A bind refused with EBUSY is a queue the last owner has not finished
-    // giving back, which is what a restart finds; it is retried rather than
-    // reported. The loop sits around the whole of xsk_socket__create()
-    // because that is where the bind is, and libxdp unwinds a failed bind
-    // completely - the RX and TX ring mappings go, the UMEM's refcount and
-    // its context list come back to where they were, the descriptor it
-    // borrowed from the UMEM is left open - so a second attempt starts from
-    // the same state as the first and `xsk_` is written only on success.
+    // EBUSY is a queue its last owner has not yet given back (a restart): retried.
+    // A failed bind leaves the UMEM's own rings set up, so each retry registers
+    // a fresh UMEM over the same area (UmemRegion::reregister()).
     size_t pauses = 0;
     int const ret = detail::retry_while_busy(
         config.bind_busy_retries,
         [&] {
+            if (pauses != 0) {
+                umem_result = umem_.reregister(config.fill_ring_size, config.completion_ring_size, rings_);
+            }
+            if (!umem_result) {
+                return -ECANCELED;  // not EBUSY: the retries end, and the refusal is reported below
+            }
             return xsk_socket__create(&xsk_, ifname_str.c_str(), config.queue_id, *umem_result, &rings_.rx, &rings_.tx, &xsk_cfg);
         },
         [&pauses] {
             ++pauses;
             detail::pause_for_busy_bind();
         });
+    if (!umem_result) {
+        auto const refusal = umem_result.error();
+        close();
+        return failure(refusal);
+    }
     if (ret != 0) {
         bool const refused_zero_copy = config.bind_mode == XdpBindMode::zero_copy && (-ret == EOPNOTSUPP || -ret == EINVAL);
         close();
