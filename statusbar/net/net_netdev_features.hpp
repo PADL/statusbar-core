@@ -169,6 +169,16 @@ class NetdevClient
     /// The netdev family's id as open() resolved it (0 when closed).
     [[nodiscard]] auto family_id() const noexcept -> uint16_t { return family_id_; }
 
+    /// One request built by `build` (out, seq), each netdev reply handed to `parse` (message) -> Status.
+    /// Errors: the socket's request()'s.
+    template <typename Build, typename Parse>
+    [[nodiscard]] auto request(Build const& build, Parse const& parse) -> Status
+    {
+        return socket_.request(reply_, build, [&](std::span<uint8_t const> const message, uint16_t const type) -> Status {
+            return type == family_id_ ? parse(message) : success();
+        });
+    }
+
     /// The kernel's extended-ack reason for the last request that failed (empty: none given).
     [[nodiscard]] auto last_message() const noexcept -> std::string const& { return socket_.last_message(); }
 

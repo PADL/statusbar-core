@@ -14,6 +14,7 @@ statusbar_add_module(
   net_linux_xdp.cpp
   net_message_reactor.cpp
   net_netdev_features.cpp
+  net_netdev_napi.cpp
   net_netlink.cpp
   net_rawnet.cpp
   net_rawnet_port.cpp
@@ -52,6 +53,7 @@ statusbar_add_module(
   net_interface_info_test.cpp
   net_launch_order_test.cpp
   net_netdev_features_test.cpp
+  net_netdev_napi_test.cpp
   net_netlink_test.cpp
   net_tc_launch_time_test.cpp
   net_tc_qdisc_test.cpp
@@ -73,6 +75,7 @@ statusbar_add_module(
 # runs where the kernel it frames for is.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_netdev_features_fuzzer.cpp)
+  add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_netdev_napi_fuzzer.cpp)
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_netlink_fuzzer.cpp)
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_tc_qdisc_fuzzer.cpp)
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_vlan_link_fuzzer.cpp)
@@ -105,6 +108,27 @@ set_property(
 
 # Optional: libbpf/libxdp for AF_XDP support (Linux only)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # The netdev uapi enumerators net_netdev_napi.cpp asserts against, where the
+  # headers have them (queue and NAPI commands 6.9, busy-poll 7.1).
+  include(CheckCXXSourceCompiles)
+  include(CMakePushCheckState)
+  cmake_push_check_state(RESET)
+  set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+  check_cxx_source_compiles(
+    "#include <linux/netdev.h>
+    static_assert(NETDEV_A_QUEUE_NAPI_ID != 0 && NETDEV_A_NAPI_PID != 0);"
+    STATUSBAR_HAVE_NETDEV_QUEUE_NAPI)
+  check_cxx_source_compiles(
+    "#include <linux/netdev.h>
+    static_assert(NETDEV_NAPI_THREADED_BUSY_POLL != 0);"
+    STATUSBAR_HAVE_NETDEV_NAPI_BUSY_POLL)
+  cmake_pop_check_state()
+  foreach(_have QUEUE_NAPI NAPI_BUSY_POLL)
+    if(STATUSBAR_HAVE_NETDEV_${_have})
+      target_compile_definitions(statusbar-net PRIVATE HAVE_NETDEV_${_have}=1)
+    endif()
+  endforeach()
+
   find_package(PkgConfig)
   if(PkgConfig_FOUND)
     pkg_check_modules(LIBBPF libbpf)
