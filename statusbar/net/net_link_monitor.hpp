@@ -22,6 +22,9 @@
 /// Two ways in besides the poll, for a change the poll would be late to or
 /// never see: recheck() reads the carrier now, told() takes the caller's word
 /// for the state. Either reports a transition the way the poll does.
+///
+/// CarrierWatch (net_carrier_watch.hpp) is the event-driven alternative on
+/// Linux: rtnetlink's link notifications, with the carrier-down count.
 
 #include "statusbar/net/net_message_reactor.hpp"  // Pollable
 #include "statusbar/net/net_posix_util.hpp"       // read_interface_carrier
