@@ -1050,40 +1050,46 @@ namespace {
 
 auto detail::BpfState::install_tcam_rules(std::span<CompiledRule<32> const> rules) -> Status
 {
-    auto catch_all = catch_all_rule_for(default_action_);
-    std::size_t const extra = catch_all.has_value() ? 1U : 0U;
-    if (rules.size() + extra > TCAM_MAX_RULES) {
+    auto const catch_all = catch_all_rule_for(default_action_);
+    if (rules.size() + (catch_all.has_value() ? 1U : 0U) > TCAM_MAX_RULES) {
         return failure(XdpError::too_many_filter_rules);
     }
+    // The rules, the catch-all, then every slot after them cleared: the scan stops at the first vacant one.
+    auto const written = write_tcam_rules(rules, catch_all);
+    return written ? clear_tcam_slots(*written) : forward_failure(written);
+}
 
-    auto write_slot = [this](std::uint32_t index, CompiledRule<32> const& rule) -> Status {
-        if (bpf_map_update_elem(rules_map_fd_, &index, &rule, BPF_ANY) != 0) {
-            return failure(XdpError::bpf_map_update_failed);
-        }
-        return success();
-    };
-
+auto detail::BpfState::write_tcam_rules(std::span<CompiledRule<32> const> rules, std::optional<CompiledRule<32>> const& catch_all)
+    -> StatusValue<std::uint32_t>
+{
     std::uint32_t slot = 0;
     for (auto const& rule : rules) {
-        if (auto s = write_slot(slot, rule); !s) {
-            return s;
+        if (auto s = write_tcam_slot(slot++, detail::tcam_slot(rule)); !s) {
+            return forward_failure(s);
         }
-        ++slot;
     }
-    if (catch_all.has_value()) {
-        if (auto s = write_slot(slot, *catch_all); !s) {
-            return s;
-        }
-        ++slot;
+    if (auto s = catch_all.has_value() ? write_tcam_slot(slot++, *catch_all) : Status{}; !s) {
+        return forward_failure(s);
     }
+    return slot;
+}
 
+auto detail::BpfState::clear_tcam_slots(std::uint32_t const from) -> Status
+{
     CompiledRule<32> const empty{};
-    for (std::uint32_t i = slot; i < TCAM_MAX_RULES; ++i) {
-        if (auto s = write_slot(i, empty); !s) {
+    for (std::uint32_t i = from; i < TCAM_MAX_RULES; ++i) {
+        if (auto s = write_tcam_slot(i, empty); !s) {
             return s;
         }
     }
+    return success();
+}
 
+auto detail::BpfState::write_tcam_slot(std::uint32_t index, CompiledRule<32> const& rule) -> Status
+{
+    if (bpf_map_update_elem(rules_map_fd_, &index, &rule, BPF_ANY) != 0) {
+        return failure(XdpError::bpf_map_update_failed);
+    }
     return success();
 }
 
