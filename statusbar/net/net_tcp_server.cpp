@@ -3,6 +3,7 @@
 
 #include "statusbar/net/net_tcp_server.hpp"
 
+#include <poll.h>
 #include <unistd.h>
 
 #include <cassert>
@@ -13,8 +14,10 @@
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 
 namespace statusbar::net {
 
@@ -43,6 +46,36 @@ void set_accepted_options(int fd, TcpServerOptions const& options, int family)
     int const one = 1;
     (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
+}
+
+#if defined(POLLRDHUP)
+constexpr short PEER_SHUT_DOWN = POLLRDHUP | POLLHUP;
+#else
+constexpr short PEER_SHUT_DOWN = POLLHUP;
+#endif
+
+/// After recv() returned 0 on SOCK_SEQPACKET `fd`: true for EOF (the peer shut down and nothing is
+/// queued), false for an empty message. Empty messages still queued at EOF carry nothing.
+[[nodiscard]] auto seqpacket_eof(int const fd) noexcept -> bool
+{
+    pollfd peer{.fd = fd, .events = PEER_SHUT_DOWN, .revents = 0};
+    int const ready = ::poll(&peer, 1, 0);
+    if (ready >= 0 && (ready == 0 || (peer.revents & PEER_SHUT_DOWN) == 0)) {
+        return false;  // a failed poll counts as EOF: the read must not spin on it
+    }
+    int queued = 0;
+    return ::ioctl(fd, FIONREAD, &queued) < 0 || queued == 0;
+}
+
+/// One message of SOCK_SEQPACKET `fd` into `out`: recvmsg()'s result, `truncated` when it was longer
+/// than `out` (the rest discarded). recvmsg's MSG_TRUNC is POSIX, unlike recv()'s input flag.
+[[nodiscard]] auto receive_one(int const fd, std::span<uint8_t> const out, bool& truncated) noexcept -> ssize_t
+{
+    iovec io{.iov_base = out.data(), .iov_len = out.size()};
+    msghdr message{.msg_iov = &io, .msg_iovlen = 1};
+    ssize_t const n = ::recvmsg(fd, &message, 0);
+    truncated = n > 0 && (message.msg_flags & MSG_TRUNC) != 0;
+    return n;
 }
 
 /// An AF_UNIX SOCK_SEQPACKET socket bound to `addr`.
@@ -258,6 +291,11 @@ auto TcpConnectionPool::read(size_t slot, std::span<uint8_t> out) -> StatusValue
         return failure(NetError::invalid_handle);
     }
     auto& s = slots_[slot];
+    return is_unix() && options_.unix_seqpacket ? read_message(s, out) : read_stream(s, out);
+}
+
+auto TcpConnectionPool::read_stream(Slot& s, std::span<uint8_t> const out) -> StatusValue<size_t>
+{
     ssize_t const n = ::recv(s.fd.get(), out.data(), out.size(), 0);
     if (n > 0) {
         s.last_activity_ns = last_now_ns_;
@@ -270,6 +308,20 @@ auto TcpConnectionPool::read(size_t slot, std::span<uint8_t> out) -> StatusValue
         return failure(NetError::would_block);
     }
     return failure(NetError::receive_failed);
+}
+
+auto TcpConnectionPool::read_message(Slot& s, std::span<uint8_t> const out) -> StatusValue<size_t>
+{
+    bool truncated = false;
+    ssize_t n = 0;
+    do {  // 0 is an empty message unless the peer has shut down
+        n = receive_one(s.fd.get(), out, truncated);
+    } while (n == 0 && !seqpacket_eof(s.fd.get()));
+    if (n < 0) {
+        return failure(would_block() || was_interrupted() ? NetError::would_block : NetError::receive_failed);
+    }
+    s.last_activity_ns = last_now_ns_;
+    return truncated ? StatusValue<size_t>{failure(NetError::buffer_full)} : size_t(n);
 }
 
 auto TcpConnectionPool::write(size_t slot, std::span<uint8_t const> data) -> StatusValue<size_t>

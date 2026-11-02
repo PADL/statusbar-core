@@ -366,6 +366,119 @@ TEST(net_tcp_server, unix_seqpacket_keeps_message_boundaries)
     ::close(fd);
 }
 
+/// Records accepts and closes; reads nothing, so a test reads the pool itself.
+class QuietHandler : public TcpConnectionHandler
+{
+  public:
+    void on_accept(size_t slot, SocketAddress const&, int64_t) override { accepts.push_back(slot); }
+    void on_readable(size_t, int64_t) override {}
+    void on_closed(size_t slot, int64_t) override { closes.push_back(slot); }
+
+    std::vector<size_t> accepts;
+    std::vector<size_t> closes;
+};
+
+TEST(net_tcp_server, unix_seqpacket_refuses_a_message_longer_than_the_buffer)
+{
+    TempSocketDir tmp;
+    auto bind_addr = SocketAddress::local(tmp.path());
+    QuietHandler handler;
+    TcpServerOptions options;
+    options.unix_seqpacket = true;
+    TcpConnectionPool pool{*bind_addr, 2, handler, options};
+    EXPECT_TRUE(pool.valid());
+    int const fd = ::socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    EXPECT_EQ(::connect(fd, bind_addr->sockaddr(), bind_addr->length()), 0);
+    pump(pool, 5);
+    EXPECT_EQ(handler.accepts.size(), 1U);
+
+    std::array<uint8_t, 8> const big{1, 2, 3, 4, 5, 6, 7, 8};
+    std::array<uint8_t, 2> const small{9, 10};
+    EXPECT_EQ(::send(fd, big.data(), big.size(), 0), ssize_t{8});
+    EXPECT_EQ(::send(fd, small.data(), small.size(), 0), ssize_t{2});
+    std::array<uint8_t, 4> in{};
+    auto const truncated = pool.read(handler.accepts[0], in);
+    EXPECT_TRUE(!truncated && truncated.error() == NetError::buffer_full);
+    auto const next = pool.read(handler.accepts[0], in);  // the long one is gone, the next intact
+    EXPECT_TRUE(next && *next == 2 && in[0] == 9 && in[1] == 10);
+    ::close(fd);
+}
+
+TEST(net_tcp_server, unix_seqpacket_an_empty_message_is_not_eof)
+{
+    TempSocketDir tmp;
+    auto bind_addr = SocketAddress::local(tmp.path());
+    QuietHandler handler;
+    TcpServerOptions options;
+    options.unix_seqpacket = true;
+    TcpConnectionPool pool{*bind_addr, 2, handler, options};
+    EXPECT_TRUE(pool.valid());
+    int const fd = ::socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    EXPECT_EQ(::connect(fd, bind_addr->sockaddr(), bind_addr->length()), 0);
+    pump(pool, 5);
+    EXPECT_EQ(handler.accepts.size(), 1U);
+    size_t const slot = handler.accepts[0];
+
+    std::array<uint8_t, 16> in{};
+    EXPECT_EQ(::send(fd, in.data(), 0, 0), ssize_t{0});
+    auto const empty = pool.read(slot, in);  // skipped: nothing else queued yet
+    EXPECT_TRUE(!empty && empty.error() == NetError::would_block);
+    std::array<uint8_t, 1> const one{7};
+    EXPECT_EQ(::send(fd, in.data(), 0, 0), ssize_t{0});
+    EXPECT_EQ(::send(fd, one.data(), one.size(), 0), ssize_t{1});
+    auto const after = pool.read(slot, in);
+    EXPECT_TRUE(after && *after == 1 && in[0] == 7);
+    EXPECT_EQ(::send(fd, one.data(), one.size(), 0), ssize_t{1});
+    ::close(fd);  // a message queued before the close is still read, then EOF
+    auto const last = pool.read(slot, in);
+    EXPECT_TRUE(last && *last == 1);
+    auto const eof = pool.read(slot, in);
+    EXPECT_TRUE(eof && *eof == 0);
+}
+
+TEST(net_tcp_server, unix_seqpacket_empty_messages_queued_at_close_end_in_eof)
+{
+    TempSocketDir tmp;
+    auto bind_addr = SocketAddress::local(tmp.path());
+    QuietHandler handler;
+    TcpServerOptions options;
+    options.unix_seqpacket = true;
+    TcpConnectionPool pool{*bind_addr, 2, handler, options};
+    EXPECT_TRUE(pool.valid());
+    int const fd = ::socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    EXPECT_EQ(::connect(fd, bind_addr->sockaddr(), bind_addr->length()), 0);
+    pump(pool, 5);
+    EXPECT_EQ(handler.accepts.size(), 1U);
+
+    std::array<uint8_t, 4> in{};
+    EXPECT_EQ(::send(fd, in.data(), 0, 0), ssize_t{0});
+    EXPECT_EQ(::send(fd, in.data(), 0, 0), ssize_t{0});
+    ::close(fd);
+    auto const eof = pool.read(handler.accepts[0], in);
+    EXPECT_TRUE(eof && *eof == 0);
+}
+
+TEST(net_tcp_server, unix_seqpacket_a_peer_shut_down_for_writing_is_eof)
+{
+    TempSocketDir tmp;
+    auto bind_addr = SocketAddress::local(tmp.path());
+    QuietHandler handler;
+    TcpServerOptions options;
+    options.unix_seqpacket = true;
+    TcpConnectionPool pool{*bind_addr, 2, handler, options};
+    EXPECT_TRUE(pool.valid());
+    int const fd = ::socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    EXPECT_EQ(::connect(fd, bind_addr->sockaddr(), bind_addr->length()), 0);
+    pump(pool, 5);
+    EXPECT_EQ(handler.accepts.size(), 1U);
+
+    std::array<uint8_t, 4> in{};
+    EXPECT_EQ(::shutdown(fd, SHUT_WR), 0);
+    auto const eof = pool.read(handler.accepts[0], in);
+    EXPECT_TRUE(eof && *eof == 0);
+    ::close(fd);
+}
+
 TEST(net_tcp_server, unix_stale_socket_replaced)
 {
     TempSocketDir tmp;

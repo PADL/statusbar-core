@@ -44,7 +44,9 @@
 /// peer(slot) is AF_UNIX with an empty path().
 ///
 /// With unix_seqpacket the listener is SOCK_SEQPACKET: write() sends one
-/// whole message or, when the peer's queue is full, nothing (0).
+/// whole message or, when the peer's queue is full, nothing (0); read()
+/// returns one message, skips empty ones and refuses (buffer_full) and
+/// discards one longer than its buffer.
 
 #include "statusbar/net/net_address.hpp"
 #include "statusbar/net/net_fd_multiplexer.hpp"
@@ -112,7 +114,8 @@ class TcpConnectionPool : public Pollable
     [[nodiscard]] auto local_addr() const -> StatusValue<SocketAddress>;
 
     /// Reads into @p out. 0 => orderly EOF; NetError::would_block => no
-    /// data now; other errors mean the connection is dead — close() it.
+    /// data now; NetError::buffer_full => a SOCK_SEQPACKET message longer
+    /// than @p out, discarded; other errors mean the connection is dead.
     [[nodiscard]] auto read(size_t slot, std::span<uint8_t> out) -> StatusValue<size_t>;
 
     /// Sends what the kernel accepts (possibly 0) and returns the count;
@@ -149,6 +152,10 @@ class TcpConnectionPool : public Pollable
     [[nodiscard]] auto prepare_unix_path(SocketAddress const& bind_addr) const -> bool;
     [[nodiscard]] auto open_listener(SocketAddress const& bind_addr) -> StatusValue<FileDescriptor>;
     void claim_unix_path();
+    /// read() of a stream: 0 at orderly EOF.
+    [[nodiscard]] auto read_stream(Slot& s, std::span<uint8_t> out) -> StatusValue<size_t>;
+    /// read() of one SOCK_SEQPACKET message: empty ones skipped, buffer_full for one longer than @p out.
+    [[nodiscard]] auto read_message(Slot& s, std::span<uint8_t> out) -> StatusValue<size_t>;
     void accept_ready(int64_t now_ns);
     void close_slot(size_t slot, int64_t now_ns);
     [[nodiscard]] auto slot_ok(size_t slot) const noexcept -> bool { return slot < slots_.size() && slots_[slot].in_use; }
