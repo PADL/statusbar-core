@@ -141,26 +141,6 @@ auto launch_time_etf(LaunchTimeQueue const& queue) noexcept -> EtfQdisc
 
 namespace {
 
-/// Nothing installed at a parent is an answer, not a failure: the kernel
-/// reports it as a bad handle.
-[[nodiscard]] auto is_nothing_there(std::error_code const& error) noexcept -> bool
-{
-    return error == make_error_code(NetError::invalid_handle);
-}
-
-/// What is installed at @p parent, or nullopt for nothing.
-[[nodiscard]] auto qdisc_at(TcControl& tc, int const ifindex, std::uint32_t const parent) -> StatusValue<std::optional<QdiscInfo>>
-{
-    auto const info = tc.get(ifindex, parent);
-    if (info) {
-        return std::optional<QdiscInfo>{*info};
-    }
-    if (is_nothing_there(info.error())) {
-        return std::optional<QdiscInfo>{};
-    }
-    return forward_failure(info);
-}
-
 /// Whether a root the kernel reported lays the queues out as @p wanted
 /// does: the same classes, the same queues in each, the same priority map.
 [[nodiscard]] auto same_layout(MqprioQdisc const& reported, MqprioQdisc const& wanted) noexcept -> bool
@@ -182,6 +162,14 @@ enum class RootState : std::uint8_t
     foreign,  ///< somebody else's handle: another talker's root, or a shaper configured by hand
 };
 
+/// The root as this run sees it: its state, and the root itself where one
+/// is installed.
+struct Root
+{
+    RootState state{RootState::missing};
+    std::optional<QdiscInfo> installed{};
+};
+
 /// Which of those the root is. Ours is an mqprio under our handle major
 /// whose layout is the one this run wants. The handle alone is not enough -
 /// a config that moved the socket's queue or its PTP queue between runs
@@ -190,20 +178,20 @@ enum class RootState : std::uint8_t
 /// root that reports none is not ours either. Those are `stale`, and told
 /// apart from `foreign` because the two are replaced differently: see
 /// ensure_root(). Neither is ours to keep or to delete on `off`.
-[[nodiscard]] auto root_state(TcControl& tc, int const ifindex, MqprioQdisc const& wanted) -> StatusValue<RootState>
+[[nodiscard]] auto root_state(TcControl& tc, int const ifindex, MqprioQdisc const& wanted) -> StatusValue<Root>
 {
-    auto const root = qdisc_at(tc, ifindex, ROOT);
+    auto const root = find_qdisc(tc, ifindex, ROOT);
     if (!root) {
         return forward_failure(root);
     }
     if (!root->has_value()) {
-        return RootState::missing;
+        return Root{};
     }
     if (handle_major((*root)->handle) != wanted.major) {
-        return RootState::foreign;
+        return Root{.state = RootState::foreign, .installed = *root};
     }
     bool const ours = (*root)->kind_name() == "mqprio" && (*root)->has_mqprio_params && same_layout((*root)->mqprio, wanted);
-    return ours ? RootState::ours : RootState::stale;
+    return Root{.state = ours ? RootState::ours : RootState::stale, .installed = *root};
 }
 
 /// The handle of the etf on @p parent, or nullopt if what is there is not an
@@ -211,7 +199,7 @@ enum class RootState : std::uint8_t
 [[nodiscard]] auto etf_handle_at(TcControl& tc, int const ifindex, std::uint32_t const parent)
     -> StatusValue<std::optional<std::uint32_t>>
 {
-    auto const found = qdisc_at(tc, ifindex, parent);
+    auto const found = find_qdisc(tc, ifindex, parent);
     if (!found) {
         return forward_failure(found);
     }
@@ -227,14 +215,21 @@ enum class RootState : std::uint8_t
 /// the interface already has as a change to the qdisc holding it, and
 /// mqprio has no change operation, so that request is refused with EINVAL
 /// and our own older root would stay forever. A foreign root has a
-/// different handle, and a replace under ours grafts over it in one request.
-[[nodiscard]] auto ensure_root(TcControl& tc, int const ifindex, MqprioQdisc const& root, RootState const state) -> Status
+/// different handle, and a replace under ours grafts over it in one request
+/// - except a foreign mqprio or taprio, which is deleted first
+/// (remove_other_tc_root()).
+[[nodiscard]] auto ensure_root(TcControl& tc, int const ifindex, MqprioQdisc const& root, Root const& seen) -> Status
 {
-    if (state == RootState::ours) {
+    if (seen.state == RootState::ours) {
         return success();
     }
-    if (state == RootState::stale) {
+    if (seen.state == RootState::stale) {
         if (auto const gone = tc.remove(ifindex, make_handle(root.major, 0), ROOT); !gone) {
+            return forward_failure(gone);
+        }
+    }
+    if (seen.state == RootState::foreign) {
+        if (auto const gone = remove_other_tc_root(tc, ifindex, *seen.installed, root.major); !gone) {
             return forward_failure(gone);
         }
     }
@@ -273,7 +268,7 @@ enum class RootState : std::uint8_t
     if (!etf_was_there) {
         return forward_failure(etf_was_there);
     }
-    return *state == RootState::ours && *etf_was_there ? LaunchTimeQueueAction::kept : LaunchTimeQueueAction::installed;
+    return state->state == RootState::ours && *etf_was_there ? LaunchTimeQueueAction::kept : LaunchTimeQueueAction::installed;
 }
 
 /// `off` where the root goes too: deleting it takes its etf with it.
@@ -309,7 +304,7 @@ enum class RootState : std::uint8_t
 /// `off` where the root stays: the layout is wanted for its own sake, so it is
 /// laid or kept and only the etf is taken away.
 [[nodiscard]] auto settle_off_keeping_root(
-    TcControl& tc, int const ifindex, LaunchTimeQueue const& queue, MqprioQdisc const& root, RootState const state)
+    TcControl& tc, int const ifindex, LaunchTimeQueue const& queue, MqprioQdisc const& root, Root const& state)
     -> StatusValue<LaunchTimeQueueAction>
 {
     if (auto const laid = ensure_root(tc, ifindex, root, state); !laid) {
@@ -322,7 +317,7 @@ enum class RootState : std::uint8_t
     if (*removed) {
         return LaunchTimeQueueAction::removed;
     }
-    return state == RootState::ours ? LaunchTimeQueueAction::kept : LaunchTimeQueueAction::installed;
+    return state.state == RootState::ours ? LaunchTimeQueueAction::kept : LaunchTimeQueueAction::installed;
 }
 
 /// `off`, either way round.
@@ -336,7 +331,7 @@ enum class RootState : std::uint8_t
     if (queue.persistent_root) {
         return settle_off_keeping_root(tc, ifindex, queue, root, *state);
     }
-    return settle_off_removing_root(tc, ifindex, queue, *state == RootState::ours);
+    return settle_off_removing_root(tc, ifindex, queue, state->state == RootState::ours);
 }
 
 }  // namespace
