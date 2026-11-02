@@ -223,6 +223,7 @@ struct XdpSocketStats
     uint64_t tx_flush_transient{0};  ///< kicks that dropped a frame or found the link down (EBUSY, ENOBUFS, ENETDOWN)
     int tx_flush_errno{0};           ///< the last refused kick's errno
     uint64_t rx_wakeup_count{0};     ///< fill-ring wakeups (recvfrom)
+    uint64_t tx_flush_stalled{0};    ///< kicks made as a busy-polled queue made no progress since the last flush (or lost carrier)
 };
 
 namespace detail {
@@ -547,6 +548,31 @@ class NapiBusyPoll
     static constexpr uint8_t ARMED = 1;
     static constexpr uint8_t POLLING = 2;
     std::atomic<uint8_t> state_{OFF};
+};
+
+/// The TX ring at one flush: descriptors not yet consumed, and the kernel's progress (the TX consumer
+/// plus the completion producer, so a full hardware ring that still completes counts as moving).
+struct TxRingState
+{
+    uint32_t pending{0};
+    uint32_t progress{0};
+};
+
+/// The TX ring's progress from one flush to the next. A busy-polled queue whose kthread stopped polling
+/// (a reset, `ethtool -L`) neither consumes nor completes, so the flush kicks again. Socket thread only.
+class TxProgress
+{
+  public:
+    /// A flush seeing `ring`: true when the last flush left descriptors pending and nothing moved since.
+    [[nodiscard]] constexpr auto stalled(TxRingState const ring) noexcept -> bool
+    {
+        bool const stuck = last_.pending != 0 && ring.pending != 0 && ring.progress == last_.progress;
+        last_ = ring;
+        return stuck;
+    }
+
+  private:
+    TxRingState last_{};
 };
 
 /// The XDP_FLAGS_* mode bit for an attach mode.
@@ -993,7 +1019,7 @@ class XdpSocket
     /// True when the UMEM reserves TX metadata (XdpConfig::tx_launch_time).
     [[nodiscard]] auto tx_launch_time() const noexcept -> bool { return umem_.tx_metadata_len() != 0; }
     /// The queue's NAPI busy polls from its kthread (Documentation/networking/napi.rst): in zero-copy mode
-    /// tx_flush() skips its kicks once one more has scheduled the kthread. Any thread; close() clears it.
+    /// tx_flush() skips its kicks once one has scheduled the kthread, until it stalls. Any thread; close() clears it.
     void set_napi_busy_poll(bool const on) noexcept { napi_busy_poll_.set(on); }
     [[nodiscard]] auto napi_busy_poll() const noexcept -> bool { return napi_busy_poll_.on(); }
 
@@ -1035,8 +1061,8 @@ class XdpSocket
         return success();
     }
 
-    /// One sendto() kick, skipped when detail::tx_kick_needed() says so. Transient
-    /// errors are counted, not failures; the rest fail (tx_flush_failed, tx_flush_errno).
+    /// One sendto() kick, skipped when detail::tx_kick_needed() says so and a busy-polled queue has not stalled.
+    /// Transient errors are counted, not failures; the rest fail (tx_flush_failed, tx_flush_errno).
     [[nodiscard]] auto tx_flush() -> Status;
 
     [[nodiscard]] auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>>;
@@ -1069,10 +1095,13 @@ class XdpSocket
     /// Record what the bind obtained (mode, wakeup, zero-copy) and the cycle budget.
     void record_bind(XdpConfig const& config, XdpAttachMode attached) noexcept;
     /// TX descriptors the kernel has not consumed yet (copy mode sends at most a batch per kick,
-    /// so some may be left from the last one).
-    [[nodiscard]] auto tx_pending() const noexcept -> uint32_t;
+    /// so some may be left from the last one), and its progress on the TX and completion rings.
+    [[nodiscard]] auto tx_ring_state() const noexcept -> detail::TxRingState;
     /// One sendto() kick, counted; transient refusals are not failures.
     [[nodiscard]] auto kick() -> Status;
+    /// A busy-polled zero-copy queue that has left `ring` pending and made no progress since the last
+    /// flush (counted). A carrier loss looks the same, and is counted too.
+    [[nodiscard]] auto tx_busy_poll_stalled(detail::TxRingState ring) noexcept -> bool;
 
     void swap(XdpSocket& other) noexcept
     {  // NOLINT(statusbar-block-statements): every field swapped
@@ -1085,6 +1114,7 @@ class XdpSocket
         std::swap(zero_copy_, other.zero_copy_);
         std::swap(need_wakeup_, other.need_wakeup_);
         napi_busy_poll_.swap(other.napi_busy_poll_);
+        std::swap(tx_progress_, other.tx_progress_);
     }
 
     struct xsk_socket* xsk_{nullptr};
@@ -1096,6 +1126,7 @@ class XdpSocket
     bool zero_copy_{false};
     bool need_wakeup_{false};
     detail::NapiBusyPoll napi_busy_poll_;
+    detail::TxProgress tx_progress_;
 };
 
 /// One XdpProgram and one XdpSocket on one interface queue: the EthernetPort

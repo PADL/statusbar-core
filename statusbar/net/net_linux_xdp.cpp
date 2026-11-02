@@ -759,6 +759,7 @@ void XdpSocket::close() noexcept
     zero_copy_ = false;
     need_wakeup_ = false;
     set_napi_busy_poll(false);
+    tx_progress_ = {};
 }
 
 auto XdpSocket::tx_commit(uint64_t handle, size_t frame_length) -> Status
@@ -779,9 +780,11 @@ auto XdpSocket::tx_commit(uint64_t handle, size_t frame_length) -> Status
     return success();
 }
 
-auto XdpSocket::tx_pending() const noexcept -> uint32_t
+auto XdpSocket::tx_ring_state() const noexcept -> detail::TxRingState
 {
-    return *rings_.tx.producer - __atomic_load_n(rings_.tx.consumer, __ATOMIC_ACQUIRE);
+    uint32_t const consumer = __atomic_load_n(rings_.tx.consumer, __ATOMIC_ACQUIRE);
+    uint32_t const completed = __atomic_load_n(rings_.comp.producer, __ATOMIC_ACQUIRE);
+    return {.pending = *rings_.tx.producer - consumer, .progress = consumer + completed};
 }
 
 auto XdpSocket::tx_flush() -> Status
@@ -789,12 +792,21 @@ auto XdpSocket::tx_flush() -> Status
     if (xsk_ == nullptr) {
         return failure(XdpError::not_open);
     }
-    if (!detail::tx_kick_needed(
-            tx_pending(), need_wakeup_, xsk_ring_prod__needs_wakeup(&rings_.tx) != 0, zero_copy_, napi_busy_poll_.polling())) {
-        ++stats_.tx_flush_skipped;
-        return success();
+    auto const ring = tx_ring_state();
+    if (tx_busy_poll_stalled(ring) ||
+        detail::tx_kick_needed(
+            ring.pending, need_wakeup_, xsk_ring_prod__needs_wakeup(&rings_.tx) != 0, zero_copy_, napi_busy_poll_.polling())) {
+        return kick();
     }
-    return kick();
+    ++stats_.tx_flush_skipped;
+    return success();
+}
+
+auto XdpSocket::tx_busy_poll_stalled(detail::TxRingState const ring) noexcept -> bool
+{
+    bool const stalled = tx_progress_.stalled(ring) && zero_copy_ && napi_busy_poll_.polling();
+    stats_.tx_flush_stalled += stalled ? 1U : 0U;
+    return stalled;
 }
 
 auto XdpSocket::kick() -> Status

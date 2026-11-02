@@ -202,6 +202,20 @@ TEST(xdp_config, busy_poll_skips_kicks_only_after_one_has_scheduled_the_kthread)
     EXPECT_FALSE(other.on() || other.polling());
 }
 
+TEST(TxProgress, a_busy_polled_queue_that_makes_no_progress_between_flushes_is_kicked)
+{
+    using detail::TxRingState;
+    detail::TxProgress progress;
+    EXPECT_FALSE(progress.stalled(TxRingState{.pending = 0, .progress = 10}));
+    EXPECT_FALSE(progress.stalled(TxRingState{.pending = 3, .progress = 10}));  // left at this flush: none owed yet
+    EXPECT_FALSE(progress.stalled(TxRingState{.pending = 5, .progress = 12}));  // it moved: the kthread polls
+    EXPECT_TRUE(progress.stalled(TxRingState{.pending = 6, .progress = 12}));   // left last time, nothing since
+    EXPECT_TRUE(progress.stalled(TxRingState{.pending = 6, .progress = 12}));   // and again until it moves
+    EXPECT_FALSE(progress.stalled(TxRingState{.pending = 6, .progress = 13}));  // completions alone: a full hardware ring
+    EXPECT_FALSE(progress.stalled(TxRingState{.pending = 0, .progress = 18}));  // drained
+    EXPECT_FALSE(progress.stalled(TxRingState{.pending = 1, .progress = 18}));  // nothing was left last time
+}
+
 TEST(xdp_config, attach_flags)
 {
     EXPECT_EQ(detail::xdp_attach_flags(XdpAttachMode::native), static_cast<uint32_t>(XDP_FLAGS_DRV_MODE));
@@ -1321,6 +1335,7 @@ TEST(xdp_integration, tx_flush_kicks_only_when_there_is_something_to_send)
     EXPECT_TRUE(ctx.tx_flush().has_value());
     EXPECT_EQ(ctx.stats().tx_flush_count, uint64_t{1});
     EXPECT_EQ(ctx.stats().tx_flush_skipped, uint64_t{2});
+    EXPECT_EQ(ctx.stats().tx_flush_stalled, uint64_t{0});  // copy mode is never busy polled
 
     // Multicast filter entries come and go.
     ieee::Eui48 const group{0x91, 0xE0, 0xF0, 0x00, 0x12, 0x34};
