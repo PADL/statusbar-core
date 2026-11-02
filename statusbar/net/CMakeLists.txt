@@ -13,6 +13,7 @@ statusbar_add_module(
   net_linux_mmap.cpp
   net_linux_xdp.cpp
   net_message_reactor.cpp
+  net_netlink.cpp
   net_rawnet.cpp
   net_rawnet_port.cpp
   net_ring_buffer_base.cpp
@@ -44,6 +45,7 @@ statusbar_add_module(
   net_group_membership_test.cpp
   net_link_monitor_test.cpp
   net_linux_xdp_test.cpp
+  net_netlink_test.cpp
   net_interface_info_test.cpp
   net_launch_order_test.cpp
   net_tc_launch_time_test.cpp
