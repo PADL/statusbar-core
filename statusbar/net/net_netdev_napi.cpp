@@ -6,6 +6,7 @@
 #if defined(__linux__)
 
 #    include "statusbar/buffer/buffer.hpp"
+#    include "statusbar/net/net_socket.hpp"
 
 #    include <sched.h>
 
@@ -148,11 +149,6 @@ struct NapiFields
         napis.ids[napis.count++] = *id;
     }
     return napis;
-}
-
-[[nodiscard]] auto errno_code() noexcept -> std::error_code
-{
-    return {errno, std::system_category()};
 }
 
 /// The CPU set of `cpu` alone, 0 <= `cpu` < CPU_SETSIZE.

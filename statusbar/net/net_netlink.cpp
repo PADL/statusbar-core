@@ -6,6 +6,7 @@
 #if defined(__linux__)
 
 #    include "statusbar/net/net_posix_util.hpp"
+#    include "statusbar/net/net_socket.hpp"
 
 #    include <algorithm>
 #    include <cerrno>
@@ -24,11 +25,6 @@ static_assert(
     ATTRIBUTE_TYPE_MASK == static_cast<uint16_t>(NLA_TYPE_MASK) && align4(5) == NLMSG_ALIGN(5) && align4(5) == NLA_ALIGN(5));
 
 namespace {
-
-[[nodiscard]] auto errno_code() noexcept -> std::error_code
-{
-    return {errno, std::system_category()};
-}
 
 /// The extended ack's NLMSGERR_ATTR_MSG after the struct nlmsgerr (capped or not) of `message`.
 void read_ext_ack_message(

@@ -126,7 +126,7 @@ class Socket
         uint32_t const seq = ++seq_;
         last_message_.clear();
         return build(std::span<uint8_t>{request}, seq).and_then([&](size_t const length) {
-            return exchange(std::span<uint8_t const>{request.data(), length}, seq, buffer, on_reply);
+            return transact(std::span<uint8_t const>{request.data(), length}, seq, buffer, on_reply);
         });
     }
 
@@ -140,13 +140,17 @@ class Socket
     /// The kernel's extended-ack message for the last failed request (empty: none given, or it succeeded).
     [[nodiscard]] auto last_message() const noexcept -> std::string const& { return last_message_; }
 
-    /// Send `request` (sequence `seq`), then hand each reply addressed to it, read into `buffer`,
-    /// to `on_message` (message, type, flags) -> std::optional<Status> until that returns a result.
-    template <typename OnMessage>
+  private:
+    /// request() once built: `request` (sequence `seq`) sent, each reply addressed to it read into
+    /// `buffer` and deliver()ed until one ends the request.
+    template <typename OnReply>
     [[nodiscard]] auto transact(
-        std::span<uint8_t const> const request, uint32_t const seq, std::span<uint8_t> const buffer, OnMessage const& on_message)
+        std::span<uint8_t const> const request, uint32_t const seq, std::span<uint8_t> const buffer, OnReply const& on_reply)
         -> Status
     {
+        if (!is_open()) {
+            return failure(std::make_error_code(std::errc::bad_file_descriptor));
+        }
         if (auto sent = send(request); !sent) {
             return sent;
         }
@@ -155,41 +159,20 @@ class Socket
             if (!received) {
                 return failure(received.error());
             }
-            if (auto done = for_each_reply(*received, seq, on_message)) {
+            if (auto done = for_each_reply(*received, seq, request.size(), on_reply)) {
                 return *done;
             }
         }
-    }
-
-  private:
-    /// request() once built: `request` (sequence `seq`) sent, its replies to `on_reply` up to its end_status().
-    template <typename OnReply>
-    [[nodiscard]] auto exchange(
-        std::span<uint8_t const> const request, uint32_t const seq, std::span<uint8_t> const buffer, OnReply const& on_reply)
-        -> Status
-    {
-        if (!is_open()) {
-            return failure(std::make_error_code(std::errc::bad_file_descriptor));
-        }
-        return transact(
-            request,
-            seq,
-            buffer,
-            [&](std::span<uint8_t const> const message, uint16_t const type, uint16_t const flags) -> std::optional<Status> {
-                if (auto end = end_status(message, type, flags, request.size(), last_message_)) {
-                    return end;
-                }
-                auto status = on_reply(message, type);
-                return status ? std::nullopt : std::optional<Status>{status};
-            });
     }
 
     [[nodiscard]] auto send(std::span<uint8_t const> request) noexcept -> Status;
     /// One datagram into `buffer`: timed_out after the receive timeout, message_size when it did not fit.
     [[nodiscard]] auto receive(std::span<uint8_t> buffer) noexcept -> StatusValue<std::span<uint8_t const>>;
 
-    template <typename OnMessage>
-    [[nodiscard]] auto for_each_reply(std::span<uint8_t const> const reply, uint32_t const seq, OnMessage const& on_message)
+    /// Each message of datagram `reply` addressed to request `seq` deliver()ed: the first result, else nullopt.
+    template <typename OnReply>
+    [[nodiscard]] auto for_each_reply(
+        std::span<uint8_t const> const reply, uint32_t const seq, size_t const request_size, OnReply const& on_reply)
         -> std::optional<Status>
     {
         for (size_t offset = 0; offset + MESSAGE_HEADER <= reply.size();) {
@@ -198,14 +181,26 @@ class Socket
                 return failure(bad_message());
             }
             if (load<uint32_t>(reply, offset + 8) == seq && load<uint32_t>(reply, offset + 12) == portid_) {
-                auto const type = load<uint16_t>(reply, offset + 4);
-                if (auto done = on_message(reply.subspan(offset, length), type, load<uint16_t>(reply, offset + 6))) {
+                if (auto done = deliver(reply.subspan(offset, length), request_size, on_reply)) {
                     return done;
                 }
             }
             offset += align4(length);
         }
         return std::nullopt;
+    }
+
+    /// One message of the request: its end_status(), else `on_reply`'s failure, else nullopt.
+    template <typename OnReply>
+    [[nodiscard]] auto deliver(std::span<uint8_t const> const message, size_t const request_size, OnReply const& on_reply)
+        -> std::optional<Status>
+    {
+        auto const type = load<uint16_t>(message, 4);
+        if (auto end = end_status(message, type, load<uint16_t>(message, 6), request_size, last_message_)) {
+            return end;
+        }
+        auto status = on_reply(message, type);
+        return status ? std::nullopt : std::optional<Status>{status};
     }
 
     FileDescriptor fd_{};

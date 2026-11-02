@@ -8,6 +8,7 @@
 #    include "statusbar/buffer/buffer.hpp"
 #    include "statusbar/net/net_netlink.hpp"
 #    include "statusbar/net/net_posix_util.hpp"
+#    include "statusbar/net/net_socket.hpp"
 
 #    include <array>
 #    include <cerrno>
@@ -61,11 +62,6 @@ static_assert(sizeof(ifinfomsg) == 16 && offsetof(ifinfomsg, ifi_index) == 4 && 
         });
     link.carrier = carrier.value_or((flags & LOWER_UP) != 0);
     return status ? StatusValue<LinkCarrier>{link} : failure(status.error());
-}
-
-[[nodiscard]] auto errno_code() noexcept -> std::error_code
-{
-    return {errno, std::system_category()};
 }
 
 /// True for an NLMSG_ERROR carrying an error: the kernel refused the RTM_GETLINK (ENODEV: no such link).
