@@ -191,14 +191,34 @@ void prepare_area(std::span<uint8_t> const area) noexcept
 
 auto detail::UmemRegion::allocate(UmemGeometry const& geometry, RingSet& rings) -> StatusValue<struct xsk_umem*>
 {
+    return map(geometry).and_then([&] { return create(geometry, rings); });
+}
+
+auto detail::UmemRegion::map(UmemGeometry const& geometry) -> Status
+{
     close();
-    auto const status = map_area(geometry.frame_count * geometry.frame_size).and_then([&] { return create_umem(geometry, rings); });
-    if (!status) {
-        close();
+    return map_area(geometry.frame_count * geometry.frame_size);
+}
+
+auto detail::UmemRegion::create(UmemGeometry const& geometry, RingSet& rings) -> StatusValue<struct xsk_umem*>
+{
+    release_umem();
+    if (area_ == nullptr) {
+        return failure(XdpError::umem_creation_failed);  // not mapped
+    }
+    if (auto status = create_umem(geometry, rings); !status) {
         return failure(status.error());
     }
     set_geometry(geometry);
     return umem_;
+}
+
+void detail::UmemRegion::release_umem() noexcept
+{
+    if (umem_ != nullptr) {
+        (void)xsk_umem__delete(umem_);
+        umem_ = nullptr;
+    }
 }
 
 auto detail::UmemRegion::map_area(size_t const size) -> Status
@@ -226,10 +246,7 @@ auto detail::UmemRegion::create_umem(UmemGeometry const& geometry, RingSet& ring
 
 void detail::UmemRegion::close() noexcept
 {
-    if (umem_ != nullptr) {
-        (void)xsk_umem__delete(umem_);
-        umem_ = nullptr;
-    }
+    release_umem();
     if (area_ != nullptr) {
         ::munmap(area_, area_size_);
         area_ = nullptr;
@@ -699,6 +716,9 @@ auto XdpSocket::bind_queue(XdpConfig const& config, detail::UmemGeometry const& 
         .bind_flags = bind_flags,
     };
     std::string const ifname_str(config.interface_name);
+    if (auto mapped = umem_.map(geometry); !mapped) {
+        return mapped;
+    }
     // The kernel frees a closed socket's hold on its queue later (an RCU grace
     // period and a work item), so a bind right after a close can see EBUSY.
     for (size_t attempt = 0;; ++attempt) {
@@ -710,6 +730,7 @@ auto XdpSocket::bind_queue(XdpConfig const& config, detail::UmemGeometry const& 
             return success();
         }
         if (attempt == BIND_BUSY_RETRIES) {
+            close();
             return failure(XdpError::xsk_creation_failed);
         }
         struct timespec const pause{.tv_sec = 0, .tv_nsec = BIND_BUSY_PAUSE_NS};
@@ -721,21 +742,31 @@ auto XdpSocket::create_once(
     XdpConfig const& config, detail::UmemGeometry const& geometry, std::string const& ifname, xsk_socket_config const& xsk_cfg)
     -> StatusValue<bool>
 {
-    // A failed create leaves its UMEM's rings configured: each attempt starts from a fresh UMEM.
-    auto umem_result = umem_.allocate(geometry, rings_);
+    // A failed create leaves the UMEM's fd (the socket's) with its rings set up: each attempt registers a fresh UMEM.
+    auto umem_result = umem_.create(geometry, rings_);
     if (!umem_result) {
         close();
         return failure(umem_result.error());
     }
     int const ret = xsk_socket__create(&xsk_, ifname.c_str(), config.queue_id, *umem_result, &rings_.rx, &rings_.tx, &xsk_cfg);
     if (ret != 0) {
-        xsk_ = nullptr;
-        close();
+        abandon_bind(ret == -EBUSY);
     }
     if (ret != 0 && ret != -EBUSY) {
         return failure(XdpError::xsk_creation_failed);
     }
     return ret == 0;
+}
+
+void XdpSocket::abandon_bind(bool const retry) noexcept
+{
+    xsk_ = nullptr;
+    if (!retry) {
+        close();
+        return;
+    }
+    umem_.release_umem();
+    rings_ = {};
 }
 
 void XdpSocket::record_bind(XdpConfig const& config, XdpAttachMode const attached) noexcept
