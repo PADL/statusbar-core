@@ -189,62 +189,35 @@ auto NetdevClient::open() -> Status
 
 auto NetdevClient::resolve_family() -> Status
 {
-    Wanted wanted{.type = GENL_CONTROLLER_ID};
-    auto const status = send([](std::span<uint8_t> out, uint32_t seq) { return build_get_family(out, FAMILY_NAME, seq); }, wanted);
-    if (!status || !wanted.family_id) {
+    std::optional<uint16_t> id;
+    auto const status = socket_.request(
+        reply_,
+        [](std::span<uint8_t> out, uint32_t seq) { return build_get_family(out, FAMILY_NAME, seq); },
+        [&](std::span<uint8_t const> const message, uint16_t const type) -> Status {
+            return type == GENL_CONTROLLER_ID ? parse_family_id(message).transform([&](uint16_t const got) { id = got; })
+                                              : success();
+        });
+    if (!status || !id) {
         return failure(status ? bad_message() : status.error());
     }
-    family_id_ = *wanted.family_id;
+    family_id_ = *id;
     return success();
 }
 
 auto NetdevClient::features(int const ifindex) -> StatusValue<DeviceFeatures>
 {
-    Wanted wanted{.type = family_id_};
-    auto const status =
-        send([&](std::span<uint8_t> out, uint32_t seq) { return build_dev_get(out, family_id_, ifindex, seq); }, wanted);
-    if (!status || !wanted.device) {
+    std::optional<DeviceFeatures> device;
+    auto const status = socket_.request(
+        reply_,
+        [&](std::span<uint8_t> out, uint32_t seq) { return build_dev_get(out, family_id_, ifindex, seq); },
+        [&](std::span<uint8_t const> const message, uint16_t const type) -> Status {
+            return type == family_id_ ? parse_dev(message, family_id_).transform([&](DeviceFeatures const& got) { device = got; })
+                                      : success();
+        });
+    if (!status || !device) {
         return failure(status ? bad_message() : status.error());  // an ack without a reply is malformed
     }
-    return *wanted.device;
-}
-
-template <typename Build>
-auto NetdevClient::send(Build const& build, Wanted& wanted) -> Status
-{
-    RequestBuffer request{};
-    uint32_t const seq = ++seq_;
-    return build(std::span<uint8_t>{request}, seq).and_then([&](size_t const length) {
-        return transact(std::span<uint8_t const>{request.data(), length}, seq, wanted);
-    });
-}
-
-auto NetdevClient::transact(std::span<uint8_t const> const request, uint32_t const seq, Wanted& wanted) -> Status
-{
-    last_message_.clear();
-    if (!socket_.is_open()) {
-        return failure(std::make_error_code(std::errc::bad_file_descriptor));
-    }
-    return socket_.transact(
-        request, seq, reply_, [&](std::span<uint8_t const> const message, uint16_t const type, uint16_t const flags) {
-            return read_reply(message, type, flags, request.size(), wanted);
-        });
-}
-
-auto NetdevClient::read_reply(
-    std::span<uint8_t const> const message, uint16_t const type, uint16_t const flags, size_t const request_size, Wanted& wanted)
-    -> std::optional<Status>
-{
-    if (type == NLMSG_ERROR) {
-        return netlink::ack_status(message, flags, request_size, last_message_);
-    }
-    if (type != wanted.type) {
-        return std::nullopt;
-    }
-    auto const parsed = wanted.type == GENL_CONTROLLER_ID
-        ? parse_family_id(message).transform([&](uint16_t const id) { wanted.family_id = id; })
-        : parse_dev(message, wanted.type).transform([&](DeviceFeatures const& device) { wanted.device = device; });
-    return parsed ? std::nullopt : std::optional<Status>{parsed};
+    return *device;
 }
 
 auto query_xsk_features(int const ifindex) -> StatusValue<XskFeatures>

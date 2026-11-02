@@ -121,33 +121,14 @@ class NetdevClient
     [[nodiscard]] auto features(int ifindex) -> StatusValue<DeviceFeatures>;
 
     /// The kernel's extended-ack message for the last failed request (empty: none given).
-    [[nodiscard]] auto last_message() const noexcept -> std::string const& { return last_message_; }
+    [[nodiscard]] auto last_message() const noexcept -> std::string const& { return socket_.last_message(); }
 
   private:
-    /// What a transaction parses from the replies before its ack.
-    struct Wanted
-    {
-        uint16_t type{0};  ///< GENL_CONTROLLER_ID: a family id; else the netdev family: a device
-        std::optional<uint16_t> family_id{};
-        std::optional<DeviceFeatures> device{};
-    };
-
     /// CTRL_CMD_GETFAMILY "netdev" into family_id_.
     [[nodiscard]] auto resolve_family() -> Status;
-    /// Build one request with `build` (out, seq) -> StatusValue<size_t> under the next sequence number and transact it.
-    template <typename Build>
-    [[nodiscard]] auto send(Build const& build, Wanted& wanted) -> Status;
-    /// Send `request` (sequence `seq`) and read up to its NLMSG_ERROR ack, parsing into `wanted`.
-    [[nodiscard]] auto transact(std::span<uint8_t const> request, uint32_t seq, Wanted& wanted) -> Status;
-    /// One message addressed to the transaction: its result if it ends it, else nullopt.
-    [[nodiscard]] auto read_reply(
-        std::span<uint8_t const> message, uint16_t type, uint16_t flags, size_t request_size, Wanted& wanted)
-        -> std::optional<Status>;
 
     netlink::Socket socket_{};
-    uint32_t seq_{0};
     uint16_t family_id_{0};
-    std::string last_message_{};
     std::array<uint8_t, 4096> reply_{};  ///< family and dev-get replies are under 1 KiB
 };
 
