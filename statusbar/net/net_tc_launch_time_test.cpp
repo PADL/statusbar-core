@@ -322,18 +322,69 @@ TEST(tc_launch_time, a_qdisc_of_another_kind_under_our_handle_is_deleted_and_lai
 
 // Somebody else's root is not ours to keep: the queue layout behind it is
 // unknown, so the class the etf would hang on may not be the socket's queue.
-// It is under a different handle, so a replace under ours grafts over it in
-// one request: nothing is deleted, and nothing of theirs is named.
-TEST(tc_launch_time, on_replaces_a_root_that_is_not_ours_in_one_request)
+// An mqprio or taprio under another handle is deleted first: replaced in
+// place, its destroy would run after our root's init and reset the device's
+// traffic classes. A root that sets none (fq) is grafted over in one request.
+TEST(tc_launch_time, on_deletes_another_handles_mqprio_or_taprio_before_laying_ours)
+{
+    for (auto const* const kind : {"mqprio", "taprio"}) {
+        tc::TcRecorder recorder;
+        recorder.set_get_result_for(tc::ROOT, installed(kind, tc::make_handle(0x1234, 0), tc::ROOT));
+        auto const action = tc::settle_launch_time_queue(recorder, IFINDEX, four_queues(), tc::LaunchTimeMode::on);
+        EXPECT_TRUE(action.has_value() && *action == tc::LaunchTimeQueueAction::installed);
+        EXPECT_TRUE((operations_of(recorder) == std::vector{Op::get, Op::remove, Op::replace_mqprio, Op::get, Op::replace_etf}));
+        EXPECT_TRUE(recorder.requests()[1].handle == tc::make_handle(0x1234, 0));
+    }
+}
+
+TEST(tc_launch_time, on_replaces_a_root_that_sets_no_traffic_classes_in_one_request)
 {
     tc::TcRecorder recorder;
-    recorder.set_get_result_for(tc::ROOT, installed("mqprio", tc::make_handle(0x1234, 0), tc::ROOT));
+    recorder.set_get_result_for(tc::ROOT, installed("fq", tc::make_handle(0x1234, 0), tc::ROOT));
     auto const action = tc::settle_launch_time_queue(recorder, IFINDEX, four_queues(), tc::LaunchTimeMode::on);
-    EXPECT_TRUE(action.has_value());
-    if (action) {
-        EXPECT_TRUE(*action == tc::LaunchTimeQueueAction::installed);
-    }
+    EXPECT_TRUE(action.has_value() && *action == tc::LaunchTimeQueueAction::installed);
     EXPECT_TRUE((operations_of(recorder) == std::vector{Op::get, Op::replace_mqprio, Op::get, Op::replace_etf}));
+}
+
+TEST(tc_root, only_another_handles_mqprio_or_taprio_is_removed_before_ours)
+{
+    tc::TcRecorder recorder;
+    auto const ours = installed("mqprio", tc::make_handle(MAJOR, 0), tc::ROOT);
+    auto const fq = installed("fq", tc::make_handle(0x8000, 0), tc::ROOT);
+    auto const unnamed = installed("mq", 0, tc::ROOT);
+    EXPECT_TRUE(tc::remove_other_tc_root(recorder, IFINDEX, ours, MAJOR) == StatusValue<bool>{false});
+    EXPECT_TRUE(tc::remove_other_tc_root(recorder, IFINDEX, fq, MAJOR) == StatusValue<bool>{false});
+    EXPECT_TRUE(tc::remove_other_tc_root(recorder, IFINDEX, unnamed, MAJOR) == StatusValue<bool>{false});
+    EXPECT_TRUE(recorder.requests().empty());
+    auto const taprio = installed("taprio", tc::make_handle(0x8000, 0), tc::ROOT);
+    EXPECT_TRUE(tc::remove_other_tc_root(recorder, IFINDEX, taprio, MAJOR) == StatusValue<bool>{true});
+    EXPECT_TRUE((operations_of(recorder) == std::vector{Op::remove}));
+}
+
+TEST(tc_root, an_own_mqprio_root_is_removed_and_nothing_else)
+{
+    tc::TcRecorder none;
+    EXPECT_TRUE(tc::remove_own_mqprio_root(none, IFINDEX, 0) == StatusValue<bool>{false});
+    EXPECT_TRUE(none.requests().empty());
+    tc::TcRecorder other;
+    other.set_get_result_for(tc::ROOT, installed("mqprio", tc::make_handle(0x9000, 0), tc::ROOT));
+    EXPECT_TRUE(tc::remove_own_mqprio_root(other, IFINDEX, MAJOR) == StatusValue<bool>{false});
+    EXPECT_TRUE((operations_of(other) == std::vector{Op::get}));
+    tc::TcRecorder ours;
+    ours.set_get_result_for(tc::ROOT, installed("mqprio", tc::make_handle(MAJOR, 0), tc::ROOT));
+    EXPECT_TRUE(tc::remove_own_mqprio_root(ours, IFINDEX, MAJOR) == StatusValue<bool>{true});
+    EXPECT_TRUE(removes_our_root_at(ours, 1));
+}
+
+TEST(tc_root, an_empty_root_is_none_and_a_failed_query_is_not)
+{
+    tc::TcRecorder recorder;
+    auto const none = tc::find_qdisc(recorder, IFINDEX, tc::ROOT);
+    EXPECT_TRUE(none.has_value() && !none->has_value());
+    recorder.fail_gets(make_error_code(std::errc::timed_out));
+    auto const failed = tc::remove_own_mqprio_root(recorder, IFINDEX, MAJOR);
+    EXPECT_FALSE(failed.has_value());
+    EXPECT_TRUE((operations_of(recorder) == std::vector{Op::get, Op::get}));
 }
 
 // The delete is a request like any other, and a refusal of it stops the
