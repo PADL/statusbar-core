@@ -954,7 +954,19 @@ class XdpSocket
     /// True when the UMEM reserves TX metadata (XdpConfig::tx_launch_time).
     [[nodiscard]] auto tx_launch_time() const noexcept -> bool { return umem_.tx_metadata_len() != 0; }
 
-    void begin_cycle() noexcept { budget_.rx_cycle_count = 0; }
+    /// Experiment: with STATUSBAR_XDP_BUSY_POLL=1 in the environment at open(), the socket prefers busy
+    /// polling (SO_PREFER_BUSY_POLL) and the caller's cycle runs the queue's NAPI itself.
+    static constexpr int BUSY_POLL_US = 10;
+    static constexpr int BUSY_POLL_BUDGET = 64;
+
+    /// Start a cycle; under busy poll, one non-blocking recvfrom(): two NAPI passes of BUSY_POLL_BUDGET at most.
+    void begin_cycle() noexcept
+    {
+        budget_.rx_cycle_count = 0;
+        if (busy_poll_) {
+            busy_poll();
+        }
+    }
 
     /// A free UMEM frame to fill and tx_commit(); free_list_empty when the fill
     /// ring and RX hold the rest (XdpConfig::umem_frame_count).
@@ -1026,9 +1038,14 @@ class XdpSocket
         -> StatusValue<bool>;
     /// Record what the bind obtained (mode, wakeup, zero-copy) and the cycle budget.
     void record_bind(XdpConfig const& config, XdpAttachMode attached) noexcept;
+    /// Set the busy-poll socket options when the environment asks for them; a refused one closes the
+    /// socket and fails with xsk_creation_failed.
+    [[nodiscard]] auto enable_busy_poll() noexcept -> Status;
+    /// One recvfrom(MSG_DONTWAIT): the kernel polls the queue's NAPI (twice at most) and returns.
+    void busy_poll() noexcept;
 
     void swap(XdpSocket& other) noexcept
-    {
+    {  // NOLINT(statusbar-block-statements): memberwise swap
         std::swap(xsk_, other.xsk_);
         std::swap(umem_, other.umem_);
         std::swap(rings_, other.rings_);
@@ -1037,6 +1054,7 @@ class XdpSocket
         std::swap(bind_mode_, other.bind_mode_);
         std::swap(zero_copy_, other.zero_copy_);
         std::swap(need_wakeup_, other.need_wakeup_);
+        std::swap(busy_poll_, other.busy_poll_);
     }
 
     struct xsk_socket* xsk_{nullptr};
@@ -1047,6 +1065,7 @@ class XdpSocket
     XdpBindMode bind_mode_{XdpBindMode::auto_};
     bool zero_copy_{false};
     bool need_wakeup_{false};
+    bool busy_poll_{false};
 };
 
 /// One XdpProgram and one XdpSocket on one interface queue: the EthernetPort

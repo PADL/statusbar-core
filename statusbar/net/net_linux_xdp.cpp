@@ -8,8 +8,12 @@
 
 #if defined(__linux__) && defined(HAVE_XDP)
 #    include <algorithm>
+#    include <cstdlib>
 #    include <filesystem>
+#    include <string_view>
 #    include <system_error>
+
+#    include <sys/socket.h>
 #endif
 
 namespace statusbar::net {
@@ -682,7 +686,49 @@ auto XdpSocket::open(XdpConfig const& config, detail::UmemGeometry const& geomet
         return status;
     }
     record_bind(config, attached);
+    return enable_busy_poll();
+}
+
+namespace {
+
+/// SO_PREFER_BUSY_POLL, SO_BUSY_POLL and SO_BUSY_POLL_BUDGET on @p fd: false when one is refused.
+auto set_busy_poll_options(int const fd, int const usecs, int const budget) noexcept -> bool
+{
+    int const prefer = 1;
+    return ::setsockopt(fd, SOL_SOCKET, SO_PREFER_BUSY_POLL, &prefer, sizeof(prefer)) == 0 &&
+        ::setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &usecs, sizeof(usecs)) == 0 &&
+        ::setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL_BUDGET, &budget, sizeof(budget)) == 0;
+}
+
+/// The NAPI ID the bind gave @p fd (0: none, so nothing would be polled).
+auto napi_id_of(int const fd) noexcept -> int
+{
+    int napi_id = 0;
+    socklen_t length = sizeof(napi_id);
+    return ::getsockopt(fd, SOL_SOCKET, SO_INCOMING_NAPI_ID, &napi_id, &length) == 0 ? napi_id : 0;
+}
+
+}  // namespace
+
+auto XdpSocket::enable_busy_poll() noexcept -> Status
+{
+    char const* const env = std::getenv("STATUSBAR_XDP_BUSY_POLL");  // NOLINT(concurrency-mt-unsafe): read once at open
+    if (env == nullptr || std::string_view{env} != "1") {
+        return success();
+    }
+    int const fd = xsk_socket__fd(xsk_);
+    if (!set_busy_poll_options(fd, BUSY_POLL_US, BUSY_POLL_BUDGET) || napi_id_of(fd) == 0) {
+        close();
+        return failure(XdpError::xsk_creation_failed);
+    }
+    busy_poll_ = true;
     return success();
+}
+
+void XdpSocket::busy_poll() noexcept
+{
+    // Never blocks: with MSG_DONTWAIT, sk_busy_loop(sk, 1) polls the NAPI once, and busy_poll_stop() once more.
+    (void)::recvfrom(xsk_socket__fd(xsk_), nullptr, 0, MSG_DONTWAIT, nullptr, nullptr);
 }
 
 auto XdpSocket::bind_queue(XdpConfig const& config, detail::UmemGeometry const& geometry, uint16_t const bind_flags) -> Status
@@ -746,7 +792,7 @@ void XdpSocket::record_bind(XdpConfig const& config, XdpAttachMode const attache
 }
 
 void XdpSocket::close() noexcept
-{
+{  // NOLINT(statusbar-block-statements): many-field reset
     if (xsk_ != nullptr) {
         xsk_socket__delete(xsk_);
         xsk_ = nullptr;
@@ -758,6 +804,7 @@ void XdpSocket::close() noexcept
     bind_mode_ = XdpBindMode::auto_;
     zero_copy_ = false;
     need_wakeup_ = false;
+    busy_poll_ = false;
 }
 
 auto XdpSocket::tx_commit(uint64_t handle, size_t frame_length) -> Status
@@ -786,7 +833,7 @@ auto XdpSocket::tx_flush() -> Status
     // Descriptors the kernel has not consumed yet (copy mode sends at most a
     // batch per kick, so some may be left from the last one).
     if (*rings_.tx.producer - __atomic_load_n(rings_.tx.consumer, __ATOMIC_ACQUIRE) == 0 ||
-        (need_wakeup_ && xsk_ring_prod__needs_wakeup(&rings_.tx) == 0)) {
+        (need_wakeup_ && !busy_poll_ && xsk_ring_prod__needs_wakeup(&rings_.tx) == 0)) {
         ++stats_.tx_flush_skipped;
         return success();
     }
@@ -874,7 +921,7 @@ auto XdpSocket::fill_replenish() -> Status
         }
     }
     // The driver ran out of fill entries and stopped: wake it.
-    if (need_wakeup_ && xsk_ != nullptr && xsk_ring_prod__needs_wakeup(&rings_.fill) != 0) {
+    if (need_wakeup_ && !busy_poll_ && xsk_ != nullptr && xsk_ring_prod__needs_wakeup(&rings_.fill) != 0) {
         ++stats_.rx_wakeup_count;
         (void)::recvfrom(xsk_socket__fd(xsk_), nullptr, 0, MSG_DONTWAIT, nullptr, nullptr);
     }
