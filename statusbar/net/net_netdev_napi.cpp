@@ -322,32 +322,9 @@ auto NapiClient::queue_napis(int const ifindex, uint32_t const queue_id) -> Stat
 template <typename Build, typename Parse>
 auto NapiClient::request(uint16_t const type, Build const& build, Parse const& parse) -> Status
 {
-    RequestBuffer buffer{};
-    uint32_t const seq = ++seq_;
-    return build(std::span<uint8_t>{buffer}, seq).and_then([&](size_t const length) {
-        return transact(std::span<uint8_t const>{buffer.data(), length}, seq, type, parse);
+    return socket_.request(reply_, build, [&](std::span<uint8_t const> const message, uint16_t const got) -> Status {
+        return got == type ? parse(message) : success();
     });
-}
-
-template <typename Parse>
-auto NapiClient::transact(std::span<uint8_t const> const request, uint32_t const seq, uint16_t const type, Parse const& parse)
-    -> Status
-{
-    last_message_.clear();
-    if (!socket_.is_open()) {
-        return failure(std::make_error_code(std::errc::bad_file_descriptor));
-    }
-    return socket_.transact(
-        request,
-        seq,
-        reply_,
-        [&](std::span<uint8_t const> const message, uint16_t const got, uint16_t const flags) -> std::optional<Status> {
-            if (got == NLMSG_ERROR) {
-                return netlink::ack_status(message, flags, request.size(), last_message_);
-            }
-            auto parsed = got == type ? parse(message) : success();
-            return parsed ? std::nullopt : std::optional<Status>{parsed};
-        });
 }
 
 //

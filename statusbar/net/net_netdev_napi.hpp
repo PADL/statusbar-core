@@ -139,23 +139,17 @@ class NapiClient
     [[nodiscard]] auto queue_napis(int ifindex, uint32_t queue_id) -> StatusValue<QueueNapis>;
 
     /// The kernel's extended-ack message for the last failed request (empty: none given).
-    [[nodiscard]] auto last_message() const noexcept -> std::string const& { return last_message_; }
+    [[nodiscard]] auto last_message() const noexcept -> std::string const& { return socket_.last_message(); }
 
   private:
     /// CTRL_CMD_GETFAMILY "netdev" into family_id_.
     [[nodiscard]] auto resolve_family() -> Status;
-    /// Build one request with `build` (out, seq) and transact it, handing each reply of nlmsg_type
-    /// `type` to `parse` (message) -> Status.
+    /// Socket::request() of `build` (out, seq), each reply of nlmsg_type `type` handed to `parse` (message) -> Status.
     template <typename Build, typename Parse>
     [[nodiscard]] auto request(uint16_t type, Build const& build, Parse const& parse) -> Status;
-    /// Send `request` (sequence `seq`) and read up to its ack, as request().
-    template <typename Parse>
-    [[nodiscard]] auto transact(std::span<uint8_t const> request, uint32_t seq, uint16_t type, Parse const& parse) -> Status;
 
     netlink::Socket socket_{};
-    uint32_t seq_{0};
     uint16_t family_id_{0};
-    std::string last_message_{};
     std::array<uint8_t, 4096> reply_{};  ///< queue and NAPI replies are under 256 octets
 };
 
