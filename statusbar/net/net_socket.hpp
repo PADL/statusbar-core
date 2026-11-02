@@ -198,11 +198,11 @@ using FileDescriptor = ::statusbar::FileDescriptor;
     return success();
 }
 
-/// The current errno as an error code (system category), for failures whose
-/// cause the caller wants to keep.
-[[nodiscard]] inline auto errno_code() noexcept -> std::error_code
+/// @p err (default: the current errno) as an error code (system category), for failures whose
+/// cause the caller wants to keep; pass a saved errno once later calls may have changed it.
+[[nodiscard]] inline auto errno_code(int const err = errno) noexcept -> std::error_code
 {
-    return {errno, std::system_category()};
+    return {err, std::system_category()};
 }
 
 /// A non-blocking, close-on-exec IPv4 UDP socket.

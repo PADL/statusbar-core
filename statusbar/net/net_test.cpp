@@ -1829,6 +1829,14 @@ TEST(net_socket, makes_a_nonblocking_udp_socket)
     EXPECT_TRUE(refused.error().category() == std::system_category());
 }
 
+TEST(net_socket, errno_code_keeps_a_saved_errno_or_reads_the_current_one)
+{
+    errno = ENOENT;
+    EXPECT_TRUE(errno_code() == std::error_code(ENOENT, std::system_category()));
+    EXPECT_TRUE(errno_code(EADDRINUSE) == std::error_code(EADDRINUSE, std::system_category()));
+    EXPECT_TRUE(errno_code(EADDRINUSE) == std::errc::address_in_use);
+}
+
 TEST(net_socket, a_group_membership_is_a_joined_socket_or_the_join_s_errno)
 {
     auto const refused = open_group_membership(statusbar::ip::IPv4Address{10, 0, 0, 1}, 0);
