@@ -1347,7 +1347,7 @@ auto XdpContext::open(XdpConfig const& config) -> Status
 }
 
 void XdpContext::close() noexcept
-{
+{  // NOLINT(statusbar-block-statements): every member back to a closed context's, one reset
     if (xsk_ != nullptr) {
         xsk_socket__delete(xsk_);
         xsk_ = nullptr;
@@ -1358,6 +1358,8 @@ void XdpContext::close() noexcept
 
     zero_copy_ = false;
     tx_pending_.store(false, std::memory_order_relaxed);
+    napi_busy_poll_.set(false);
+    tx_progress_ = {};
     bind_retries_ = 0;
     tx_frame_reserve_ = 0;
     interface_ = {};
