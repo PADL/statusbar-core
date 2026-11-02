@@ -673,6 +673,13 @@ class UmemRegion
     /// mmap + prefault + create the UMEM (its frame headroom geometry.headroom + tx_metadata_len)
     /// with `rings`' fill and completion rings. Returns xsk_umem* for xsk_socket__create.
     [[nodiscard]] auto allocate(UmemGeometry const& geometry, RingSet& rings) -> StatusValue<struct xsk_umem*>;
+    /// mmap and prefault the area for `geometry` (closing what was there), for create() to register.
+    [[nodiscard]] auto map(UmemGeometry const& geometry) -> Status;
+    /// Register the mapped area as a fresh UMEM with `rings`' fill and completion rings (deleting any earlier
+    /// one): xsk_umem* for xsk_socket__create. The area is kept on failure.
+    [[nodiscard]] auto create(UmemGeometry const& geometry, RingSet& rings) -> StatusValue<struct xsk_umem*>;
+    /// Delete the UMEM, keeping the area mapped for another create().
+    void release_umem() noexcept;
 
     void close() noexcept;
 
@@ -1102,11 +1109,13 @@ class XdpSocket
   private:
     /// Create the socket on `config.queue_id`, retrying while the queue is busy.
     [[nodiscard]] auto bind_queue(XdpConfig const& config, detail::UmemGeometry const& geometry, uint16_t bind_flags) -> Status;
-    /// One fresh UMEM (`geometry`) and socket create: true when bound, false when the queue
-    /// was busy (EBUSY; closed again), else the UMEM's or xsk_creation_failed.
+    /// One fresh UMEM (`geometry`, over the area bind_queue() mapped) and socket create: true when bound,
+    /// false when the queue was busy (EBUSY; the UMEM deleted, the area kept), else the UMEM's or xsk_creation_failed.
     [[nodiscard]] auto create_once(
         XdpConfig const& config, detail::UmemGeometry const& geometry, std::string const& ifname, xsk_socket_config const& xsk_cfg)
         -> StatusValue<bool>;
+    /// After a failed create: the socket forgotten, and on `retry` the UMEM deleted but the area kept, else close().
+    void abandon_bind(bool retry) noexcept;
     /// Record what the bind obtained (mode, wakeup, zero-copy) and the cycle budget.
     void record_bind(XdpConfig const& config, XdpAttachMode attached) noexcept;
     /// TX descriptors the kernel has not consumed yet (copy mode sends at most a batch per kick,

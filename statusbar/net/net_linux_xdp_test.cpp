@@ -850,6 +850,32 @@ TEST(xdp_integration, reopen_on_the_same_queue_right_after_close)
     }
 }
 
+TEST(UmemRegion, one_mapped_area_is_registered_again_after_a_release)
+{
+    if (getuid() != 0) {
+        return;
+    }
+    auto const geometry = detail::umem_geometry(XdpConfig{.umem_frame_count = 64});
+    EXPECT_TRUE(geometry.has_value());
+    if (!geometry) {
+        return;
+    }
+    detail::RingSet rings{};
+    detail::UmemRegion region{};
+    EXPECT_TRUE(region.map(*geometry).has_value());
+    auto const first = region.create(*geometry, rings);
+    EXPECT_TRUE(first.has_value());
+    auto const frame = region.alloc_frame();
+    EXPECT_TRUE(frame.has_value());
+    auto const area = region.writable_span(frame.value_or(0)).data();
+    region.release_umem();
+    rings = {};
+    auto const second = region.create(*geometry, rings);
+    EXPECT_TRUE(second.has_value());
+    EXPECT_EQ(region.available_frames(), size_t{64});  // its free list anew
+    EXPECT_TRUE(region.writable_span(region.alloc_frame().value_or(1)).data() == area);
+}
+
 TEST(xdp_integration, tx_rx_loopback)
 {
     if (getuid() != 0) {
