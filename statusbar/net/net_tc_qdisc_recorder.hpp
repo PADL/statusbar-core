@@ -88,6 +88,10 @@ class TcRecorder final : public TcControl
     /// two to differ, which one result cannot express.
     auto set_get_result_for(std::uint32_t parent, QdiscInfo info) -> void { by_parent_.emplace_back(parent, info); }
 
+    /// Fail every `get()` with `error`, the way a query the kernel could not
+    /// answer would, until `std::nullopt` is set again.
+    auto fail_gets(std::optional<std::error_code> error) noexcept -> void { get_failure_ = error; }
+
     auto replace_mqprio(int ifindex, MqprioQdisc const& qdisc) -> Status override
     {
         requests_.push_back(Request{
@@ -152,6 +156,9 @@ class TcRecorder final : public TcControl
     auto get(int ifindex, std::uint32_t parent) -> StatusValue<QdiscInfo> override
     {
         requests_.push_back(Request{.operation = Operation::get, .ifindex = ifindex, .parent = parent});
+        if (get_failure_) {
+            return failure(*get_failure_);
+        }
         return answer_for(parent);
     }
 
@@ -187,6 +194,7 @@ class TcRecorder final : public TcControl
         return failure(error);
     }
 
+    std::optional<std::error_code> get_failure_;
     std::vector<Request> requests_;
     std::optional<QdiscInfo> get_result_;
     std::vector<std::pair<std::uint32_t, QdiscInfo>> by_parent_;

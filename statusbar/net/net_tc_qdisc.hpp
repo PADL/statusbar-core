@@ -479,6 +479,20 @@ class TcClient final : public TcControl
     std::string last_message_;
 };
 
+/// What is installed at @p parent of @p ifindex: nullopt for nothing (the kernel's bad
+/// handle, an answer and not a failure), else the query's failure.
+[[nodiscard]] auto find_qdisc(TcControl& tc, int ifindex, std::uint32_t parent) -> StatusValue<std::optional<QdiscInfo>>;
+
+/// Delete @p ifindex's root if it is an mqprio under `major:0`, its children with it;
+/// any other root stays. Returns whether it was deleted, or the failure.
+[[nodiscard]] auto remove_own_mqprio_root(TcControl& tc, int ifindex, std::uint16_t major) -> StatusValue<bool>;
+
+/// Delete @p root (find_qdisc()'s ROOT) if it is an mqprio or taprio under another handle than
+/// `major:0`: replaced in place, its destroy would reset the traffic classes after ours is laid.
+/// Returns whether it was deleted, or the delete's failure.
+[[nodiscard]] auto remove_other_tc_root(TcControl& tc, int ifindex, QdiscInfo const& root, std::uint16_t major)
+    -> StatusValue<bool>;
+
 #endif  // __linux__
 
 }  // namespace statusbar::net::tc
