@@ -145,12 +145,12 @@ class NapiClient
     /// CTRL_CMD_GETFAMILY "netdev" into family_id_.
     [[nodiscard]] auto resolve_family() -> Status;
     /// Build one request with `build` (out, seq) and transact it, handing each reply of nlmsg_type
-    /// `type` to `take` (message) -> Status.
-    template <typename Build, typename Take>
-    [[nodiscard]] auto request(uint16_t type, Build const& build, Take const& take) -> Status;
+    /// `type` to `parse` (message) -> Status.
+    template <typename Build, typename Parse>
+    [[nodiscard]] auto request(uint16_t type, Build const& build, Parse const& parse) -> Status;
     /// Send `request` (sequence `seq`) and read up to its ack, as request().
-    template <typename Take>
-    [[nodiscard]] auto transact(std::span<uint8_t const> request, uint32_t seq, uint16_t type, Take const& take) -> Status;
+    template <typename Parse>
+    [[nodiscard]] auto transact(std::span<uint8_t const> request, uint32_t seq, uint16_t type, Parse const& parse) -> Status;
 
     netlink::Socket socket_{};
     uint32_t seq_{0};

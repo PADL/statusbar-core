@@ -30,7 +30,7 @@ constexpr uint32_t LOWER_UP = 1U << 16;
 static_assert(sizeof(ifinfomsg) == 16 && offsetof(ifinfomsg, ifi_index) == 4 && offsetof(ifinfomsg, ifi_flags) == 8);
 
 /// One link attribute into `link` (and `carrier` when IFLA_CARRIER is sent).
-[[nodiscard]] auto take_link_attribute(
+[[nodiscard]] auto parse_link_attribute(
     uint16_t const type, std::span<uint8_t const> const payload, LinkCarrier& link, std::optional<bool>& carrier) -> Status
 {
     auto const masked = type & netlink::ATTRIBUTE_TYPE_MASK;
@@ -53,7 +53,7 @@ static_assert(sizeof(ifinfomsg) == 16 && offsetof(ifinfomsg, ifi_index) == 4 && 
     std::optional<bool> carrier;
     auto const status =
         netlink::walk_attributes(message.subspan(LINK_HEADER), [&](uint16_t type, std::span<uint8_t const> payload) {
-            return take_link_attribute(type, payload, link, carrier);
+            return parse_link_attribute(type, payload, link, carrier);
         });
     link.carrier = carrier.value_or((flags & LOWER_UP) != 0);
     return status ? StatusValue<LinkCarrier>{link} : failure(status.error());

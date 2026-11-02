@@ -52,7 +52,7 @@ void put_u32(BufferSerializerBuilder& b, uint16_t const type, uint32_t const val
 }
 
 /// An attribute's u32 (or NLA_UINT, 4 or 8 octets) value into `out`; bad_message for another size or one past 32 bits.
-[[nodiscard]] auto take_u32(std::span<uint8_t const> const payload, uint32_t& out) -> Status
+[[nodiscard]] auto parse_u32(std::span<uint8_t const> const payload, uint32_t& out) -> Status
 {
     if (payload.size() == sizeof(uint32_t)) {
         out = load<uint32_t>(payload, 0);
@@ -65,10 +65,10 @@ void put_u32(BufferSerializerBuilder& b, uint16_t const type, uint32_t const val
     return success();
 }
 
-/// take_u32() into an optional.
-[[nodiscard]] auto take_u32(std::span<uint8_t const> const payload, std::optional<uint32_t>& out) -> Status
+/// parse_u32() into an optional.
+[[nodiscard]] auto parse_u32(std::span<uint8_t const> const payload, std::optional<uint32_t>& out) -> Status
 {
-    return take_u32(payload, out.emplace());
+    return parse_u32(payload, out.emplace());
 }
 
 /// A threaded mode the kernel reports, or nullopt for one past busy_poll.
@@ -87,17 +87,17 @@ struct QueueFields
 };
 
 /// One queue attribute into `fields`.
-[[nodiscard]] auto take_queue_attribute(uint16_t const type, std::span<uint8_t const> const payload, QueueFields& fields) -> Status
+[[nodiscard]] auto parse_queue_attribute(uint16_t const type, std::span<uint8_t const> const payload, QueueFields& fields) -> Status
 {  // NOLINT(statusbar-block-statements): the attribute table
     switch (type & netlink::ATTRIBUTE_TYPE_MASK) {
         case QUEUE_ID:
-            return take_u32(payload, fields.id);
+            return parse_u32(payload, fields.id);
         case QUEUE_IFINDEX:
-            return take_u32(payload, fields.ifindex);
+            return parse_u32(payload, fields.ifindex);
         case QUEUE_TYPE:
-            return take_u32(payload, fields.type);
+            return parse_u32(payload, fields.type);
         case QUEUE_NAPI_ID:
-            return take_u32(payload, fields.napi_id);
+            return parse_u32(payload, fields.napi_id);
         default:
             return success();
     }
@@ -113,19 +113,19 @@ struct NapiFields
 };
 
 /// One NAPI attribute into `fields`.
-[[nodiscard]] auto take_napi_attribute(uint16_t const type, std::span<uint8_t const> const payload, NapiFields& fields) -> Status
+[[nodiscard]] auto parse_napi_attribute(uint16_t const type, std::span<uint8_t const> const payload, NapiFields& fields) -> Status
 {  // NOLINT(statusbar-block-statements): the attribute table
     switch (type & netlink::ATTRIBUTE_TYPE_MASK) {
         case NAPI_ID:
-            return take_u32(payload, fields.id);
+            return parse_u32(payload, fields.id);
         case NAPI_IFINDEX:
-            return take_u32(payload, fields.ifindex);
+            return parse_u32(payload, fields.ifindex);
         case NAPI_IRQ:
-            return take_u32(payload, fields.napi.irq);
+            return parse_u32(payload, fields.napi.irq);
         case NAPI_PID:
-            return take_u32(payload, fields.napi.pid);
+            return parse_u32(payload, fields.napi.pid);
         case NAPI_THREADED:
-            return take_u32(payload, fields.threaded);
+            return parse_u32(payload, fields.threaded);
         default:
             return success();
     }
@@ -217,7 +217,7 @@ auto parse_queue(std::span<uint8_t const> const message, uint16_t const family_i
     QueueFields fields;
     auto const status = genl_attributes(message, family_id, CMD_QUEUE_GET).and_then([&](std::span<uint8_t const> const attributes) {
         return walk_attributes(attributes, [&](uint16_t const type, std::span<uint8_t const> const payload) {
-            return take_queue_attribute(type, payload, fields);
+            return parse_queue_attribute(type, payload, fields);
         });
     });
     if (!status || !fields.id || !fields.ifindex || !fields.type || *fields.type > static_cast<uint32_t>(QueueType::tx)) {
@@ -232,7 +232,7 @@ auto parse_napi(std::span<uint8_t const> const message, uint16_t const family_id
     NapiFields fields;
     auto const status = genl_attributes(message, family_id, CMD_NAPI_GET).and_then([&](std::span<uint8_t const> const attributes) {
         return walk_attributes(attributes, [&](uint16_t const type, std::span<uint8_t const> const payload) {
-            return take_napi_attribute(type, payload, fields);
+            return parse_napi_attribute(type, payload, fields);
         });
     });
     if (!status || !fields.id) {
@@ -319,18 +319,18 @@ auto NapiClient::queue_napis(int const ifindex, uint32_t const queue_id) -> Stat
     return napis.count != 0 ? StatusValue<QueueNapis>{napis} : failure(std::errc::operation_not_supported);
 }
 
-template <typename Build, typename Take>
-auto NapiClient::request(uint16_t const type, Build const& build, Take const& take) -> Status
+template <typename Build, typename Parse>
+auto NapiClient::request(uint16_t const type, Build const& build, Parse const& parse) -> Status
 {
     RequestBuffer buffer{};
     uint32_t const seq = ++seq_;
     return build(std::span<uint8_t>{buffer}, seq).and_then([&](size_t const length) {
-        return transact(std::span<uint8_t const>{buffer.data(), length}, seq, type, take);
+        return transact(std::span<uint8_t const>{buffer.data(), length}, seq, type, parse);
     });
 }
 
-template <typename Take>
-auto NapiClient::transact(std::span<uint8_t const> const request, uint32_t const seq, uint16_t const type, Take const& take)
+template <typename Parse>
+auto NapiClient::transact(std::span<uint8_t const> const request, uint32_t const seq, uint16_t const type, Parse const& parse)
     -> Status
 {
     last_message_.clear();
@@ -345,8 +345,8 @@ auto NapiClient::transact(std::span<uint8_t const> const request, uint32_t const
             if (got == NLMSG_ERROR) {
                 return netlink::ack_status(message, flags, request.size(), last_message_);
             }
-            auto taken = got == type ? take(message) : success();
-            return taken ? std::nullopt : std::optional<Status>{taken};
+            auto parsed = got == type ? parse(message) : success();
+            return parsed ? std::nullopt : std::optional<Status>{parsed};
         });
 }
 

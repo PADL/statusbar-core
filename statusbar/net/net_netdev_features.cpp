@@ -51,7 +51,7 @@ constexpr size_t MAX_FAMILY_NAME = GENL_NAMSIZ - 1;
 
 /// A fixed-size attribute's value into `out`; bad_message when its payload is another size.
 template <typename T>
-[[nodiscard]] auto take_scalar(std::span<uint8_t const> const payload, T& out) -> Status
+[[nodiscard]] auto parse_scalar(std::span<uint8_t const> const payload, T& out) -> Status
 {
     if (payload.size() != sizeof(T)) {
         return failure(bad_message());
@@ -140,7 +140,7 @@ auto parse_family_id(std::span<uint8_t const> const message) -> StatusValue<uint
     auto const status =
         genl_attributes(message, GENL_CONTROLLER_ID, CTRL_NEWFAMILY).and_then([&](std::span<uint8_t const> const attributes) {
             return walk_attributes(attributes, [&](uint16_t const type, std::span<uint8_t const> const payload) -> Status {
-                return (type & netlink::ATTRIBUTE_TYPE_MASK) == CTRL_FAMILY_ID ? take_scalar(payload, id.emplace()) : success();
+                return (type & netlink::ATTRIBUTE_TYPE_MASK) == CTRL_FAMILY_ID ? parse_scalar(payload, id.emplace()) : success();
             });
         });
     if (!status || !id) {
@@ -157,11 +157,11 @@ auto parse_dev(std::span<uint8_t const> const message, uint16_t const family_id)
         return walk_attributes(attributes, [&](uint16_t const type, std::span<uint8_t const> const payload) -> Status {
             switch (type & netlink::ATTRIBUTE_TYPE_MASK) {
                 case DEV_IFINDEX:
-                    return take_scalar(payload, ifindex.emplace());
+                    return parse_scalar(payload, ifindex.emplace());
                 case DEV_XDP_FEATURES:
-                    return take_scalar(payload, device.xdp_features);
+                    return parse_scalar(payload, device.xdp_features);
                 case DEV_XSK_FEATURES:
-                    return take_scalar(payload, device.xsk.flags);
+                    return parse_scalar(payload, device.xsk.flags);
                 default:
                     return success();
             }
@@ -241,10 +241,10 @@ auto NetdevClient::read_reply(
     if (type != wanted.type) {
         return std::nullopt;
     }
-    auto const taken = wanted.type == GENL_CONTROLLER_ID
+    auto const parsed = wanted.type == GENL_CONTROLLER_ID
         ? parse_family_id(message).transform([&](uint16_t const id) { wanted.family_id = id; })
         : parse_dev(message, wanted.type).transform([&](DeviceFeatures const& device) { wanted.device = device; });
-    return taken ? std::nullopt : std::optional<Status>{taken};
+    return parsed ? std::nullopt : std::optional<Status>{parsed};
 }
 
 auto query_xsk_features(int const ifindex) -> StatusValue<XskFeatures>
