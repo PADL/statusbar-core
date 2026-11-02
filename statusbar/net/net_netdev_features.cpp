@@ -20,7 +20,7 @@
 namespace statusbar::net::netdev {
 
 // The layouts the builders write field by field, and the constants mirrored from the uapi.
-static_assert(sizeof(genlmsghdr) == 4);
+static_assert(sizeof(genlmsghdr) == 4 && GENL_HEADER == NLMSG_HDRLEN + GENL_HDRLEN);
 static_assert(GENL_CONTROLLER_ID == GENL_ID_CTRL && CTRL_GETFAMILY == CTRL_CMD_GETFAMILY && CTRL_NEWFAMILY == CTRL_CMD_NEWFAMILY);
 static_assert(CTRL_FAMILY_ID == CTRL_ATTR_FAMILY_ID && CTRL_FAMILY_NAME == CTRL_ATTR_FAMILY_NAME);
 #    if __has_include(<linux/netdev.h>)  // 6.3+
@@ -44,11 +44,27 @@ using netlink::bad_message;
 using netlink::load;
 using netlink::walk_attributes;
 
-constexpr size_t GENL_HEADER = netlink::MESSAGE_HEADER + sizeof(genlmsghdr);
 constexpr size_t NLA_HEADER = netlink::ATTRIBUTE_HEADER;
 constexpr uint16_t REQUEST_FLAGS = NLM_F_REQUEST | NLM_F_ACK;
 /// GENL_NAMSIZ less its NUL.
 constexpr size_t MAX_FAMILY_NAME = GENL_NAMSIZ - 1;
+
+/// A fixed-size attribute's value into `out`; bad_message when its payload is another size.
+template <typename T>
+[[nodiscard]] auto take_scalar(std::span<uint8_t const> const payload, T& out) -> Status
+{
+    if (payload.size() != sizeof(T)) {
+        return failure(bad_message());
+    }
+    out = load<T>(payload, 0);
+    return success();
+}
+
+}  // namespace
+
+//
+// Generic netlink framing
+//
 
 void put_genl_header(
     BufferSerializerBuilder& b,
@@ -67,8 +83,7 @@ void put_attribute_header(BufferSerializerBuilder& b, size_t const payload, uint
     b.append(static_cast<uint16_t>(NLA_HEADER + payload)).append(type);
 }
 
-/// The attributes of a generic netlink message of nlmsg_type `type` and command `cmd`.
-[[nodiscard]] auto genl_attributes(std::span<uint8_t const> const message, uint16_t const type, uint8_t const cmd)
+auto genl_attributes(std::span<uint8_t const> const message, uint16_t const type, uint8_t const cmd)
     -> StatusValue<std::span<uint8_t const>>
 {
     if (message.size() < GENL_HEADER) {
@@ -81,19 +96,6 @@ void put_attribute_header(BufferSerializerBuilder& b, size_t const payload, uint
     }
     return message.subspan(GENL_HEADER, length - GENL_HEADER);
 }
-
-/// A fixed-size attribute's value into `out`; bad_message when its payload is another size.
-template <typename T>
-[[nodiscard]] auto take_scalar(std::span<uint8_t const> const payload, T& out) -> Status
-{
-    if (payload.size() != sizeof(T)) {
-        return failure(bad_message());
-    }
-    out = load<T>(payload, 0);
-    return success();
-}
-
-}  // namespace
 
 //
 // Builders and parsers
