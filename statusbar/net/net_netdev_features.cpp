@@ -78,11 +78,6 @@ void put_genl_header(
     b.append(cmd).append(version).append(uint16_t{0});
 }
 
-void put_attribute_header(BufferSerializerBuilder& b, size_t const payload, uint16_t const type)
-{
-    b.append(static_cast<uint16_t>(NLA_HEADER + payload)).append(type);
-}
-
 auto genl_attributes(std::span<uint8_t const> const message, uint16_t const type, uint8_t const cmd)
     -> StatusValue<std::span<uint8_t const>>
 {
@@ -111,7 +106,7 @@ auto build_get_family(std::span<uint8_t> const out, std::string_view const name,
     MutableBuffer buffer{out};
     BufferSerializerBuilder b{buffer};
     put_genl_header(b, length, GENL_CONTROLLER_ID, seq, CTRL_GETFAMILY, 1);
-    put_attribute_header(b, name.size() + 1, CTRL_FAMILY_NAME);
+    netlink::put_attribute_header(b, name.size() + 1, CTRL_FAMILY_NAME);
     for (char const c : name) {
         b.append(static_cast<uint8_t>(c));
     }
@@ -129,7 +124,7 @@ auto build_dev_get(std::span<uint8_t> const out, uint16_t const family_id, int c
     MutableBuffer buffer{out};
     BufferSerializerBuilder b{buffer};
     put_genl_header(b, length, family_id, seq, CMD_DEV_GET, FAMILY_VERSION);
-    put_attribute_header(b, sizeof(uint32_t), DEV_IFINDEX);
+    netlink::put_attribute_header(b, sizeof(uint32_t), DEV_IFINDEX);
     b.append(static_cast<uint32_t>(ifindex));
     return netlink::finish(b, length);
 }

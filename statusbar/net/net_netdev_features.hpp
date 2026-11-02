@@ -72,16 +72,14 @@ struct DeviceFeatures
 };
 
 /// Room for any request the builders write (all are under 48 octets).
-inline constexpr size_t MAX_REQUEST_SIZE = 64;
-using RequestBuffer = std::array<uint8_t, MAX_REQUEST_SIZE>;
+inline constexpr size_t MAX_REQUEST_SIZE = netlink::MAX_REQUEST_SIZE;
+using RequestBuffer = netlink::RequestBuffer;
 
 /// sizeof(struct nlmsghdr) + sizeof(struct genlmsghdr): where a generic netlink message's attributes start.
 inline constexpr size_t GENL_HEADER = netlink::MESSAGE_HEADER + 4;
 
 /// Append a struct nlmsghdr (NLM_F_REQUEST | NLM_F_ACK) and a struct genlmsghdr for `cmd` at `version`.
 void put_genl_header(BufferSerializerBuilder& b, size_t length, uint16_t type, uint32_t seq, uint8_t cmd, uint8_t version);
-/// Append a struct nlattr header for a `payload`-octet attribute of `type`.
-void put_attribute_header(BufferSerializerBuilder& b, size_t payload, uint16_t type);
 /// The attributes of a generic netlink message of nlmsg_type `type` and command `cmd`; bad_message when
 /// truncated or another message.
 [[nodiscard]] auto genl_attributes(std::span<uint8_t const> message, uint16_t type, uint8_t cmd)

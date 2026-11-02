@@ -73,6 +73,11 @@ void read_ext_ack_message(
 
 }  // namespace
 
+void put_attribute_header(BufferSerializerBuilder& b, size_t const payload, uint16_t const type)
+{
+    b.append(static_cast<uint16_t>(ATTRIBUTE_HEADER + payload)).append(type);
+}
+
 void put_header(BufferSerializerBuilder& b, size_t const length, uint16_t const type, uint16_t const flags, uint32_t const seq)
 {
     b.append(static_cast<uint32_t>(length)).append(type).append(flags).append(seq).append(uint32_t{0});

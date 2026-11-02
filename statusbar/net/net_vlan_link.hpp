@@ -9,9 +9,10 @@
 
 #if defined(__linux__)
 
-#    include "statusbar/net/net_tc_qdisc.hpp"
+#    include "statusbar/net/net_netlink.hpp"
 #    include "statusbar/status/status.hpp"
 
+#    include <array>
 #    include <cstddef>
 #    include <cstdint>
 #    include <span>
@@ -71,24 +72,24 @@ class VlanControl
     VlanControl() noexcept = default;
 };
 
-/// VlanControl over a blocking NETLINK_ROUTE socket (a tc::TcClient's). Not
-/// thread-safe; meant for the reactor thread.
+/// VlanControl over a blocking NETLINK_ROUTE socket. Not thread-safe; meant for the reactor thread.
 class VlanLinkClient final : public VlanControl
 {
   public:
     VlanLinkClient() noexcept = default;
 
     /// Open and bind the socket. Errors: the socket's errno.
-    [[nodiscard]] auto open() noexcept -> Status { return rtnl_.open(); }
-    [[nodiscard]] auto is_open() const noexcept -> bool { return rtnl_.is_open(); }
+    [[nodiscard]] auto open() noexcept -> Status;
+    [[nodiscard]] auto is_open() const noexcept -> bool { return socket_.is_open(); }
 
     [[nodiscard]] auto add_vlan(int parent_ifindex, std::string_view name, uint16_t vid) -> Status override;
     [[nodiscard]] auto remove_link(std::string_view name) -> Status override;
     [[nodiscard]] auto bring_up(std::string_view name) -> Status override;
-    [[nodiscard]] auto last_message() const noexcept -> std::string const& override { return rtnl_.last_message(); }
+    [[nodiscard]] auto last_message() const noexcept -> std::string const& override { return socket_.last_message(); }
 
   private:
-    tc::TcClient rtnl_{};
+    netlink::Socket socket_{};
+    std::array<uint8_t, 4096> reply_{};  ///< acks are capped: under 1 KiB with the extended-ack text
 };
 
 }  // namespace statusbar::net::vlan

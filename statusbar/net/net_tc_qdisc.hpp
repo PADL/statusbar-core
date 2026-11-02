@@ -110,8 +110,8 @@ struct QdiscInfo
 };
 
 /// Room for any request the builders write (the largest, mqprio, is 136 bytes).
-inline constexpr size_t MAX_REQUEST_SIZE = 256;
-using RequestBuffer = std::array<uint8_t, MAX_REQUEST_SIZE>;
+inline constexpr size_t MAX_REQUEST_SIZE = netlink::MAX_REQUEST_SIZE;
+using RequestBuffer = netlink::RequestBuffer;
 
 /// Build `tc qdisc replace ... root mqprio` (RTM_NEWQDISC, CREATE | REPLACE, handle major:0) into
 /// @p out; returns its length. Errors: invalid_argument for major 0, num_tc 0 or over MAX_TRAFFIC_CLASSES, or a
@@ -204,14 +204,6 @@ class TcClient final : public TcControl
     [[nodiscard]] auto get(int ifindex, uint32_t parent) -> StatusValue<QdiscInfo> override;
 
     [[nodiscard]] auto last_message() const noexcept -> std::string const& override { return socket_.last_message(); }
-
-    /// Send one other rtnetlink request that the kernel acknowledges (e.g. net_vlan_link's RTM_NEWLINK),
-    /// built by @p build (out, seq) -> StatusValue<size_t>. Errors: the builder's, or the kernel's errno.
-    template <typename Build>
-    [[nodiscard]] auto request(Build const& build) -> Status
-    {
-        return send(build);
-    }
 
   private:
     /// What a dump looks for: the qdisc of @p ifindex on @p parent.

@@ -31,6 +31,7 @@ inline constexpr uint16_t ATTRIBUTE_TYPE_MASK = 0x3FFF;
 
 /// Room for any request a client builds (the largest, tc's mqprio, is 136 octets).
 inline constexpr size_t MAX_REQUEST_SIZE = 256;
+using RequestBuffer = std::array<uint8_t, MAX_REQUEST_SIZE>;
 
 /// NLMSG_ALIGN / NLA_ALIGN / RTA_ALIGN: `n` rounded up to 4.
 [[nodiscard]] constexpr auto align4(size_t const n) noexcept -> size_t
@@ -52,6 +53,9 @@ template <typename T>
     span_load(value, bytes.subspan(at, sizeof(T)));
     return value;
 }
+
+/// Append a struct nlattr / rtattr header for a `payload`-octet attribute of `type`.
+void put_attribute_header(BufferSerializerBuilder& b, size_t payload, uint16_t type);
 
 /// Append a struct nlmsghdr (nlmsg_pid 0: to the kernel).
 void put_header(BufferSerializerBuilder& b, size_t length, uint16_t type, uint16_t flags, uint32_t seq);
@@ -118,7 +122,7 @@ class Socket
     template <typename Build, typename OnReply>
     [[nodiscard]] auto request(std::span<uint8_t> const buffer, Build const& build, OnReply const& on_reply) -> Status
     {
-        std::array<uint8_t, MAX_REQUEST_SIZE> request{};
+        RequestBuffer request{};
         uint32_t const seq = ++seq_;
         last_message_.clear();
         return build(std::span<uint8_t>{request}, seq).and_then([&](size_t const length) {

@@ -81,7 +81,7 @@ TEST(vlan_link, new_vlan)
         0x06, 0x00, 0x01, 0x00,  0x02, 0x00,  0x00, 0x00,
     };
     // clang-format on
-    tc::RequestBuffer out{};
+    netlink::RequestBuffer out{};
     auto const length = build_new_vlan(out, 3, "enp8s0.2", 2, 5);
     EXPECT_TRUE(length.has_value());
     EXPECT_TRUE(same_bytes(std::span{out}.first(*length), want));
@@ -89,7 +89,7 @@ TEST(vlan_link, new_vlan)
 
 TEST(vlan_link, new_vlan_refuses_bad_arguments)
 {
-    tc::RequestBuffer out{};
+    netlink::RequestBuffer out{};
     EXPECT_FALSE(build_new_vlan(out, 0, "enp8s0.2", 2, 5).has_value());           // no parent
     EXPECT_FALSE(build_new_vlan(out, 3, "", 2, 5).has_value());                   // no name
     EXPECT_FALSE(build_new_vlan(out, 3, "a_name_too_long_x", 2, 5).has_value());  // over IFNAMSIZ - 1
@@ -116,7 +116,7 @@ TEST(vlan_link, delete_link)
         0x0d, 0x00, 0x03, 0x00,  'e', 'n', 'p', '8', 's', '0', '.', '2', 0x00,  0x00, 0x00, 0x00,
     };
     // clang-format on
-    tc::RequestBuffer out{};
+    netlink::RequestBuffer out{};
     auto const length = build_delete_link(out, "enp8s0.2", 6);
     EXPECT_TRUE(length.has_value());
     EXPECT_TRUE(same_bytes(std::span{out}.first(*length), want));
@@ -140,7 +140,7 @@ TEST(vlan_link, set_link_up)
         0x0d, 0x00, 0x03, 0x00,  'e', 'n', 'p', '8', 's', '0', '.', '2', 0x00,  0x00, 0x00, 0x00,
     };
     // clang-format on
-    tc::RequestBuffer out{};
+    netlink::RequestBuffer out{};
     auto const up = build_set_link_up(out, "enp8s0.2", true, 7);
     EXPECT_TRUE(up.has_value());
     EXPECT_TRUE(same_bytes(std::span{out}.first(*up), want));
@@ -171,7 +171,7 @@ TEST(vlan_link, no_ipv6_addresses)
         0x05, 0x00, 0x08, 0x00,  0x01,  0x00, 0x00, 0x00,
     };
     // clang-format on
-    tc::RequestBuffer out{};
+    netlink::RequestBuffer out{};
     auto const length = build_no_ipv6_addresses(out, "enp8s0.2", 8);
     EXPECT_TRUE(length.has_value());
     EXPECT_TRUE(same_bytes(std::span{out}.first(*length), want));

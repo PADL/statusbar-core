@@ -40,7 +40,7 @@ namespace {
 
 constexpr size_t NLMSG_HEADER = sizeof(nlmsghdr);
 constexpr size_t TCMSG_SIZE = sizeof(tcmsg);
-constexpr size_t RTA_HEADER = sizeof(rtattr);
+constexpr size_t RTA_HEADER = netlink::ATTRIBUTE_HEADER;
 constexpr uint16_t REPLACE_FLAGS = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE;
 constexpr uint16_t DELETE_FLAGS = NLM_F_REQUEST | NLM_F_ACK;
 /// A dump ends with NLMSG_DONE; NLM_F_ACK would add nothing.
@@ -62,11 +62,6 @@ void put_tcmsg(BufferSerializerBuilder& b, int const ifindex, uint32_t const han
         .append(uint32_t{0});  // tcm_info
 }
 
-void put_rta(BufferSerializerBuilder& b, size_t const payload, uint16_t const type)
-{
-    b.append(static_cast<uint16_t>(RTA_HEADER + payload)).append(type);
-}
-
 void put_pad(BufferSerializerBuilder& b, size_t const count)
 {
     for (size_t i = 0; i < count; ++i) {
@@ -77,7 +72,7 @@ void put_pad(BufferSerializerBuilder& b, size_t const count)
 /// TCA_KIND: the NUL-terminated name, padded to 4.
 void put_kind(BufferSerializerBuilder& b, std::string_view const kind)
 {
-    put_rta(b, kind.size() + 1, TCA_KIND);
+    netlink::put_attribute_header(b, kind.size() + 1, TCA_KIND);
     for (char const c : kind) {
         b.append(static_cast<uint8_t>(c));
     }
@@ -123,7 +118,7 @@ auto build_replace_mqprio(std::span<uint8_t> const out, int const ifindex, Mqpri
     put_tcmsg(b, ifindex, make_handle(qdisc.major, 0), ROOT);
     put_kind(b, KIND);
     // TCA_OPTIONS is the flat struct tc_mqprio_qopt (q_mqprio.c: addattr_l(TCA_OPTIONS, &opt)).
-    put_rta(b, QOPT, TCA_OPTIONS);
+    netlink::put_attribute_header(b, QOPT, TCA_OPTIONS);
     b.append(qdisc.num_tc);
     for (uint8_t const tc : qdisc.prio_tc_map) {
         b.append(tc);
@@ -153,8 +148,8 @@ auto build_replace_cbs(std::span<uint8_t> const out, int const ifindex, CbsQdisc
     put_tcmsg(b, ifindex, 0, qdisc.parent);
     put_kind(b, KIND);
     // TCA_OPTIONS nests TCA_CBS_PARMS (q_cbs.c: addattr_nest + addattr_l(TCA_CBS_PARMS, &opt)).
-    put_rta(b, PARMS, TCA_OPTIONS);
-    put_rta(b, QOPT, TCA_CBS_PARMS);
+    netlink::put_attribute_header(b, PARMS, TCA_OPTIONS);
+    netlink::put_attribute_header(b, QOPT, TCA_CBS_PARMS);
     b.append(static_cast<uint8_t>(qdisc.offload ? 1 : 0));
     put_pad(b, 3);
     b.append(qdisc.hicredit).append(qdisc.locredit).append(qdisc.idleslope_kbps).append(qdisc.sendslope_kbps);
@@ -177,8 +172,8 @@ auto build_replace_etf(std::span<uint8_t> const out, int const ifindex, EtfQdisc
     put_tcmsg(b, ifindex, 0, qdisc.parent);
     put_kind(b, KIND);
     // TCA_OPTIONS nests TCA_ETF_PARMS (q_etf.c: addattr_nest + addattr_l(TCA_ETF_PARMS, &opt)).
-    put_rta(b, PARMS, TCA_OPTIONS);
-    put_rta(b, QOPT, TCA_ETF_PARMS);
+    netlink::put_attribute_header(b, PARMS, TCA_OPTIONS);
+    netlink::put_attribute_header(b, QOPT, TCA_ETF_PARMS);
     b.append(qdisc.delta_ns).append(qdisc.clockid).append(flags);
     return netlink::finish(b, length);
 }

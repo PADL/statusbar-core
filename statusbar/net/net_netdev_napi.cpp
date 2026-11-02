@@ -47,7 +47,7 @@ constexpr size_t U32_ATTRIBUTE = netlink::ATTRIBUTE_HEADER + sizeof(uint32_t);
 /// Append one u32 attribute.
 void put_u32(BufferSerializerBuilder& b, uint16_t const type, uint32_t const value)
 {
-    put_attribute_header(b, sizeof(uint32_t), type);
+    netlink::put_attribute_header(b, sizeof(uint32_t), type);
     b.append(value);
 }
 
