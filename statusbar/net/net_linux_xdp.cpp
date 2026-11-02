@@ -1297,7 +1297,7 @@ void XdpContext::close() noexcept
     umem_.close();
 
     zero_copy_ = false;
-    tx_pending_ = false;
+    tx_pending_.store(false, std::memory_order_relaxed);
     bind_retries_ = 0;
     tx_frame_reserve_ = 0;
     interface_ = {};
@@ -1565,8 +1565,9 @@ auto XdpContext::tx_commit(uint64_t handle, size_t frame_length) -> Status
     xsk_ring_prod__submit(&rings_.tx, 1);
     ++stats_.tx_count;
     // The kernel does not know about it until tx_flush() kicks, and that is
-    // what makes the kick needed rather than skippable.
-    tx_pending_ = true;
+    // what makes the kick needed rather than skippable. Release: a kicker
+    // that sees the flag sees the submit above.
+    tx_pending_.store(true, std::memory_order_release);
     return success();
 }
 

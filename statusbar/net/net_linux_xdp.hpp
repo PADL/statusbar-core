@@ -46,6 +46,7 @@ extern unsigned int const xdp_filter_bpf_o_len;
 #include "statusbar/status/throw_or_abort.hpp"
 
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -1689,20 +1690,28 @@ class XdpContext
     ///
     /// A kick refused with EAGAIN and friends leaves the frames pending, so
     /// the next call tries again rather than counting them as delivered.
+    ///
+    /// May be called from a thread other than the one committing frames (a
+    /// kicker that spares the sender the syscall): the pending flag is
+    /// claimed before the kick and re-armed if the kick is refused, so a
+    /// commit that lands between the claim and the syscall sets it again
+    /// and the next kick carries that frame. Only this method and
+    /// tx_commit share state, through that flag; the flush counters are
+    /// this method's alone.
     [[nodiscard]] auto tx_flush() -> Status
     {
-        if (!tx_pending_) {
+        if (!tx_pending_.exchange(false, std::memory_order_acq_rel)) {
             ++stats_.tx_flush_skipped;
             return success();
         }
         auto const ret = ::sendto(xsk_socket__fd(xsk_), nullptr, 0, MSG_DONTWAIT, nullptr, 0);
         ++stats_.tx_flush_count;
         if (ret >= 0) {
-            tx_pending_ = false;
             return success();
         }
         int const err = errno;
         stats_.tx_flush_errno = err;
+        tx_pending_.store(true, std::memory_order_release);  // the frames are still waiting
         if (detail::transient_kick_errno(err)) {
             // Momentary, and the frames stay pending for the next kick. The
             // caller hears success so it does not escalate on a hiccup; the
@@ -1812,7 +1821,9 @@ class XdpContext
         std::swap(program_, other.program_);
         std::swap(bind_retries_, other.bind_retries_);
         std::swap(tx_frame_reserve_, other.tx_frame_reserve_);
-        std::swap(tx_pending_, other.tx_pending_);
+        bool const mine = tx_pending_.load(std::memory_order_relaxed);
+        tx_pending_.store(other.tx_pending_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        other.tx_pending_.store(mine, std::memory_order_relaxed);
         std::swap(zero_copy_, other.zero_copy_);
     }
 
@@ -1832,7 +1843,9 @@ class XdpContext
     size_t tx_frame_reserve_{0};
     /// Frames are in the TX ring that the kernel has not been kicked for.
     /// Set by tx_commit(), cleared only by a kick the kernel accepted.
-    bool tx_pending_{false};
+    /// Frames submitted since the last kick that got through. Atomic so a
+    /// kicker thread can run tx_flush() against this thread's tx_commit().
+    std::atomic<bool> tx_pending_{false};
     bool zero_copy_{false};
 };
 
