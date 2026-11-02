@@ -14,6 +14,7 @@ statusbar_add_module(
   net_linux_xdp.cpp
   net_message_reactor.cpp
   net_netdev_features.cpp
+  net_netdev_napi.cpp
   net_netlink.cpp
   net_rawnet.cpp
   net_rawnet_port.cpp
@@ -48,6 +49,7 @@ statusbar_add_module(
   net_link_monitor_test.cpp
   net_linux_xdp_test.cpp
   net_netdev_features_test.cpp
+  net_netdev_napi_test.cpp
   net_netlink_test.cpp
   net_interface_info_test.cpp
   net_launch_order_test.cpp
@@ -71,6 +73,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_tc_qdisc_fuzzer.cpp)
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_vlan_link_fuzzer.cpp)
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_netdev_features_fuzzer.cpp)
+  add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_netdev_napi_fuzzer.cpp)
 endif()
 
 add_executable(net_tcp_echo_example net_tcp_echo_example.cpp)
@@ -100,8 +103,9 @@ set_property(
 
 # Optional: libbpf/libxdp for AF_XDP support (Linux only)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  # The netdev uapi constants net_netdev_features.cpp asserts against, where the
-  # headers have them (xsk-features 6.8, tx-launch-time-fifo 6.15).
+  # The netdev uapi constants net_netdev_features.cpp and net_netdev_napi.cpp
+  # assert against, where the headers have them (xsk-features 6.8, queue and
+  # NAPI commands 6.9, tx-launch-time-fifo 6.15, busy-poll 7.1).
   include(CheckCXXSourceCompiles)
   include(CMakePushCheckState)
   cmake_push_check_state(RESET)
@@ -114,8 +118,16 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     "#include <linux/netdev.h>
     static_assert(NETDEV_XSK_FLAGS_TX_LAUNCH_TIME_FIFO != 0);"
     STATUSBAR_HAVE_NETDEV_XSK_LAUNCH_TIME)
+  check_cxx_source_compiles(
+    "#include <linux/netdev.h>
+    static_assert(NETDEV_A_QUEUE_NAPI_ID != 0 && NETDEV_A_NAPI_PID != 0);"
+    STATUSBAR_HAVE_NETDEV_QUEUE_NAPI)
+  check_cxx_source_compiles(
+    "#include <linux/netdev.h>
+    static_assert(NETDEV_NAPI_THREADED_BUSY_POLL != 0);"
+    STATUSBAR_HAVE_NETDEV_NAPI_BUSY_POLL)
   cmake_pop_check_state()
-  foreach(_have XSK_FEATURES XSK_LAUNCH_TIME)
+  foreach(_have XSK_FEATURES XSK_LAUNCH_TIME QUEUE_NAPI NAPI_BUSY_POLL)
     if(STATUSBAR_HAVE_NETDEV_${_have})
       target_compile_definitions(statusbar-net PRIVATE HAVE_NETDEV_${_have}=1)
     endif()
