@@ -17,6 +17,7 @@
 // call sites read cleanly.
 
 #include "statusbar/buffer/file_descriptor.hpp"
+#include "statusbar/buffer/span_utils.hpp"
 #include "statusbar/ieee/ieee_ethernet.hpp"
 #include "statusbar/status/status.hpp"
 
@@ -104,8 +105,8 @@ namespace detail {
 /// Write @p iface (shorter than IFNAMSIZ) into ifr.ifr_name, NUL-padded.
 inline void set_ifr_name(ifreq& ifr, std::string_view const iface) noexcept
 {
-    std::memset(ifr.ifr_name, 0, sizeof(ifr.ifr_name));
-    std::memcpy(ifr.ifr_name, iface.data(), iface.size());
+    span_zero(ifname_bytes(ifr));
+    span_copy(ifname_bytes(ifr).first(iface.size()), make_const_span(iface));
 }
 
 }  // namespace detail

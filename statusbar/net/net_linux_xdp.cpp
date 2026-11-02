@@ -281,7 +281,7 @@ struct ProgIdentity
         return std::nullopt;
     }
     ProgIdentity identity{.id = info.id};
-    std::memcpy(identity.tag.data(), info.tag, BPF_TAG_SIZE);
+    span_copy(make_span(identity.tag), std::span<uint8_t const, BPF_TAG_SIZE>{info.tag});
     return identity;
 }
 

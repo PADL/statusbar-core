@@ -7,6 +7,8 @@
 /// and 802.1Q-tagged, for NICs with and without rx-vlan-offload), and where an
 /// AVTP frame's PDU starts. ATDECC, MAAP and the rest stay with the kernel.
 
+#include "statusbar/buffer/span_utils.hpp"
+#include "statusbar/ieee/ieee_base.hpp"
 #include "statusbar/net/net_compiled_rule.hpp"
 #include "statusbar/net/net_tcam_bpf_abi.h"
 #include "statusbar/sg14/inplace_vector.h"
@@ -63,20 +65,25 @@ using XdpRules = sg14::inplace_vector<CompiledRule<32>, TCAM_MAX_RULES>;
 
 namespace detail {
 
+/// The network-order doublet at `offset` of `frame`, which holds it.
+[[nodiscard]] inline auto doublet_at(std::span<std::uint8_t const> const frame, std::size_t const offset) noexcept -> std::uint16_t
+{
+    ieee::doublet_t value{};
+    span_load(value, frame.subspan(offset, sizeof(value)));
+    return value.get();
+}
+
 /// 14 or 18: where the payload after an AVTP ethertype starts, untagged or
 /// under one 802.1Q tag; nullopt when the frame is not AVTP.
-[[nodiscard]] constexpr auto avtp_ethertype_end(std::span<std::uint8_t const> const frame) noexcept -> std::optional<std::size_t>
+[[nodiscard]] inline auto avtp_ethertype_end(std::span<std::uint8_t const> const frame) noexcept -> std::optional<std::size_t>
 {
-    auto const u16_at = [frame](std::size_t const offset) {
-        return static_cast<std::uint16_t>((frame[offset] << 8) | frame[offset + 1]);
-    };
     if (frame.size() < 14) {
         return std::nullopt;
     }
-    if (u16_at(12) == ETHERTYPE_AVTP) {
+    if (doublet_at(frame, 12) == ETHERTYPE_AVTP) {
         return 14;
     }
-    if (u16_at(12) == ETHERTYPE_VLAN && frame.size() >= 18 && u16_at(16) == ETHERTYPE_AVTP) {
+    if (doublet_at(frame, 12) == ETHERTYPE_VLAN && frame.size() >= 18 && doublet_at(frame, 16) == ETHERTYPE_AVTP) {
         return 18;
     }
     return std::nullopt;
@@ -86,7 +93,7 @@ namespace detail {
 
 /// Where the AVTP PDU starts in an Ethernet frame: 14 untagged, 18 after one
 /// 802.1Q tag; nullopt if not AVTP or too short for the 12-byte AVTP header.
-[[nodiscard]] constexpr auto avtp_payload_offset(std::span<std::uint8_t const> const frame) noexcept -> std::optional<std::size_t>
+[[nodiscard]] inline auto avtp_payload_offset(std::span<std::uint8_t const> const frame) noexcept -> std::optional<std::size_t>
 {
     constexpr std::size_t AVTP_HEADER = 12;
     auto const offset = detail::avtp_ethertype_end(frame);

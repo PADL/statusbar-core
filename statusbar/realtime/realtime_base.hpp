@@ -117,8 +117,7 @@ inline void set_current_thread_name(std::string_view const name) noexcept
     constexpr std::size_t max_len = 63;
 #    endif
     std::array<char, max_len + 1> buf{};
-    std::size_t const n = name.size() < max_len ? name.size() : max_len;
-    std::memcpy(buf.data(), name.data(), n);
+    (void)name.copy(buf.data(), max_len);  // at most max_len: buf's last char stays the NUL
 #    if defined(__linux__)
     (void)::pthread_setname_np(::pthread_self(), buf.data());
 #    else

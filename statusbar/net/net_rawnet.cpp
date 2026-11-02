@@ -6,6 +6,7 @@
 #include "statusbar/net/net_posix_util.hpp"
 #include "statusbar/net/net_rawnet_filter.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstring>
@@ -62,10 +63,10 @@ namespace {
 /// already attached). @return 0, or the setsockopt errno.
 auto attach_filter(int const sock_fd, rawnet_filter::Program const& program) noexcept -> int
 {
-    static_assert(sizeof(sock_filter) == sizeof(cbpf::Instruction));
-    static_assert(offsetof(sock_filter, k) == offsetof(cbpf::Instruction, k));
     std::array<sock_filter, std::tuple_size_v<decltype(program.code)>> code{};
-    std::memcpy(code.data(), program.code.data(), program.length * sizeof(sock_filter));
+    std::ranges::transform(program.instructions(), code.begin(), [](cbpf::Instruction const& ins) {
+        return sock_filter{.code = ins.code, .jt = ins.jt, .jf = ins.jf, .k = ins.k};
+    });
     sock_fprog const prog{.len = static_cast<unsigned short>(program.length), .filter = code.data()};
     return ::setsockopt(sock_fd, SOL_SOCKET, SO_ATTACH_FILTER, &prog, sizeof(prog)) == 0 ? 0 : errno;
 }
