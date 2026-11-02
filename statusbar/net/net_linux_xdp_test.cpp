@@ -368,6 +368,16 @@ TEST(xdp_pin_path, the_entry_names_are_fixed)
     EXPECT_TRUE(XdpProgram::pin_entry(XdpProgram::pin_path_for("bad/name"), XdpProgram::PIN_PROG).empty());
 }
 
+TEST(xdp_config, a_rule_for_any_frame_size_does_not_end_the_bpf_table)
+{
+    CompiledRule<32> rule{};
+    rule.result_flags = flag::process;
+    EXPECT_EQ(detail::tcam_slot(rule).min_frame_size, std::uint16_t{TCAM_WINDOW_BYTES});
+    EXPECT_EQ(detail::tcam_slot(rule).result_flags, rule.result_flags);
+    rule.min_frame_size = 60;
+    EXPECT_EQ(detail::tcam_slot(rule).min_frame_size, std::uint16_t{60});
+}
+
 TEST(xdp_config, compiled_rule_defaults)
 {
     CompiledRule<32> rule{};
