@@ -218,7 +218,7 @@ struct XdpSocketStats
     uint64_t umem_exhausted_count{0};  ///< sends refused: no UMEM frame
     uint64_t rx_budget_hit_count{0};   ///< drains that hit the per-tick budget
     uint64_t tx_flush_count{0};        ///< kicks made (sendto)
-    uint64_t tx_flush_skipped{0};      ///< kicks not needed: nothing was waiting
+    uint64_t tx_flush_skipped{0};      ///< kicks not made: nothing waiting, or busy polled
     /// Kicks the kernel refused for a reason that will not pass by itself.
     /// Disjoint from tx_flush_transient: a caller rides out the transient
     /// ones and escalates on these.
@@ -226,6 +226,9 @@ struct XdpSocketStats
     uint64_t tx_flush_transient{0};  ///< kicks refused with EAGAIN/EBUSY/ENOBUFS/ENETDOWN
     int tx_flush_errno{0};           ///< the last refused kick's errno, transient or not
     uint64_t rx_wakeup_count{0};     ///< fill-ring wakeups (recvfrom)
+    /// Kicks made because a busy-polled queue made no progress since the last
+    /// flush (its kthread stopped polling, or the carrier went).
+    uint64_t tx_flush_stalled{0};
 };
 
 // A caller keeping a published copy in an itc::SeqlockValue needs this: a
@@ -485,6 +488,74 @@ struct CycleBudget
     size_t completion_drain_max{64};
     size_t rx_cycle_count{0};
 };
+
+/// A queue's threaded NAPI busy poll as its socket sees it: off; armed (set,
+/// but the kthread sleeps until an interrupt or a kick schedules it); polling
+/// (a kick made since). A relaxed atomic, set from any thread.
+class NapiBusyPoll
+{
+  public:
+    /// Busy poll on (armed until the next kick) or off.
+    void set(bool const on) noexcept { state_.store(on ? ARMED : OFF, std::memory_order_relaxed); }
+    /// Whether busy poll is on, armed or polling.
+    [[nodiscard]] auto on() const noexcept -> bool { return state_.load(std::memory_order_relaxed) != OFF; }
+    /// Whether a kick has scheduled the kthread since busy poll came on.
+    [[nodiscard]] auto polling() const noexcept -> bool { return state_.load(std::memory_order_relaxed) == POLLING; }
+    /// A kick was made: an armed queue's kthread is scheduled, and polls from now on.
+    void kicked() noexcept
+    {
+        uint8_t armed = ARMED;
+        (void)state_.compare_exchange_strong(armed, POLLING, std::memory_order_relaxed);
+    }
+    /// Exchange states with @p other (XdpContext's move); not concurrent with a set().
+    void swap(NapiBusyPoll& other) noexcept
+    {
+        state_.store(
+            other.state_.exchange(state_.load(std::memory_order_relaxed), std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+
+  private:
+    static constexpr uint8_t OFF = 0;
+    static constexpr uint8_t ARMED = 1;
+    static constexpr uint8_t POLLING = 2;
+    std::atomic<uint8_t> state_{OFF};
+};
+
+/// The TX ring at one flush: descriptors not yet consumed, and the kernel's
+/// progress (the TX consumer plus the completion producer, so a full hardware
+/// ring that still completes frames counts as moving).
+struct TxRingState
+{
+    uint32_t pending{0};
+    uint32_t progress{0};
+};
+
+/// The TX ring's progress from one flush to the next. A busy-polled queue
+/// whose kthread stopped polling (an adapter reset, `ethtool -L`) neither
+/// consumes nor completes. The flushing thread's alone.
+class TxProgress
+{
+  public:
+    /// True when the last flush left descriptors pending and nothing moved since.
+    /// A burst after an idle flush is kicked one flush late if the kthread stopped: accepted.
+    [[nodiscard]] constexpr auto stalled(TxRingState const ring) noexcept -> bool
+    {
+        bool const stuck = last_.pending != 0 && ring.pending != 0 && ring.progress == last_.progress;
+        last_ = ring;
+        return stuck;
+    }
+
+  private:
+    TxRingState last_{};
+};
+
+/// Whether tx_flush() kicks: for frames committed since the last kick, except
+/// on a zero-copy queue whose NAPI kthread busy polls and sends unkicked,
+/// which is kicked only when it has @p stalled.
+[[nodiscard]] constexpr auto tx_kick_due(bool const pending, bool const busy_polled, bool const stalled) noexcept -> bool
+{
+    return busy_polled ? stalled : pending;
+}
 
 /// @p rule as a BPF rules_map slot. There a min_frame_size of 0 ends the
 /// table, while TcamClassifier reads 0 as any frame of the window, so 0
@@ -1774,17 +1845,19 @@ class XdpContext
     /// claimed before the kick and re-armed if the kick is refused, so a
     /// commit that lands between the claim and the syscall sets it again
     /// and the next kick carries that frame. Only this method and
-    /// tx_commit share state, through that flag; the flush counters are
-    /// this method's alone.
+    /// tx_commit share state, through that flag and the TX ring's indexes,
+    /// read with acquire. One thread flushes at a time: the flush counters
+    /// and the busy-poll progress are the flusher's alone.
     [[nodiscard]] auto tx_flush() -> Status
     {
-        if (!tx_pending_.exchange(false, std::memory_order_acq_rel)) {
+        if (!tx_kick_due()) {
             ++stats_.tx_flush_skipped;
             return success();
         }
         auto const ret = ::sendto(xsk_socket__fd(xsk_), nullptr, 0, MSG_DONTWAIT, nullptr, 0);
         ++stats_.tx_flush_count;
         if (ret >= 0) {
+            napi_busy_poll_.kicked();
             return success();
         }
         int const err = errno;
@@ -1924,7 +1997,36 @@ class XdpContext
     /// days needs a fresh window without a reopen.
     auto reset_stats() noexcept -> void { stats_ = Stats{}; }
 
+    /// The queue is busy polled by its NAPI kthread (or no longer): in zero-copy mode tx_flush()
+    /// skips the kick once one has scheduled the kthread, and kicks a queue that stops making
+    /// progress. Any thread; close() clears it.
+    void set_napi_busy_poll(bool const on) noexcept { napi_busy_poll_.set(on); }
+    /// Whether set_napi_busy_poll() turned busy poll on. Any thread.
+    [[nodiscard]] auto napi_busy_poll() const noexcept -> bool { return napi_busy_poll_.on(); }
+
   private:
+    /// Whether tx_flush() kicks, consuming the pending flag (detail::tx_kick_due()).
+    [[nodiscard]] auto tx_kick_due() noexcept -> bool
+    {
+        bool const busy_polled = zero_copy_ && napi_busy_poll_.polling();
+        bool const stalled = busy_polled && tx_progress_.stalled(tx_ring_state());
+        stats_.tx_flush_stalled += stalled ? 1U : 0U;
+        if (busy_polled && !stalled) {
+            return false;  // the flag stays set: a kick is owed if busy poll stops before the kthread sends
+        }
+        return detail::tx_kick_due(tx_pending_.exchange(false, std::memory_order_acq_rel), busy_polled, stalled);
+    }
+
+    /// The TX ring's state, read with the producer's and the kernel's own
+    /// orderings so a kicker thread sees the committing thread's submits.
+    [[nodiscard]] auto tx_ring_state() const noexcept -> detail::TxRingState
+    {
+        uint32_t const produced = __atomic_load_n(rings_.tx.producer, __ATOMIC_ACQUIRE);
+        uint32_t const consumed = __atomic_load_n(rings_.tx.consumer, __ATOMIC_ACQUIRE);
+        uint32_t const completed = __atomic_load_n(rings_.comp.producer, __ATOMIC_ACQUIRE);
+        return {.pending = produced - consumed, .progress = consumed + completed};
+    }
+
     void swap(XdpContext& other) noexcept
     {
         swap_socket(other);
@@ -1951,6 +2053,8 @@ class XdpContext
         std::swap(bind_retries_, other.bind_retries_);
         std::swap(tx_frame_reserve_, other.tx_frame_reserve_);
         std::swap(zero_copy_, other.zero_copy_);
+        napi_busy_poll_.swap(other.napi_busy_poll_);
+        std::swap(tx_progress_, other.tx_progress_);
     }
     /// The one atomic, swapped by value: nothing else touches either
     /// context while it is being moved.
@@ -1989,6 +2093,8 @@ class XdpContext
     /// kicker thread can run tx_flush() against this thread's tx_commit().
     std::atomic<bool> tx_pending_{false};
     bool zero_copy_{false};
+    detail::NapiBusyPoll napi_busy_poll_;
+    detail::TxProgress tx_progress_;
 };
 
 /// Whether this build and this kernel can put a launch time on an AF_XDP
@@ -2137,6 +2243,9 @@ class XdpContext
     }
 
     auto reset_stats() noexcept -> void { stats_ = Stats{}; }
+
+    void set_napi_busy_poll(bool /*on*/) noexcept {}
+    [[nodiscard]] auto napi_busy_poll() const noexcept -> bool { return false; }
 
     [[nodiscard]] auto kernel_stats() const -> StatusValue<XdpKernelStats> { return failure(XdpError::not_supported_on_platform); }
 

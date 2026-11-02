@@ -368,6 +368,60 @@ TEST(xdp_pin_path, the_entry_names_are_fixed)
     EXPECT_TRUE(XdpProgram::pin_entry(XdpProgram::pin_path_for("bad/name"), XdpProgram::PIN_PROG).empty());
 }
 
+TEST(napi_busy_poll, busy_poll_skips_kicks_only_after_one_has_scheduled_the_kthread)
+{
+    detail::NapiBusyPoll napi;
+    EXPECT_FALSE(napi.on() || napi.polling());
+    napi.kicked();
+    EXPECT_FALSE(napi.polling());  // off stays off
+    napi.set(true);
+    EXPECT_TRUE(napi.on() && !napi.polling());  // armed: the kthread sleeps until scheduled
+    napi.kicked();
+    EXPECT_TRUE(napi.polling());
+    napi.set(true);
+    EXPECT_FALSE(napi.polling());  // applied again (a reset): one more kick owed
+    napi.kicked();
+    detail::NapiBusyPoll other;
+    napi.swap(other);
+    EXPECT_TRUE(other.polling() && !napi.on());
+    other.set(false);
+    EXPECT_FALSE(other.on() || other.polling());
+}
+
+TEST(napi_busy_poll, a_busy_polled_queue_is_kicked_only_when_it_stalls)
+{
+    // pending, busy polled, stalled
+    EXPECT_FALSE(detail::tx_kick_due(false, false, false));
+    EXPECT_TRUE(detail::tx_kick_due(true, false, false));
+    EXPECT_FALSE(detail::tx_kick_due(true, true, false));
+    EXPECT_TRUE(detail::tx_kick_due(true, true, true));
+    EXPECT_TRUE(detail::tx_kick_due(false, true, true));  // left in the ring since a skipped kick
+}
+
+TEST(TxProgress, a_busy_polled_queue_that_makes_no_progress_between_flushes_is_kicked)
+{
+    using detail::TxRingState;
+    detail::TxProgress progress;
+    EXPECT_FALSE(progress.stalled(TxRingState{.pending = 0, .progress = 10}));
+    EXPECT_FALSE(progress.stalled(TxRingState{.pending = 3, .progress = 10}));  // left at this flush: none owed yet
+    EXPECT_FALSE(progress.stalled(TxRingState{.pending = 5, .progress = 12}));  // it moved: the kthread polls
+    EXPECT_TRUE(progress.stalled(TxRingState{.pending = 6, .progress = 12}));   // left last time, nothing since
+    EXPECT_TRUE(progress.stalled(TxRingState{.pending = 6, .progress = 12}));   // and again until it moves
+    EXPECT_FALSE(progress.stalled(TxRingState{.pending = 6, .progress = 13}));  // completions alone: a full hardware ring
+    EXPECT_FALSE(progress.stalled(TxRingState{.pending = 0, .progress = 18}));  // drained
+    EXPECT_FALSE(progress.stalled(TxRingState{.pending = 1, .progress = 18}));  // nothing was left last time
+}
+
+TEST(napi_busy_poll, a_closed_context_is_not_busy_polled)
+{
+    XdpContext ctx;
+    EXPECT_FALSE(ctx.napi_busy_poll());
+    ctx.set_napi_busy_poll(true);
+    EXPECT_TRUE(ctx.napi_busy_poll());
+    ctx.close();
+    EXPECT_FALSE(ctx.napi_busy_poll());
+}
+
 TEST(xdp_config, a_rule_for_any_frame_size_does_not_end_the_bpf_table)
 {
     CompiledRule<32> rule{};
