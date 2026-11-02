@@ -4,6 +4,7 @@
 #include "statusbar/net/net_tcp_server.hpp"
 
 #include <fcntl.h>
+#include <poll.h>
 #include <unistd.h>
 
 #include <cassert>
@@ -14,8 +15,10 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/file.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 
 namespace statusbar::net {
 
@@ -47,6 +50,55 @@ void set_accepted_options(int fd, TcpServerOptions const& options, int family)
     int const one = 1;
     (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
+}
+
+#if defined(POLLRDHUP)
+constexpr short PEER_SHUT_DOWN = POLLRDHUP | POLLHUP;
+#else
+constexpr short PEER_SHUT_DOWN = POLLHUP;
+#endif
+
+/// After a read of 0 on SOCK_SEQPACKET @p fd: true for EOF (the peer shut down, nothing queued: Linux's
+/// FIONREAD sums a seqpacket queue, so only empty messages read as nothing), false for an empty message.
+/// A failed poll counts as EOF, so the read cannot spin on it.
+[[nodiscard]] auto seqpacket_eof(int const fd) noexcept -> bool
+{
+    pollfd peer{.fd = fd, .events = PEER_SHUT_DOWN, .revents = 0};
+    int const ready = ::poll(&peer, 1, 0);
+    if (ready >= 0 && (ready == 0 || (peer.revents & PEER_SHUT_DOWN) == 0)) {
+        return false;
+    }
+    int queued = 0;
+    return ::ioctl(fd, FIONREAD, &queued) < 0 || queued == 0;
+}
+
+/// One message of SOCK_SEQPACKET @p fd into @p out: recvmsg()'s result, and
+/// @p truncated when it was longer than @p out (the rest discarded).
+/// recvmsg()'s MSG_TRUNC output flag is POSIX, unlike recv()'s input flag.
+[[nodiscard]] auto receive_one(int const fd, std::span<uint8_t> const out, bool& truncated) noexcept -> ssize_t
+{
+    iovec io{.iov_base = out.data(), .iov_len = out.size()};
+    msghdr message{.msg_iov = &io, .msg_iovlen = 1};
+    ssize_t const n = ::recvmsg(fd, &message, 0);
+    truncated = n >= 0 && (message.msg_flags & MSG_TRUNC) != 0;
+    return n;
+}
+
+/// Empty messages read in a row before a seqpacket read gives up for now (would_block).
+constexpr size_t MAX_EMPTY_MESSAGES = 64;
+
+/// One non-empty message of SOCK_SEQPACKET @p fd into @p out, as receive_one(); 0 for EOF. A run of
+/// MAX_EMPTY_MESSAGES empty ones (a half-closed peer raises no POLLHUP without POLLRDHUP) is EAGAIN.
+[[nodiscard]] auto receive_message(int const fd, std::span<uint8_t> const out, bool& truncated) noexcept -> ssize_t
+{
+    for (size_t empty = 0; empty < MAX_EMPTY_MESSAGES; ++empty) {
+        ssize_t const n = receive_one(fd, out, truncated);
+        if (n != 0 || truncated || seqpacket_eof(fd)) {
+            return n;
+        }
+    }
+    errno = EAGAIN;
+    return -1;
 }
 
 /// Remove a socket file only while it is still the one we created. Compared
@@ -430,6 +482,11 @@ auto TcpConnectionPool::read(size_t slot, std::span<uint8_t> out) -> StatusValue
         return failure(NetError::invalid_handle);
     }
     auto& s = slots_[slot];
+    return options_.unix_seqpacket && !unix_.path.empty() ? read_message(s, out) : read_stream(s, out);
+}
+
+auto TcpConnectionPool::read_stream(Slot& s, std::span<uint8_t> const out) -> StatusValue<size_t>
+{
     ssize_t const n = ::recv(s.fd.get(), out.data(), out.size(), 0);
     if (n > 0) {
         s.last_activity_ns = last_now_ns_;
@@ -442,6 +499,19 @@ auto TcpConnectionPool::read(size_t slot, std::span<uint8_t> out) -> StatusValue
         return failure(NetError::would_block);
     }
     return failure(NetError::receive_failed);
+}
+
+auto TcpConnectionPool::read_message(Slot& s, std::span<uint8_t> const out) -> StatusValue<size_t>
+{
+    bool truncated = false;
+    ssize_t const n = receive_message(s.fd.get(), out, truncated);
+    if (n < 0) {
+        return failure(would_block() || was_interrupted() ? NetError::would_block : NetError::receive_failed);
+    }
+    if (n > 0) {
+        s.last_activity_ns = last_now_ns_;  // as a stream read: EOF is not activity
+    }
+    return truncated ? StatusValue<size_t>{failure(NetError::buffer_full)} : static_cast<size_t>(n);
 }
 
 auto TcpConnectionPool::write(size_t slot, std::span<uint8_t const> data) -> StatusValue<size_t>
