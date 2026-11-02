@@ -16,6 +16,9 @@
 #    include <cstdint>
 #    include <span>
 
+#    include <linux/netlink.h>
+#    include <sys/socket.h>
+
 namespace {
 
 using namespace statusbar::net;
@@ -90,17 +93,82 @@ TEST(net_carrier_watch, a_malformed_newlink_is_refused)
     EXPECT_FALSE(parse_link_carrier(patched(0, 0x14), 3).has_value());              // shorter than ifinfomsg
 }
 
-TEST(net_carrier_watch, the_watch_opens_unprivileged_and_waits)
+TEST(net_carrier_watch, a_get_link_names_the_index_alone)
 {
-    // Host-dependent: skipped where NETLINK_ROUTE is unavailable.
+    if (!LITTLE) {
+        return;
+    }
+    // clang-format off
+    constexpr std::array<uint8_t, 32> EXPECTED{
+        0x20, 0x00, 0x00, 0x00, 0x12, 0x00, 0x01, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    // clang-format on
+    std::array<uint8_t, 32> out{};
+    auto const length = build_get_link(out, 3, 5);
+    EXPECT_TRUE(length && *length == out.size());
+    EXPECT_TRUE(out == EXPECTED);
+    EXPECT_FALSE(build_get_link(out, 0, 5).has_value());
+    EXPECT_FALSE(build_get_link(std::span{out}.first(16), 3, 5).has_value());
+}
+
+TEST(net_carrier_watch, the_watch_reports_the_state_at_open_then_waits)
+{
+    // Host-dependent: skipped where NETLINK_ROUTE is unavailable. Loopback (ifindex 1) always has a carrier.
     int reports = 0;
-    CarrierWatch watch{3, [&reports](LinkCarrier const&) { ++reports; }};
+    bool carrier = false;
+    CarrierWatch watch{1, [&](LinkCarrier const& link) {
+                           ++reports;
+                           carrier = link.carrier;
+                       }};
     if (!watch.open().has_value()) {
         return;
     }
     EXPECT_TRUE(watch.fd() >= 0);
     watch.on_ready(0);
     EXPECT_FALSE(watch.finished());
+    EXPECT_EQ(reports, 1);
+    EXPECT_TRUE(carrier);
+    watch.on_ready(0);
+    EXPECT_EQ(reports, 1);
+}
+
+TEST(net_carrier_watch, after_an_overrun_the_link_is_asked_for_again)
+{
+    // Host-dependent: skipped where NETLINK_ROUTE is unavailable. Unanswered requests overrun a small queue.
+    int reports = 0;
+    CarrierWatch watch{1, [&reports](LinkCarrier const&) { ++reports; }};
+    if (!watch.open().has_value()) {
+        return;
+    }
+    int const small = 1;
+    (void)::setsockopt(watch.fd(), SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
+    std::array<uint8_t, 32> request{};
+    sockaddr_nl const kernel{.nl_family = AF_NETLINK, .nl_pad = 0, .nl_pid = 0, .nl_groups = 0};
+    for (uint32_t seq = 2; seq < 66; ++seq) {
+        auto const length = build_get_link(request, 1, seq);
+        (void)::sendto(
+            watch.fd(), request.data(), length.value_or(0), 0, reinterpret_cast<sockaddr const*>(&kernel), sizeof(kernel));
+    }
+    watch.on_ready(0);  // the replies that fitted, then the overrun's request
+    EXPECT_FALSE(watch.finished());
+    int const drained = reports;
+    EXPECT_TRUE(drained < 65);
+    watch.on_ready(0);
+    EXPECT_EQ(reports, drained + 1);
+    EXPECT_FALSE(watch.finished());
+}
+
+TEST(net_carrier_watch, a_link_the_kernel_does_not_know_finishes_the_watch)
+{
+    int reports = 0;
+    CarrierWatch watch{0x7FFFFFF0, [&reports](LinkCarrier const&) { ++reports; }};
+    if (!watch.open().has_value()) {
+        return;
+    }
+    watch.on_ready(0);
+    EXPECT_TRUE(watch.finished());
+    EXPECT_EQ(reports, 0);
 }
 
 #endif  // __linux__

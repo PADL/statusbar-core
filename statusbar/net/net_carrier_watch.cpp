@@ -5,9 +5,11 @@
 
 #if defined(__linux__)
 
+#    include "statusbar/buffer/buffer.hpp"
 #    include "statusbar/net/net_netlink.hpp"
 #    include "statusbar/net/net_posix_util.hpp"
 
+#    include <array>
 #    include <cerrno>
 #    include <cstddef>
 #    include <system_error>
@@ -25,6 +27,8 @@ using netlink::bad_message;
 using netlink::load;
 
 constexpr size_t LINK_HEADER = netlink::MESSAGE_HEADER + sizeof(ifinfomsg);
+/// The RTM_GETLINK's sequence number: the watch has one request outstanding at most.
+constexpr uint32_t REQUEST_SEQ = 1;
 /// IFF_LOWER_UP (linux/if.h, which clashes with the libc <net/if.h> others include).
 constexpr uint32_t LOWER_UP = 1U << 16;
 static_assert(sizeof(ifinfomsg) == 16 && offsetof(ifinfomsg, ifi_index) == 4 && offsetof(ifinfomsg, ifi_flags) == 8);
@@ -64,6 +68,13 @@ static_assert(sizeof(ifinfomsg) == 16 && offsetof(ifinfomsg, ifi_index) == 4 && 
     return {errno, std::system_category()};
 }
 
+/// True for an NLMSG_ERROR carrying an error: the kernel refused the RTM_GETLINK (ENODEV: no such link).
+[[nodiscard]] auto is_error_reply(std::span<uint8_t const> const message) noexcept -> bool
+{
+    return load<uint16_t>(message, offsetof(nlmsghdr, nlmsg_type)) == NLMSG_ERROR &&
+        message.size() >= netlink::MESSAGE_HEADER + sizeof(int32_t) && load<int32_t>(message, netlink::MESSAGE_HEADER) != 0;
+}
+
 }  // namespace
 
 auto parse_link_carrier(std::span<uint8_t const> const message, int const ifindex) -> StatusValue<std::optional<LinkCarrier>>
@@ -83,6 +94,24 @@ auto parse_link_carrier(std::span<uint8_t const> const message, int const ifinde
         .transform([](LinkCarrier const& link) { return std::optional{link}; });
 }
 
+auto build_get_link(std::span<uint8_t> const out, int const ifindex, uint32_t const seq) -> StatusValue<size_t>
+{  // NOLINT(statusbar-block-statements): the RTM_GETLINK request, field by field
+    if (ifindex <= 0) {
+        return failure(std::make_error_code(std::errc::invalid_argument));
+    }
+    MutableBuffer buffer{out};
+    BufferSerializerBuilder b{buffer};
+    netlink::put_header(b, LINK_HEADER, RTM_GETLINK, NLM_F_REQUEST, seq);
+    // ifinfomsg: family AF_UNSPEC, pad, type 0, the index, flags 0, change 0.
+    b.append(uint8_t{AF_UNSPEC})
+        .append(uint8_t{0})
+        .append(uint16_t{0})
+        .append(int32_t{ifindex})
+        .append(uint32_t{0})
+        .append(uint32_t{0});
+    return netlink::finish(b, LINK_HEADER);
+}
+
 auto CarrierWatch::open() -> Status
 {
     FileDescriptor fd{::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, NETLINK_ROUTE)};
@@ -94,22 +123,43 @@ auto CarrierWatch::open() -> Status
         return failure(errno_code());
     }
     fd_ = std::move(fd);
-    return success();
+    return request_link();
 }
 
 void CarrierWatch::on_ready(int64_t /*now_ns*/)
 {
-    for (;;) {
+    while (!failed_) {
         auto const received = ::recv(fd_.get(), buffer_.data(), buffer_.size(), MSG_DONTWAIT);
         if (received >= 0) {
             deliver(std::span<uint8_t const>{buffer_.data(), static_cast<size_t>(received)});
             continue;
         }
-        if (errno != ENOBUFS && errno != EINTR) {
-            failed_ = errno != EAGAIN && errno != EWOULDBLOCK;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            resync();
             return;
         }
+        // An overrun (ENOBUFS) lost notifications: once the queue is drained, the link is asked for again.
+        resync_ = resync_ || errno == ENOBUFS;
+        failed_ = errno != ENOBUFS && errno != EINTR;
     }
+}
+
+void CarrierWatch::resync()
+{
+    if (resync_) {
+        resync_ = false;
+        failed_ = !request_link().has_value();
+    }
+}
+
+auto CarrierWatch::request_link() noexcept -> Status
+{
+    std::array<uint8_t, LINK_HEADER> request{};
+    return build_get_link(request, ifindex_, REQUEST_SEQ).and_then([&](size_t const length) -> Status {
+        sockaddr_nl const kernel{.nl_family = AF_NETLINK, .nl_pad = 0, .nl_pid = 0, .nl_groups = 0};
+        bool const sent = ::sendto(fd_.get(), request.data(), length, 0, sockaddr_cast(kernel), sizeof(kernel)) >= 0;
+        return sent ? success() : Status{failure(errno_code())};
+    });
 }
 
 void CarrierWatch::deliver(std::span<uint8_t const> const datagram)
@@ -119,11 +169,18 @@ void CarrierWatch::deliver(std::span<uint8_t const> const datagram)
         if (length < netlink::MESSAGE_HEADER || length > datagram.size() - at) {
             return;
         }
-        if (auto const link = parse_link_carrier(datagram.subspan(at, length), ifindex_); link && *link) {
-            on_change_(**link);
-        }
+        report(datagram.subspan(at, length));
         at += netlink::align4(length);
     }
+}
+
+void CarrierWatch::report(std::span<uint8_t const> const message)
+{
+    if (auto const link = parse_link_carrier(message, ifindex_); link && *link) {
+        on_change_(**link);
+        return;
+    }
+    failed_ = failed_ || is_error_reply(message);
 }
 
 }  // namespace statusbar::net
