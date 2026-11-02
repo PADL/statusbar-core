@@ -65,9 +65,8 @@ namespace statusbar::net::tc {
 /// therefore live on the stack with no allocation.
 inline constexpr std::size_t MAX_REQUEST_SIZE = 256;
 
-/// A buffer big enough for any request this module builds. Named because
-/// another implementation of this module names it, and a caller written
-/// against that one should not have to spell the array out.
+/// A buffer big enough for any request this module builds, named so a
+/// caller does not have to spell the array out.
 using RequestBuffer = std::array<std::uint8_t, MAX_REQUEST_SIZE>;
 
 /// TC_H_ROOT: the parent of a root qdisc.
@@ -82,8 +81,8 @@ inline constexpr std::uint32_t UNSPEC = 0U;
 inline constexpr std::size_t MAX_TRAFFIC_CLASSES = 16;
 inline constexpr std::size_t PRIO_MAP_SIZE = 16;
 
-/// The same count, under the name another implementation of this module
-/// gives it, so a caller that spells the map type out compiles either way.
+/// The same count under the name a caller that spells the map type out by
+/// priority expects.
 inline constexpr std::size_t PRIORITY_COUNT = PRIO_MAP_SIZE;
 
 /// The skb priority PTP event traffic is sent at. IEEE 802.1Q Table 8-5 puts
@@ -151,17 +150,16 @@ struct MqprioQdisc
 /// port transmit rate) and `locredit` is normally negative.
 struct CbsQdisc
 {
-    // The first six fields are named and ordered as another implementation
-    // of this module names and orders them, so that a positional
-    // CbsQdisc{...} written against either one means the same thing. That
-    // ordering is the reason to care: the names merely fail to compile when
-    // they disagree, where a different order silently assigns a credit to a
-    // slope. handle_major is ours alone and comes last for the same reason.
+    // After `parent`, the fields are named and ordered as the kernel's
+    // `tc_cbs_qopt` orders them, so that a positional CbsQdisc{...} reads
+    // as the kernel struct does. That ordering is the reason to care: the
+    // names merely fail to compile when they disagree, where a different
+    // order silently assigns a credit to a slope. handle_major is ours
+    // alone and comes last for the same reason.
     //
-    // `offload` keeps our name and our default. Both implementations call it
-    // offload, but the other one's MqprioQdisc defaults its equivalent
-    // (`hw`) to false; defaulting a shaper to software is the failure
-    // FEAT-008 exists to prevent, so ours stays on.
+    // `offload` defaults on. A shaper that silently falls back to software
+    // is the failure hardware shaping exists to prevent, so it is never
+    // the default here.
 
     /// The mqprio class this shaper serves, e.g. make_handle(0x8001, 1).
     std::uint32_t parent{0};
@@ -176,8 +174,6 @@ struct CbsQdisc
     std::int32_t sendslope_kbps{0};  ///< kbit/s credit drains at while sending
 
     /// Handle major for the cbs itself; installed as `major:0`. Not 0.
-    /// Ours only - the other implementation takes the major from the handle
-    /// it is written with.
     std::uint16_t handle_major{0};
 
     auto operator==(CbsQdisc const&) const noexcept -> bool = default;
@@ -400,9 +396,8 @@ class TcClient final : public TcControl
     /// Whether the socket is open.
     [[nodiscard]] auto valid() const noexcept -> bool { return fd_ >= 0; }
 
-    /// The same question as valid(), under the name another implementation
-    /// of this module gives it, so a caller written against that one compiles
-    /// against this one.
+    /// The same question as valid(), under the name a caller written
+    /// against a socket-style API expects.
     [[nodiscard]] auto is_open() const noexcept -> bool { return valid(); }
 
     /// The netlink socket, for a caller that multiplexes it, and so a test

@@ -394,13 +394,10 @@ template <typename Report>
     return envelope.report;
 }
 
-/// Say out loud that a namespace test could not run. A silent skip reads
-/// exactly like a pass in the runner's output, which is how a test that
-/// needs something stops being run at all.
-auto skip_no_namespaces(char const* test_name) -> void
-{
-    std::printf("  SKIP: %s needs user namespaces (unshare(CLONE_NEWUSER|CLONE_NEWNET) refused)\n", test_name);
-}
+/// What every namespace test says when it cannot run. SKIP() counts it apart
+/// from the passes, so a test that needs something does not quietly stop
+/// being run at all.
+constexpr char const* NEEDS_USER_NAMESPACES = "needs user namespaces (unshare(CLONE_NEWUSER|CLONE_NEWNET) refused)";
 
 // ---------------------------------------------------------------------------
 // Scaffolding for the namespace tests.
@@ -1039,8 +1036,7 @@ TEST(vlan_link, the_whole_lifecycle_against_a_real_kernel)
 {
     auto const report = in_private_netns<LifecycleReport>(run_lifecycle);
     if (!report) {
-        skip_no_namespaces("the_whole_lifecycle_against_a_real_kernel");
-        return;
+        SKIP(NEEDS_USER_NAMESPACES);
     }
     EXPECT_EQ(report->setup_errno, 0);
     EXPECT_TRUE(report->parent_ifindex > 0);
@@ -1102,8 +1098,7 @@ TEST(vlan_link, a_link_somebody_else_made_is_adopted_and_outlives_us)
 {
     auto const report = in_private_netns<AdoptReport>(run_adoption);
     if (!report) {
-        skip_no_namespaces("a_link_somebody_else_made_is_adopted_and_outlives_us");
-        return;
+        SKIP(NEEDS_USER_NAMESPACES);
     }
     EXPECT_EQ(report->setup_errno, 0);
     EXPECT_EQ(report->out_of_band_errno, 0);
@@ -1167,8 +1162,7 @@ TEST(vlan_link, a_name_held_by_a_different_link_is_a_conflict_not_an_adoption)
 {
     auto const report = in_private_netns<ConflictReport>(run_conflicts);
     if (!report) {
-        skip_no_namespaces("a_name_held_by_a_different_link_is_a_conflict_not_an_adoption");
-        return;
+        SKIP(NEEDS_USER_NAMESPACES);
     }
     EXPECT_EQ(report->setup_errno, 0);
     EXPECT_EQ(report->out_of_band_errno, 0);
@@ -1211,8 +1205,7 @@ TEST(vlan_link, the_kernels_own_words_reach_last_message)
 {
     auto const report = in_private_netns<ExtAckReport>(run_ext_ack);
     if (!report) {
-        skip_no_namespaces("the_kernels_own_words_reach_last_message");
-        return;
+        SKIP(NEEDS_USER_NAMESPACES);
     }
     EXPECT_EQ(report->add_error, EOPNOTSUPP);
     // This is the criterion the issue asks for, met against a real kernel:
@@ -1286,8 +1279,7 @@ TEST(vlan_link, destroying_a_client_removes_only_what_it_created)
 {
     auto const report = in_private_netns<CloseReport>(run_close);
     if (!report) {
-        skip_no_namespaces("destroying_a_client_removes_only_what_it_created");
-        return;
+        SKIP(NEEDS_USER_NAMESPACES);
     }
     EXPECT_EQ(report->setup_errno, 0);
     EXPECT_EQ(report->add_error, 0);

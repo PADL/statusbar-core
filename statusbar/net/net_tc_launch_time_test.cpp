@@ -7,9 +7,11 @@
 #include "statusbar/test/test.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <string_view>
 #include <system_error>
+#include <vector>
 
 using namespace statusbar;
 using namespace statusbar::net;
@@ -68,6 +70,27 @@ constexpr std::uint16_t MAJOR = 0x9100;
     info.has_mqprio_params = true;
     info.mqprio = *tc::launch_time_mqprio(queue);
     return info;
+}
+
+using Op = tc::TcRecorder::Operation;
+
+/// The operations the recorder saw, in order, for a one-line comparison.
+[[nodiscard]] auto operations_of(tc::TcRecorder const& recorder) -> std::vector<Op>
+{
+    std::vector<Op> ops;
+    for (auto const& request : recorder.requests()) {
+        ops.push_back(request.operation);
+    }
+    return ops;
+}
+
+/// Whether the recorder saw our root deleted - `major:0` at the root - at
+/// `index`.
+[[nodiscard]] auto removes_our_root_at(tc::TcRecorder const& recorder, std::size_t const index) -> bool
+{
+    auto const requests = recorder.requests();
+    return index < requests.size() && requests[index].operation == Op::remove &&
+        requests[index].handle == tc::make_handle(MAJOR, 0) && requests[index].parent == tc::ROOT;
 }
 
 }  // namespace
@@ -244,8 +267,11 @@ TEST(tc_launch_time, on_keeps_a_root_and_etf_an_earlier_run_left)
 
 // Our handle on a root laid for another queue layout - the config moved the
 // PTP queue between runs - is not ours to keep either: class 2, where the etf
-// would hang, was "everything else" in the old layout. It is replaced.
-TEST(tc_launch_time, on_replaces_our_root_when_its_layout_is_not_the_one_wanted)
+// would hang, was "everything else" in the old layout. It is replaced - and
+// deleted first, because the kernel takes a replace under a handle the
+// interface already holds as a change to the qdisc there, which mqprio does
+// not support: the request comes back EINVAL and the old root stays.
+TEST(tc_launch_time, on_deletes_our_root_before_laying_it_again_when_its_layout_is_not_the_one_wanted)
 {
     tc::TcRecorder recorder;
     recorder.set_get_result_for(tc::ROOT, our_root(three_queues()));
@@ -254,19 +280,18 @@ TEST(tc_launch_time, on_replaces_our_root_when_its_layout_is_not_the_one_wanted)
     if (action) {
         EXPECT_TRUE(*action == tc::LaunchTimeQueueAction::installed);
     }
-    bool replaced = false;
-    for (auto const& request : recorder.requests()) {
-        if (request.operation == tc::TcRecorder::Operation::replace_mqprio) {
-            replaced = true;
-            EXPECT_EQ(request.mqprio.num_tc, 3);
-        }
+    EXPECT_TRUE((operations_of(recorder) == std::vector{Op::get, Op::remove, Op::replace_mqprio, Op::get, Op::replace_etf}));
+    EXPECT_TRUE(removes_our_root_at(recorder, 1));
+    auto const requests = recorder.requests();
+    if (requests.size() > 2) {
+        EXPECT_EQ(requests[2].mqprio.num_tc, 3);
     }
-    EXPECT_TRUE(replaced);
 }
 
 // And a root that merely carries our handle, reporting no layout at all, is
-// not ours: there is nothing to say what its classes mean.
-TEST(tc_launch_time, a_root_with_our_handle_but_no_layout_is_replaced)
+// not ours: there is nothing to say what its classes mean. Same handle, same
+// refusal from the kernel, so it too goes before the new one is laid.
+TEST(tc_launch_time, a_root_with_our_handle_but_no_layout_is_deleted_and_laid_again)
 {
     tc::TcRecorder recorder;
     recorder.set_get_result_for(tc::ROOT, installed("mqprio", tc::make_handle(MAJOR, 0), tc::ROOT));
@@ -275,11 +300,31 @@ TEST(tc_launch_time, a_root_with_our_handle_but_no_layout_is_replaced)
     if (action) {
         EXPECT_TRUE(*action == tc::LaunchTimeQueueAction::installed);
     }
+    EXPECT_TRUE((operations_of(recorder) == std::vector{Op::get, Op::remove, Op::replace_mqprio, Op::get, Op::replace_etf}));
+    EXPECT_TRUE(removes_our_root_at(recorder, 1));
+}
+
+// Our handle on a qdisc of another kind is the same case: the kernel refuses
+// a replace whose kind differs from what holds the handle, so it is deleted
+// first. The delete names the handle alone, and a kind is not needed for it.
+TEST(tc_launch_time, a_qdisc_of_another_kind_under_our_handle_is_deleted_and_laid_again)
+{
+    tc::TcRecorder recorder;
+    recorder.set_get_result_for(tc::ROOT, installed("prio", tc::make_handle(MAJOR, 0), tc::ROOT));
+    auto const action = tc::settle_launch_time_queue(recorder, IFINDEX, four_queues(), tc::LaunchTimeMode::on);
+    EXPECT_TRUE(action.has_value());
+    if (action) {
+        EXPECT_TRUE(*action == tc::LaunchTimeQueueAction::installed);
+    }
+    EXPECT_TRUE((operations_of(recorder) == std::vector{Op::get, Op::remove, Op::replace_mqprio, Op::get, Op::replace_etf}));
+    EXPECT_TRUE(removes_our_root_at(recorder, 1));
 }
 
 // Somebody else's root is not ours to keep: the queue layout behind it is
 // unknown, so the class the etf would hang on may not be the socket's queue.
-TEST(tc_launch_time, on_replaces_a_root_that_is_not_ours)
+// It is under a different handle, so a replace under ours grafts over it in
+// one request: nothing is deleted, and nothing of theirs is named.
+TEST(tc_launch_time, on_replaces_a_root_that_is_not_ours_in_one_request)
 {
     tc::TcRecorder recorder;
     recorder.set_get_result_for(tc::ROOT, installed("mqprio", tc::make_handle(0x1234, 0), tc::ROOT));
@@ -288,6 +333,20 @@ TEST(tc_launch_time, on_replaces_a_root_that_is_not_ours)
     if (action) {
         EXPECT_TRUE(*action == tc::LaunchTimeQueueAction::installed);
     }
+    EXPECT_TRUE((operations_of(recorder) == std::vector{Op::get, Op::replace_mqprio, Op::get, Op::replace_etf}));
+}
+
+// The delete is a request like any other, and a refusal of it stops the
+// sequence: laying the root over a stale one the kernel would not give up is
+// exactly the request it refuses.
+TEST(tc_launch_time, a_refused_delete_of_a_stale_root_stops_before_the_root_is_laid)
+{
+    tc::TcRecorder recorder;
+    recorder.set_get_result_for(tc::ROOT, our_root(three_queues()));
+    recorder.fail_next_write(std::make_error_code(std::errc::operation_not_permitted), "Operation not permitted");
+    auto const action = tc::settle_launch_time_queue(recorder, IFINDEX, four_queues(), tc::LaunchTimeMode::on);
+    EXPECT_FALSE(action.has_value());
+    EXPECT_TRUE((operations_of(recorder) == std::vector{Op::get, Op::remove}));
 }
 
 TEST(tc_launch_time, on_lays_only_the_etf_when_the_root_is_already_ours)
@@ -366,6 +425,22 @@ TEST(tc_launch_time, off_with_a_persistent_root_removes_only_the_etf)
     auto const& last = requests.back();
     EXPECT_TRUE(last.operation == tc::TcRecorder::Operation::remove);
     EXPECT_EQ(last.parent, tc::make_handle(MAJOR, 1));
+}
+
+// A persistent root under our handle but with an older layout is laid again
+// for the same reason `on` lays it again - and deleted first for the same
+// reason too.
+TEST(tc_launch_time, off_with_a_persistent_root_deletes_a_stale_root_of_ours_before_laying_it_again)
+{
+    tc::TcRecorder recorder;
+    recorder.set_get_result_for(tc::ROOT, our_root(three_queues()));
+    auto const action = tc::settle_launch_time_queue(recorder, IFINDEX, four_queues(), tc::LaunchTimeMode::off);
+    EXPECT_TRUE(action.has_value());
+    if (action) {
+        EXPECT_TRUE(*action == tc::LaunchTimeQueueAction::installed);
+    }
+    EXPECT_TRUE((operations_of(recorder) == std::vector{Op::get, Op::remove, Op::replace_mqprio, Op::get}));
+    EXPECT_TRUE(removes_our_root_at(recorder, 1));
 }
 
 // Nothing of ours anywhere, and a root to keep: the root is laid, and there is

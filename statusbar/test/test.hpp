@@ -73,6 +73,12 @@ class TestRegister
     static auto run(TestInfo info) -> bool;
     static auto run(std::vector<TestInfo> const& infos) -> bool;
 
+    /// The three parts of run(): reset the per-test state, run the body
+    /// (with or without exceptions), then count and print what happened.
+    static auto begin_test() noexcept -> void;
+    static auto body_did_not_fail(TestInfo const& info) -> bool;
+    static auto report_outcome(TestInfo const& info, bool did_not_fail) -> bool;
+
     static int g_registered_test_count;
     static int g_registered_test_ran_count;
     static int g_test_count;
@@ -186,6 +192,12 @@ inline void print_ne_fail(char const* ea, char const* eb, A const&, B const&, ch
 /// Not for a precondition that *should* hold - a setup step that fails
 /// where it was expected to work is a failure, and asserting on it is how
 /// a broken environment gets noticed instead of papered over.
+///
+/// Write it in the test body. It returns from the function it is written
+/// in, so from a helper it hands control back to the test, which goes on
+/// without what the helper could not set up; the runner reports what
+/// happens next as a failure, not as the skip. A helper reports whether it
+/// managed, and the test skips on the answer.
 #define SKIP(reason)                                                                                                               \
     do {                                                                                                                           \
         ::statusbar::test::TestRegister::skip_current(reason);                                                                     \

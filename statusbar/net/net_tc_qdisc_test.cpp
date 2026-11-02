@@ -936,7 +936,7 @@ TEST(tc_qdisc, get_reads_back_the_root_qdisc_of_loopback)
     // whole send/drain/filter/parse path including the port-id filter.
     tc::TcClient client;
     if (!client.open()) {
-        return;
+        SKIP("a NETLINK_ROUTE socket could not be opened");
     }
     auto const lo = ::if_nametoindex("lo");
     EXPECT_TRUE(lo > 0);
@@ -959,7 +959,7 @@ TEST(tc_qdisc, get_reports_a_qdisc_that_is_not_there_as_a_bad_handle)
 {
     tc::TcClient client;
     if (!client.open()) {
-        return;
+        SKIP("a NETLINK_ROUTE socket could not be opened");
     }
     auto const lo = ::if_nametoindex("lo");
     if (lo == 0) {
@@ -982,7 +982,7 @@ TEST(tc_qdisc, two_dumps_in_a_row_both_succeed)
     // like success. The second get() here fails if the first left anything.
     tc::TcClient client;
     if (!client.open()) {
-        return;
+        SKIP("a NETLINK_ROUTE socket could not be opened");
     }
     auto const lo = ::if_nametoindex("lo");
     if (lo == 0) {
@@ -997,7 +997,7 @@ TEST(tc_qdisc, an_unprivileged_write_fails_and_the_client_survives_it)
 {
     tc::TcClient client;
     if (!client.open()) {
-        return;
+        SKIP("a NETLINK_ROUTE socket could not be opened");
     }
 
     // An ifindex no interface has, so this cannot disturb the host even
@@ -1138,7 +1138,7 @@ TEST(tc_qdisc, the_client_installs_a_receive_timeout)
     // test binary into a hang without it, and into a clean failure with it.
     tc::TcClient client;
     if (!client.open()) {
-        return;
+        SKIP("a NETLINK_ROUTE socket could not be opened");
     }
 
     timeval timeout{};

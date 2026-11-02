@@ -4,8 +4,8 @@
 // AnyEthernetPort and RawnetPort.
 //
 // The loopback tests need CAP_NET_RAW (AF_PACKET on Linux, /dev/bpf on
-// macOS). Unprivileged they skip, and say so, for the reason the rawnet
-// tests give: a silent skip reads as a pass.
+// macOS). Unprivileged they SKIP(), which the runner counts apart from the
+// passes: a silent skip would read as one.
 
 #include "statusbar/net/net_any_ethernet_port.hpp"
 
@@ -107,13 +107,9 @@ TEST(rawnet_port, a_handle_that_was_never_handed_out_is_refused)
 
 namespace {
 
-[[nodiscard]] auto open_rawnet_or_skip(AnyEthernetPort& port, char const* test_name) -> bool
+[[nodiscard]] auto open_rawnet(AnyEthernetPort& port) -> bool
 {
-    if (port.open(EthernetBackend::rawnet, {.interface_name = LOOPBACK, .ethertype = AVTP})) {
-        return true;
-    }
-    std::printf("  SKIP: %s needs CAP_NET_RAW (raw socket open refused)\n", test_name);
-    return false;
+    return port.open(EthernetBackend::rawnet, {.interface_name = LOOPBACK, .ethertype = AVTP}).has_value();
 }
 
 }  // namespace
@@ -123,8 +119,8 @@ namespace {
 TEST(any_ethernet_port, rawnet_round_trips_a_frame_on_loopback)
 {
     AnyEthernetPort port;
-    if (!open_rawnet_or_skip(port, "rawnet_round_trips_a_frame_on_loopback")) {
-        return;
+    if (!open_rawnet(port)) {
+        SKIP("needs CAP_NET_RAW (raw socket open refused)");
     }
     EXPECT_TRUE(port.valid());
     EXPECT_TRUE(port.backend().has_value());

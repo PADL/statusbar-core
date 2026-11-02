@@ -17,43 +17,63 @@ bool TestRegister::g_current_test_failed = false;
 bool TestRegister::g_current_test_skipped = false;
 char const* TestRegister::g_current_test_skip_reason = "";
 
-auto TestRegister::run(TestInfo const info) -> bool
+auto TestRegister::begin_test() noexcept -> void
 {
     ++g_test_count;
-    bool result = false;
     g_registered_test_ran_count++;
     g_current_test_failed = false;
     g_current_test_skipped = false;
     g_current_test_skip_reason = "";
+}
+
+auto TestRegister::body_did_not_fail(TestInfo const& info) -> bool
+{
 #if __cpp_exceptions
     try {
         info.func();
-        result = !g_current_test_failed;
+        return !g_current_test_failed;
     } catch (...) {
-        result = false;
+        return false;
     }
 #else
     info.func();
-    result = !g_current_test_failed;
+    return !g_current_test_failed;
 #endif
+}
 
+auto TestRegister::report_outcome(TestInfo const& info, bool const did_not_fail) -> bool
+{
     // A skipped test is neither: nothing was verified, so calling it a pass
     // would overstate the run and calling it a failure would break a build
-    // on a machine that simply cannot host the test.
-    if (g_current_test_skipped) {
+    // on a machine that simply cannot host the test. A failure outranks the
+    // skip, though: SKIP() returns from the function it is written in, so
+    // one written in a helper hands control back to the test, which goes on
+    // against whatever the helper could not set up - and what it then
+    // reports is that failure, not the skip it meant to be.
+    if (g_current_test_skipped && did_not_fail) {
         ++g_test_skipped;
         std::println("SKIP: {} {} - {}", info.group, info.name, g_current_test_skip_reason);
         return true;
     }
-
-    if (result) {
+    if (did_not_fail) {
         ++g_test_passed;
         std::println("PASS: {} {}", info.group, info.name);
+    } else if (g_current_test_skipped) {
+        ++g_test_failed;
+        std::println(
+            "FAIL: {} {} (skipped from a helper - {} - and then went on)", info.group, info.name, g_current_test_skip_reason);
     } else {
         ++g_test_failed;
         std::println("FAIL: {} {}", info.group, info.name);
     }
-    return result;
+    return did_not_fail;
+}
+
+auto TestRegister::run(TestInfo const info) -> bool
+{
+    begin_test();
+    bool const did_not_fail = body_did_not_fail(info);
+    return report_outcome(info, did_not_fail);
 }
 
 auto TestRegister::run(std::vector<TestInfo> const& infos) -> bool

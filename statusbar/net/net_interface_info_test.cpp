@@ -302,8 +302,8 @@ TEST(interface_info, a_real_interface_reports_a_driver_name)
     }
 
     // Not asserting *which* driver: the point is that a non-virtual
-    // interface answers with a non-empty name, which is how FEAT-010
-    // would find out it is on igb or igc.
+    // interface answers with a non-empty name, which is how a launch-time
+    // probe would find out it is on igb or igc.
     auto const driver = driver_name(name);
     if (driver) {
         EXPECT_FALSE(driver->empty());

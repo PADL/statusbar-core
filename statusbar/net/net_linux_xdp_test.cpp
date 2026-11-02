@@ -102,6 +102,7 @@ TEST(xdp_error, all_errors_have_messages)
     check(XdpError::queue_busy);
     check(XdpError::foreign_program);
     check(XdpError::pin_not_adoptable);
+    check(XdpError::program_unidentifiable);
     check(XdpError::stats_read_failed);
 }
 
@@ -753,6 +754,43 @@ TEST(xdp_stats, transient_kick_errnos_are_the_ones_that_pass)
     // escalate instead of sending into it again.
     static_assert(!detail::transient_kick_errno(EINVAL));
     static_assert(!detail::transient_kick_errno(EPERM));
+}
+
+// Whose program is on the interface decides whether open() may replace it,
+// and the kernel only answers that question for CAP_SYS_ADMIN. A daemon
+// running under a service file's CAP_BPF and CAP_NET_ADMIN is told EPERM
+// about its own program, and before this was refused as foreign_program
+// forever: its own pinned program, after a redeploy, was somebody else's.
+TEST(xdp_ownership, a_program_the_kernel_will_not_name_is_ours_only_when_we_pinned_it)
+{
+    using detail::AttachedProgramOwner;
+    using detail::attachment_is_ours;
+    EXPECT_TRUE(attachment_is_ours(AttachedProgramOwner::ours, 7, 0).value_or(false));
+    EXPECT_FALSE(attachment_is_ours(AttachedProgramOwner::foreign, 7, 7).value_or(true));
+    EXPECT_TRUE(attachment_is_ours(AttachedProgramOwner::unknown, 7, 7).value_or(false));
+}
+
+TEST(xdp_ownership, a_program_the_kernel_will_not_name_and_the_pin_does_not_vouch_for_is_reported_not_guessed)
+{
+    using detail::AttachedProgramOwner;
+    using detail::attachment_is_ours;
+    auto const unpinned = attachment_is_ours(AttachedProgramOwner::unknown, 7, 0);
+    EXPECT_FALSE(unpinned.has_value());
+    if (!unpinned) {
+        EXPECT_EQ(unpinned.error(), XdpError::program_unidentifiable);
+    }
+    // A pin that holds a different program vouches for nothing on the
+    // interface: ours to unpin, not ours to detach.
+    auto const other = attachment_is_ours(AttachedProgramOwner::unknown, 7, 8);
+    EXPECT_FALSE(other.has_value());
+}
+
+TEST(xdp_ownership, the_unidentifiable_message_names_the_privilege_and_says_the_program_stays)
+{
+    std::error_code const ec = XdpError::program_unidentifiable;
+    EXPECT_TRUE(ec.message().find("CAP_SYS_ADMIN") != std::string::npos);
+    EXPECT_TRUE(ec.message().find("left alone") != std::string::npos);
+    EXPECT_TRUE(ec.message() != std::error_code{XdpError::foreign_program}.message());
     static_assert(!detail::transient_kick_errno(ENODEV));
     static_assert(!detail::transient_kick_errno(EBADF));
     static_assert(!detail::transient_kick_errno(0));
@@ -2806,7 +2844,7 @@ TEST(xdp_integration, pinned_and_adopted_report_every_combination_truthfully)
     }
 }
 
-// The failure FEAT-007 exists for, reproduced: close a queue and bind it
+// The failure the bind retry exists for, reproduced: close a queue and bind it
 // again immediately. Without the retry this fails - not every iteration,
 // which is what makes the bug so unpleasant to chase, but often enough that
 // twenty turns round the loop find it.

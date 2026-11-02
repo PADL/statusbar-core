@@ -955,7 +955,7 @@ TEST(config_set, set_eui64)
 }
 
 //
-// Quoted keys that contain a dot (BUG-004)
+// Quoted keys that contain a dot
 //
 
 TEST(config_quoted_dotted_key, a_quoted_table_survives_a_save_and_a_reload)

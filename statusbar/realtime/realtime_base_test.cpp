@@ -271,7 +271,7 @@ TEST(realtime_detail, save_file_noop_on_missing_src)
 TEST_MAIN(statusbar_realtime, realtime_base_test)
 
 //
-// Spin Hints and Thread Names (FEAT-014)
+// Spin Hints and Thread Names
 //
 
 namespace {

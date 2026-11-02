@@ -4,7 +4,7 @@
 // End-to-end equivalence: for a crafted frame matrix, the XDP BPF
 // program (loaded in the kernel and exercised via BPF_PROG_TEST_RUN)
 // must return XDP_DROP iff the userspace TcamClassifier<32> matches
-// the same rule set on the same bytes. Skips silently when the current
+// the same rule set on the same bytes. SKIP()s, and says why, when the current
 // process lacks CAP_BPF / CAP_SYS_ADMIN or the kernel refuses the
 // program load for other environmental reasons.
 
@@ -111,6 +111,12 @@ struct LoadedProgram
     return out;
 }
 
+/// Why a test skips when the program would not load: an unprivileged run
+/// (no CAP_BPF), or a kernel that refused the object. SKIP() counts it
+/// apart from the passes, so a sandboxed `make test` stays green and says
+/// what it did not check.
+constexpr char const* NEEDS_PROGRAM_LOAD = "needs CAP_BPF, or the kernel refused the program load";
+
 [[nodiscard]] auto install_rules(int rules_map_fd, std::span<CompiledRule<32> const> rules) -> bool
 {
     for (std::uint32_t i = 0; i < TCAM_MAX_RULES; ++i) {
@@ -169,10 +175,7 @@ TEST(xdp_equiv, bpf_matches_tcam_classifier)
 
     auto loaded = try_load_program();
     if (loaded.prog_fd < 0) {
-        // Unprivileged test run (no CAP_BPF) or the kernel refused the
-        // program load. Treat as a skip so `make test` stays green in
-        // sandboxed environments.
-        return;
+        SKIP(NEEDS_PROGRAM_LOAD);
     }
 
     // Two rules, both with flag::drop. Using drop means the BPF
@@ -222,7 +225,7 @@ TEST(xdp_equiv, short_frame_passes)
 
     auto loaded = try_load_program();
     if (loaded.prog_fd < 0) {
-        return;
+        SKIP(NEEDS_PROGRAM_LOAD);
     }
 
     auto const drop_any = ClassifierRuleBuilder<32>{}.ethertype(0x0800).vlan_untagged().result(flag::drop).build();

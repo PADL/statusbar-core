@@ -27,8 +27,8 @@ namespace statusbar::net {
 namespace {
 
 /// The part of set_subtype_filter()'s contract that depends on neither a
-/// socket nor a platform. Kept here so both implementations agree and so
-/// the argument faults are reachable in a unit test with no privilege.
+/// socket nor a platform. Kept apart so the argument faults are reachable
+/// in a unit test with no privilege.
 [[nodiscard]] auto validate_subtypes(std::span<uint8_t const> subtypes) noexcept -> Status
 {
     if (subtypes.empty() || subtypes.size() > rawnet_filter::MAX_SUBTYPES) {

@@ -452,7 +452,7 @@ TEST(toml_parser, array_of_tables)
 }
 
 //
-// Quoted keys that contain a dot (BUG-004)
+// Quoted keys that contain a dot
 //
 // `[port."eth0.100"]` names ONE table called `eth0.100` inside `port`.
 // The quoting is what makes the dot a character rather than a separator,
@@ -618,9 +618,9 @@ TEST(toml_quoted_dotted_key, an_array_of_tables_can_be_named_with_a_dot)
 TEST(toml_quoted_dotted_key, a_sub_table_under_an_array_of_tables_parses_either_way)
 {
     // This test used to assert that both spellings FAILED -- the limitation
-    // it pinned became BUG-006, and BUG-006 is fixed, so it now pins the
-    // behaviour instead. Kept here as well as in the BUG-006 group because
-    // the quoted spelling is what makes it this group's business.
+    // it pinned has since been lifted, so it now pins the behaviour instead.
+    // Kept here as well as in the array-sub-table group because the quoted
+    // spelling is what makes it this group's business.
     auto bare = parse("[[s]]\nx = 1\n[s.a]\nv = 7\n");
     auto quoted = parse("[[s]]\nx = 1\n[s.\"a.b\"]\nv = 7\n");
     EXPECT_TRUE(bare.has_value());
@@ -632,7 +632,7 @@ TEST(toml_quoted_dotted_key, a_sub_table_under_an_array_of_tables_parses_either_
 }
 
 //
-// Table headers under an array of tables (BUG-006)
+// Table headers under an array of tables
 //
 // `[s.x]` after `[[s]]` belongs to the element `[[s]]` last appended. We
 // used to reject the document: `s` is an Array where the walk wanted a

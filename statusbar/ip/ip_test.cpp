@@ -180,7 +180,7 @@ TEST(ipv4_address, parse_dotted_quad)
 }
 
 // A leading-zero octet has two readings - octal to inet_aton(3), decimal to
-// us - so it is refused rather than guessed at. See BUG-002.
+// us - so it is refused rather than guessed at.
 TEST(ipv4_address, parse_refuses_leading_zero_octets)
 {
     EXPECT_FALSE(parse_ipv4("10.10.032.5").has_value());

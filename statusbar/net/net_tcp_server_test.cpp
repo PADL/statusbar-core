@@ -353,7 +353,7 @@ TEST(net_tcp_server, idle_timeout_sweeps)
 TEST_MAIN(statusbar_net, net_tcp_server_test)
 
 //
-// AF_UNIX local control socket (FEAT-017)
+// AF_UNIX local control socket
 //
 
 TEST(net_tcp_server_local, a_stream_listener_echoes_a_local_client)

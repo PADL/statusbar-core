@@ -22,7 +22,6 @@
 
 #include <array>
 #include <cstdint>
-#include <cstdio>
 #include <span>
 #include <vector>
 
@@ -44,20 +43,16 @@ constexpr std::uint8_t SUBTYPE_ADP = 0x7A;
 
 #if defined(__linux__)
 
-/// Open a context on `lo`, or say out loud that the test is skipping.
-///
-/// AF_PACKET needs CAP_NET_RAW, so unprivileged every test below can
-/// only skip — and a silent skip is indistinguishable from a pass in the
-/// runner's output, which is how a root-only test quietly stops being
-/// run at all. Printing makes "6 of 10 asserted" visible.
-[[nodiscard]] auto open_or_skip(RawnetContext& ctx, char const* test_name, bool transmit_only = false) -> bool
+/// Open a context on `lo`. AF_PACKET needs CAP_NET_RAW, so unprivileged
+/// every test below can only skip - with SKIP(), which the runner counts
+/// apart from the passes, so "6 of 10 asserted" stays visible instead of a
+/// root-only test quietly ceasing to be run at all.
+[[nodiscard]] auto open_on_loopback(RawnetContext& ctx, bool transmit_only = false) -> bool
 {
-    if (ctx.open("lo", AVTP, nullptr, /*qdisc_bypass=*/false, transmit_only)) {
-        return true;
-    }
-    std::printf("  SKIP: %s needs CAP_NET_RAW (AF_PACKET open refused)\n", test_name);
-    return false;
+    return ctx.open("lo", AVTP, nullptr, /*qdisc_bypass=*/false, transmit_only).has_value();
 }
+
+constexpr char const* NEEDS_CAP_NET_RAW = "needs CAP_NET_RAW (AF_PACKET open refused)";
 
 #endif  // __linux__
 
@@ -137,8 +132,8 @@ TEST(rawnet_talker, set_priority_rejects_a_negative_priority)
 TEST(rawnet_talker, transmit_only_refuses_join_leave_and_subtype_filter)
 {
     RawnetContext ctx;
-    if (!open_or_skip(ctx, "transmit_only_refuses_join_leave_and_subtype_filter", /*transmit_only=*/true)) {
-        return;
+    if (!open_on_loopback(ctx, /*transmit_only=*/true)) {
+        SKIP(NEEDS_CAP_NET_RAW);
     }
 
     Eui48 const group{0x91, 0xE0, 0xF0, 0x00, 0x0E, 0x80};
@@ -168,8 +163,8 @@ TEST(rawnet_talker, transmit_only_refuses_join_leave_and_subtype_filter)
 TEST(rawnet_talker, a_transmit_only_socket_can_still_send)
 {
     RawnetContext ctx;
-    if (!open_or_skip(ctx, "a_transmit_only_socket_can_still_send", /*transmit_only=*/true)) {
-        return;
+    if (!open_on_loopback(ctx, /*transmit_only=*/true)) {
+        SKIP(NEEDS_CAP_NET_RAW);
     }
 
     // Refusing join/leave/filter must not have cost us the one thing the
@@ -185,8 +180,8 @@ TEST(rawnet_talker, a_transmit_only_socket_can_still_send)
 TEST(rawnet_talker, set_priority_is_readable_back_from_the_socket)
 {
     RawnetContext ctx;
-    if (!open_or_skip(ctx, "set_priority_is_readable_back_from_the_socket")) {
-        return;
+    if (!open_on_loopback(ctx)) {
+        SKIP(NEEDS_CAP_NET_RAW);
     }
 
     EXPECT_TRUE(ctx.set_priority(3).has_value());
@@ -211,8 +206,8 @@ TEST(rawnet_talker, set_priority_works_on_a_transmit_only_socket)
     // also the one that should be transmit-only; refusing here would
     // make the two features mutually exclusive.
     RawnetContext ctx;
-    if (!open_or_skip(ctx, "set_priority_works_on_a_transmit_only_socket", /*transmit_only=*/true)) {
-        return;
+    if (!open_on_loopback(ctx, /*transmit_only=*/true)) {
+        SKIP(NEEDS_CAP_NET_RAW);
     }
 
     EXPECT_TRUE(ctx.set_priority(4).has_value());
@@ -226,8 +221,8 @@ TEST(rawnet_talker, set_priority_works_on_a_transmit_only_socket)
 TEST(rawnet_talker, a_filtered_socket_receives_only_in_set_subtypes)
 {
     RawnetContext receiver;
-    if (!open_or_skip(receiver, "a_filtered_socket_receives_only_in_set_subtypes")) {
-        return;
+    if (!open_on_loopback(receiver)) {
+        SKIP(NEEDS_CAP_NET_RAW);
     }
 
     RawnetContext sender;

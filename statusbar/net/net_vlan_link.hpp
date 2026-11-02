@@ -262,8 +262,8 @@ class VlanLinkClient final : public VlanControl
 
     [[nodiscard]] auto valid() const noexcept -> bool { return fd_ >= 0; }
 
-    /// The same question as valid(), under the name another implementation
-    /// of this module gives it.
+    /// The same question as valid(), under the name a caller written
+    /// against a socket-style API expects.
     [[nodiscard]] auto is_open() const noexcept -> bool { return valid(); }
     [[nodiscard]] auto fd() const noexcept -> int { return fd_; }
 

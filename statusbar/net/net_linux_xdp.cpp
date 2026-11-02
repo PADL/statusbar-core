@@ -85,6 +85,9 @@ auto XdpErrorCategory::message(int ev) const -> std::string
             return "An XDP program that is not ours is pinned at this path; it has been left alone";
         case XdpError::pin_not_adoptable:
             return "The pinned XDP program is not the one this build attaches, so it cannot be adopted";
+        case XdpError::program_unidentifiable:
+            return "The XDP program on the interface could not be identified: reading a program by its id needs "
+                   "CAP_SYS_ADMIN, and it has been left alone";
         case XdpError::stats_read_failed:
             return "Reading the kernel's socket statistics failed";
         case XdpError::tx_metadata_not_supported:
@@ -285,24 +288,59 @@ constexpr uint32_t IdentityEntries = 1;
     return success();
 }
 
-/// Whether the attached program with this id is one of ours, by the name
+/// Whether the program behind this descriptor is one of ours, by the name
 /// the kernel recorded for it. Any build of ours answers yes, which is the
 /// point: an orphan left by an older build is ours to clear away, not a
 /// stranger's to be refused forever.
-/// @param id A program id from XdpProgram::query(); 0 (programs in both
-///           modes at once) is nobody's, since the kernel will not name one
-[[nodiscard]] auto is_our_program(uint32_t const id) noexcept -> bool
+[[nodiscard]] auto is_ours_by_name(int const prog_fd) noexcept -> bool
 {
-    OwnedFd const prog{id == 0 ? -1 : bpf_prog_get_fd_by_id(id)};
-    if (!prog.valid()) {
-        return false;
-    }
     struct bpf_prog_info info{};
     uint32_t length = sizeof(info);
-    if (bpf_prog_get_info_by_fd(prog.get(), &info, &length) != 0) {
+    if (bpf_prog_get_info_by_fd(prog_fd, &info, &length) != 0) {
         return false;
     }
     return std::string_view{static_cast<char const*>(info.name)} == XDP_PROGRAM_NAME;
+}
+
+/// What the kernel says of the attached program with this id. Opening a
+/// program by its id is a CAP_SYS_ADMIN privilege: a daemon with CAP_BPF and
+/// CAP_NET_ADMIN alone gets EPERM for its own program as for anybody's, and
+/// that is `unknown`, not `foreign` - the caller has the pin to ask next.
+/// @param id A program id from XdpProgram::query(); 0 (programs in both
+///           modes at once) is nobody's, since the kernel will not name one
+[[nodiscard]] auto attached_program_owner(uint32_t const id) noexcept -> detail::AttachedProgramOwner
+{
+    using detail::AttachedProgramOwner;
+    if (id == 0) {
+        return AttachedProgramOwner::foreign;
+    }
+    OwnedFd const prog{bpf_prog_get_fd_by_id(id)};
+    if (!prog.valid()) {
+        return errno == EPERM ? AttachedProgramOwner::unknown : AttachedProgramOwner::foreign;
+    }
+    return is_ours_by_name(prog.get()) ? AttachedProgramOwner::ours : AttachedProgramOwner::foreign;
+}
+
+/// The id of the program pinned in `pin_path`, 0 for no pin, no path, or a
+/// pin that will not open. Whose directory it is was the caller's question,
+/// asked first through XdpProgram::owner(), so a program pinned here is
+/// ours. Opening a pin and reading the id of a descriptor one holds need
+/// no privilege beyond the bpffs permissions.
+[[nodiscard]] auto pinned_program_id(std::string_view const pin_path) -> uint32_t
+{
+    if (pin_path.empty()) {
+        return 0;
+    }
+    OwnedFd const prog{bpf_obj_get(XdpProgram::pin_entry(pin_path, XdpProgram::PIN_PROG).c_str())};
+    return prog.valid() ? program_info_id(prog.get()) : 0;
+}
+
+/// Whether the attached program `id` is ours to take off the interface: by
+/// name where the kernel gives it, else by being the program we pinned.
+/// @param pinned_id The id of the program in our pin directory, 0 for none
+[[nodiscard]] auto attachment_is_ours(uint32_t const id, uint32_t const pinned_id) noexcept -> StatusValue<bool>
+{
+    return detail::attachment_is_ours(attached_program_owner(id), id, pinned_id);
 }
 
 }  // namespace
@@ -482,11 +520,15 @@ auto unpin(std::string_view const pin_path, Keep const& keep_first_error) -> voi
 /// Then the attachment, in the mode it is actually in: flags of 0 mean
 /// "native" to the kernel on any driver with ndo_bpf, so a generic attach
 /// would survive a detach that did not say so. Only a program of ours, by
-/// name: one somebody else attached stays, and that is a success here -
-/// there was nothing of ours to remove.
+/// name or by being the one we pinned: one somebody else attached stays,
+/// and that is a success here - there was nothing of ours to remove. One
+/// the kernel will not name and the pin does not vouch for is reported,
+/// not guessed at.
+/// @param pinned_id The id of the program our pin directory held, read
+///                  before the pins went, 0 for none
 /// @param keep_first_error Where the first failure, if any, is kept
 template <typename Keep>
-auto detach_ours(unsigned int const if_index, Keep const& keep_first_error) -> void
+auto detach_ours(unsigned int const if_index, uint32_t const pinned_id, Keep const& keep_first_error) -> void
 {
     struct bpf_xdp_query_opts opts{};
     opts.sz = sizeof(opts);
@@ -496,7 +538,15 @@ auto detach_ours(unsigned int const if_index, Keep const& keep_first_error) -> v
     }
     for (auto const& [id, mode] :
          {std::pair{opts.drv_prog_id, XdpAttachMode::native}, std::pair{opts.skb_prog_id, XdpAttachMode::generic}}) {
-        if (id == 0 || !is_our_program(id)) {
+        if (id == 0) {
+            continue;
+        }
+        auto const ours = attachment_is_ours(id, pinned_id);
+        if (!ours) {
+            keep_first_error(failure(ours.error()));
+            continue;
+        }
+        if (!*ours) {
             continue;
         }
         if (int const ret = bpf_xdp_detach(static_cast<int>(if_index), detail::BpfAttachment::attach_flags(mode), nullptr);
@@ -538,8 +588,11 @@ auto XdpProgram::detach([[maybe_unused]] unsigned int const if_index, [[maybe_un
             result = status;
         }
     };
+    // Read before the pins go: it is what vouches for the attachment when
+    // the kernel will not name it.
+    uint32_t const pinned_id = pinned_program_id(pin_path);
     unpin(pin_path, keep_first_error);
-    detach_ours(if_index, keep_first_error);
+    detach_ours(if_index, pinned_id, keep_first_error);
     return result;
 #else
     return failure(XdpError::not_supported_on_platform);
@@ -972,19 +1025,25 @@ namespace {
 }
 
 /// Whether open() may take what is on the interface off it: nothing is
-/// attached, or what is attached is one of ours by name. The pin directory
-/// being ours - or nobody's - says nothing about the attachment: a program
-/// somebody else attached, pinned elsewhere or nowhere, is theirs, and the
-/// ownership contract says it may not be detached. Programs in two modes at
-/// once report an id of zero, which is nobody's: a guess is not a claim.
+/// attached, or what is attached is one of ours - by name, or by being the
+/// program pinned in our own directory when the kernel will not give the
+/// name. The pin directory being ours - or nobody's - says nothing about the
+/// attachment by itself: a program somebody else attached, pinned elsewhere
+/// or nowhere, is theirs, and the ownership contract says it may not be
+/// detached. Programs in two modes at once report an id of zero, which is
+/// nobody's: a guess is not a claim.
 /// @param if_index The interface
-[[nodiscard]] auto attachment_replaceable(unsigned int const if_index) -> StatusValue<bool>
+/// @param pin_path Our pin directory, empty when not pinning
+[[nodiscard]] auto attachment_replaceable(unsigned int const if_index, std::string_view const pin_path) -> StatusValue<bool>
 {
     auto const attached = XdpProgram::query(if_index);
     if (!attached) {
         return failure(attached.error());
     }
-    return !attached->has_value() || is_our_program((*attached)->program_id);
+    if (!attached->has_value()) {
+        return true;
+    }
+    return attachment_is_ours((*attached)->program_id, pinned_program_id(pin_path));
 }
 
 }  // namespace
@@ -1168,7 +1227,7 @@ auto XdpContext::open(XdpConfig const& config) -> Status
         // name, and goes, with any pins that would collide with the ones
         // about to be made. We never write into a map we did not recognise;
         // we replace it.
-        auto const replaceable = attachment_replaceable(interface_.index);
+        auto const replaceable = attachment_replaceable(interface_.index, config.pin_path);
         if (!replaceable) {
             close();
             return failure(replaceable.error());

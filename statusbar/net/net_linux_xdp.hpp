@@ -99,6 +99,7 @@ enum class XdpError
     queue_busy,
     foreign_program,
     pin_not_adoptable,
+    program_unidentifiable,
     stats_read_failed,
     tx_metadata_not_supported,
     launch_time_not_supported,
@@ -542,6 +543,45 @@ struct AttachPlan
     return err == EAGAIN || err == EWOULDBLOCK || err == EBUSY || err == ENOBUFS || err == ENETDOWN;
 }
 
+/// What the kernel let us learn about a program attached to an interface.
+enum class AttachedProgramOwner : uint8_t
+{
+    ours,     ///< loaded under our program name
+    foreign,  ///< loaded under another name, or nobody's: an id of 0
+    unknown,  ///< the kernel would not say: opening a program by its id needs CAP_SYS_ADMIN
+};
+
+/// Whether the attached program `id` is ours to take off the interface,
+/// given what the kernel said of it and the id of the program our own pin
+/// directory holds (0 for none).
+///
+/// Ours by name is ours, and so is a program the kernel would not name when
+/// it is the one we pinned: a daemon running with CAP_BPF and CAP_NET_ADMIN
+/// but not CAP_SYS_ADMIN - the capability set a service file gives it -
+/// gets EPERM for its own program as for anybody's, and without this could
+/// never replace its own pinned program across a redeploy. One the kernel
+/// would not name and the pin does not vouch for is a refusal that says so,
+/// `program_unidentifiable`, rather than a claim either way.
+///
+/// Pure, so every arm is testable without the kernel that would need root,
+/// and then the lack of it, to produce them.
+[[nodiscard]] inline auto attachment_is_ours(AttachedProgramOwner const owner, uint32_t const id, uint32_t const pinned_id) noexcept
+    -> StatusValue<bool>
+{
+    switch (owner) {
+        case AttachedProgramOwner::ours:
+            return true;
+        case AttachedProgramOwner::foreign:
+            return false;
+        case AttachedProgramOwner::unknown:
+            break;
+    }
+    if (pinned_id != 0 && pinned_id == id) {
+        return true;
+    }
+    return failure(XdpError::program_unidentifiable);
+}
+
 /// FNV-1a over `bytes`, 64 bits wide.
 ///
 /// Used to fingerprint the embedded BPF object, so a filter that has been
@@ -824,7 +864,10 @@ class XdpProgram
     /// Only ours: a pin directory that is somebody else's is refused as
     /// foreign_program and left as it is, and a program on the interface
     /// that is not ours by name stays attached - that counts as nothing of
-    /// ours to remove, and succeeds.
+    /// ours to remove, and succeeds. A program the kernel will not name -
+    /// reading one by its id needs CAP_SYS_ADMIN - is ours when it is the
+    /// one pinned at `pin_path`, and otherwise reported as
+    /// program_unidentifiable rather than guessed at either way.
     /// A non-empty `pin_path` must be one pinnable() accepts - this call
     /// unlinks within it and then removes it, so a path built by hand rather
     /// than by pin_path_for() is refused instead of followed.

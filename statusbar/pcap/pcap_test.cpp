@@ -540,7 +540,7 @@ TEST(pcap_file_rw, write_and_read_with_ethernet_components)
 
 // `write_too_small_ignored` lived here. It wrote a 10-byte frame and a
 // 15-byte frame and asserted the file held only the 15-byte one, which
-// pinned BUG-003 as intended behaviour. Its replacement is
+// pinned the discarding of runts as intended behaviour. Its replacement is
 // `pcap_short_frame a_runt_between_two_frames_displaces_neither`, which
 // writes the same shape and asserts every frame survives.
 
@@ -1710,7 +1710,7 @@ TEST(pcap_writer_vector, write_packet_components_vector_with_ts)
 }
 
 //
-// Original (wire) length tests (BUG-005)
+// Original (wire) length tests
 //
 // A snapped capture keeps part of a frame. incl_len is what is in the file;
 // orig_len is what was on the wire, and it is the only way a reader knows it
@@ -2104,7 +2104,7 @@ TEST(pcapng_original_length, the_two_argument_read_still_works_on_a_snapped_bloc
 }
 
 //
-// Short-frame tests (BUG-003)
+// Short-frame tests
 //
 // A capture is a record of what happened. A frame shorter than an Ethernet
 // header is a runt or a truncation -- a wire event, and usually the very

@@ -135,7 +135,10 @@ enum class LaunchTimeQueueAction : std::uint8_t
 ///
 /// A root that is not ours is never deleted, and on `on` is replaced: the
 /// layout behind it is unknown, so the class the etf would hang on may not be
-/// the socket's queue.
+/// the socket's queue. One under our handle that is not what this run wants -
+/// an older layout of ours, or no layout at all - is deleted and then laid,
+/// because the kernel will not change an mqprio in place: a replace under a
+/// handle the interface already holds is refused.
 ///
 /// @return What it did, or the first refusal — whose reason is in
 ///         `TcControl::last_message()`. The layout is checked before anything
