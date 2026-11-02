@@ -486,6 +486,15 @@ struct CycleBudget
     size_t rx_cycle_count{0};
 };
 
+/// @p rule as a BPF rules_map slot. There a min_frame_size of 0 ends the
+/// table, while TcamClassifier reads 0 as any frame of the window, so 0
+/// becomes the window's size: shorter frames are passed before any rule.
+[[nodiscard]] constexpr auto tcam_slot(CompiledRule<32> rule) noexcept -> CompiledRule<32>
+{
+    rule.min_frame_size = rule.min_frame_size == 0 ? std::uint16_t{TCAM_WINDOW_BYTES} : rule.min_frame_size;
+    return rule;
+}
+
 /// Which attach mode to try, and what to try if that fails.
 struct AttachPlan
 {
@@ -1546,7 +1555,15 @@ class BpfState
     [[nodiscard]] auto program_id() const noexcept -> uint32_t { return program_id_; }
 
   private:
+    /// @p rules and the default action's catch-all into rules_map, the slots after them cleared.
     [[nodiscard]] auto install_tcam_rules(std::span<CompiledRule<32> const> rules) -> Status;
+    /// @p rules, then @p catch_all, from slot 0: the first slot left.
+    [[nodiscard]] auto write_tcam_rules(std::span<CompiledRule<32> const> rules, std::optional<CompiledRule<32>> const& catch_all)
+        -> StatusValue<std::uint32_t>;
+    /// Every slot from @p from on vacant (min_frame_size 0 ends the BPF scan).
+    [[nodiscard]] auto clear_tcam_slots(std::uint32_t from) -> Status;
+    /// One rules_map slot written.
+    [[nodiscard]] auto write_tcam_slot(std::uint32_t index, CompiledRule<32> const& rule) -> Status;
 
     void swap(BpfState& other) noexcept
     {
