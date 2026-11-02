@@ -40,6 +40,7 @@ In-depth references that go beyond the per-module overviews:
 
 - [DESERIALIZER_GUIDE.md](DESERIALIZER_GUIDE.md) — comprehensive guide to the buffer module's compiled-deserializer API.
 - [ERROR_HANDLING_EXAMPLES.md](ERROR_HANDLING_EXAMPLES.md) — patterns for using `Status` and `std::expected` across the codebase.
+- [REPORT_2_3_0_PI5.md](REPORT_2_3_0_PI5.md) — what reached 2.3.0 (runtime Ethernet port, AF_XDP ownership and counters, launch time and the qdiscs under it) and how it behaved on a Raspberry Pi 5.
 - [XDP_TCAM.md](XDP_TCAM.md) — design and migration plan for the net module's XDP packet classifier: moving the kernel-side filter to a TCAM interpreter that shares the userspace `CompiledRule` representation.
 
 ## Build system
