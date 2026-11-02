@@ -15,6 +15,7 @@ statusbar_add_module(
   net_linux_xdp.cpp
   net_message_reactor.cpp
   net_netdev_features.cpp
+  net_netdev_napi.cpp
   net_netlink.cpp
   net_phc.cpp
   net_rawnet.cpp
@@ -55,6 +56,7 @@ statusbar_add_module(
   net_interface_info_test.cpp
   net_launch_order_test.cpp
   net_netdev_features_test.cpp
+  net_netdev_napi_test.cpp
   net_netlink_test.cpp
   net_phc_test.cpp
   net_tc_launch_time_test.cpp
@@ -98,6 +100,7 @@ statusbar_add_module(
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_netdev_features_fuzzer.cpp)
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_dpll_fuzzer.cpp)
+  add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_netdev_napi_fuzzer.cpp)
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_netlink_fuzzer.cpp)
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_tc_qdisc_fuzzer.cpp)
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_vlan_link_fuzzer.cpp)
@@ -130,6 +133,26 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   if(HAVE_NETDEV_XSK_LAUNCH_TIME)
     target_compile_definitions(statusbar-net
                                PUBLIC HAVE_NETDEV_XSK_LAUNCH_TIME=1)
+  endif()
+  # The queue and NAPI commands (Linux 6.9) and threaded busy poll (7.1), the
+  # enumerators net_netdev_napi.cpp asserts its mirrors against.
+  check_cxx_source_compiles(
+    "
+    #include <linux/netdev.h>
+    int main() { return int{NETDEV_A_QUEUE_NAPI_ID} + int{NETDEV_A_NAPI_PID}; }
+    "
+    HAVE_NETDEV_QUEUE_NAPI)
+  check_cxx_source_compiles(
+    "
+    #include <linux/netdev.h>
+    int main() { return NETDEV_NAPI_THREADED_BUSY_POLL; }
+    "
+    HAVE_NETDEV_NAPI_BUSY_POLL)
+  if(HAVE_NETDEV_QUEUE_NAPI)
+    target_compile_definitions(statusbar-net PRIVATE HAVE_NETDEV_QUEUE_NAPI=1)
+  endif()
+  if(HAVE_NETDEV_NAPI_BUSY_POLL)
+    target_compile_definitions(statusbar-net PRIVATE HAVE_NETDEV_NAPI_BUSY_POLL=1)
   endif()
 endif()
 
