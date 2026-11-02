@@ -1584,6 +1584,29 @@ static void destroy_veth_pair(char const* name_a)
     (void)system(cmd);
 }
 
+TEST(UmemRegion, one_mapped_area_is_registered_again_for_a_retried_bind)
+{
+    if (getuid() != 0) {
+        SKIP("needs root");
+    }
+    detail::RingSet rings{};
+    detail::UmemRegion region{};
+    auto const first = region.allocate(64, 4096, 0, 64, 64, rings);
+    EXPECT_TRUE(first.has_value());
+    if (!first) {
+        return;
+    }
+    auto const frame = region.alloc_frame();
+    EXPECT_TRUE(frame.has_value());
+    auto const* const area = region.writable_span(frame.value_or(0)).data();
+    region.free_frame(frame.value_or(0));
+    auto const second = region.reregister(64, 64, rings);
+    EXPECT_TRUE(second.has_value());
+    EXPECT_EQ(region.available_frames(), size_t{64});  // the free list is the area's, and kept
+    EXPECT_TRUE(rings.fill.ring != nullptr && rings.comp.ring != nullptr);
+    EXPECT_TRUE(region.writable_span(frame.value_or(0)).data() == area);
+}
+
 TEST(xdp_integration, open_close_lifecycle)
 {
     if (getuid() != 0) {
