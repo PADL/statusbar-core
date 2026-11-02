@@ -147,8 +147,9 @@ class TcpConnectionPool : public Pollable
     /// listener, the path clients connect to.
     [[nodiscard]] auto local_addr() const -> StatusValue<SocketAddress>;
 
-    /// Reads into @p out. 0 => orderly EOF; NetError::would_block => no
-    /// data now; other errors mean the connection is dead — close() it.
+    /// Reads into @p out (SOCK_SEQPACKET: one message, empty ones skipped). 0 => orderly EOF; would_block =>
+    /// no data now; buffer_full => a message longer than @p out, discarded, the connection still usable;
+    /// other errors mean the connection is dead.
     [[nodiscard]] auto read(size_t slot, std::span<uint8_t> out) -> StatusValue<size_t>;
 
     /// Sends what the kernel accepts (possibly 0) and returns the count;
@@ -183,6 +184,11 @@ class TcpConnectionPool : public Pollable
 
     void accept_ready(int64_t now_ns);
     void close_slot(size_t slot, int64_t now_ns);
+    /// read() of a stream: 0 at orderly EOF.
+    [[nodiscard]] auto read_stream(Slot& s, std::span<uint8_t> out) -> StatusValue<size_t>;
+    /// read() of one SOCK_SEQPACKET message: empty ones skipped, buffer_full
+    /// for one longer than @p out.
+    [[nodiscard]] auto read_message(Slot& s, std::span<uint8_t> out) -> StatusValue<size_t>;
 
     /// The constructor's two halves, one per address family: bind, then
     /// hand the listener to register_listener(). Each leaves the pool
