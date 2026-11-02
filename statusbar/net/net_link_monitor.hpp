@@ -18,6 +18,8 @@
 /// The link reader is injectable so the transition/throttle logic is unit
 /// testable without a real interface; the production constructor uses
 /// read_interface_carrier() (SIOCGIFFLAGS / IFF_RUNNING).
+/// CarrierWatch (net_carrier_watch.hpp) is the event-driven alternative on
+/// Linux: rtnetlink's link notifications, with the carrier-down count.
 
 #include "statusbar/net/net_message_reactor.hpp"  // Pollable
 #include "statusbar/net/net_posix_util.hpp"       // read_interface_carrier
