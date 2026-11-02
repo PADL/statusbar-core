@@ -111,11 +111,9 @@ inline void set_ifr_name(ifreq& ifr, std::string_view const iface) noexcept
 
 }  // namespace detail
 
-/// Run one interface ioctl (SIOCGIFMTU, SIOCETHTOOL, SIOCGIFHWADDR...) on
-/// @p ifr, after writing @p iface into ifr.ifr_name (the rest of @p ifr, e.g.
-/// an ifr_data set with set_ifr_data, is left as the caller filled it). A
-/// transient AF_INET datagram socket is the ioctl carrier. Errors:
-/// no_such_device for an empty or over-long name; the socket's or the ioctl's errno.
+/// Run interface ioctl @p request on @p ifr with @p iface written into ifr_name (the rest as the caller
+/// filled it), over a transient AF_INET datagram socket. Errors: no_such_device for an empty or
+/// over-long name; the socket's or the ioctl's errno.
 [[nodiscard]] inline auto ifreq_ioctl(std::string_view const iface, unsigned long const request, ifreq& ifr) noexcept -> Status
 {
     if (iface.empty() || iface.size() >= IFNAMSIZ) {

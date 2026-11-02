@@ -117,14 +117,9 @@ class RawnetContext
     ///        wire — but it skips the egress tap, so bypass frames are invisible
     ///        to tcpdump/AF_PACKET on the *sending* host. Default-off keeps local
     ///        capture working; enable only for latency-critical TX.
-    /// @param transmit_only Open a socket that only sends and never receives
-    ///        (Linux: an AF_PACKET socket of protocol 0, never bound). A
-    ///        multicast_mac is then only the default destination, not joined.
-    ///        Use it for every socket nobody reads (a stream talker): an
-    ///        unread receiving socket is handed, and drops, a copy of every
-    ///        frame of its ethertype. join_multicast, leave_multicast and
-    ///        set_subtype_filter then refuse (invalid_argument): joining binds
-    ///        the socket, which would hook it, unfiltered, into delivery.
+    /// @param transmit_only A socket that only sends, for one nobody reads (multicast_mac then only the
+    ///        default destination; join, leave and set_subtype_filter refuse with invalid_argument).
+    ///        docs/NET_MODULE.md says why.
     /// @return Status indicating success or failure
     [[nodiscard]] auto open(
         std::string_view interface_name,
@@ -133,18 +128,11 @@ class RawnetContext
         bool qdisc_bypass = false,
         bool transmit_only = false) noexcept -> Status;
 
-    /// Narrow reception to frames of this socket's ethertype whose first
-    /// payload byte (the AVTP subtype, for 0x22F0) is in @p subtypes,
-    /// untagged or under one 802.1Q tag. Replaces the ethertype-only kernel
-    /// filter open() attached; an empty set restores it. On a shared
-    /// ethertype it keeps, for example, an ATDECC socket from being woken by
-    /// every AVB stream frame on the segment. Linux only: elsewhere a no-op
-    /// success (receivers still check the subtype themselves).
-    /// Frames already queued when it is attached stay queued (the kernel does
-    /// not refilter them), so a receiver still checks the subtype.
-    /// @return invalid_argument for more than rawnet_filter::MAX_SUBTYPES
-    ///         (8) subtypes or on a transmit_only socket; the setsockopt errno
-    ///         on failure
+    /// Narrow reception to frames whose first payload byte (the AVTP subtype) is in @p subtypes; an
+    /// empty set restores the ethertype filter. Frames already queued are not refiltered. Linux only:
+    /// elsewhere a no-op success. docs/NET_MODULE.md has the details.
+    /// @return invalid_argument for more than rawnet_filter::MAX_SUBTYPES subtypes or on a transmit_only
+    ///         socket; the setsockopt errno on failure
     [[nodiscard]] auto set_subtype_filter(std::span<uint8_t const> subtypes) const noexcept -> Status;
 
     /// Close the socket
@@ -199,16 +187,9 @@ class RawnetContext
     /// @return Status indicating success or failure
     [[nodiscard]] auto leave_multicast(Eui48 const& multicast_mac) const noexcept -> Status;
 
-    /// Set the socket's priority (SO_PRIORITY), the skb->priority of every
-    /// frame it sends.
-    ///
-    /// This is what steers a PACKET_QDISC_BYPASS socket onto a hardware TX
-    /// queue: bypass frames skip every software qdisc, and the kernel picks
-    /// their queue from skb->priority through the netdev's priority-to-traffic-
-    /// class map (which an mqprio root installs, even in software mode) and that
-    /// class's queue range. With priority 0 they land on a best-effort queue,
-    /// whatever PCP their VLAN tag carries. Priorities 0-6 need no privilege;
-    /// 7 and above need CAP_NET_ADMIN. Linux only: elsewhere a no-op success.
+    /// Set SO_PRIORITY, the skb->priority of every frame sent: it picks a PACKET_QDISC_BYPASS frame's
+    /// TX queue through the mqprio map (docs/NET_MODULE.md). 7 and above need CAP_NET_ADMIN. Linux
+    /// only: elsewhere a no-op success.
     /// @return the setsockopt errno on failure; bad_file_descriptor when not open
     [[nodiscard]] auto set_priority(int priority) noexcept -> Status;
 

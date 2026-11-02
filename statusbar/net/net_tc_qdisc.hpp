@@ -3,29 +3,9 @@
 // Copyright 2026 Jeff Koftinoff <jeff.koftinoff@statusbar.com>
 // SPDX-License-Identifier: MIT
 
-/// @file net_tc_qdisc.hpp
-/// @brief A small rtnetlink traffic-control client: install, replace and
-/// delete queueing disciplines (mqprio, cbs, etf, and option-less ones such as
-/// pfifo_fast) the way `tc qdisc replace|del` does, without libnl or iproute2.
-///
-/// Two layers:
-///   - pure message builders (build_*), which write one complete
-///     RTM_NEWQDISC / RTM_DELQDISC / RTM_GETQDISC request (nlmsghdr + tcmsg +
-///     TCA_KIND + TCA_OPTIONS) into a caller buffer, and parse_qdisc, which
-///     reads one RTM_NEWQDISC of the kernel's qdisc dump: socket-free,
-///     unit-tested against hand-checked bytes. Netlink is host byte order; the layouts are
-///     linux/rtnetlink.h's struct tcmsg and linux/pkt_sched.h's
-///     struct tc_mqprio_qopt / tc_cbs_qopt / tc_etf_qopt, written field by
-///     field (the .cpp static_asserts the kernel's sizes and offsets), with the
-///     attribute framing iproute2's q_mqprio.c / q_cbs.c / q_etf.c use:
-///     mqprio's TCA_OPTIONS is the flat tc_mqprio_qopt, cbs's and etf's are
-///     nests holding TCA_CBS_PARMS / TCA_ETF_PARMS.
-///   - TcClient, a NETLINK_ROUTE socket that sends one request with
-///     NLM_F_ACK and returns the kernel's answer as a Status (its errno),
-///     keeping the kernel's extended-ack text for logs. It implements
-///     TcControl, the interface a caller takes so tests can record requests.
-///
-/// Changing qdiscs needs CAP_NET_ADMIN; reading one does not. Linux only, PTP_PRIORITY aside.
+/// A small rtnetlink traffic-control client, as `tc qdisc replace|del|show` without libnl: socket-free
+/// builders and a parser for mqprio, cbs, etf and option-less qdiscs, and TcClient (a TcControl) to send
+/// them. Changing qdiscs needs CAP_NET_ADMIN, reading them none. Linux only, PTP_PRIORITY aside; docs/NET_MODULE.md.
 
 #include <cstdint>
 
@@ -79,10 +59,8 @@ struct MqprioQdisc
     auto operator==(MqprioQdisc const&) const noexcept -> bool = default;
 };
 
-/// A credit-based shaper on one mqprio queue: `tc qdisc replace dev <if>
-/// parent <parent> cbs idleslope .. sendslope .. hicredit .. locredit ..
-/// offload <0|1>`. Slopes in kbit/s, credits in bytes (IEEE 802.1Q 8.6.8.2,
-/// Annex L).
+/// A credit-based shaper on one mqprio queue (`tc qdisc replace ... cbs`): slopes in kbit/s, credits in
+/// bytes (IEEE 802.1Q-2022 Clause 8.6.8.2, Annex L).
 struct CbsQdisc
 {
     uint32_t parent{0};  ///< mqprio_major:(queue + 1)
@@ -135,11 +113,9 @@ struct QdiscInfo
 inline constexpr size_t MAX_REQUEST_SIZE = 256;
 using RequestBuffer = std::array<uint8_t, MAX_REQUEST_SIZE>;
 
-/// Build `tc qdisc replace ... root mqprio` (RTM_NEWQDISC, NLM_F_REQUEST |
-/// NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE; tcm_handle major:0, tcm_parent
-/// ROOT) into @p out. Returns the message length. Errors: invalid_argument for
-/// major 0, num_tc 0 or over MAX_TRAFFIC_CLASSES, or a map entry not below num_tc;
-/// BufferError::insufficient_space when @p out is too small.
+/// Build `tc qdisc replace ... root mqprio` (RTM_NEWQDISC, CREATE | REPLACE, handle major:0) into
+/// @p out; returns its length. Errors: invalid_argument for major 0, num_tc 0 or over MAX_TRAFFIC_CLASSES, or a
+/// map entry not below num_tc; BufferError::insufficient_space when @p out is too small.
 [[nodiscard]] auto build_replace_mqprio(std::span<uint8_t> out, int ifindex, MqprioQdisc const& qdisc, uint32_t seq)
     -> StatusValue<size_t>;
 
@@ -161,27 +137,18 @@ using RequestBuffer = std::array<uint8_t, MAX_REQUEST_SIZE>;
 [[nodiscard]] auto build_replace_kind(std::span<uint8_t> out, int ifindex, uint32_t parent, std::string_view kind, uint32_t seq)
     -> StatusValue<size_t>;
 
-/// Build `tc qdisc del ... [parent <parent>] [handle <handle>]` (RTM_DELQDISC,
-/// NLM_F_REQUEST | NLM_F_ACK, no attributes) into @p out. Deleting a root
-/// mqprio (parent ROOT, its handle) takes its children with it. Returns the
-/// message length.
+/// Build `tc qdisc del ... [parent <parent>] [handle <handle>]` (RTM_DELQDISC) into @p out; returns its
+/// length. Deleting a root mqprio takes its children with it.
 [[nodiscard]] auto build_delete(std::span<uint8_t> out, int ifindex, uint32_t handle, uint32_t parent, uint32_t seq)
     -> StatusValue<size_t>;
 
-/// Build `tc qdisc show` (RTM_GETQDISC, NLM_F_REQUEST | NLM_F_DUMP, no
-/// attributes) into @p out. The kernel dumps every qdisc of every device in
-/// the namespace (tc_dump_qdisc ignores tcm_ifindex, which is set to @p
-/// ifindex for the record); the caller filters. A dump rather than a single
-/// get: tc_get_qdisc answers through rtnetlink_send, which with NLM_F_ECHO
-/// also tells every RTNLGRP_TC listener (`tc monitor`) of a "new" qdisc.
-/// Returns the message length.
+/// Build `tc qdisc show` (RTM_GETQDISC, NLM_F_DUMP) into @p out; returns its length. The kernel dumps every
+/// qdisc in the namespace and the caller filters; docs/NET_MODULE.md says why a dump, not a get.
 [[nodiscard]] auto build_dump(std::span<uint8_t> out, int ifindex, uint32_t seq) -> StatusValue<size_t>;
 
-/// Parse one RTM_NEWQDISC message (nlmsghdr + tcmsg + attributes), one part
-/// of the kernel's answer to build_dump. mqprio's TCA_OPTIONS is the flat
-/// tc_mqprio_qopt followed by optional attributes (ignored); cbs's nests
-/// TCA_CBS_PARMS, etf's TCA_ETF_PARMS. Errors: bad_message for a truncated or malformed message,
-/// another type, or a known kind whose options are short.
+/// Parse one RTM_NEWQDISC of build_dump's answer (mqprio's flat tc_mqprio_qopt; cbs's and etf's nested
+/// parameters). Errors: bad_message for a truncated or malformed message, another type, or a known kind
+/// whose options are short.
 [[nodiscard]] auto parse_qdisc(std::span<uint8_t const> message) -> StatusValue<QdiscInfo>;
 
 /// The qdisc requests a caller makes (TcClient in a host; a recorder in tests).
@@ -218,10 +185,8 @@ class TcControl
 /// an mqprio of ours replaces it: replaced in place, its destroy would reset our TC map. Any other root stays.
 [[nodiscard]] auto remove_other_tc_root(TcControl& tc, int ifindex, QdiscInfo const& root, uint16_t major) -> StatusValue<bool>;
 
-/// A blocking NETLINK_ROUTE socket for qdisc requests. Each call sends one
-/// request and waits (at most about a second) for its acknowledgement. Not
-/// thread-safe; meant for the reactor thread, where a request is rare
-/// (install, an admission change, shutdown).
+/// A blocking NETLINK_ROUTE socket for qdisc requests: each call sends one and waits (about a second at
+/// most) for its answer. Not thread-safe; for the reactor thread, where a request is rare.
 class TcClient final : public TcControl
 {
   public:

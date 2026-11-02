@@ -115,10 +115,8 @@ class SocketAddress
         return ipv6(addr, port, scope_id);
     }
 
-    /// Create an AF_LOCAL (AF_UNIX) address for an absolute filesystem path
-    /// (no abstract namespace). Fails with NetError::invalid_address when
-    /// @p path is not absolute (empty or not starting with '/'), contains a
-    /// NUL, or does not fit in sun_path with its terminating NUL.
+    /// An AF_UNIX address for an absolute filesystem path (no abstract namespace). Errors:
+    /// NetError::invalid_address for a path that is not absolute, holds a NUL or does not fit sun_path with its NUL.
     /// @param path Absolute filesystem path of the socket
     [[nodiscard]] static auto local(std::string_view path) noexcept -> StatusValue<SocketAddress>;
 
@@ -217,10 +215,8 @@ class SocketAddress
 [[nodiscard]] auto create_udp_socket(SocketAddress const& addr, bool do_bind, int dscp = -1, bool ipv6_only = false)
     -> StatusValue<FileDescriptor>;
 
-/// Create a TCP socket optionally bound to the given address
-/// For an AF_UNIX address this is a SOCK_STREAM unix socket: SO_REUSEADDR
-/// and DSCP are not applied, and the caller owns any filesystem entry
-/// bind creates (stale-path handling and unlink).
+/// Create a TCP socket optionally bound to the given address. For AF_UNIX: a SOCK_STREAM unix socket
+/// without SO_REUSEADDR or DSCP; the caller owns the filesystem entry bind creates.
 /// @param addr The address to use (determines address family)
 /// @param do_bind If true, bind to the address
 /// @param dscp Optional DSCP value (0-63). If >= 0, sets the DSCP on the socket (IP families only).

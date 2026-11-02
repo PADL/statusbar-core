@@ -30,23 +30,9 @@
 /// (otherwise the pending connection would keep the listener readable and
 /// spin the poll); on_rejected(peer) reports it.
 ///
-/// AF_UNIX: pass SocketAddress::local(path) as the bind address. A stale
-/// socket file at the path (one nobody is listening on: a probe connect is
-/// refused) is unlinked before bind; a live socket or any other kind of
-/// filesystem entry there makes the pool invalid and is left alone. (The
-/// probe shows up as a connect-then-EOF on the live listener.) The socket
-/// is bound, given unix_mode and set listening in a private directory
-/// beside the path, then hard-linked into place, so the mode never reaches
-/// anything a symlink at the path points to. The staged name,
-/// "<dir>/.XXXXXX/s", must fit sun_path too, and the directory must not be
-/// writable by others. The pool owns the socket file at the
-/// path and unlinks it when destroyed. Accepted peers are usually unnamed:
-/// peer(slot) is AF_UNIX with an empty path().
-///
-/// With unix_seqpacket the listener is SOCK_SEQPACKET: write() sends one
-/// whole message or, when the peer's queue is full, nothing (0); read()
-/// returns one message, skips empty ones and refuses (buffer_full) and
-/// discards one longer than its buffer.
+/// AF_UNIX: pass SocketAddress::local(path); a stale socket there is replaced, a live one or another entry
+/// (or a directory others can write) makes the pool invalid. With unix_seqpacket the listener is
+/// SOCK_SEQPACKET, one message per read() and write(); docs/NET_MODULE.md has the rules.
 
 #include "statusbar/net/net_address.hpp"
 #include "statusbar/net/net_fd_multiplexer.hpp"

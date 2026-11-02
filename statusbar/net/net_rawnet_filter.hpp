@@ -3,16 +3,9 @@
 // Copyright 2026 Jeff Koftinoff <jeff.koftinoff@statusbar.com>
 // SPDX-License-Identifier: MIT
 
-/// The classic-BPF receive filters a RawnetContext attaches to its socket.
-///
-/// Platform independent so the exact bytecode is unit tested (and run through
-/// cbpf::interpret) on any host. Each program accepts a frame whose ethertype
-/// is the socket's, untagged (ethertype at L2 offset 12) or under one 802.1Q
-/// tag (0x8100 at 12, the inner ethertype at 16). Frames whose tag the NIC
-/// stripped into packet metadata (RX VLAN offload) are seen untagged; a frame
-/// this host sends with a software tag reaches the egress tap tagged. The
-/// subtype variant also requires the first byte after the L2 header (14, or
-/// 18 when tagged), the AVTP subtype for ethertype 0x22F0, to be one of a set.
+/// The classic-BPF receive filters a RawnetContext attaches to its socket: the socket's ethertype,
+/// untagged or under one 802.1Q tag, and optionally an AVTP subtype set. Platform independent, so the
+/// bytecode is unit tested through cbpf::interpret on any host; docs/NET_MODULE.md covers VLAN offload.
 
 #include "statusbar/net/net_cbpf_emit.hpp"
 

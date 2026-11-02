@@ -3,10 +3,8 @@
 // Copyright 2026 Jeff Koftinoff <jeff.koftinoff@statusbar.com>
 // SPDX-License-Identifier: MIT
 
-/// @file net_rss.hpp
-/// @brief A NIC's RSS indirection table (ethtool -x / -X): which RX queue each
-/// hash bucket lands on, read and written with ETHTOOL_GRXFHINDIR /
-/// ETHTOOL_SRXFHINDIR. An AF_XDP socket bound to one queue steers every bucket to it.
+/// A NIC's RSS indirection table (ethtool -x / -X, ETHTOOL_GRXFHINDIR / ETHTOOL_SRXFHINDIR): which RX
+/// queue each hash bucket lands on. An AF_XDP socket bound to one queue steers every bucket to it.
 
 #include "statusbar/status/status.hpp"
 

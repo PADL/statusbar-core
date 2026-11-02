@@ -87,12 +87,9 @@ inline auto now_monotonic_raw_ns() noexcept -> int64_t
 
 }  // namespace detail
 
-/// One iteration of a busy-wait: a CPU spin hint (`pause` on x86, `yield` on
-/// ARM) and no syscall. Lowers the power of the spin, frees execution
-/// resources for a hyperthread sibling and avoids the memory-order mis-
-/// speculation penalty on loop exit. Unlike sched_yield it never enters the
-/// kernel, so a spin made of these lands within tens of nanoseconds of its
-/// deadline rather than within a syscall round trip.
+/// One iteration of a busy-wait: a CPU spin hint (`pause` on x86, `yield` on ARM), no syscall.
+/// Unlike sched_yield it never enters the kernel, so a spin lands within tens of nanoseconds of its
+/// deadline (docs/REALTIME_MODULE.md).
 inline void cpu_relax() noexcept
 {
 #if defined(__x86_64__) || defined(__i386__)
@@ -104,10 +101,8 @@ inline void cpu_relax() noexcept
 #endif
 }
 
-/// Name the calling thread, for `top -H`, `ps -L`, perf and gdb. Linux keeps
-/// at most 15 characters; a longer name is truncated. Do not call it on a
-/// process's main thread: there the name is the process name (`pgrep`,
-/// `killall`, systemd's comm). A no-op where threads cannot be named.
+/// Name the calling thread (`top -H`, perf, gdb), truncated to 15 characters on Linux. Not on the main
+/// thread, whose name is the process name (`pgrep`, systemd's comm). A no-op where threads have none.
 inline void set_current_thread_name(std::string_view const name) noexcept
 {
 #if defined(__linux__) || defined(__APPLE__)

@@ -1,10 +1,9 @@
 // Copyright 2026 Jeff Koftinoff <jeff.koftinoff@statusbar.com>
 // SPDX-License-Identifier: MIT
 
-/// A clang-tidy plugin with the house check statusbar-block-statements: a block ({...}) holds at most
-/// MaxStatements statements (default 4), each counted once whatever its kind (a switch's body, and
-/// the bodies the compiler writes for implicit or defaulted members, are exempt); an exception is marked
-/// `// NOLINT(statusbar-block-statements): <reason>` on the opening brace's line.
+/// The check statusbar-block-statements: a block ({...}) holds at most MaxStatements statements (default 4),
+/// each counted once whatever its kind (a nested block once); switch and compiler-written bodies are exempt.
+/// An exception is marked `// NOLINT(statusbar-block-statements): <reason>` on the opening brace's line.
 
 #include "clang-tidy/ClangTidyCheck.h"
 #include "clang-tidy/ClangTidyModule.h"

@@ -238,13 +238,8 @@ auto TcpConnectionPool::open_listener(SocketAddress const& bind_addr) -> StatusV
     if (!is_unix()) {
         return create_tcp_listener(bind_addr, options_.backlog, options_.dscp);
     }
-    // Bound, given its mode and listening inside a private (0700) directory
-    // beside the path, then linked into place: the mode never reaches
-    // anything but our own socket file, whatever is swapped in at the path,
-    // and link(), like bind(), never follows or replaces what is there (a
-    // live socket that appeared since prepare_unix_path is refused). Nobody
-    // can connect until the socket is at the path, with its final mode.
-    // A socket there afterwards is ours to unlink (claim_unix_path).
+    // Bound, given its mode and listening in a private directory, then linked into place: no
+    // client sees it before its final mode (docs/NET_MODULE.md, AF_UNIX listeners).
     auto const private_dir = make_private_dir(unix_path_);
     if (!private_dir) {
         return failure(private_dir.error());

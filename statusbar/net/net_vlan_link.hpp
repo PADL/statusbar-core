@@ -3,31 +3,9 @@
 // Copyright 2026 Jeff Koftinoff <jeff.koftinoff@statusbar.com>
 // SPDX-License-Identifier: MIT
 
-/// @file net_vlan_link.hpp
-/// @brief Create and delete an 802.1Q VLAN link over rtnetlink, the way
-/// `ip link add link <if> name <if>.<vid> type vlan id <vid>` and `ip link del
-/// <name>` do, without libnl or iproute2.
-///
-/// What it is for: registering a VID with a NIC's receive VLAN filter. A NIC
-/// with rx-vlan-filter on (igb's is fixed on) drops frames tagged with a VID
-/// nobody registered, before any socket sees them. The kernel registers a VID
-/// (ndo_vlan_rx_add_vid) when a VLAN link on it is registered, whether or not
-/// the link is up, and unregisters it when the last such link is deleted. The
-/// link is left down: a down VLAN link takes no addresses and, for frames on
-/// its VID, only the real device's ETH_P_ALL taps (packet sockets bound to
-/// it) see them. Brought up with no address (bring_up()), it lets a socket
-/// join an IP group on it, so the kernel reports the membership tagged with
-/// the VID (IGMP snooping on that VLAN, RFC 4541).
-///
-/// Two layers, as net_tc_qdisc's: pure builders (build_new_vlan,
-/// build_delete_link) writing one RTM_NEWLINK / RTM_DELLINK request into a
-/// caller buffer (socket-free, unit-tested against hand-checked bytes), and
-/// VlanLinkClient, which sends them over a tc::TcClient's NETLINK_ROUTE
-/// socket. It implements VlanControl, the interface a caller takes so tests
-/// can record requests.
-///
-/// Needs CAP_NET_ADMIN, and the 8021q module (the kernel loads it on demand,
-/// as rtnl-link-vlan). Linux only.
+/// Create and delete an 802.1Q VLAN link over rtnetlink, as `ip link add ... type vlan id <vid>` and
+/// `ip link del` do, to register a VID with a NIC's receive VLAN filter: socket-free builders and
+/// VlanLinkClient. Needs CAP_NET_ADMIN and the 8021q module. Linux only; docs/NET_MODULE.md.
 
 #if defined(__linux__)
 
@@ -50,12 +28,9 @@ inline constexpr size_t MAX_LINK_NAME = 15;
 /// pass MAX_LINK_NAME.
 [[nodiscard]] auto vlan_link_name(std::string_view interface, uint16_t vid) -> std::string;
 
-/// Build `ip link add link <parent> name <name> type vlan id <vid>`
-/// (RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL: an
-/// existing link of that name, or of that VID on the parent, is EEXIST) into
-/// @p out. Returns the message length. Errors: invalid_argument for a parent
-/// ifindex of 0 or less, an empty name or one over MAX_LINK_NAME, or a VID
-/// outside 1..4094; BufferError::insufficient_space when @p out is too small.
+/// Build `ip link add link <parent> name <name> type vlan id <vid>` (RTM_NEWLINK, CREATE | EXCL: an existing
+/// name or VID is EEXIST) into @p out; returns its length. Errors: invalid_argument for a parent of 0 or less,
+/// an empty name or one over MAX_LINK_NAME, or a VID outside 1..4094; BufferError when @p out is too small.
 [[nodiscard]] auto build_new_vlan(std::span<uint8_t> out, int parent_ifindex, std::string_view name, uint16_t vid, uint32_t seq)
     -> StatusValue<size_t>;
 

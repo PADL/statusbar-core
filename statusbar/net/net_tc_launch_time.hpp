@@ -3,10 +3,9 @@
 // Copyright 2026 Jeff Koftinoff <jeff.koftinoff@statusbar.com>
 // SPDX-License-Identifier: MIT
 
-/// Launch time on a TX queue (tc-etf(8)): what a host wants of etf given the driver's one answer and,
-/// on an interface with no other shaping, an mqprio root that keeps one TX queue for an AF_XDP
-/// socket's timed frames, with an offloaded etf on it, and PTP event traffic on a queue of its own.
-/// See docs/NET_MODULE.md ("launch time").
+/// Launch time on a TX queue (tc-etf(8)), on an interface with no other shaping: an mqprio root keeping one
+/// TX queue for an AF_XDP socket's timed frames, an offloaded etf on it, and PTP event traffic on a queue of
+/// its own. docs/NET_MODULE.md ("launch time") has the contract.
 
 #include "statusbar/net/net_tc_qdisc.hpp"
 #include "statusbar/status/status.hpp"

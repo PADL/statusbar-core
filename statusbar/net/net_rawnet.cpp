@@ -74,28 +74,11 @@ auto attach_filter(int const sock_fd, rawnet_filter::Program const& program) noe
 /// An AF_PACKET socket for @p ethertype (see the comment within); -1 when refused.
 [[nodiscard]] auto open_packet_socket(uint16_t const ethertype, bool const transmit_only) noexcept -> int
 {
-    // A transmit-only socket is created with protocol 0: it is never hooked
-    // into packet delivery (ptype_all or a protocol hash) at all, so it
-    // receives nothing. sendto still names the frame's protocol in
-    // sll_protocol. Opened with ETH_P_ALL and never read, it would instead be
-    // handed a clone of every frame of `ethertype` on every interface, then
-    // drop each one with its receive buffer full.
-    //
-    // Otherwise create with ETH_P_ALL (not htons(ethertype)) so the socket sits in the
-    // kernel's ptype_all list and therefore receives BOTH wire frames AND
-    // locally-transmitted (PACKET_OUTGOING) frames via the egress tap. The egress
-    // tap (dev_queue_xmit_nit) only feeds ETH_P_ALL sockets, never protocol-bound
-    // ones — so a protocol-bound socket cannot hear another process's TX on the
-    // same host, and an L2 switch will not reflect a frame back to its source
-    // port (802.1Q). ETH_P_ALL is what makes same-host RX work (e.g. an on-box
-    // ATDECC controller hearing a co-located entity). A cBPF filter below narrows
-    // delivery back down to `ethertype` in the kernel so we don't drown in
-    // unrelated traffic. TX is unaffected (sendto carries its own sll_protocol).
+    // Transmit-only: protocol 0, never hooked into delivery. Otherwise ETH_P_ALL, so frames this
+    // host sends reach the socket through the egress tap, then a cBPF filter narrows it to
+    // `ethertype` (docs/NET_MODULE.md, raw sockets).
     int const sock_fd = ::socket(AF_PACKET, SOCK_RAW, transmit_only ? 0 : htons(ETH_P_ALL));
-    // Attach a classic-BPF program: accept only frames whose ethertype is
-    // `ethertype`, whether untagged (ethertype at L2 offset 12) or carrying one
-    // 802.1Q tag (0x8100 at 12, inner ethertype at 16). set_subtype_filter
-    // narrows it further.
+    // Only `ethertype`, untagged or under one 802.1Q tag (rawnet_filter); set_subtype_filter narrows it.
     if (sock_fd >= 0 && !transmit_only) {
         (void)attach_filter(sock_fd, rawnet_filter::ethertype_filter(ethertype));  // non-fatal
     }
@@ -184,9 +167,7 @@ auto RawnetContext::identify_interface(std::string_view const interface_name) no
 auto RawnetContext::configure(Eui48 const* multicast_mac, bool const qdisc_bypass) noexcept -> Status
 {
     configure_packet_socket(fd_, interface_index_, qdisc_bypass, transmit_only_);
-    // Set default destination MAC if provided. A transmit-only socket only
-    // sends to it: joining would bind it, and so hook it into delivery.
-    if (multicast_mac != nullptr) {
+    if (multicast_mac != nullptr) {  // a transmit-only socket only sends to it: joining would hook it into delivery
         default_dest_mac_ = *multicast_mac;
         if (auto status = transmit_only_ ? success() : join_multicast(*multicast_mac); !status) {
             return status;
