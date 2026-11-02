@@ -206,9 +206,12 @@ class TcControl
     TcControl() noexcept = default;
 };
 
+/// The qdisc on @p parent of @p ifindex, nullopt when there is none (get()'s ENOENT). Errors: the query's.
+[[nodiscard]] auto find_qdisc(TcControl& tc, int ifindex, uint32_t parent) -> StatusValue<std::optional<QdiscInfo>>;
+
 /// Delete @p ifindex's root if it is an mqprio with handle @p major:0, which only its own user lays:
 /// any other root is left alone. Its children go with it (on igb/igc, one adapter reset). Returns
-/// whether it was deleted. Errors: the delete's netlink errno.
+/// whether it was deleted. Errors: the query's (but ENOENT, no root) or the delete's netlink errno.
 [[nodiscard]] auto remove_own_mqprio_root(TcControl& tc, int ifindex, uint16_t major) -> StatusValue<bool>;
 
 /// Delete @p root, @p ifindex's root, if it is an mqprio or taprio under another handle than @p major:0, before

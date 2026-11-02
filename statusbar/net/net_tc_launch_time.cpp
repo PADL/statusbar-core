@@ -83,7 +83,7 @@ auto ptp_mqprio(LaunchTimeQueue const& queue, uint16_t const ptp) noexcept -> Mq
 }
 
 /// Whether @p root is our mqprio, laid as @p mqprio.
-auto is_ours(StatusValue<QdiscInfo> const& root, MqprioQdisc const& mqprio) noexcept -> bool
+auto is_ours(std::optional<QdiscInfo> const& root, MqprioQdisc const& mqprio) noexcept -> bool
 {
     return root && root->handle == make_handle(mqprio.major, 0) && root->mqprio == mqprio;
 }
@@ -104,26 +104,28 @@ auto lay_root(TcControl& tc, int const ifindex, MqprioQdisc const& mqprio) -> St
 /// taprio root goes first (remove_other_tc_root).
 auto put_root(TcControl& tc, int const ifindex, MqprioQdisc const& mqprio) -> StatusValue<bool>
 {
-    auto const root = tc.get(ifindex, ROOT);
-    if (is_ours(root, mqprio)) {
-        return true;
-    }
-    auto const other = root ? remove_other_tc_root(tc, ifindex, *root, mqprio.major) : StatusValue<bool>{false};
-    return other.and_then([&](bool) { return lay_root(tc, ifindex, mqprio); }).transform([] { return false; });
+    return find_qdisc(tc, ifindex, ROOT).and_then([&](std::optional<QdiscInfo> const& root) -> StatusValue<bool> {
+        if (is_ours(root, mqprio)) {
+            return true;
+        }
+        auto const other = root ? remove_other_tc_root(tc, ifindex, *root, mqprio.major) : StatusValue<bool>{false};
+        return other.and_then([&](bool) { return lay_root(tc, ifindex, mqprio); }).transform([] { return false; });
+    });
 }
 
 /// @p etf on its parent, kept when it is already there: whether it was kept.
 auto put_etf(TcControl& tc, int const ifindex, EtfQdisc const& etf) -> StatusValue<bool>
 {
-    auto const child = tc.get(ifindex, etf.parent);
-    if (child && child->etf == etf) {
-        return true;
-    }
-    // etf has no change operation: another etf goes first.
-    if (auto removed = child && child->kind == "etf" ? tc.remove(ifindex, child->handle, etf.parent) : Status{}; !removed) {
-        return forward_failure(removed);
-    }
-    return tc.replace_etf(ifindex, etf).transform([] { return false; });
+    return find_qdisc(tc, ifindex, etf.parent).and_then([&](std::optional<QdiscInfo> const& child) -> StatusValue<bool> {
+        if (child && child->etf == etf) {
+            return true;
+        }
+        // etf has no change operation: another etf goes first.
+        if (auto removed = child && child->kind == "etf" ? tc.remove(ifindex, child->handle, etf.parent) : Status{}; !removed) {
+            return forward_failure(removed);
+        }
+        return tc.replace_etf(ifindex, etf).transform([] { return false; });
+    });
 }
 
 /// Our root and etf for @p queue on @p ifindex.
@@ -141,11 +143,12 @@ auto install(TcControl& tc, int const ifindex, LaunchTimeQueue const& queue) -> 
 /// An etf on @p parent deleted: whether there was one.
 auto clear_etf(TcControl& tc, int const ifindex, uint32_t const parent) -> StatusValue<bool>
 {
-    auto const child = tc.get(ifindex, parent);
-    if (!child || child->kind != "etf") {
-        return false;
-    }
-    return tc.remove(ifindex, child->handle, parent).transform([] { return true; });
+    return find_qdisc(tc, ifindex, parent).and_then([&](std::optional<QdiscInfo> const& child) -> StatusValue<bool> {
+        if (!child || child->kind != "etf") {
+            return false;
+        }
+        return tc.remove(ifindex, child->handle, parent).transform([] { return true; });
+    });
 }
 
 /// Our root for @p queue laid or kept, and an etf on the queue's class deleted.

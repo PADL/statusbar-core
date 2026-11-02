@@ -389,14 +389,29 @@ auto TcClient::replace_etf(int const ifindex, EtfQdisc const& qdisc) -> Status
     return send([&](std::span<uint8_t> out, uint32_t seq) { return build_replace_etf(out, ifindex, qdisc, seq); });
 }
 
+auto find_qdisc(TcControl& tc, int const ifindex, uint32_t const parent) -> StatusValue<std::optional<QdiscInfo>>
+{
+    auto found = tc.get(ifindex, parent);
+    if (found) {
+        return std::optional<QdiscInfo>{std::move(*found)};
+    }
+    if (found.error() == std::errc::no_such_file_or_directory) {
+        return std::optional<QdiscInfo>{};
+    }
+    return failure(found.error());
+}
+
 auto remove_own_mqprio_root(TcControl& tc, int const ifindex, uint16_t const major) -> StatusValue<bool>
 {
-    uint32_t const handle = make_handle(major, 0);
-    auto const root = tc.get(ifindex, ROOT);
-    if (major == 0 || !root || root->handle != handle || root->kind != "mqprio") {
+    if (major == 0) {
         return false;
     }
-    return tc.remove(ifindex, handle, ROOT).transform([] { return true; });
+    return find_qdisc(tc, ifindex, ROOT).and_then([&](std::optional<QdiscInfo> const& root) -> StatusValue<bool> {
+        if (!root || root->handle != make_handle(major, 0) || root->kind != "mqprio") {
+            return false;
+        }
+        return tc.remove(ifindex, root->handle, ROOT).transform([] { return true; });
+    });
 }
 
 auto remove_other_tc_root(TcControl& tc, int const ifindex, QdiscInfo const& root, uint16_t const major) -> StatusValue<bool>

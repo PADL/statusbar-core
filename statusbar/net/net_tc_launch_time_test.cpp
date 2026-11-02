@@ -51,6 +51,7 @@ class RecordingTc final : public TcControl
     std::optional<QdiscInfo> root{};    ///< get(ROOT)'s answer (none: ENOENT)
     std::vector<QdiscInfo> children{};  ///< the qdiscs below the root
     std::error_code etf_error{};        ///< every replace_etf's answer
+    std::error_code get_error{};        ///< every get's answer when set
 
     auto replace_mqprio(int /*ifindex*/, MqprioQdisc const& q) -> Status override
     {
@@ -90,6 +91,9 @@ class RecordingTc final : public TcControl
     {
         requests.push_back(
             parent == ROOT ? std::string{"show root"} : std::format("show {:x}:{:x}", parent >> 16U, parent & 0xFFFFU));
+        if (get_error) {
+            return failure(get_error);
+        }
         auto const it = std::ranges::find(children, parent, &QdiscInfo::parent);
         if (parent == ROOT && root) {
             return *root;
@@ -339,6 +343,34 @@ TEST(tc_own_root, only_an_mqprio_with_our_handle_is_removed)
     EXPECT_TRUE(remove_own_mqprio_root(tc, IFINDEX, 0x9000) == StatusValue<bool>{true});
     EXPECT_TRUE((tc.take() == std::vector<std::string>{"show root", "del root 9000:"}));
     EXPECT_FALSE(tc.root.has_value());
+}
+
+TEST(tc_own_root, a_failed_root_query_is_the_result)
+{
+    RecordingTc tc;
+    tc.root = QdiscInfo{.handle = make_handle(0x9000, 0), .parent = ROOT, .kind = "mqprio"};
+    tc.get_error = std::make_error_code(std::errc::timed_out);
+    auto const failed = remove_own_mqprio_root(tc, IFINDEX, 0x9000);
+    EXPECT_TRUE(!failed && failed.error() == std::errc::timed_out);
+    EXPECT_TRUE((tc.take() == std::vector<std::string>{"show root"}));
+}
+
+TEST(tc_own_root, no_root_is_none_of_ours)
+{
+    RecordingTc tc;
+    EXPECT_TRUE(remove_own_mqprio_root(tc, IFINDEX, 0x9000) == StatusValue<bool>{false});
+    EXPECT_TRUE((tc.take() == std::vector<std::string>{"show root"}));
+}
+
+// A failed query is the result: nothing is laid or deleted over a state that is not known.
+TEST(tc_launch_time, a_failed_query_lays_nothing)
+{
+    RecordingTc tc;
+    tc.root = default_root();
+    tc.get_error = std::make_error_code(std::errc::timed_out);
+    auto const on = settle_launch_time_queue(tc, IFINDEX, queue_zero_of_four(), LaunchTimeMode::on);
+    EXPECT_TRUE(!on && on.error() == std::errc::timed_out);
+    EXPECT_TRUE((tc.take() == std::vector<std::string>{"show root"}));
 }
 
 // A refused etf (EOPNOTSUPP: no etf offload) is the result, our root left in place.
