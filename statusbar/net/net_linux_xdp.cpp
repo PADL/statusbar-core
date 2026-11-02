@@ -846,37 +846,44 @@ auto XdpSocket::tx_complete() -> Status
 
 auto XdpSocket::rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
 {
-    if (budget_.rx_drain_max > 0 && budget_.rx_cycle_count >= budget_.rx_drain_max) {
-        ++stats_.rx_budget_hit_count;
-        return std::optional<EthernetRxSlot>{};
-    }
-
     uint32_t idx = 0;
-    if (xsk_ring_cons__peek(&rings_.rx, 1, &idx) == 0) {
+    if (rx_budget_spent() || xsk_ring_cons__peek(&rings_.rx, 1, &idx) == 0) {
         return std::optional<EthernetRxSlot>{};
     }
-
     auto const* desc = xsk_ring_cons__rx_desc(&rings_.rx, idx);
-
-    int64_t timestamp_ns = 0;
-    if (budget_.rx_clock_id >= 0) {
-        struct timespec ts{};
-        (void)::clock_gettime(budget_.rx_clock_id, &ts);
-        timestamp_ns = (static_cast<int64_t>(ts.tv_sec) * 1'000'000'000) + ts.tv_nsec;
-    }
-
-    EthernetRxSlot slot{
+    EthernetRxSlot const slot{
         .handle = desc->addr,
         .buffer = umem_.readable_span(desc->addr, desc->len),
-        .timestamp_ns = timestamp_ns,
+        .timestamp_ns = rx_timestamp_ns(),
     };
+    release_rx_slot();  // the UMEM frame stays valid until rx_release(handle)
+    return std::optional<EthernetRxSlot>{slot};
+}
 
-    // Release ring slot — UMEM frame remains valid until rx_release(handle)
+auto XdpSocket::rx_budget_spent() noexcept -> bool
+{
+    if (budget_.rx_drain_max == 0 || budget_.rx_cycle_count < budget_.rx_drain_max) {
+        return false;
+    }
+    ++stats_.rx_budget_hit_count;
+    return true;
+}
+
+auto XdpSocket::rx_timestamp_ns() const noexcept -> int64_t
+{
+    if (budget_.rx_clock_id < 0) {
+        return 0;
+    }
+    struct timespec ts{};
+    (void)::clock_gettime(budget_.rx_clock_id, &ts);
+    return (static_cast<int64_t>(ts.tv_sec) * 1'000'000'000) + ts.tv_nsec;
+}
+
+void XdpSocket::release_rx_slot() noexcept
+{
     xsk_ring_cons__release(&rings_.rx, 1);
     ++budget_.rx_cycle_count;
     ++stats_.rx_count;
-
-    return std::optional<EthernetRxSlot>{slot};
 }
 
 auto XdpSocket::fill_replenish() -> Status
@@ -1000,30 +1007,38 @@ void XdpContext::close() noexcept
     interface_ = {};
 }
 
+namespace {
+
+/// An ifreq naming interface `index` and carrying `addr` as its hardware address.
+[[nodiscard]] auto multicast_ifreq(unsigned int const index, ieee::Eui48 const& addr) noexcept -> StatusValue<ifreq>
+{
+    struct ifreq ifr{};
+    if (::if_indextoname(index, ifr.ifr_name) == nullptr) {
+        return failure(XdpError::interface_not_found);
+    }
+    span_copy(hwaddr_bytes(ifr), make_const_span(addr.value));
+    ifr.ifr_hwaddr.sa_family = AF_UNSPEC;
+    return ifr;
+}
+
+/// Interface ioctl `request` on `ifr` over a transient datagram socket. Errors: `error` when refused.
+[[nodiscard]] auto carried_ioctl(unsigned long const request, ifreq& ifr, XdpError const error) noexcept -> Status
+{
+    FileDescriptor const carrier = detail::ioctl_carrier_socket();
+    if (!carrier.valid()) {
+        return failure(XdpError::socket_creation_failed);
+    }
+    return ::ioctl(carrier.get(), request, &ifr) < 0 ? Status{failure(error)} : success();
+}
+
+}  // namespace
+
 auto XdpContext::multicast_ioctl(unsigned long const request, ieee::Eui48 const& addr, XdpError const error) -> Status
 {
     if (!socket_.valid()) {
         return failure(XdpError::not_open);
     }
-
-    struct ifreq ifr{};
-    if (::if_indextoname(interface_.index, ifr.ifr_name) == nullptr) {
-        return failure(XdpError::interface_not_found);
-    }
-    span_copy(hwaddr_bytes(ifr), make_const_span(addr.value));
-    ifr.ifr_hwaddr.sa_family = AF_UNSPEC;
-
-    int sock_fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock_fd < 0) {
-        return failure(XdpError::socket_creation_failed);
-    }
-    auto close_sock = detail::scopeguard([&]() noexcept { ::close(sock_fd); });
-
-    if (::ioctl(sock_fd, request, &ifr) < 0) {
-        return failure(error);
-    }
-
-    return success();
+    return multicast_ifreq(interface_.index, addr).and_then([&](ifreq ifr) { return carried_ioctl(request, ifr, error); });
 }
 
 auto XdpContext::join_multicast(ieee::Eui48 const& addr) -> Status

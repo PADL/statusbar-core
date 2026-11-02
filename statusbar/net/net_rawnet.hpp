@@ -250,6 +250,17 @@ class RawnetContext
 #endif
 
   private:
+#if defined(__linux__)
+    /// open() once the socket is taken: the interface, the socket's options, closed again on failure.
+    [[nodiscard]] auto set_up(std::string_view interface_name, Eui48 const* multicast_mac, bool qdisc_bypass) noexcept -> Status;
+    /// interface_index_ and my_mac_ of @p interface_name. Errors: invalid_address, socket_creation_failed.
+    [[nodiscard]] auto identify_interface(std::string_view interface_name) noexcept -> Status;
+    /// The default destination (joined unless transmit-only), then non-blocking.
+    [[nodiscard]] auto configure(Eui48 const* multicast_mac, bool qdisc_bypass) noexcept -> Status;
+    /// Errors: not_connected when closed, invalid_argument when transmit-only (no membership).
+    [[nodiscard]] auto membership_usable() const noexcept -> Status;
+#endif
+
     int fd_{-1};
     uint16_t ethertype_{0};
     int interface_index_{-1};

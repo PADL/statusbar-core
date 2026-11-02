@@ -32,7 +32,7 @@ namespace statusbar::net {
 
 auto RawnetContext::operator=(RawnetContext&& other) noexcept -> RawnetContext&
 {
-    if (this != &other) {
+    if (this != &other) {  // NOLINT(statusbar-block-statements): every field moved
         close();
         fd_ = other.fd_;
         ethertype_ = other.ethertype_;
@@ -71,11 +71,8 @@ auto attach_filter(int const sock_fd, rawnet_filter::Program const& program) noe
     return ::setsockopt(sock_fd, SOL_SOCKET, SO_ATTACH_FILTER, &prog, sizeof(prog)) == 0 ? 0 : errno;
 }
 
-}  // namespace
-
-[[nodiscard]] auto RawnetContext::open(
-    std::string_view interface_name, uint16_t ethertype, Eui48 const* multicast_mac, bool qdisc_bypass, bool transmit_only) noexcept
-    -> Status
+/// An AF_PACKET socket for @p ethertype (see the comment within); -1 when refused.
+[[nodiscard]] auto open_packet_socket(uint16_t const ethertype, bool const transmit_only) noexcept -> int
 {
     // A transmit-only socket is created with protocol 0: it is never hooked
     // into packet delivery (ptype_all or a protocol hash) at all, so it
@@ -95,41 +92,20 @@ auto attach_filter(int const sock_fd, rawnet_filter::Program const& program) noe
     // delivery back down to `ethertype` in the kernel so we don't drown in
     // unrelated traffic. TX is unaffected (sendto carries its own sll_protocol).
     int const sock_fd = ::socket(AF_PACKET, SOCK_RAW, transmit_only ? 0 : htons(ETH_P_ALL));
-    if (sock_fd < 0) {
-        return failure(NetError::socket_creation_failed);
-    }
-
     // Attach a classic-BPF program: accept only frames whose ethertype is
     // `ethertype`, whether untagged (ethertype at L2 offset 12) or carrying one
     // 802.1Q tag (0x8100 at 12, inner ethertype at 16). set_subtype_filter
     // narrows it further.
-    if (!transmit_only) {
+    if (sock_fd >= 0 && !transmit_only) {
         (void)attach_filter(sock_fd, rawnet_filter::ethertype_filter(ethertype));  // non-fatal
     }
+    return sock_fd;
+}
 
-    // Get interface index
-    struct ifreq ifr{};
-    if (interface_name.size() >= sizeof(ifr.ifr_name)) {
-        ::close(sock_fd);
-        return failure(NetError::invalid_address);
-    }
-    span_copy(ifname_bytes(ifr).first(interface_name.size()), make_const_span(interface_name));
-
-    if (::ioctl(sock_fd, SIOCGIFINDEX, &ifr) < 0) {
-        ::close(sock_fd);
-        return failure(NetError::invalid_address);
-    }
-    interface_index_ = ifr.ifr_ifindex;
-
-    // Get MAC address
-    if (::ioctl(sock_fd, SIOCGIFHWADDR, &ifr) < 0) {
-        ::close(sock_fd);
-        return failure(NetError::socket_creation_failed);
-    }
-    for (int i = 0; i < 6; ++i) {
-        my_mac_.value[i] = static_cast<uint8_t>(ifr.ifr_hwaddr.sa_data[i]);
-    }
-
+/// The TX path of @p sock_fd: PACKET_QDISC_BYPASS when asked; built for local capture visibility,
+/// never bypassed, and a receiving socket opened promiscuous instead.
+void configure_packet_socket(int const sock_fd, int const ifindex, bool const qdisc_bypass, bool const transmit_only) noexcept
+{
     // Optionally bypass the qdisc for lower TX latency (packets go directly to
     // the driver via packet_direct_xmit). OPT-IN and OFF by default.
     //
@@ -151,40 +127,72 @@ auto attach_filter(int const sock_fd, rawnet_filter::Program const& program) noe
     (void)qdisc_bypass;
     if (!transmit_only) {
         struct packet_mreq promisc{};
-        promisc.mr_ifindex = interface_index_;
+        promisc.mr_ifindex = ifindex;
         promisc.mr_type = PACKET_MR_PROMISC;
         (void)::setsockopt(sock_fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &promisc, sizeof(promisc));
     }
 #    else
+    (void)ifindex;
+    (void)transmit_only;
     if (qdisc_bypass) {
         int const bypass = 1;
-        if (::setsockopt(sock_fd, SOL_PACKET, PACKET_QDISC_BYPASS, &bypass, sizeof(bypass)) < 0) {
-            // Non-fatal: older kernels may not support this option.
-        }
+        (void)::setsockopt(sock_fd, SOL_PACKET, PACKET_QDISC_BYPASS, &bypass, sizeof(bypass));  // older kernels refuse it
     }
 #    endif
+}
 
+}  // namespace
+
+[[nodiscard]] auto RawnetContext::open(
+    std::string_view interface_name, uint16_t ethertype, Eui48 const* multicast_mac, bool qdisc_bypass, bool transmit_only) noexcept
+    -> Status
+{
+    int const sock_fd = open_packet_socket(ethertype, transmit_only);
+    if (sock_fd < 0) {
+        return failure(NetError::socket_creation_failed);
+    }
     fd_ = sock_fd;
     ethertype_ = ethertype;
     transmit_only_ = transmit_only;
+    return set_up(interface_name, multicast_mac, qdisc_bypass);
+}
 
+auto RawnetContext::set_up(std::string_view const interface_name, Eui48 const* multicast_mac, bool const qdisc_bypass) noexcept
+    -> Status
+{
+    auto status = identify_interface(interface_name).and_then([&] { return configure(multicast_mac, qdisc_bypass); });
+    if (!status) {
+        close();
+    }
+    return status;
+}
+
+auto RawnetContext::identify_interface(std::string_view const interface_name) noexcept -> Status
+{
+    struct ifreq ifr{};
+    if (!ifreq_ioctl(interface_name, SIOCGIFINDEX, ifr)) {
+        return failure(NetError::invalid_address);
+    }
+    interface_index_ = ifr.ifr_ifindex;
+    if (!ifreq_ioctl(interface_name, SIOCGIFHWADDR, ifr)) {
+        return failure(NetError::socket_creation_failed);
+    }
+    span_copy(my_mac_.span(), hwaddr_bytes(ifr));
+    return success();
+}
+
+auto RawnetContext::configure(Eui48 const* multicast_mac, bool const qdisc_bypass) noexcept -> Status
+{
+    configure_packet_socket(fd_, interface_index_, qdisc_bypass, transmit_only_);
     // Set default destination MAC if provided. A transmit-only socket only
     // sends to it: joining would bind it, and so hook it into delivery.
     if (multicast_mac != nullptr) {
         default_dest_mac_ = *multicast_mac;
-        if (auto status = transmit_only ? success() : join_multicast(*multicast_mac); !status) {
-            close();
+        if (auto status = transmit_only_ ? success() : join_multicast(*multicast_mac); !status) {
             return status;
         }
     }
-
-    // Set non-blocking
-    if (auto status = set_nonblocking(fd_); !status) {
-        close();
-        return status;
-    }
-
-    return success();
+    return set_nonblocking(fd_);
 }
 
 [[nodiscard]] auto RawnetContext::set_subtype_filter(std::span<uint8_t const> const subtypes) const noexcept -> Status
@@ -414,15 +422,22 @@ void RawnetContext::close() noexcept
     return success(payload_len);
 }
 
-[[nodiscard]] auto RawnetContext::join_multicast(Eui48 const& multicast_mac) const noexcept -> Status
-{
-    if (fd_ < 0) {
-        return failure(NetError::not_connected);
-    }
-    if (transmit_only_) {
-        return failure(std::make_error_code(std::errc::invalid_argument));
-    }
+namespace {
 
+/// A PACKET_MR_MULTICAST packet_mreq for @p mac on interface @p ifindex.
+[[nodiscard]] auto membership(int const ifindex, Eui48 const& mac) noexcept -> packet_mreq
+{
+    struct packet_mreq mreq{};
+    mreq.mr_ifindex = ifindex;
+    mreq.mr_type = PACKET_MR_MULTICAST;
+    mreq.mr_alen = 6;
+    span_copy(std::span{mreq.mr_address}.first(6), make_const_span(mac.value));
+    return mreq;
+}
+
+/// Bind @p fd to interface @p ifindex for every protocol (see the comment within).
+[[nodiscard]] auto bind_all_protocols(int const fd, int const ifindex) noexcept -> Status
+{
     // Bind to interface. CRITICAL: bind with sll_protocol = ETH_P_ALL, NOT
     // htons(ethertype_). Binding to a specific protocol re-registers the socket
     // under that protocol's hash and removes it from the kernel's ptype_all list
@@ -435,29 +450,15 @@ void RawnetContext::close() noexcept
     // widen what we actually receive — it only preserves same-host delivery.
     struct sockaddr_ll saddr{};
     saddr.sll_family = AF_PACKET;
-    saddr.sll_ifindex = interface_index_;
+    saddr.sll_ifindex = ifindex;
     saddr.sll_pkttype = PACKET_MULTICAST;
     saddr.sll_protocol = htons(ETH_P_ALL);
-
-    if (::bind(fd_, sockaddr_cast(saddr), sizeof(saddr)) < 0) {
-        return failure(NetError::bind_failed);
-    }
-
-    // Add multicast membership
-    struct packet_mreq mreq{};
-    mreq.mr_ifindex = interface_index_;
-    mreq.mr_type = PACKET_MR_MULTICAST;
-    mreq.mr_alen = 6;
-    span_copy(std::span{mreq.mr_address}.first(6), make_const_span(multicast_mac.value));
-
-    if (::setsockopt(fd_, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
-        return failure(NetError::socket_creation_failed);
-    }
-
-    return success();
+    return ::bind(fd, sockaddr_cast(saddr), sizeof(saddr)) < 0 ? Status{failure(NetError::bind_failed)} : success();
 }
 
-[[nodiscard]] auto RawnetContext::leave_multicast(Eui48 const& multicast_mac) const noexcept -> Status
+}  // namespace
+
+auto RawnetContext::membership_usable() const noexcept -> Status
 {
     if (fd_ < 0) {
         return failure(NetError::not_connected);
@@ -465,20 +466,31 @@ void RawnetContext::close() noexcept
     if (transmit_only_) {
         return failure(std::make_error_code(std::errc::invalid_argument));
     }
+    return success();
+}
 
-    // Symmetric to join_multicast: drop the NIC multicast filter entry. No
-    // re-bind needed — leaving membership does not touch the socket's protocol
-    // binding.
-    struct packet_mreq mreq{};
-    mreq.mr_ifindex = interface_index_;
-    mreq.mr_type = PACKET_MR_MULTICAST;
-    mreq.mr_alen = 6;
-    span_copy(std::span{mreq.mr_address}.first(6), make_const_span(multicast_mac.value));
+[[nodiscard]] auto RawnetContext::join_multicast(Eui48 const& multicast_mac) const noexcept -> Status
+{
+    if (auto status = membership_usable().and_then([&] { return bind_all_protocols(fd_, interface_index_); }); !status) {
+        return status;
+    }
+    auto const mreq = membership(interface_index_, multicast_mac);
+    if (::setsockopt(fd_, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+        return failure(NetError::socket_creation_failed);
+    }
+    return success();
+}
 
+[[nodiscard]] auto RawnetContext::leave_multicast(Eui48 const& multicast_mac) const noexcept -> Status
+{
+    if (auto status = membership_usable(); !status) {
+        return status;
+    }
+    // Symmetric to join_multicast: no re-bind, as leaving does not touch the socket's protocol binding.
+    auto const mreq = membership(interface_index_, multicast_mac);
     if (::setsockopt(fd_, SOL_PACKET, PACKET_DROP_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
         return failure(NetError::socket_creation_failed);
     }
-
     return success();
 }
 

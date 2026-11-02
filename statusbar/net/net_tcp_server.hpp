@@ -156,7 +156,19 @@ class TcpConnectionPool : public Pollable
     [[nodiscard]] auto read_stream(Slot& s, std::span<uint8_t> out) -> StatusValue<size_t>;
     /// read() of one SOCK_SEQPACKET message: empty ones skipped, buffer_full for one longer than @p out.
     [[nodiscard]] auto read_message(Slot& s, std::span<uint8_t> out) -> StatusValue<size_t>;
+    /// Construction's AF_UNIX phase: the path taken and checked (prepare_unix_path).
+    [[nodiscard]] auto use_unix_path(SocketAddress const& bind_addr) -> bool;
+    /// Make @p listener the pool's, non-blocking and watched by the multiplexer (closed when it cannot be).
+    void adopt_listener(FileDescriptor listener) noexcept;
     void accept_ready(int64_t now_ns);
+    /// One accept() into @p peer, an unnamed AF_UNIX peer normalised: the fd, or -1.
+    [[nodiscard]] auto accept_one(SocketAddress& peer) const noexcept -> int;
+    /// Give accepted @p fd the next free slot, or reject it when none is left or it cannot be watched.
+    void admit(int fd, SocketAddress const& peer, int64_t now_ns);
+    /// Close @p fd and report it (on_rejected).
+    void reject(int fd, SocketAddress const& peer, int64_t now_ns);
+    /// Put @p fd, already watched under @p slot (free_.back()), in that slot and report it (on_accept).
+    void occupy(size_t slot, int fd, SocketAddress const& peer, int64_t now_ns);
     void close_slot(size_t slot, int64_t now_ns);
     [[nodiscard]] auto slot_ok(size_t slot) const noexcept -> bool { return slot < slots_.size() && slots_[slot].in_use; }
 

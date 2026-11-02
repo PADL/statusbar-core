@@ -163,9 +163,7 @@ inline void set_ifr_name(ifreq& ifr, std::string_view const iface) noexcept
         return std::nullopt;
     }
     ieee::Eui48 mac{};
-    auto const src = hwaddr_bytes(ifr);
-    auto const dst = mac.span();
-    std::ranges::copy(src, dst.begin());
+    span_copy(mac.span(), hwaddr_bytes(ifr));
     return mac;
 }
 

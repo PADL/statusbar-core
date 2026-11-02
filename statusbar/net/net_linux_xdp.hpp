@@ -1114,6 +1114,12 @@ class XdpSocket
     [[nodiscard]] auto tx_ring_state() const noexcept -> detail::TxRingState;
     /// One sendto() kick, counted; transient refusals are not failures.
     [[nodiscard]] auto kick() -> Status;
+    /// True (counted) when this cycle's RX budget is spent.
+    [[nodiscard]] auto rx_budget_spent() noexcept -> bool;
+    /// Now on the configured RX clock, ns; 0 without one.
+    [[nodiscard]] auto rx_timestamp_ns() const noexcept -> int64_t;
+    /// Hand the peeked RX descriptor back to the kernel, counted.
+    void release_rx_slot() noexcept;
     /// A busy-polled zero-copy queue that has left `ring` pending and made no progress since the last
     /// flush (counted). A carrier loss looks the same, and is counted too.
     [[nodiscard]] auto tx_busy_poll_stalled(detail::TxRingState ring) noexcept -> bool;

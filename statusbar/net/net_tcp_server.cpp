@@ -182,17 +182,23 @@ TcpConnectionPool::TcpConnectionPool(
     for (size_t i = max_connections; i > 0; --i) {
         free_.push_back(uint32_t(i - 1));  // pop_back hands out low slots first
     }
-    if (bind_addr.family() == AF_UNIX) {
-        unix_path_ = std::string{bind_addr.path()};
-        if (unix_path_.empty() || !prepare_unix_path(bind_addr)) {
-            return;
-        }
-    }
-    auto listener = open_listener(bind_addr);
-    if (!listener || !mux_.valid()) {
+    if (bind_addr.family() == AF_UNIX && !use_unix_path(bind_addr)) {
         return;
     }
-    listener_ = FileDescriptor{listener->release()};
+    if (auto listener = open_listener(bind_addr); listener && mux_.valid()) {
+        adopt_listener(std::move(*listener));
+    }
+}
+
+auto TcpConnectionPool::use_unix_path(SocketAddress const& bind_addr) -> bool
+{
+    unix_path_ = std::string{bind_addr.path()};
+    return !unix_path_.empty() && prepare_unix_path(bind_addr);
+}
+
+void TcpConnectionPool::adopt_listener(FileDescriptor listener) noexcept
+{
+    listener_ = std::move(listener);
     (void)set_nonblocking(listener_.get());
     if (!mux_.add(listener_.get(), LISTENER_TAG, true, false)) {
         listener_.close();
@@ -425,39 +431,54 @@ void TcpConnectionPool::accept_ready(int64_t now_ns)
 {
     for (;;) {
         SocketAddress peer;
-        peer.reset_length();
-        int const fd = ::accept(listener_.get(), peer.sockaddr(), peer.length_ptr());
+        int const fd = accept_one(peer);
         if (fd < 0) {
             return;  // EAGAIN (or transient error): nothing more pending
         }
-        if (is_unix() && peer.family() != AF_UNIX) {
-            // Unnamed peer reported with no address at all: normalise to
-            // AF_UNIX with an empty path so peer() stays a valid address.
-            peer.sockaddr()->sa_family = AF_UNIX;
-            peer.set_length(socklen_t(offsetof(sockaddr_un, sun_path)));
-        }
-        if (free_.empty()) {
-            ::close(fd);
-            handler_.on_rejected(peer, now_ns);
-            continue;
-        }
-        set_accepted_options(fd, options_, peer.family());
-        size_t const slot = free_.back();
-        auto& s = slots_[slot];
-        s.fd = FileDescriptor{fd};
-        if (!mux_.add(fd, uint32_t(slot), true, false)) {
-            s.fd.close();
-            handler_.on_rejected(peer, now_ns);
-            continue;
-        }
-        free_.pop_back();
-        s.peer = peer;
-        s.last_activity_ns = now_ns;
-        s.in_use = true;
-        s.want_write = false;
-        ++active_;
-        handler_.on_accept(slot, s.peer, now_ns);
+        admit(fd, peer, now_ns);
     }
+}
+
+auto TcpConnectionPool::accept_one(SocketAddress& peer) const noexcept -> int
+{
+    peer.reset_length();
+    int const fd = ::accept(listener_.get(), peer.sockaddr(), peer.length_ptr());
+    if (fd >= 0 && is_unix() && peer.family() != AF_UNIX) {
+        // Unnamed peer reported with no address at all: normalise to
+        // AF_UNIX with an empty path so peer() stays a valid address.
+        peer.sockaddr()->sa_family = AF_UNIX;
+        peer.set_length(socklen_t(offsetof(sockaddr_un, sun_path)));
+    }
+    return fd;
+}
+
+void TcpConnectionPool::admit(int const fd, SocketAddress const& peer, int64_t const now_ns)
+{
+    if (free_.empty()) {
+        reject(fd, peer, now_ns);
+        return;
+    }
+    set_accepted_options(fd, options_, peer.family());
+    size_t const slot = free_.back();
+    if (!mux_.add(fd, uint32_t(slot), true, false)) {
+        reject(fd, peer, now_ns);
+        return;
+    }
+    occupy(slot, fd, peer, now_ns);
+}
+
+void TcpConnectionPool::reject(int const fd, SocketAddress const& peer, int64_t const now_ns)
+{
+    ::close(fd);
+    handler_.on_rejected(peer, now_ns);
+}
+
+void TcpConnectionPool::occupy(size_t const slot, int const fd, SocketAddress const& peer, int64_t const now_ns)
+{
+    free_.pop_back();
+    slots_[slot] = Slot{.fd = FileDescriptor{fd}, .peer = peer, .last_activity_ns = now_ns, .in_use = true, .want_write = false};
+    ++active_;
+    handler_.on_accept(slot, slots_[slot].peer, now_ns);
 }
 
 void TcpConnectionPool::close_slot(size_t slot, int64_t now_ns)

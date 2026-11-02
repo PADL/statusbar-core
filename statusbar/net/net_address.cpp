@@ -94,6 +94,27 @@ auto local_to_string(sockaddr_storage const& storage, socklen_t length, std::str
     return "@" + std::string(std::next(std::begin(sun->sun_path)), std::next(std::begin(sun->sun_path), std::ptrdiff_t(avail)));
 }
 
+/// "host:port" for IPv4, "[host]:port" for IPv6.
+auto join_host_port(std::string_view const host, std::string_view const port, bool const ipv6) -> std::string
+{
+    std::string result{ipv6 ? "[" : ""};
+    result.append(host).append(ipv6 ? "]:" : ":").append(port);
+    return result;
+}
+
+/// Render an IP address numerically with its port (getnameinfo), "<error>" when refused.
+auto ip_to_string(struct sockaddr const* address, socklen_t const length, sa_family_t const family) -> std::string
+{
+    std::array<char, 128> host_buf{};
+    std::array<char, 32> port_buf{};
+    int const err = ::getnameinfo(
+        address, length, host_buf.data(), host_buf.size(), port_buf.data(), port_buf.size(), NI_NUMERICHOST | NI_NUMERICSERV);
+    if (err != 0) {
+        return "<error>";
+    }
+    return join_host_port(host_buf.data(), port_buf.data(), family == AF_INET6);
+}
+
 }  // namespace
 
 auto SocketAddress::from_string(std::string_view host, std::string_view port, int socket_type) -> StatusValue<SocketAddress>
@@ -164,28 +185,7 @@ auto SocketAddress::to_string() const -> std::string
     if (storage_.ss_family == AF_UNIX) {
         return local_to_string(storage_, length_, path());
     }
-
-    std::array<char, 128> host_buf{};
-    std::array<char, 32> port_buf{};
-
-    int const err = ::getnameinfo(
-        sockaddr(), length_, host_buf.data(), host_buf.size(), port_buf.data(), port_buf.size(), NI_NUMERICHOST | NI_NUMERICSERV);
-
-    if (err != 0) {
-        return "<error>";
-    }
-
-    std::string result;
-    if (storage_.ss_family == AF_INET6) {
-        result = "[";
-        result += host_buf.data();
-        result += "]:";
-    } else {
-        result = host_buf.data();
-        result += ":";
-    }
-    result += port_buf.data();
-    return result;
+    return ip_to_string(sockaddr(), length_, storage_.ss_family);
 }
 
 auto create_udp_socket(SocketAddress const& addr, bool do_bind, int dscp, bool ipv6_only) -> StatusValue<FileDescriptor>
@@ -222,6 +222,22 @@ auto create_udp_socket(SocketAddress const& addr, bool do_bind, int dscp, bool i
     return success(std::move(result));
 }
 
+namespace {
+
+/// Bind stream socket @p fd to @p addr, with SO_REUSEADDR first for an IP family.
+[[nodiscard]] auto bind_stream_socket(int const fd, SocketAddress const& addr) -> Status
+{
+    if (auto status = addr.family() == AF_UNIX ? success() : set_reuse_addr(fd); !status) {
+        return status;
+    }
+    if (::bind(fd, addr.sockaddr(), addr.length()) < 0) {
+        return failure(NetError::bind_failed);
+    }
+    return success();
+}
+
+}  // namespace
+
 auto create_tcp_socket(SocketAddress const& addr, bool do_bind, int dscp) -> StatusValue<FileDescriptor>
 {
     int const fd = ::socket(addr.family(), SOCK_STREAM, 0);
@@ -230,21 +246,12 @@ auto create_tcp_socket(SocketAddress const& addr, bool do_bind, int dscp) -> Sta
     }
 
     FileDescriptor result{fd};
-    bool const is_unix = addr.family() == AF_UNIX;
-
-    if (do_bind) {
-        if (!is_unix) {
-            if (auto status = set_reuse_addr(fd); !status) {
-                return forward_failure(status);
-            }
-        }
-        if (::bind(fd, addr.sockaddr(), addr.length()) < 0) {
-            return failure(NetError::bind_failed);
-        }
+    if (auto status = do_bind ? bind_stream_socket(fd, addr) : success(); !status) {
+        return forward_failure(status);
     }
 
     // Set DSCP if specified (IP families only)
-    if (dscp >= 0 && !is_unix) {
+    if (dscp >= 0 && addr.family() != AF_UNIX) {
         if (auto status = set_dscp(fd, addr.family(), static_cast<uint8_t>(dscp)); !status) {
             return forward_failure(status);
         }
