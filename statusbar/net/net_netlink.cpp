@@ -133,6 +133,16 @@ auto dump_status(std::span<uint8_t const> const message) noexcept -> Status
     return error == 0 ? success() : failure(std::error_code{-error, std::system_category()});
 }
 
+auto end_status(
+    std::span<uint8_t const> const message, uint16_t const type, uint16_t const flags, size_t const request_size, std::string& text)
+    -> std::optional<Status>
+{
+    if (type == NLMSG_ERROR) {
+        return ack_status(message, flags, request_size, text);
+    }
+    return type == NLMSG_DONE ? std::optional<Status>{dump_status(message)} : std::nullopt;
+}
+
 //
 // Socket
 //

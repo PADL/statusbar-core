@@ -3,9 +3,9 @@
 // Copyright 2026 Jeff Koftinoff <jeff.koftinoff@statusbar.com>
 // SPDX-License-Identifier: MIT
 
-/// Netlink plumbing shared by the rtnetlink and generic-netlink clients: a blocking
-/// socket that sends one request and reads its replies, ack and extended-ack
-/// parsing, and attribute walking. Host byte order throughout. Linux only.
+/// Netlink plumbing shared by the rtnetlink and generic-netlink clients: a blocking socket that
+/// sends one request and reads its replies up to the ack, and attribute writing, walking and
+/// parsing. Host byte order throughout. Linux only.
 
 #if defined(__linux__)
 
@@ -13,6 +13,7 @@
 #    include "statusbar/buffer/file_descriptor.hpp"
 #    include "statusbar/status/status.hpp"
 
+#    include <array>
 #    include <cstddef>
 #    include <cstdint>
 #    include <optional>
@@ -27,6 +28,9 @@ inline constexpr size_t MESSAGE_HEADER = 16;
 inline constexpr size_t ATTRIBUTE_HEADER = 4;
 /// nlattr::nla_type without NLA_F_NESTED / NLA_F_NET_BYTEORDER.
 inline constexpr uint16_t ATTRIBUTE_TYPE_MASK = 0x3FFF;
+
+/// Room for any request a client builds (the largest, tc's mqprio, is 136 octets).
+inline constexpr size_t MAX_REQUEST_SIZE = 256;
 
 /// NLMSG_ALIGN / NLA_ALIGN / RTA_ALIGN: `n` rounded up to 4.
 [[nodiscard]] constexpr auto align4(size_t const n) noexcept -> size_t
@@ -90,6 +94,12 @@ template <typename Visit>
 /// A dump's NLMSG_DONE: its payload is the dump's error (0 when complete).
 [[nodiscard]] auto dump_status(std::span<uint8_t const> message) noexcept -> Status;
 
+/// The end of a request: an NLMSG_ERROR's ack_status() (its extended-ack text into `text`) or an
+/// NLMSG_DONE's dump_status(); nullopt for any other message.
+[[nodiscard]] auto end_status(
+    std::span<uint8_t const> message, uint16_t type, uint16_t flags, size_t request_size, std::string& text)
+    -> std::optional<Status>;
+
 /// A blocking netlink socket bound to a kernel-assigned port id, with extended and capped
 /// acks and a 1 s receive timeout. Replies land in a buffer the caller owns. Not thread-safe.
 class Socket
@@ -101,6 +111,30 @@ class Socket
     [[nodiscard]] auto is_open() const noexcept -> bool { return fd_.valid(); }
     /// Close the socket (a no-op when not open).
     void close() noexcept { fd_ = FileDescriptor{}; }
+
+    /// Build a request with `build` (out, seq) -> StatusValue<size_t> under the next sequence number,
+    /// send it and read its replies into `buffer`, each but the ack (or a dump's NLMSG_DONE) handed to
+    /// `on_reply` (message, type) -> Status. Errors: bad_file_descriptor, the builder's, `on_reply`'s, the kernel's.
+    template <typename Build, typename OnReply>
+    [[nodiscard]] auto request(std::span<uint8_t> const buffer, Build const& build, OnReply const& on_reply) -> Status
+    {
+        std::array<uint8_t, MAX_REQUEST_SIZE> request{};
+        uint32_t const seq = ++seq_;
+        last_message_.clear();
+        return build(std::span<uint8_t>{request}, seq).and_then([&](size_t const length) {
+            return exchange(std::span<uint8_t const>{request.data(), length}, seq, buffer, on_reply);
+        });
+    }
+
+    /// request() of a request the kernel only acknowledges: any other reply is ignored.
+    template <typename Build>
+    [[nodiscard]] auto request(std::span<uint8_t> const buffer, Build const& build) -> Status
+    {
+        return request(buffer, build, [](std::span<uint8_t const>, uint16_t) { return success(); });
+    }
+
+    /// The kernel's extended-ack message for the last failed request (empty: none given, or it succeeded).
+    [[nodiscard]] auto last_message() const noexcept -> std::string const& { return last_message_; }
 
     /// Send `request` (sequence `seq`), then hand each reply addressed to it, read into `buffer`,
     /// to `on_message` (message, type, flags) -> std::optional<Status> until that returns a result.
@@ -124,6 +158,28 @@ class Socket
     }
 
   private:
+    /// request() once built: `request` (sequence `seq`) sent, its replies to `on_reply` up to its end_status().
+    template <typename OnReply>
+    [[nodiscard]] auto exchange(
+        std::span<uint8_t const> const request, uint32_t const seq, std::span<uint8_t> const buffer, OnReply const& on_reply)
+        -> Status
+    {
+        if (!is_open()) {
+            return failure(std::make_error_code(std::errc::bad_file_descriptor));
+        }
+        return transact(
+            request,
+            seq,
+            buffer,
+            [&](std::span<uint8_t const> const message, uint16_t const type, uint16_t const flags) -> std::optional<Status> {
+                if (auto end = end_status(message, type, flags, request.size(), last_message_)) {
+                    return end;
+                }
+                auto status = on_reply(message, type);
+                return status ? std::nullopt : std::optional<Status>{status};
+            });
+    }
+
     [[nodiscard]] auto send(std::span<uint8_t const> request) noexcept -> Status;
     /// One datagram into `buffer`: timed_out after the receive timeout, message_size when it did not fit.
     [[nodiscard]] auto receive(std::span<uint8_t> buffer) noexcept -> StatusValue<std::span<uint8_t const>>;
@@ -150,6 +206,8 @@ class Socket
 
     FileDescriptor fd_{};
     uint32_t portid_{0};
+    uint32_t seq_{0};
+    std::string last_message_{};
 };
 
 }  // namespace statusbar::net::netlink

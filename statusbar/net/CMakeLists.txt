@@ -47,6 +47,7 @@ statusbar_add_module(
   net_linux_xdp_test.cpp
   net_netdev_features_test.cpp
   net_netdev_napi_test.cpp
+  net_netlink_test.cpp
   net_launch_order_test.cpp
   net_tc_launch_time_test.cpp
   net_tc_qdisc_test.cpp
