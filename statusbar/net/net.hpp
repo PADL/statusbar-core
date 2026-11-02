@@ -10,6 +10,7 @@
 /// It supports single-threaded, event-driven networking using poll().
 
 #include "statusbar/net/net_address.hpp"
+#include "statusbar/net/net_any_ethernet_port.hpp"
 #include "statusbar/net/net_bpf_port.hpp"
 #include "statusbar/net/net_cbpf_emit.hpp"
 #include "statusbar/net/net_compiled_rule.hpp"
@@ -21,6 +22,7 @@
 #include "statusbar/net/net_posix_util.hpp"
 #include "statusbar/net/net_raw_ethernet_pollable.hpp"
 #include "statusbar/net/net_rawnet.hpp"
+#include "statusbar/net/net_rawnet_port.hpp"
 #include "statusbar/net/net_ring_buffer_base.hpp"
 #include "statusbar/net/net_ring_queue_base.hpp"
 #include "statusbar/net/net_rss.hpp"

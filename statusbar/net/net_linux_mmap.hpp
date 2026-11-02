@@ -227,6 +227,9 @@ class MmapContext
     /// @param addr Multicast MAC address to join
     [[nodiscard]] auto join_multicast(ieee::Eui48 const& addr) -> Status;
 
+    /// Drop a multicast group membership taken with join_multicast().
+    [[nodiscard]] auto leave_multicast(ieee::Eui48 const& addr) -> Status;
+
     //
     // Per-cycle housekeeping
     //
@@ -331,6 +334,7 @@ class MmapContext
     }
     [[nodiscard]] auto rx_release(uint64_t) -> Status { return failure(MmapError::not_supported_on_platform); }
     [[nodiscard]] auto join_multicast(ieee::Eui48 const&) -> Status { return failure(MmapError::not_supported_on_platform); }
+    [[nodiscard]] auto leave_multicast(ieee::Eui48 const&) -> Status { return failure(MmapError::not_supported_on_platform); }
     void begin_cycle() noexcept {}
     [[nodiscard]] auto end_cycle() -> Status { return failure(MmapError::not_supported_on_platform); }
 };

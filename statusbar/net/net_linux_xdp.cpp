@@ -1659,14 +1659,15 @@ auto XdpContext::fill_replenish() -> Status
     return success();
 }
 
-auto XdpContext::join_multicast(ieee::Eui48 const& addr) -> Status
-{
-    if (xsk_ == nullptr) {
-        return failure(XdpError::not_open);
-    }
+namespace {
 
+// SIOCADDMULTI and SIOCDELMULTI take the same ifreq: the interface name
+// and the group as a hardware address. One routine for both, with the
+// request selecting the direction.
+auto change_multicast_membership(unsigned int const if_index, ieee::Eui48 const& addr, unsigned long const request) -> Status
+{
     struct ifreq ifr{};
-    if (::if_indextoname(interface_.index, ifr.ifr_name) == nullptr) {
+    if (::if_indextoname(if_index, ifr.ifr_name) == nullptr) {
         return failure(XdpError::interface_not_found);
     }
     span_copy(hwaddr_bytes(ifr), make_const_span(addr.value));
@@ -1678,11 +1679,29 @@ auto XdpContext::join_multicast(ieee::Eui48 const& addr) -> Status
     }
     auto close_sock = detail::scopeguard([&]() noexcept { ::close(sock_fd); });
 
-    if (::ioctl(sock_fd, SIOCADDMULTI, &ifr) < 0) {
+    if (::ioctl(sock_fd, request, &ifr) < 0) {
         return failure(XdpError::join_multicast_failed);
     }
 
     return success();
+}
+
+}  // namespace
+
+auto XdpContext::join_multicast(ieee::Eui48 const& addr) -> Status
+{
+    if (xsk_ == nullptr) {
+        return failure(XdpError::not_open);
+    }
+    return change_multicast_membership(interface_.index, addr, SIOCADDMULTI);
+}
+
+auto XdpContext::leave_multicast(ieee::Eui48 const& addr) -> Status
+{
+    if (xsk_ == nullptr) {
+        return failure(XdpError::not_open);
+    }
+    return change_multicast_membership(interface_.index, addr, SIOCDELMULTI);
 }
 
 #endif  // __linux__ && HAVE_XDP

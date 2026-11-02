@@ -423,6 +423,25 @@ auto MmapContext::join_multicast(ieee::Eui48 const& addr) -> Status
     return success();
 }
 
+auto MmapContext::leave_multicast(ieee::Eui48 const& addr) -> Status
+{
+    if (!valid()) {
+        return failure(MmapError::not_open);
+    }
+
+    struct packet_mreq mreq{};
+    mreq.mr_ifindex = static_cast<int>(if_index_);
+    mreq.mr_type = PACKET_MR_MULTICAST;
+    mreq.mr_alen = 6;
+    span_copy(std::span{mreq.mr_address}.first(6), make_const_span(addr.value));
+
+    if (::setsockopt(fd_, SOL_PACKET, PACKET_DROP_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+        return failure(MmapError::join_multicast_failed);
+    }
+
+    return success();
+}
+
 }  // namespace statusbar::net
 
 #endif  // __linux__

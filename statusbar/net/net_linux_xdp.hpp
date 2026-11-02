@@ -1733,6 +1733,9 @@ class XdpContext
     /// @param addr Multicast MAC address to join
     [[nodiscard]] auto join_multicast(ieee::Eui48 const& addr) -> Status;
 
+    /// Drop a NIC multicast filter entry added with join_multicast().
+    [[nodiscard]] auto leave_multicast(ieee::Eui48 const& addr) -> Status;
+
     /// The socket's counters, as of now. See XdpSocketStats on what a reader
     /// on another thread may and may not expect of them.
     [[nodiscard]] auto socket_stats() const noexcept -> XdpSocketStats const& { return stats_; }
@@ -1968,6 +1971,7 @@ class XdpContext
     }
 
     [[nodiscard]] auto join_multicast(ieee::Eui48 const&) -> Status { return failure(XdpError::not_supported_on_platform); }
+    [[nodiscard]] auto leave_multicast(ieee::Eui48 const&) -> Status { return failure(XdpError::not_supported_on_platform); }
 
     [[nodiscard]] auto socket_stats() const noexcept -> XdpSocketStats const& { return stats_; }
     [[nodiscard]] auto stats() const noexcept -> Stats const& { return stats_; }

@@ -6,6 +6,7 @@ statusbar_add_module(
   net
   SOURCES
   net_address.cpp
+  net_any_ethernet_port.cpp
   net_bpf_port.cpp
   net_error.cpp
   net_interface_info.cpp
@@ -13,6 +14,7 @@ statusbar_add_module(
   net_linux_xdp.cpp
   net_message_reactor.cpp
   net_rawnet.cpp
+  net_rawnet_port.cpp
   net_ring_buffer_base.cpp
   net_rss.cpp
   net_tap_bridge.cpp
@@ -32,6 +34,7 @@ statusbar_add_module(
   statusbar-status
   statusbar-itc
   TESTS
+  net_any_ethernet_port_test.cpp
   net_cbpf_emit_test.cpp
   net_rawnet_filter_test.cpp
   net_rawnet_test.cpp
