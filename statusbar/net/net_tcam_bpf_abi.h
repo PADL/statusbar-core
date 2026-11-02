@@ -43,9 +43,10 @@ enum
      * Keep in sync with statusbar::net::tcam_default_window_bytes. */
     TCAM_WINDOW_BYTES = 32,
 
-    /* Maximum number of rules the BPF program evaluates per frame.
+    /* Maximum number of rules the BPF program evaluates per frame; it
+     * stops at the first vacant slot, so a frame costs the active rules.
      * Matches statusbar::net::tcam_default_capacity. */
-    TCAM_MAX_RULES = 16,
+    TCAM_MAX_RULES = 32,
 
     /* xsk_map's capacity: one slot per NIC receive queue, keyed by
      * rx_queue_index. Part of the ABI because a pinned map is adopted
