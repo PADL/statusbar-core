@@ -469,7 +469,7 @@ auto TcClient::read_reply(
         return netlink::dump_status(message);
     }
     if (type == RTM_NEWQDISC && wanted != nullptr && !wanted->came && message.size() >= NLMSG_HEADER + TCMSG_SIZE) {
-        if (auto status = take_qdisc(message, *wanted); !status) {
+        if (auto status = parse_wanted_qdisc(message, *wanted); !status) {
             return status;
         }
         return std::nullopt;
@@ -480,7 +480,7 @@ auto TcClient::read_reply(
     return std::nullopt;
 }
 
-auto TcClient::take_qdisc(std::span<uint8_t const> const message, Wanted& wanted) -> Status
+auto TcClient::parse_wanted_qdisc(std::span<uint8_t const> const message, Wanted& wanted) -> Status
 {
     auto const ifindex = load<int32_t>(message, NLMSG_HEADER + offsetof(tcmsg, tcm_ifindex));
     auto const parent = load<uint32_t>(message, NLMSG_HEADER + offsetof(tcmsg, tcm_parent));

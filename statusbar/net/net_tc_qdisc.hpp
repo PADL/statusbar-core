@@ -285,7 +285,7 @@ class TcClient final : public TcControl
         std::span<uint8_t const> message, uint16_t type, uint16_t flags, size_t request_size, Wanted* wanted)
         -> std::optional<Status>;
     /// Parse a dump's RTM_NEWQDISC into @p wanted when it is the qdisc wanted (else ignore it).
-    [[nodiscard]] static auto take_qdisc(std::span<uint8_t const> message, Wanted& wanted) -> Status;
+    [[nodiscard]] static auto parse_wanted_qdisc(std::span<uint8_t const> message, Wanted& wanted) -> Status;
 
     netlink::Socket socket_{};
     uint32_t seq_{0};
