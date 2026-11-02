@@ -13,8 +13,10 @@
 #if defined(__linux__) && defined(HAVE_XDP)
 
 #    include "statusbar/net/net_compiled_rule.hpp"
+#    include "statusbar/net/net_linux_xdp.hpp"
 #    include "statusbar/net/net_tcam_bpf_abi.h"
 #    include "statusbar/net/net_tcam_classifier.hpp"
+#    include "statusbar/net/net_xdp_avtp_rules.hpp"
 
 #    include <unistd.h>
 
@@ -122,7 +124,7 @@ constexpr char const* NEEDS_PROGRAM_LOAD = "needs CAP_BPF, or the kernel refused
     for (std::uint32_t i = 0; i < TCAM_MAX_RULES; ++i) {
         CompiledRule<32> slot{};
         if (i < rules.size()) {
-            slot = rules[i];
+            slot = statusbar::net::detail::tcam_slot(rules[i]);  // as XdpProgram's installer writes it
         }
         if (::bpf_map_update_elem(rules_map_fd, &i, &slot, BPF_ANY) != 0) {
             return false;
@@ -215,6 +217,93 @@ TEST(xdp_equiv, bpf_matches_tcam_classifier)
         EXPECT_EQ(classifier_matched, c.expect_match);
         EXPECT_EQ(bpf_dropped, c.expect_match);
         EXPECT_EQ(classifier_matched, bpf_dropped);
+    }
+}
+
+TEST(xdp_equiv, avtp_stream_rules_match_in_bpf_as_in_the_classifier)
+{
+    struct rlimit const rlim = {.rlim_cur = RLIM_INFINITY, .rlim_max = RLIM_INFINITY};
+    (void)::setrlimit(RLIMIT_MEMLOCK, &rlim);
+
+    auto loaded = try_load_program();
+    if (loaded.prog_fd < 0) {
+        SKIP(NEEDS_PROGRAM_LOAD);
+    }
+    // The stream rules, with drop for a clean verdict (as above).
+    auto const rules = statusbar::net::avtp_stream_rules(flag::drop);
+    std::span<CompiledRule<32> const> const view{rules.data(), rules.size()};
+    EXPECT_TRUE(install_rules(loaded.rules_map_fd, view));
+    TcamClassifier<32> classifier;
+    classifier.set_rules(view);
+    for (bool const tagged : {false, true}) {
+        for (std::uint16_t subtype = 0; subtype < 0x100; ++subtype) {
+            auto frame = make_frame(tagged ? 0x8100 : 0x22F0);
+            std::size_t at = 14;
+            if (tagged) {
+                frame[14] = 0x60;
+                frame[15] = 0x02;
+                frame[16] = 0x22;
+                frame[17] = 0xF0;
+                at = 18;
+            }
+            frame[at] = static_cast<std::uint8_t>(subtype);
+            auto const span = std::span<std::uint8_t const>{frame};
+            bool const stream = subtype == 0x00 || subtype == 0x02 || subtype == 0x04;
+            EXPECT_EQ((classifier.classify_first(span) & flag::drop) != 0U, stream);
+            EXPECT_EQ(run_prog(loaded.prog_fd, span) == XDP_DROP, stream);
+        }
+    }
+}
+
+TEST(xdp_equiv, a_full_table_matches_in_its_last_slot_and_a_vacant_slot_ends_the_scan)
+{
+    struct rlimit const rlim = {.rlim_cur = RLIM_INFINITY, .rlim_max = RLIM_INFINITY};
+    (void)::setrlimit(RLIMIT_MEMLOCK, &rlim);
+
+    auto loaded = try_load_program();
+    if (loaded.prog_fd < 0) {
+        SKIP(NEEDS_PROGRAM_LOAD);
+    }
+    // Every slot an EtherType of its own, 0x9000 + i: a frame of the last one matches only the last slot.
+    std::array<CompiledRule<32>, TCAM_MAX_RULES> rules{};
+    for (std::uint16_t i = 0; i < TCAM_MAX_RULES; ++i) {
+        rules[i] = ClassifierRuleBuilder<32>{}.ethertype(0x9000 + i).vlan_untagged().result(flag::drop).build()[0];
+    }
+    auto const last = make_frame(0x9000 + TCAM_MAX_RULES - 1);
+    EXPECT_TRUE(install_rules(loaded.rules_map_fd, rules));
+    EXPECT_EQ(run_prog(loaded.prog_fd, last), std::uint32_t{XDP_DROP});
+    EXPECT_EQ(run_prog(loaded.prog_fd, make_frame(0x9000 + TCAM_MAX_RULES)), std::uint32_t{XDP_PASS});
+
+    // A vacant slot before it: the scan stops there, as the installer never leaves a hole.
+    std::uint32_t const hole = 4;
+    CompiledRule<32> const vacant{};
+    EXPECT_EQ(::bpf_map_update_elem(loaded.rules_map_fd, &hole, &vacant, BPF_ANY), 0);
+    EXPECT_EQ(run_prog(loaded.prog_fd, last), std::uint32_t{XDP_PASS});
+    EXPECT_EQ(run_prog(loaded.prog_fd, make_frame(0x9000 + 3)), std::uint32_t{XDP_DROP});
+}
+
+TEST(xdp_equiv, a_rule_for_any_frame_size_matches_in_bpf_as_in_the_classifier)
+{
+    struct rlimit const rlim = {.rlim_cur = RLIM_INFINITY, .rlim_max = RLIM_INFINITY};
+    (void)::setrlimit(RLIMIT_MEMLOCK, &rlim);
+
+    auto loaded = try_load_program();
+    if (loaded.prog_fd < 0) {
+        SKIP(NEEDS_PROGRAM_LOAD);
+    }
+    // Rule 0 built by hand with min_frame_size 0 (any frame), then a second rule after it.
+    auto any_size = ClassifierRuleBuilder<32>{}.ethertype(0x0800).vlan_untagged().result(flag::drop).build()[0];
+    any_size.min_frame_size = 0;
+    auto const second = ClassifierRuleBuilder<32>{}.ethertype(0x88F7).vlan_untagged().result(flag::drop).build()[0];
+    std::array<CompiledRule<32>, 2> const rules{any_size, second};
+    EXPECT_TRUE(install_rules(loaded.rules_map_fd, rules));
+    TcamClassifier<32> classifier;
+    classifier.set_rules(rules);
+    for (std::uint16_t const ethertype : {std::uint16_t{0x0800}, std::uint16_t{0x88F7}, std::uint16_t{0x86DD}}) {
+        auto const frame = make_frame(ethertype);
+        bool const classifier_matched = (classifier.classify_first(frame) & flag::drop) != 0U;
+        EXPECT_EQ(run_prog(loaded.prog_fd, frame) == XDP_DROP, classifier_matched);
+        EXPECT_EQ(classifier_matched, ethertype != 0x86DD);
     }
 }
 
