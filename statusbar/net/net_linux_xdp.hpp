@@ -575,6 +575,14 @@ class TxProgress
     TxRingState last_{};
 };
 
+/// `rule` as a BPF rules_map slot: there min_frame_size 0 ends the table, while TcamClassifier matches any
+/// frame of the window, so 0 becomes the window's size (shorter frames are passed before any rule).
+[[nodiscard]] constexpr auto tcam_slot(CompiledRule<32> rule) noexcept -> CompiledRule<32>
+{
+    rule.min_frame_size = rule.min_frame_size == 0 ? std::uint16_t{TCAM_WINDOW_BYTES} : rule.min_frame_size;
+    return rule;
+}
+
 /// The XDP_FLAGS_* mode bit for an attach mode.
 /// @param mode Attach mode
 [[nodiscard]] constexpr auto xdp_attach_flags(XdpAttachMode mode) noexcept -> uint32_t
@@ -959,6 +967,13 @@ class XdpProgram
     };
 
     [[nodiscard]] auto install_tcam_rules(std::span<CompiledRule<32> const> rules) -> Status;
+    /// `rules` (as detail::tcam_slot()) then `catch_all` into slots 0..N-1: N.
+    [[nodiscard]] auto write_tcam_rules(std::span<CompiledRule<32> const> rules, std::optional<CompiledRule<32>> const& catch_all)
+        -> StatusValue<std::uint32_t>;
+    /// Zero the slots from `from` on: the BPF program stops at the first.
+    [[nodiscard]] auto clear_tcam_slots(std::uint32_t from) -> Status;
+    /// Write one rules_map slot. Errors: bpf_map_update_failed.
+    [[nodiscard]] auto write_tcam_slot(std::uint32_t index, CompiledRule<32> const& rule) -> Status;
     /// open() after its reset: query, load, then adopt or attach; the caller closes on failure.
     [[nodiscard]] auto adopt_or_attach(unsigned int if_index, Options const& options) -> Status;
     /// Load the built-in program and take its fds.

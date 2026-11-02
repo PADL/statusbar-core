@@ -216,6 +216,16 @@ TEST(TxProgress, a_busy_polled_queue_that_makes_no_progress_between_flushes_is_k
     EXPECT_FALSE(progress.stalled(TxRingState{.pending = 1, .progress = 18}));  // nothing was left last time
 }
 
+TEST(xdp_config, a_rule_for_any_frame_size_does_not_end_the_bpf_table)
+{
+    CompiledRule<32> rule{};
+    rule.result_flags = flag::process;
+    EXPECT_EQ(detail::tcam_slot(rule).min_frame_size, std::uint16_t{TCAM_WINDOW_BYTES});
+    EXPECT_EQ(detail::tcam_slot(rule).result_flags, rule.result_flags);
+    rule.min_frame_size = 60;
+    EXPECT_EQ(detail::tcam_slot(rule).min_frame_size, std::uint16_t{60});
+}
+
 TEST(xdp_config, attach_flags)
 {
     EXPECT_EQ(detail::xdp_attach_flags(XdpAttachMode::native), static_cast<uint32_t>(XDP_FLAGS_DRV_MODE));

@@ -13,6 +13,7 @@
 #if defined(__linux__) && defined(HAVE_XDP)
 
 #    include "statusbar/net/net_compiled_rule.hpp"
+#    include "statusbar/net/net_linux_xdp.hpp"
 #    include "statusbar/net/net_tcam_bpf_abi.h"
 #    include "statusbar/net/net_tcam_classifier.hpp"
 #    include "statusbar/net/net_xdp_avtp_rules.hpp"
@@ -117,7 +118,7 @@ struct LoadedProgram
     for (std::uint32_t i = 0; i < TCAM_MAX_RULES; ++i) {
         CompiledRule<32> slot{};
         if (i < rules.size()) {
-            slot = rules[i];
+            slot = statusbar::net::detail::tcam_slot(rules[i]);  // as XdpProgram's installer writes it
         }
         if (::bpf_map_update_elem(rules_map_fd, &i, &slot, BPF_ANY) != 0) {
             return false;
@@ -280,6 +281,31 @@ TEST(xdp_equiv, a_full_table_matches_in_its_last_slot_and_a_vacant_slot_ends_the
     EXPECT_EQ(::bpf_map_update_elem(loaded.rules_map_fd, &hole, &vacant, BPF_ANY), 0);
     EXPECT_EQ(run_prog(loaded.prog_fd, last), std::uint32_t{XDP_PASS});
     EXPECT_EQ(run_prog(loaded.prog_fd, make_frame(0x9000 + 3)), std::uint32_t{XDP_DROP});
+}
+
+TEST(xdp_equiv, a_rule_for_any_frame_size_matches_in_bpf_as_in_the_classifier)
+{
+    struct rlimit const rlim = {.rlim_cur = RLIM_INFINITY, .rlim_max = RLIM_INFINITY};
+    (void)::setrlimit(RLIMIT_MEMLOCK, &rlim);
+
+    auto loaded = try_load_program();
+    if (loaded.prog_fd < 0) {
+        return;
+    }
+    // Rule 0 built by hand with min_frame_size 0 (any frame), then a second rule after it.
+    auto any_size = ClassifierRuleBuilder<32>{}.ethertype(0x0800).vlan_untagged().result(flag::drop).build()[0];
+    any_size.min_frame_size = 0;
+    auto const second = ClassifierRuleBuilder<32>{}.ethertype(0x88F7).vlan_untagged().result(flag::drop).build()[0];
+    std::array<CompiledRule<32>, 2> const rules{any_size, second};
+    EXPECT_TRUE(install_rules(loaded.rules_map_fd, rules));
+    TcamClassifier<32> classifier;
+    classifier.set_rules(rules);
+    for (std::uint16_t const ethertype : {std::uint16_t{0x0800}, std::uint16_t{0x88F7}, std::uint16_t{0x86DD}}) {
+        auto const frame = make_frame(ethertype);
+        bool const classifier_matched = (classifier.classify_first(frame) & flag::drop) != 0U;
+        EXPECT_EQ(run_prog(loaded.prog_fd, frame) == XDP_DROP, classifier_matched);
+        EXPECT_EQ(classifier_matched, ethertype != 0x86DD);
+    }
 }
 
 TEST(xdp_equiv, short_frame_passes)
