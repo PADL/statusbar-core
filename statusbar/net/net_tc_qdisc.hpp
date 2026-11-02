@@ -203,12 +203,10 @@ class TcClient final : public TcControl
     [[nodiscard]] auto remove(int ifindex, uint32_t handle, uint32_t parent) -> Status override;
     [[nodiscard]] auto get(int ifindex, uint32_t parent) -> StatusValue<QdiscInfo> override;
 
-    [[nodiscard]] auto last_message() const noexcept -> std::string const& override { return last_message_; }
+    [[nodiscard]] auto last_message() const noexcept -> std::string const& override { return socket_.last_message(); }
 
-    /// Send one other rtnetlink request that the kernel acknowledges (e.g.
-    /// net_vlan_link's RTM_NEWLINK / RTM_DELLINK), built by @p build (out,
-    /// seq) -> StatusValue<size_t> into a RequestBuffer under the next
-    /// sequence number. Errors: the builder's, or the kernel's errno.
+    /// Send one other rtnetlink request that the kernel acknowledges (e.g. net_vlan_link's RTM_NEWLINK),
+    /// built by @p build (out, seq) -> StatusValue<size_t>. Errors: the builder's, or the kernel's errno.
     template <typename Build>
     [[nodiscard]] auto request(Build const& build) -> Status
     {
@@ -216,8 +214,6 @@ class TcClient final : public TcControl
     }
 
   private:
-    /// Build one request with @p build (out, seq) -> StatusValue<size_t> under
-    /// the next sequence number and transact it.
     /// What a dump looks for: the qdisc of @p ifindex on @p parent.
     struct Wanted
     {
@@ -227,34 +223,17 @@ class TcClient final : public TcControl
         bool came{false};
     };
 
+    /// Socket::request() of @p build, a request the kernel only acknowledges.
     template <typename Build>
-    [[nodiscard]] auto send(Build const& build, Wanted* wanted = nullptr) -> Status
+    [[nodiscard]] auto send(Build const& build) -> Status
     {
-        RequestBuffer request{};
-        uint32_t const seq = ++seq_;
-        auto const length = build(std::span<uint8_t>{request}, seq);
-        if (!length) {
-            return failure(length.error());
-        }
-        return transact(std::span<uint8_t const>{request.data(), *length}, seq, wanted);
+        return socket_.request(reply_, build);
     }
 
-    /// Send @p request (sequence number @p seq) and wait for its NLMSG_ERROR;
-    /// with @p wanted, @p request is a dump: read its parts up to NLMSG_DONE,
-    /// parsing the wanted qdisc. Only messages addressed to this socket
-    /// (nlmsg_pid, our port id) under @p seq count.
-    [[nodiscard]] auto transact(std::span<uint8_t const> request, uint32_t seq, Wanted* wanted) -> Status;
-    /// One message addressed to this transaction, of nlmsg_type @p type and
-    /// nlmsg_flags @p flags: its result if it ends the transaction, else nullopt.
-    [[nodiscard]] auto read_reply(
-        std::span<uint8_t const> message, uint16_t type, uint16_t flags, size_t request_size, Wanted* wanted)
-        -> std::optional<Status>;
     /// Parse a dump's RTM_NEWQDISC into @p wanted when it is the qdisc wanted (else ignore it).
     [[nodiscard]] static auto parse_wanted_qdisc(std::span<uint8_t const> message, Wanted& wanted) -> Status;
 
     netlink::Socket socket_{};
-    uint32_t seq_{0};
-    std::string last_message_{};
     /// A dump part is at most the larger of a page and the buffer read with (netlink_dump's
     /// alloc_min_size). 32 KiB in the object: hosts hold the client on the heap.
     std::array<uint8_t, 32768> reply_{};

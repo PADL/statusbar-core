@@ -437,47 +437,17 @@ auto TcClient::get(int const ifindex, uint32_t const parent) -> StatusValue<Qdis
 {
     QdiscInfo info{};
     Wanted wanted{.ifindex = ifindex, .parent = parent, .found = &info};
-    if (auto status = send([&](std::span<uint8_t> out, uint32_t seq) { return build_dump(out, ifindex, seq); }, &wanted); !status) {
-        return failure(status.error());
-    }
-    if (!wanted.came) {
-        return failure(std::make_error_code(std::errc::no_such_file_or_directory));
+    auto const status = socket_.request(
+        reply_,
+        [&](std::span<uint8_t> out, uint32_t seq) { return build_dump(out, ifindex, seq); },
+        [&](std::span<uint8_t const> const message, uint16_t const type) -> Status {
+            bool const candidate = type == RTM_NEWQDISC && !wanted.came && message.size() >= NLMSG_HEADER + TCMSG_SIZE;
+            return candidate ? parse_wanted_qdisc(message, wanted) : success();
+        });
+    if (!status || !wanted.came) {
+        return failure(status ? std::make_error_code(std::errc::no_such_file_or_directory) : status.error());
     }
     return info;
-}
-
-auto TcClient::transact(std::span<uint8_t const> const request, uint32_t const seq, Wanted* const wanted) -> Status
-{
-    last_message_.clear();
-    if (!socket_.is_open()) {
-        return failure(std::make_error_code(std::errc::bad_file_descriptor));
-    }
-    return socket_.transact(
-        request, seq, reply_, [&](std::span<uint8_t const> const message, uint16_t const type, uint16_t const flags) {
-            return read_reply(message, type, flags, request.size(), wanted);
-        });
-}
-
-auto TcClient::read_reply(
-    std::span<uint8_t const> const message,
-    uint16_t const type,
-    uint16_t const flags,
-    size_t const request_size,
-    Wanted* const wanted) -> std::optional<Status>
-{
-    if (type == NLMSG_DONE && wanted != nullptr) {
-        return netlink::dump_status(message);
-    }
-    if (type == RTM_NEWQDISC && wanted != nullptr && !wanted->came && message.size() >= NLMSG_HEADER + TCMSG_SIZE) {
-        if (auto status = parse_wanted_qdisc(message, *wanted); !status) {
-            return status;
-        }
-        return std::nullopt;
-    }
-    if (type == NLMSG_ERROR) {
-        return netlink::ack_status(message, flags, request_size, last_message_);
-    }
-    return std::nullopt;
 }
 
 auto TcClient::parse_wanted_qdisc(std::span<uint8_t const> const message, Wanted& wanted) -> Status
