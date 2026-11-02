@@ -1172,6 +1172,12 @@ class UmemRegion
         RingSet& rings,
         size_t tx_metadata_len = 0) -> StatusValue<struct xsk_umem*>;
 
+    /// A fresh UMEM over the same area, for a bind retried after EBUSY: a failed bind leaves the
+    /// first UMEM's fill and completion rings set up on its descriptor, which refuses them again.
+    /// @p rings is reset and refilled.
+    [[nodiscard]] auto reregister(size_t fill_ring_size, size_t comp_ring_size, RingSet& rings) noexcept
+        -> StatusValue<struct xsk_umem*>;
+
     /// Where the TX metadata of the frame at `addr` lives: the bytes
     /// immediately below the descriptor address, which is `addr + headroom`.
     /// Empty when the UMEM carries no metadata, or the headroom cannot hold
