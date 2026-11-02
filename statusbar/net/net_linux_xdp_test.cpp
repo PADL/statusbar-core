@@ -163,6 +163,45 @@ TEST(xdp_config, transient_kick_errors)
     EXPECT_FALSE(detail::is_transient_kick_error(ENXIO));
 }
 
+TEST(xdp_config, a_kick_is_made_only_for_pending_frames_the_kernel_waits_on)
+{
+    // pending, need_wakeup, ring asks, zero-copy, NAPI busy polls
+    EXPECT_FALSE(detail::tx_kick_needed(0, false, true, false, false));
+    EXPECT_TRUE(detail::tx_kick_needed(1, false, false, false, false));
+    EXPECT_FALSE(detail::tx_kick_needed(1, true, false, false, false));
+    EXPECT_TRUE(detail::tx_kick_needed(1, true, true, false, false));
+    EXPECT_TRUE(detail::tx_kick_needed(1, true, true, true, false));
+}
+
+TEST(xdp_config, a_busy_polled_zero_copy_queue_needs_no_kick)
+{
+    EXPECT_FALSE(detail::tx_kick_needed(4, true, true, true, true));
+    EXPECT_FALSE(detail::tx_kick_needed(4, false, false, true, true));
+    // Copy mode sends from the kick itself (the generic xmit path), busy poll or not.
+    EXPECT_TRUE(detail::tx_kick_needed(4, true, true, false, true));
+    EXPECT_TRUE(detail::tx_kick_needed(4, false, false, false, true));
+}
+
+TEST(xdp_config, busy_poll_skips_kicks_only_after_one_has_scheduled_the_kthread)
+{
+    detail::NapiBusyPoll napi;
+    EXPECT_FALSE(napi.on() || napi.polling());
+    napi.kicked();
+    EXPECT_FALSE(napi.polling());  // off stays off
+    napi.set(true);
+    EXPECT_TRUE(napi.on() && !napi.polling());  // armed: the kthread sleeps until scheduled
+    napi.kicked();
+    EXPECT_TRUE(napi.polling());
+    napi.set(true);
+    EXPECT_FALSE(napi.polling());  // applied again (a reset): one more kick owed
+    napi.kicked();
+    detail::NapiBusyPoll other;
+    napi.swap(other);
+    EXPECT_TRUE(other.polling() && !napi.on());
+    other.set(false);
+    EXPECT_FALSE(other.on() || other.polling());
+}
+
 TEST(xdp_config, attach_flags)
 {
     EXPECT_EQ(detail::xdp_attach_flags(XdpAttachMode::native), static_cast<uint32_t>(XDP_FLAGS_DRV_MODE));

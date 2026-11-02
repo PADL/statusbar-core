@@ -20,7 +20,7 @@
 namespace statusbar::net::netdev {
 
 // The layouts the builders write field by field, and the constants mirrored from the uapi.
-static_assert(sizeof(genlmsghdr) == 4);
+static_assert(sizeof(genlmsghdr) == 4 && GENL_HEADER == NLMSG_HDRLEN + GENL_HDRLEN);
 static_assert(GENL_CONTROLLER_ID == GENL_ID_CTRL && CTRL_GETFAMILY == CTRL_CMD_GETFAMILY && CTRL_NEWFAMILY == CTRL_CMD_NEWFAMILY);
 static_assert(CTRL_FAMILY_ID == CTRL_ATTR_FAMILY_ID && CTRL_FAMILY_NAME == CTRL_ATTR_FAMILY_NAME);
 #    if __has_include(<linux/netdev.h>)  // 6.3+
@@ -44,11 +44,27 @@ using netlink::bad_message;
 using netlink::load;
 using netlink::walk_attributes;
 
-constexpr size_t GENL_HEADER = netlink::MESSAGE_HEADER + sizeof(genlmsghdr);
 constexpr size_t NLA_HEADER = netlink::ATTRIBUTE_HEADER;
 constexpr uint16_t REQUEST_FLAGS = NLM_F_REQUEST | NLM_F_ACK;
 /// GENL_NAMSIZ less its NUL.
 constexpr size_t MAX_FAMILY_NAME = GENL_NAMSIZ - 1;
+
+/// A fixed-size attribute's value into `out`; bad_message when its payload is another size.
+template <typename T>
+[[nodiscard]] auto parse_scalar(std::span<uint8_t const> const payload, T& out) -> Status
+{
+    if (payload.size() != sizeof(T)) {
+        return failure(bad_message());
+    }
+    out = load<T>(payload, 0);
+    return success();
+}
+
+}  // namespace
+
+//
+// Generic netlink framing
+//
 
 void put_genl_header(
     BufferSerializerBuilder& b,
@@ -67,8 +83,7 @@ void put_attribute_header(BufferSerializerBuilder& b, size_t const payload, uint
     b.append(static_cast<uint16_t>(NLA_HEADER + payload)).append(type);
 }
 
-/// The attributes of a generic netlink message of nlmsg_type `type` and command `cmd`.
-[[nodiscard]] auto genl_attributes(std::span<uint8_t const> const message, uint16_t const type, uint8_t const cmd)
+auto genl_attributes(std::span<uint8_t const> const message, uint16_t const type, uint8_t const cmd)
     -> StatusValue<std::span<uint8_t const>>
 {
     if (message.size() < GENL_HEADER) {
@@ -81,19 +96,6 @@ void put_attribute_header(BufferSerializerBuilder& b, size_t const payload, uint
     }
     return message.subspan(GENL_HEADER, length - GENL_HEADER);
 }
-
-/// A fixed-size attribute's value into `out`; bad_message when its payload is another size.
-template <typename T>
-[[nodiscard]] auto take_scalar(std::span<uint8_t const> const payload, T& out) -> Status
-{
-    if (payload.size() != sizeof(T)) {
-        return failure(bad_message());
-    }
-    out = load<T>(payload, 0);
-    return success();
-}
-
-}  // namespace
 
 //
 // Builders and parsers
@@ -138,7 +140,7 @@ auto parse_family_id(std::span<uint8_t const> const message) -> StatusValue<uint
     auto const status =
         genl_attributes(message, GENL_CONTROLLER_ID, CTRL_NEWFAMILY).and_then([&](std::span<uint8_t const> const attributes) {
             return walk_attributes(attributes, [&](uint16_t const type, std::span<uint8_t const> const payload) -> Status {
-                return (type & netlink::ATTRIBUTE_TYPE_MASK) == CTRL_FAMILY_ID ? take_scalar(payload, id.emplace()) : success();
+                return (type & netlink::ATTRIBUTE_TYPE_MASK) == CTRL_FAMILY_ID ? parse_scalar(payload, id.emplace()) : success();
             });
         });
     if (!status || !id) {
@@ -155,11 +157,11 @@ auto parse_dev(std::span<uint8_t const> const message, uint16_t const family_id)
         return walk_attributes(attributes, [&](uint16_t const type, std::span<uint8_t const> const payload) -> Status {
             switch (type & netlink::ATTRIBUTE_TYPE_MASK) {
                 case DEV_IFINDEX:
-                    return take_scalar(payload, ifindex.emplace());
+                    return parse_scalar(payload, ifindex.emplace());
                 case DEV_XDP_FEATURES:
-                    return take_scalar(payload, device.xdp_features);
+                    return parse_scalar(payload, device.xdp_features);
                 case DEV_XSK_FEATURES:
-                    return take_scalar(payload, device.xsk.flags);
+                    return parse_scalar(payload, device.xsk.flags);
                 default:
                     return success();
             }
@@ -239,10 +241,10 @@ auto NetdevClient::read_reply(
     if (type != wanted.type) {
         return std::nullopt;
     }
-    auto const taken = wanted.type == GENL_CONTROLLER_ID
+    auto const parsed = wanted.type == GENL_CONTROLLER_ID
         ? parse_family_id(message).transform([&](uint16_t const id) { wanted.family_id = id; })
         : parse_dev(message, wanted.type).transform([&](DeviceFeatures const& device) { wanted.device = device; });
-    return taken ? std::nullopt : std::optional<Status>{taken};
+    return parsed ? std::nullopt : std::optional<Status>{parsed};
 }
 
 auto query_xsk_features(int const ifindex) -> StatusValue<XskFeatures>

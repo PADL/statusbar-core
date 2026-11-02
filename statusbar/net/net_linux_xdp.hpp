@@ -51,6 +51,7 @@ extern unsigned int const xdp_filter_bpf_o_len;
 #include "statusbar/status/throw_or_abort.hpp"
 
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -510,6 +511,44 @@ struct CycleBudget
     return error == EAGAIN || error == EWOULDBLOCK || error == EBUSY || error == ENOBUFS || error == ENETDOWN;
 }
 
+/// Whether tx_flush() must kick for `pending` unsent descriptors: not under need_wakeup until the ring asks,
+/// nor in zero-copy mode while the queue's NAPI kthread busy polls (NapiBusyPoll::polling()), sending unkicked.
+[[nodiscard]] constexpr auto tx_kick_needed(
+    uint32_t pending, bool need_wakeup, bool ring_needs_wakeup, bool zero_copy, bool napi_polling) noexcept -> bool
+{
+    if (pending == 0 || (zero_copy && napi_polling)) {
+        return false;
+    }
+    return !need_wakeup || ring_needs_wakeup;
+}
+
+/// A queue's threaded busy poll as its socket sees it: off; armed (set, but the kthread sleeps until an
+/// interrupt or a kick schedules it); polling (a kick made since). Relaxed atomic: set from any thread.
+class NapiBusyPoll
+{
+  public:
+    void set(bool const on) noexcept { state_.store(on ? ARMED : OFF, std::memory_order_relaxed); }
+    [[nodiscard]] auto on() const noexcept -> bool { return state_.load(std::memory_order_relaxed) != OFF; }
+    [[nodiscard]] auto polling() const noexcept -> bool { return state_.load(std::memory_order_relaxed) == POLLING; }
+    /// A kick was made: an armed queue's kthread is scheduled, and polls from now on.
+    void kicked() noexcept
+    {
+        uint8_t armed = ARMED;
+        (void)state_.compare_exchange_strong(armed, POLLING, std::memory_order_relaxed);
+    }
+    void swap(NapiBusyPoll& other) noexcept
+    {
+        state_.store(
+            other.state_.exchange(state_.load(std::memory_order_relaxed), std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+
+  private:
+    static constexpr uint8_t OFF = 0;
+    static constexpr uint8_t ARMED = 1;
+    static constexpr uint8_t POLLING = 2;
+    std::atomic<uint8_t> state_{OFF};
+};
+
 /// The XDP_FLAGS_* mode bit for an attach mode.
 /// @param mode Attach mode
 [[nodiscard]] constexpr auto xdp_attach_flags(XdpAttachMode mode) noexcept -> uint32_t
@@ -953,6 +992,10 @@ class XdpSocket
     [[nodiscard]] auto bind_mode() const noexcept -> XdpBindMode { return bind_mode_; }
     /// True when the UMEM reserves TX metadata (XdpConfig::tx_launch_time).
     [[nodiscard]] auto tx_launch_time() const noexcept -> bool { return umem_.tx_metadata_len() != 0; }
+    /// The queue's NAPI busy polls from its kthread (Documentation/networking/napi.rst): in zero-copy mode
+    /// tx_flush() skips its kicks once one more has scheduled the kthread. Any thread; close() clears it.
+    void set_napi_busy_poll(bool const on) noexcept { napi_busy_poll_.set(on); }
+    [[nodiscard]] auto napi_busy_poll() const noexcept -> bool { return napi_busy_poll_.on(); }
 
     void begin_cycle() noexcept { budget_.rx_cycle_count = 0; }
 
@@ -992,9 +1035,8 @@ class XdpSocket
         return success();
     }
 
-    /// One sendto() kick, skipped when the ring is drained or no wakeup is
-    /// asked for. Transient errors are counted, not failures; the rest fail
-    /// (tx_flush_failed, tx_flush_errno).
+    /// One sendto() kick, skipped when detail::tx_kick_needed() says so. Transient
+    /// errors are counted, not failures; the rest fail (tx_flush_failed, tx_flush_errno).
     [[nodiscard]] auto tx_flush() -> Status;
 
     [[nodiscard]] auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>>;
@@ -1026,9 +1068,14 @@ class XdpSocket
         -> StatusValue<bool>;
     /// Record what the bind obtained (mode, wakeup, zero-copy) and the cycle budget.
     void record_bind(XdpConfig const& config, XdpAttachMode attached) noexcept;
+    /// TX descriptors the kernel has not consumed yet (copy mode sends at most a batch per kick,
+    /// so some may be left from the last one).
+    [[nodiscard]] auto tx_pending() const noexcept -> uint32_t;
+    /// One sendto() kick, counted; transient refusals are not failures.
+    [[nodiscard]] auto kick() -> Status;
 
     void swap(XdpSocket& other) noexcept
-    {
+    {  // NOLINT(statusbar-block-statements): every field swapped
         std::swap(xsk_, other.xsk_);
         std::swap(umem_, other.umem_);
         std::swap(rings_, other.rings_);
@@ -1037,6 +1084,7 @@ class XdpSocket
         std::swap(bind_mode_, other.bind_mode_);
         std::swap(zero_copy_, other.zero_copy_);
         std::swap(need_wakeup_, other.need_wakeup_);
+        napi_busy_poll_.swap(other.napi_busy_poll_);
     }
 
     struct xsk_socket* xsk_{nullptr};
@@ -1047,6 +1095,7 @@ class XdpSocket
     XdpBindMode bind_mode_{XdpBindMode::auto_};
     bool zero_copy_{false};
     bool need_wakeup_{false};
+    detail::NapiBusyPoll napi_busy_poll_;
 };
 
 /// One XdpProgram and one XdpSocket on one interface queue: the EthernetPort
@@ -1097,6 +1146,9 @@ class XdpContext
     [[nodiscard]] auto adopted() const noexcept -> bool { return program_.adopted(); }
     /// True when tx_start() carries launch times (XdpConfig::tx_launch_time).
     [[nodiscard]] auto tx_launch_time() const noexcept -> bool { return socket_.tx_launch_time(); }
+    /// XdpSocket::set_napi_busy_poll(): the queue's NAPI busy polls, so zero-copy TX needs no kick.
+    void set_napi_busy_poll(bool const on) noexcept { socket_.set_napi_busy_poll(on); }
+    [[nodiscard]] auto napi_busy_poll() const noexcept -> bool { return socket_.napi_busy_poll(); }
     /// Whether the driver honours AF_XDP launch times (netdev xsk-features tx-launch-time-fifo):
     /// one generic netlink query; not_open when closed. The queue also needs an offloaded ETF qdisc.
     [[nodiscard]] auto launch_time_supported() const -> StatusValue<bool>;
@@ -1267,6 +1319,8 @@ class XdpContext
     [[nodiscard]] auto attach_mode() const noexcept -> XdpAttachMode { return XdpAttachMode::native; }
     [[nodiscard]] auto adopted() const noexcept -> bool { return false; }
     [[nodiscard]] auto tx_launch_time() const noexcept -> bool { return false; }
+    void set_napi_busy_poll(bool /*on*/) noexcept {}
+    [[nodiscard]] auto napi_busy_poll() const noexcept -> bool { return false; }
     [[nodiscard]] auto launch_time_supported() const -> StatusValue<bool> { return failure(XdpError::not_supported_on_platform); }
     [[nodiscard]] auto program() const noexcept -> XdpProgram const&
     {

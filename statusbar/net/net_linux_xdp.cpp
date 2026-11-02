@@ -746,7 +746,7 @@ void XdpSocket::record_bind(XdpConfig const& config, XdpAttachMode const attache
 }
 
 void XdpSocket::close() noexcept
-{
+{  // NOLINT(statusbar-block-statements): every field reset
     if (xsk_ != nullptr) {
         xsk_socket__delete(xsk_);
         xsk_ = nullptr;
@@ -758,6 +758,7 @@ void XdpSocket::close() noexcept
     bind_mode_ = XdpBindMode::auto_;
     zero_copy_ = false;
     need_wakeup_ = false;
+    set_napi_busy_poll(false);
 }
 
 auto XdpSocket::tx_commit(uint64_t handle, size_t frame_length) -> Status
@@ -778,26 +779,37 @@ auto XdpSocket::tx_commit(uint64_t handle, size_t frame_length) -> Status
     return success();
 }
 
+auto XdpSocket::tx_pending() const noexcept -> uint32_t
+{
+    return *rings_.tx.producer - __atomic_load_n(rings_.tx.consumer, __ATOMIC_ACQUIRE);
+}
+
 auto XdpSocket::tx_flush() -> Status
 {
     if (xsk_ == nullptr) {
         return failure(XdpError::not_open);
     }
-    // Descriptors the kernel has not consumed yet (copy mode sends at most a
-    // batch per kick, so some may be left from the last one).
-    if (*rings_.tx.producer - __atomic_load_n(rings_.tx.consumer, __ATOMIC_ACQUIRE) == 0 ||
-        (need_wakeup_ && xsk_ring_prod__needs_wakeup(&rings_.tx) == 0)) {
+    if (!detail::tx_kick_needed(
+            tx_pending(), need_wakeup_, xsk_ring_prod__needs_wakeup(&rings_.tx) != 0, zero_copy_, napi_busy_poll_.polling())) {
         ++stats_.tx_flush_skipped;
         return success();
     }
+    return kick();
+}
+
+auto XdpSocket::kick() -> Status
+{
     ++stats_.tx_flush_count;
     auto const ret = ::sendto(xsk_socket__fd(xsk_), nullptr, 0, MSG_DONTWAIT, nullptr, 0);
-    if (ret < 0 && detail::is_transient_kick_error(errno)) {
-        ++stats_.tx_flush_transient;
-    } else if (ret < 0) {
+    if (ret < 0 && !detail::is_transient_kick_error(errno)) {
         ++stats_.tx_flush_failed;
         stats_.tx_flush_errno = errno;
         return failure(XdpError::tx_flush_failed);
+    }
+    if (ret < 0) {
+        ++stats_.tx_flush_transient;  // ENETDOWN and the like wake nothing
+    } else {
+        napi_busy_poll_.kicked();
     }
     return success();
 }
