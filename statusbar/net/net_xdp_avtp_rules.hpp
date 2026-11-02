@@ -1,6 +1,6 @@
 #pragma once
 
-// Copyright 2026 PADL Software Pty Ltd
+// Copyright 2026 Jeff Koftinoff <jeff.koftinoff@statusbar.com>
 // SPDX-License-Identifier: MIT
 
 /// XDP filter rules for AVTP stream data (IEC 61883/IIDC, AAF, CRF; untagged

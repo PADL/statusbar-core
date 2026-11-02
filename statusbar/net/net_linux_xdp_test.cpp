@@ -1263,7 +1263,7 @@ TEST(xdp_integration, a_pinned_native_program_is_kept_adopted_and_replaced)
     attached = attached_program();
     EXPECT_TRUE(attached && attached->prog_id == replaced_id);
 
-    // The explicit detach (mediabridged --xdp-detach) removes program and pins.
+    // An explicit XdpProgram::detach (an operator's teardown) removes program and pins.
     EXPECT_TRUE(XdpProgram::detach(Veth::index(), TEST_PIN).has_value());
     EXPECT_FALSE(attached_program().has_value());
     EXPECT_FALSE(pinned(XdpProgram::PIN_PROG));
