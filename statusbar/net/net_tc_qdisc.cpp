@@ -975,6 +975,40 @@ auto TcClient::get(int ifindex, std::uint32_t parent) -> StatusValue<QdiscInfo>
     return dump_and_find({request.data(), *length}, ifindex, parent);
 }
 
+auto find_qdisc(TcControl& tc, int const ifindex, std::uint32_t const parent) -> StatusValue<std::optional<QdiscInfo>>
+{
+    auto const info = tc.get(ifindex, parent);
+    if (info) {
+        return std::optional<QdiscInfo>{*info};
+    }
+    if (info.error() == make_error_code(NetError::invalid_handle)) {
+        return std::optional<QdiscInfo>{};
+    }
+    return forward_failure(info);
+}
+
+auto remove_own_mqprio_root(TcControl& tc, int const ifindex, std::uint16_t const major) -> StatusValue<bool>
+{
+    if (major == 0) {
+        return false;
+    }
+    return find_qdisc(tc, ifindex, ROOT).and_then([&](std::optional<QdiscInfo> const& root) -> StatusValue<bool> {
+        if (!root || root->handle != make_handle(major, 0) || root->kind_name() != "mqprio") {
+            return false;
+        }
+        return tc.remove(ifindex, root->handle, ROOT).transform([] { return true; });
+    });
+}
+
+auto remove_other_tc_root(TcControl& tc, int const ifindex, QdiscInfo const& root, std::uint16_t const major) -> StatusValue<bool>
+{
+    bool const sets_tcs = root.kind_name() == "mqprio" || root.kind_name() == "taprio";
+    if (!sets_tcs || root.handle == 0 || root.handle == make_handle(major, 0)) {
+        return false;
+    }
+    return tc.remove(ifindex, root.handle, ROOT).transform([] { return true; });
+}
+
 }  // namespace statusbar::net::tc
 
 #endif  // __linux__
