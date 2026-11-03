@@ -6,6 +6,7 @@
 #if defined(__linux__)
 
 #    include "statusbar/buffer/file_descriptor.hpp"
+#    include "statusbar/net/net_netlink.hpp"
 
 #    include <unistd.h>
 
@@ -36,6 +37,7 @@ static_assert(RTATTR_SIZE == 4, "rtattr layout changed");
 static_assert(sizeof(tc_mqprio_qopt) == 82, "tc_mqprio_qopt layout changed");
 static_assert(sizeof(tc_cbs_qopt) == 20, "tc_cbs_qopt layout changed");
 static_assert(sizeof(tc_etf_qopt) == 12, "tc_etf_qopt layout changed");
+static_assert(offsetof(tc_etf_qopt, delta) == 0 && offsetof(tc_etf_qopt, clockid) == 4 && offsetof(tc_etf_qopt, flags) == 8);
 static_assert(TC_QOPT_MAX_QUEUE == static_cast<int>(MAX_TRAFFIC_CLASSES), "TC_QOPT_MAX_QUEUE changed");
 static_assert(TC_QOPT_BITMASK + 1 == static_cast<int>(PRIO_MAP_SIZE), "TC_QOPT_BITMASK changed");
 
@@ -464,6 +466,27 @@ auto parse_cbs_options(std::span<std::uint8_t const> nest, QdiscInfo& info) noex
     }
 }
 
+/// An etf's TCA_OPTIONS nest holds one TCA_ETF_PARMS; its flags are the
+/// inverse of to_qopt(EtfQdisc). A short or missing one reports nothing.
+auto parse_etf_options(std::span<std::uint8_t const> nest, QdiscInfo& info) noexcept -> void
+{
+    auto const found = netlink::find_attribute(nest, TCA_ETF_PARMS);
+    if (!found || !*found || (*found)->size() < sizeof(tc_etf_qopt)) {
+        return;
+    }
+    auto const parms = **found;
+    auto const flags = netlink::load<std::uint32_t>(parms, offsetof(tc_etf_qopt, flags));
+    info.etf = EtfQdisc{
+        .parent = info.parent,
+        .clockid = netlink::load<std::int32_t>(parms, offsetof(tc_etf_qopt, clockid)),
+        .delta_ns = netlink::load<std::int32_t>(parms, offsetof(tc_etf_qopt, delta)),
+        .offload = (flags & TC_ETF_OFFLOAD_ON) != 0,
+        .deadline_mode = (flags & TC_ETF_DEADLINE_MODE_ON) != 0,
+        .skip_sock_check = (flags & TC_ETF_SKIP_SOCK_CHECK) != 0,
+    };
+    info.has_etf_params = true;
+}
+
 /// The kernel reports an mqprio's TCA_OPTIONS as a bare tc_mqprio_qopt; the
 /// nested attributes that may follow it describe offload modes and are not
 /// read.
@@ -489,6 +512,9 @@ auto apply_attribute(std::uint16_t type, std::span<std::uint8_t const> payload, 
     }
     if (type == TCA_OPTIONS && info.kind_name() == "mqprio" && payload.size() >= sizeof(tc_mqprio_qopt)) {
         store_mqprio_params(payload, info);
+    }
+    if (type == TCA_OPTIONS && info.kind_name() == "etf") {
+        parse_etf_options(payload, info);
     }
 }
 

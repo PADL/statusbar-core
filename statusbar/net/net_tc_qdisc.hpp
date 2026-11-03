@@ -252,6 +252,11 @@ struct QdiscInfo
     bool has_mqprio_params{false};
     MqprioQdisc mqprio{};
 
+    /// Set when the qdisc is an etf and its TCA_OPTIONS carried a whole
+    /// tc_etf_qopt, so a caller can tell whether its etf is already in place.
+    bool has_etf_params{false};
+    EtfQdisc etf{};
+
     [[nodiscard]] auto kind_name() const noexcept -> std::string_view { return std::string_view{kind.data()}; }
 };
 
