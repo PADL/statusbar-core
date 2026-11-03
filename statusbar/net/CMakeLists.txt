@@ -235,11 +235,54 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
       }
       "
       HAVE_XDP_TX_METADATA_SUPPORT)
-    unset(CMAKE_REQUIRED_INCLUDES)
-    unset(CMAKE_REQUIRED_LIBRARIES)
     if(HAVE_XDP_TX_METADATA_SUPPORT)
       target_compile_definitions(statusbar-net PUBLIC HAVE_XDP_TX_METADATA=1)
+    else()
+      # Say which half is missing, so a build without launch time is no surprise
+      # at run time.
+      check_cxx_source_compiles(
+        "
+        #include <linux/if_xdp.h>
+        int main() { return XDP_TXMD_FLAGS_LAUNCH_TIME; }
+        "
+        HAVE_XDP_TXMD_FLAGS_LAUNCH_TIME)
+      check_cxx_source_compiles(
+        "
+        #include <xdp/xsk.h>
+        int main() {
+          struct xsk_umem_opts opts{};
+          opts.tx_metadata_len = 0;
+          (void)xsk_umem__create_opts(nullptr, nullptr, nullptr, &opts);
+          return 0;
+        }
+        "
+        HAVE_XSK_UMEM_CREATE_OPTS)
+      set(_why_no_tx_metadata)
+      if(NOT HAVE_XDP_TXMD_FLAGS_LAUNCH_TIME)
+        list(
+          APPEND _why_no_tx_metadata
+          "the kernel UAPI headers lack XDP_TXMD_FLAGS_LAUNCH_TIME (Linux 6.15)"
+        )
+      endif()
+      if(NOT HAVE_XSK_UMEM_CREATE_OPTS)
+        list(
+          APPEND
+          _why_no_tx_metadata
+          "libxdp is older than 1.5 (no xsk_umem__create_opts with tx_metadata_len)"
+        )
+      endif()
+      if(NOT _why_no_tx_metadata)
+        set(_why_no_tx_metadata
+            "the probe did not compile (see CMakeFiles/CMakeConfigureLog.yaml)")
+      endif()
+      list(JOIN _why_no_tx_metadata ", and " _why_no_tx_metadata)
+      message(
+        WARNING
+          "AF_XDP TX metadata is unavailable, so launch time is compiled out "
+          "of statusbar-net: ${_why_no_tx_metadata}.")
     endif()
+    unset(CMAKE_REQUIRED_INCLUDES)
+    unset(CMAKE_REQUIRED_LIBRARIES)
     # The --embed-dir flag is only needed when compiling
     # xdp_filter_bpf_embed.cpp, which is the only TU using #embed. Scope it to
     # that source rather than the whole library.
