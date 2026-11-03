@@ -162,7 +162,8 @@ using RxTimePoint = RxClock::time_point;
 /// stamp; rx_start() reads the clock once and forwards. A drain loop calls
 /// the told form.
 ///
-/// launch_time_ns is in TAI nanoseconds for TSN/AVB hardware TX scheduling.
+/// launch_time_ns is in the port's launch clock for TSN/AVB hardware TX scheduling: AF_XDP, the sending NIC's PHC;
+/// SO_TXTIME (the mmap port, etf), CLOCK_TAI.
 template <typename T>
 concept EthernetPort = requires(
     T& port, T const& cport, uint64_t handle, size_t len, int64_t launch_time_ns, ieee::Eui48 const& mac, RxTimePoint now) {
@@ -317,7 +318,7 @@ class EthernetRxGuard
 
 /// Acquire a TX guard from a port. Returns failure if the port's TX pool is exhausted.
 /// @param port The EthernetPort to acquire a TX slot from
-/// @param launch_time_ns TAI nanoseconds for TSN/AVB hardware TX scheduling (0 = immediate)
+/// @param launch_time_ns the port's launch clock (AF_XDP: the sending NIC's PHC), ns (0 = immediate)
 template <EthernetPort Port>
 [[nodiscard]] auto tx_guard(Port& port, int64_t launch_time_ns = 0) -> StatusValue<EthernetTxGuard<Port>>
 {
@@ -359,7 +360,7 @@ template <EthernetPort Port>
 /// frame length is > 0. Auto-cancels if the fill function returns 0 or throws.
 ///
 /// @param port The EthernetPort to send on
-/// @param launch_time_ns TAI nanoseconds for TSN/AVB hardware TX scheduling (0 = immediate)
+/// @param launch_time_ns the port's launch clock (AF_XDP: the sending NIC's PHC), ns (0 = immediate)
 /// @param fill Callback: receives writable buffer span, returns frame length (0 = cancel)
 template <EthernetPort Port, typename F>
 [[nodiscard]] auto send_frame(Port& port, int64_t launch_time_ns, F fill) -> Status
