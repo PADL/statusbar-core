@@ -76,10 +76,14 @@ unavailable() {
 
 # ---- what changed --------------------------------------------------------
 # -U0 so each hunk header names exactly the lines this change introduces.
-# Paths from git are relative to the repo root whatever the cwd.
+# Paths from git are relative to the repo root whatever the cwd. The output is
+# pinned against the user's configuration: diff.mnemonicPrefix or
+# diff.noprefix would rename the b/ prefix, color.diff=always would colour the
+# hunk headers, and an external diff would replace the patch altogether.
+diff_opts="--no-color --no-ext-diff --src-prefix=a/ --dst-prefix=b/ -U0 --diff-filter=ACMR"
 case "$mode" in
-    staged) diff_cmd="git -C $REPO diff --cached -U0 --diff-filter=ACMR --" ;;
-    since) diff_cmd="git -C $REPO diff -U0 --diff-filter=ACMR $since_ref -- " ;;
+    staged) diff_cmd="git -C $REPO diff --cached $diff_opts" ;;
+    since) diff_cmd="git -C $REPO diff $diff_opts $since_ref" ;;
     files) diff_cmd="" ;;
 esac
 
@@ -98,7 +102,8 @@ if [ "$mode" = "files" ]; then
         files="$files $rel"
     done
 else
-    files=$($diff_cmd '*.cpp' '*.hpp' '*.h' | awk '/^\+\+\+ b\//{ sub("^\\+\\+\\+ b/", ""); print }')
+    # The names alone: no patch to parse, so a rename, a new empty file or a mode change lists too.
+    files=$($diff_cmd --name-only -- '*.cpp' '*.hpp' '*.h')
 fi
 # Nothing to check: say nothing, need nothing.
 [ -n "$(echo "$files" | tr -d ' \n')" ] || exit 0
@@ -226,7 +231,7 @@ touched_ranges() {
         echo "1 999999"
         return
     fi
-    $diff_cmd "$1" | awk '
+    $diff_cmd -- "$1" | awk '
         /^@@/ {
             # @@ -old,n +new,m @@  — m may be absent (means 1)
             match($0, /\+[0-9]+(,[0-9]+)?/)
