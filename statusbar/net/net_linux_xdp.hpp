@@ -1769,7 +1769,7 @@ class XdpContext
         return fill_status ? comp_status : fill_status;
     }
 
-    /// @param launch_time_ns CLOCK_TAI nanoseconds to send the frame at, or 0
+    /// @param launch_time_ns the sending NIC's PHC time to send the frame at, or 0
     ///        for as soon as possible. Needs XdpConfig::tx_launch_time;
     ///        without it a non-zero time is ignored, as it always was.
     ///        tx_set_launch_time() is the same thing after the fact, and says
@@ -1913,8 +1913,8 @@ class XdpContext
     /// was registered with room for TX metadata (XdpConfig::tx_launch_time).
     [[nodiscard]] auto tx_launch_time() const noexcept -> bool { return umem_.tx_metadata_len() != 0; }
 
-    /// Send the frame at @p handle at @p launch_time_ns on CLOCK_TAI, rather
-    /// than as soon as the NIC can.
+    /// Send the frame at @p handle at @p launch_time_ns on the sending NIC's
+    /// PHC (xsk-tx-metadata.rst), rather than as soon as the NIC can.
     ///
     /// Called between tx_start() and tx_commit() for that frame. The time is
     /// written into the frame's own metadata, which is what makes a batch
@@ -1926,7 +1926,7 @@ class XdpContext
     /// order the queue needs.
     ///
     /// @param handle UMEM frame address from tx_start()
-    /// @param launch_time_ns CLOCK_TAI nanoseconds; 0 means "as soon as
+    /// @param launch_time_ns PHC nanoseconds; 0 means "as soon as
     ///        possible", and clears any time already set on the frame
     /// @return `not_open` on a closed socket, `tx_metadata_not_supported`
     ///         when the UMEM carries no metadata.

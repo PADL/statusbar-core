@@ -3,6 +3,7 @@
 
 #include "statusbar/net/net_launch_order.hpp"
 
+#include "statusbar/net/net_message_reactor.hpp"
 #include "statusbar/test/test.hpp"
 
 #include <cstdint>
@@ -164,6 +165,36 @@ TEST(launch_order, tai_now_is_a_plausible_monotonically_rising_tai_count)
     // After 2001 and before 2200, so a wrong clock or wrong units shows up.
     EXPECT_TRUE(first > 1'000'000'000ULL * 1'000'000'000ULL);
     EXPECT_TRUE(first < 7'000'000'000ULL * 1'000'000'000ULL);
+}
+
+// A frame wanted before now was committed late: it is counted without changing
+// the time it is given; one a second or more behind is the clock stepping on.
+TEST(launch_order, a_frame_wanted_before_now_is_counted_late)
+{
+    LaunchOrder order;
+    EXPECT_EQ(order.next(T - 300'000, fixed(T)), T - 300'000);
+    EXPECT_EQ(order.next(0, fixed(T)), T);
+    EXPECT_EQ(order.next(T + 100'000, fixed(T)), T + 100'000);
+    EXPECT_EQ(order.launched_late(), std::uint64_t{1});
+    EXPECT_EQ(order.max_late_ns(), std::uint64_t{300'000});
+    (void)order.next(T - 2'000'000'000, fixed(T));  // two seconds behind: a step, not a late frame
+    EXPECT_EQ(order.launched_late(), std::uint64_t{1});
+    order.reset();
+    EXPECT_EQ(order.launched_late(), std::uint64_t{0});
+    EXPECT_EQ(order.max_late_ns(), std::uint64_t{0});
+}
+
+// The sending PHC's time is now: an untimed frame goes at it, and a missing
+// clock or one that reads nothing gives 0, which the caller sends untimed.
+TEST(launch_order, phc_now_stamps_untimed_frames_and_is_zero_without_a_clock)
+{
+    std::int64_t phc = static_cast<std::int64_t>(T);
+    ClockFn const clock = [&phc] { return phc; };
+    LaunchOrder order;
+    EXPECT_EQ(order.next(0, [&] { return phc_now_ns(clock); }), T);
+    EXPECT_EQ(phc_now_ns(ClockFn{}), std::uint64_t{0});
+    phc = 0;
+    EXPECT_EQ(phc_now_ns(clock), std::uint64_t{0});
 }
 
 TEST_MAIN(statusbar_net, net_launch_order_test)
