@@ -11,6 +11,7 @@ statusbar_add_module(
   net_carrier_watch.cpp
   net_error.cpp
   net_interface_info.cpp
+  net_link_readiness.cpp
   net_linux_mmap.cpp
   net_linux_xdp.cpp
   net_message_reactor.cpp
@@ -48,6 +49,7 @@ statusbar_add_module(
   net_ethernet_port_test.cpp
   net_group_membership_test.cpp
   net_link_monitor_test.cpp
+  net_link_readiness_test.cpp
   net_linux_xdp_test.cpp
   net_netdev_features_test.cpp
   net_netdev_napi_test.cpp
@@ -71,6 +73,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   statusbar_add_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_netdev_features_fuzzer.cpp)
   statusbar_add_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_netdev_napi_fuzzer.cpp)
   statusbar_add_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_carrier_watch_fuzzer.cpp)
+  statusbar_add_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_link_readiness_fuzzer.cpp)
   statusbar_add_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_netlink_fuzzer.cpp)
   statusbar_add_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_tc_qdisc_fuzzer.cpp)
 endif()
