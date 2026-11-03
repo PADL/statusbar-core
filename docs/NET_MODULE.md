@@ -46,6 +46,7 @@ emits cBPF for kernel-side filtering.
 - `netdev::NetdevClient` — generic-netlink client for the kernel's netdev family: `features(ifindex)` returns `DeviceFeatures` (`xdp_features`, `xsk` with `launch_time()`); `netdev::launch_time_supported(ifindex)` is the one answer a host asks once and hands to `tc::launch_time_mode()` and every socket. `probe_tx_launch_time()` asks through it.
 - `netdev::NapiClient` — the netdev family's queue and NAPI commands: `queue_napis(ifindex, queue)`, `napi(id)`, `set_threaded(id, mode)`; `netdev::set_queue_threaded()` does all three for one queue and pins each kthread SCHED_OTHER to a CPU.
 - `CarrierWatch` — a reactor `Pollable` on rtnetlink link notifications for one ifindex, reporting `LinkCarrier` (`IFLA_CARRIER`, `IFLA_CARRIER_DOWN_COUNT`): event-driven, unlike `LinkMonitor`'s poll, and the down count shows a carrier lost and regained between notifications.
+- `LinkWatch` / `LinkReadiness` — a blocking rtnetlink watch of one interface's carrier, IPv4 addresses and qdisc changes; opened before a qdisc change, `await_reset()` waits out the adapter reset igb and igc schedule when an offload switches the transmit mode (`ResetWaitPolicy`: 2 s with no carrier loss means none came, else the carrier and an IPv4 address back within 30 s).
 - `TrafficClassifier` / `TcamClassifier` — rule-based steering; `ClassifierRule` for the linear matcher, `CompiledRule<32>` / `CompiledRule<64>` for the TCAM matcher (built via `ClassifierRuleBuilder`).
 
 ## Quick example
@@ -96,7 +97,7 @@ int main() {
 - `statusbar/net/net_netdev_features.hpp` — the netdev generic-netlink family: `netdev::NetdevClient`, `DeviceFeatures` / `XskFeatures`, `query_xsk_features`, `launch_time_supported` (Linux); the framing and parsers build everywhere.
 - `statusbar/net/net_rss.hpp` — ethtool RSS indirection: read a NIC's table, steer every bucket to one queue (`RssSteering` puts the table back when it goes out of scope), with a recorder double for tests.
 - `statusbar/net/net_rx_flow.hpp` — ethtool RX classifier rules: one EtherType or one VLAN priority steered to an RX queue (`RxFlowRule`, `RxFlowPlan`), and `RxFlowSteering`, which installs a plan's rules with an RSS table that keeps the other traffic off their queues and removes both again; `RxFlowControl` is the seam, `RxFlowEthtool` the NIC, `RxFlowRecorder` (`net_rx_flow_recorder.hpp`) the test double.
-- `statusbar/net/net_netdev_napi.hpp`, `net_carrier_watch.hpp` — `netdev::NapiClient` and `CarrierWatch` (Linux-only; not in `net.hpp`).
+- `statusbar/net/net_netdev_napi.hpp`, `net_carrier_watch.hpp`, `net_link_readiness.hpp` — `netdev::NapiClient`, `CarrierWatch` and `LinkWatch` (Linux-only; not in `net.hpp`).
 
 ## Dependencies
 
