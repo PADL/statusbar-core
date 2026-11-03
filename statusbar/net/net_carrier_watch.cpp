@@ -10,9 +10,14 @@
 #    include "statusbar/net/net_posix_util.hpp"
 #    include "statusbar/net/net_socket.hpp"
 
+#    include <poll.h>
+
+#    include <algorithm>
 #    include <array>
 #    include <cerrno>
+#    include <climits>
 #    include <cstddef>
+#    include <memory>
 #    include <system_error>
 
 #    include <linux/if_link.h>
@@ -177,6 +182,72 @@ void CarrierWatch::report(std::span<uint8_t const> const message)
         return;
     }
     failed_ = failed_ || is_error_reply(message);
+}
+
+namespace {
+
+/// Which reports a blocking watch takes.
+using Accept = sg14::inplace_function<bool(LinkCarrier const&), 32>;
+
+/// Wait for `watch` to be readable until `deadline_ns`, then read it: false once the deadline has passed.
+[[nodiscard]] auto read_until(CarrierWatch& watch, int64_t const deadline_ns) -> StatusValue<bool>
+{
+    int64_t const left_ms = (deadline_ns - monotonic_ns() + 999'999) / 1'000'000;
+    if (left_ms <= 0) {
+        return false;
+    }
+    pollfd ready{.fd = watch.fd(), .events = POLLIN, .revents = 0};
+    if (::poll(&ready, 1, static_cast<int>(std::min<int64_t>(left_ms, INT_MAX))) < 0 && errno != EINTR) {
+        return failure(errno_code());
+    }
+    watch.on_ready(0);  // non-blocking: nothing read when it is not readable
+    return true;
+}
+
+/// Run `watch` until it reports a `taken` link, finishes or `timeout_ns` passes. Errors: poll()'s errno,
+/// no_such_device when it finished (the kernel refused the link, or the socket failed).
+[[nodiscard]] auto drive(CarrierWatch& watch, std::optional<LinkCarrier> const& taken, int64_t const timeout_ns) -> Status
+{
+    int64_t const deadline_ns = monotonic_ns() + timeout_ns;
+    StatusValue<bool> waiting{true};
+    while (!taken && !watch.finished() && waiting && *waiting) {
+        waiting = read_until(watch, deadline_ns);
+    }
+    if (!waiting) {
+        return forward_failure(waiting);
+    }
+    return watch.finished() && !taken ? Status{failure(std::make_error_code(std::errc::no_such_device))} : success();
+}
+
+/// A CarrierWatch of `ifindex` run until `accept` takes a report or `timeout_ns` passes: the report taken.
+[[nodiscard]] auto watch_until(int const ifindex, int64_t const timeout_ns, Accept const& accept)
+    -> StatusValue<std::optional<LinkCarrier>>
+{
+    std::optional<LinkCarrier> taken;
+    auto watch = std::make_unique<CarrierWatch>(ifindex, [&taken, &accept](LinkCarrier const& link) {
+        if (!taken && accept(link)) {
+            taken = link;
+        }
+    });
+    auto status = watch->open().and_then([&] { return drive(*watch, taken, timeout_ns); });
+    return status ? StatusValue<std::optional<LinkCarrier>>{taken} : failure(status.error());
+}
+
+}  // namespace
+
+auto read_link_carrier(int const ifindex, int64_t const timeout_ns) -> StatusValue<LinkCarrier>
+{
+    auto const read = watch_until(ifindex, timeout_ns, [](LinkCarrier const&) { return true; });
+    if (!read) {
+        return forward_failure(read);
+    }
+    return *read ? StatusValue<LinkCarrier>{**read} : failure(std::make_error_code(std::errc::timed_out));
+}
+
+auto await_link_cycled(int const ifindex, LinkCarrier const& before, int64_t const timeout_ns) -> StatusValue<bool>
+{
+    auto const cycled = watch_until(ifindex, timeout_ns, [&before](LinkCarrier const& now) { return link_cycled(before, now); });
+    return cycled.transform([](std::optional<LinkCarrier> const& link) { return link.has_value(); });
 }
 
 }  // namespace statusbar::net

@@ -4,7 +4,8 @@
 // SPDX-License-Identifier: MIT
 
 /// One interface's carrier from rtnetlink: one RTM_GETLINK at open, then link notifications (RTMGRP_LINK).
-/// Its carrier_down_count shows a carrier lost and regained before the notification was sent. Linux only.
+/// Its carrier_down_count shows a carrier lost and regained before the notification was sent. A blocking
+/// read and a blocking wait for an adapter reset to run its course sit on the same watch. Linux only.
 
 #if defined(__linux__)
 
@@ -38,6 +39,13 @@ struct LinkCarrier
 /// An RTM_GETLINK of `ifindex` into `out` (the kernel answers with one RTM_NEWLINK): its length.
 /// Errors: invalid_argument for an ifindex of 0 or less, the builder's when `out` is too small.
 [[nodiscard]] auto build_get_link(std::span<uint8_t> out, int ifindex, uint32_t seq) -> StatusValue<size_t>;
+
+/// Whether @p now shows the link lost and regained since @p before (regained, when it was down then): what
+/// an adapter reset (netif_carrier_off, then the link renegotiated) leaves once it has run its course.
+[[nodiscard]] constexpr auto link_cycled(LinkCarrier const& before, LinkCarrier const& now) noexcept -> bool
+{
+    return now.carrier && (!before.carrier || now.down_count > before.down_count);
+}
 
 /// A reactor Pollable that reports the link's state when opened, then each RTM_NEWLINK of one interface (a
 /// carrier change, or any other change of the link). Reactor thread only; allocation-free once open.
@@ -79,6 +87,14 @@ class CarrierWatch final : public Pollable
     bool resync_{false};                   ///< an overrun since the last request_link()
     std::array<uint8_t, 32768> buffer_{};  ///< an RTM_NEWLINK with its statistics is a few KiB
 };
+
+/// The carrier of `ifindex` now (one RTM_GETLINK), waiting at most `timeout_ns`. Blocking. Errors: socket(),
+/// bind() or poll()'s errno, timed_out, no_such_device when the kernel refuses the link or the socket fails.
+[[nodiscard]] auto read_link_carrier(int ifindex, int64_t timeout_ns = 1'000'000'000) -> StatusValue<LinkCarrier>;
+
+/// Block until a report of `ifindex` is link_cycled() since `before`, or `timeout_ns` passes: whether one was.
+/// Errors: as read_link_carrier(), but for timed_out (false).
+[[nodiscard]] auto await_link_cycled(int ifindex, LinkCarrier const& before, int64_t timeout_ns) -> StatusValue<bool>;
 
 }  // namespace statusbar::net
 

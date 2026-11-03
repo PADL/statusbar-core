@@ -171,6 +171,36 @@ TEST(net_carrier_watch, a_link_the_kernel_does_not_know_finishes_the_watch)
     EXPECT_EQ(reports, 0);
 }
 
+TEST(net_carrier_watch, a_link_cycles_once_its_carrier_is_lost_and_regained)
+{
+    LinkCarrier const up{.carrier = true, .down_count = 4};
+    EXPECT_FALSE(link_cycled(up, up));
+    EXPECT_FALSE(link_cycled(up, LinkCarrier{.carrier = false, .down_count = 5}));
+    EXPECT_TRUE(link_cycled(up, LinkCarrier{.carrier = true, .down_count = 5}));
+}
+
+TEST(net_carrier_watch, a_link_down_before_cycles_when_it_comes_up)
+{
+    LinkCarrier const down{.carrier = false, .down_count = 4};
+    EXPECT_FALSE(link_cycled(down, down));
+    EXPECT_TRUE(link_cycled(down, LinkCarrier{.carrier = true, .down_count = 4}));
+}
+
+TEST(net_carrier_watch, the_loopback_carrier_reads_and_does_not_cycle)
+{
+    auto const lo = read_link_carrier(1);  // ifindex 1: lo, in every network namespace
+    EXPECT_TRUE(lo && lo->carrier);
+    auto const cycled = lo ? await_link_cycled(1, *lo, 50'000'000) : statusbar::StatusValue<bool>{true};
+    EXPECT_TRUE(cycled.has_value());
+    EXPECT_EQ(cycled.value_or(true), false);
+}
+
+TEST(net_carrier_watch, no_link_is_refused)
+{
+    EXPECT_EQ(read_link_carrier(0).has_value(), false);
+    EXPECT_EQ(read_link_carrier(0x7ffffff0).has_value(), false);
+}
+
 #endif  // __linux__
 
 TEST_MAIN(statusbar_net, net_carrier_watch_test)
