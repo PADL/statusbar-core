@@ -107,7 +107,11 @@ class TestPortContext
     [[nodiscard]] auto tx_cancel(uint64_t handle) -> Status;
 
     /// No-op flush (all TX is synchronous in TestPortContext).
-    [[nodiscard]] auto tx_flush() -> Status { return success(); }
+    [[nodiscard]] auto tx_flush() -> Status
+    {
+        ++tx_flushes_;
+        return success();
+    }
 
     //
     // RX API
@@ -129,13 +133,20 @@ class TestPortContext
     /// @param mac Multicast MAC address to record
     [[nodiscard]] auto join_multicast(ieee::Eui48 const& mac) -> Status;
 
+    /// Drop one membership of @p mac; success when there was none.
+    [[nodiscard]] auto leave_multicast(ieee::Eui48 const& mac) -> Status;
+
     //
     // Per-cycle housekeeping (no-ops)
     //
 
-    void begin_cycle() noexcept {}
+    void begin_cycle() noexcept { ++cycles_begun_; }
 
-    [[nodiscard]] auto end_cycle() -> Status { return success(); }
+    [[nodiscard]] auto end_cycle() -> Status
+    {
+        ++cycles_ended_;
+        return success();
+    }
 
     //
     // Test harness API (not part of EthernetPort concept)
@@ -157,6 +168,16 @@ class TestPortContext
     /// Pop and return the oldest captured TX frame, or nullopt if none.
     [[nodiscard]] auto pop_tx() -> std::optional<TxCapture>;
 
+    /// tx_flush() calls since open().
+    [[nodiscard]] auto tx_flushes() const noexcept -> size_t { return tx_flushes_; }
+    /// begin_cycle() calls since open().
+    [[nodiscard]] auto cycles_begun() const noexcept -> size_t { return cycles_begun_; }
+    /// end_cycle() calls since open().
+    [[nodiscard]] auto cycles_ended() const noexcept -> size_t { return cycles_ended_; }
+
+    /// Refuse every tx_commit() (NetError::send_failed, the slot freed) until called with false.
+    void refuse_commits(bool const refuse) noexcept { refuse_commits_ = refuse; }
+
     /// Returns the list of multicast groups joined so far.
     [[nodiscard]] auto joined_multicast_groups() const noexcept -> std::span<ieee::Eui48 const>
     {
@@ -172,6 +193,10 @@ class TestPortContext
     };
 
     bool valid_{false};
+    bool refuse_commits_{false};
+    size_t tx_flushes_{0};
+    size_t cycles_begun_{0};
+    size_t cycles_ended_{0};
     ieee::Eui48 hardware_address_{};
     unsigned int interface_index_{1};
 

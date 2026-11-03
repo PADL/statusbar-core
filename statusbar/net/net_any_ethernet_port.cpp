@@ -91,6 +91,12 @@ auto AnyEthernetPort::open_backend(EthernetBackend const backend, AnyEthernetPor
     return failure(NetError::invalid_argument);
 }
 
+auto AnyEthernetPort::open_test(TestPortConfig const& config) -> Status
+{
+    close();
+    return port_.emplace<TestPortContext>().open(config);
+}
+
 void AnyEthernetPort::close() noexcept
 {
     port_.emplace<std::monostate>();
@@ -128,6 +134,9 @@ auto AnyEthernetPort::describe() const -> std::string
     }
     if (as<RawnetPort>() != nullptr) {
         return "rawnet (AF_PACKET, two sockets)";
+    }
+    if (as<TestPortContext>() != nullptr) {
+        return "test (in process)";
     }
     return "closed";
 }

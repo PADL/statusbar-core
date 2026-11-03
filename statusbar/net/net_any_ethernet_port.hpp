@@ -46,6 +46,7 @@
 #include "statusbar/net/net_linux_mmap.hpp"
 #include "statusbar/net/net_linux_xdp.hpp"
 #include "statusbar/net/net_rawnet_port.hpp"
+#include "statusbar/net/net_test_port.hpp"
 #include "statusbar/status/status.hpp"
 
 #include <array>
@@ -137,9 +138,12 @@ class AnyEthernetPort
     /// does not have fails with its own not_supported_on_platform; a port
     /// that was open is closed first either way.
     [[nodiscard]] auto open(EthernetBackend backend, AnyEthernetPortConfig const& config) -> Status;
+    /// Open an in-process TestPortContext, for unit tests of what drives a
+    /// port (as<TestPortContext>() injects and captures). Not a backend name.
+    [[nodiscard]] auto open_test(TestPortConfig const& config) -> Status;
     void close() noexcept;
 
-    /// The backend in force, or nullopt while closed.
+    /// The backend in force, or nullopt while closed or on a test port.
     [[nodiscard]] auto backend() const noexcept -> std::optional<EthernetBackend>;
 
     /// Whether TX and RX may be driven from two threads at once: true for
@@ -185,7 +189,7 @@ class AnyEthernetPort
     }
 
   private:
-    using Port = std::variant<std::monostate, RawnetPort, MmapContext, XdpContext>;
+    using Port = std::variant<std::monostate, RawnetPort, MmapContext, XdpContext, TestPortContext>;
 
     [[nodiscard]] auto open_backend(EthernetBackend backend, AnyEthernetPortConfig const& config) -> Status;
 

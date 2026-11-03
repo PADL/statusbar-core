@@ -8,7 +8,7 @@
 namespace statusbar::net {
 
 void TestPortContext::close() noexcept
-{
+{  // NOLINT(statusbar-block-statements): a many-field reset
     valid_ = false;
     pool_.clear();
     free_list_.clear();
@@ -16,6 +16,10 @@ void TestPortContext::close() noexcept
     rx_queue_.clear();
     tx_captures_.clear();
     joined_multicast_.clear();
+    refuse_commits_ = false;
+    tx_flushes_ = 0;
+    cycles_begun_ = 0;
+    cycles_ended_ = 0;
 }
 
 auto TestPortContext::open(TestPortConfig const& config, std::pmr::memory_resource* memory_resource) -> Status
@@ -47,9 +51,13 @@ auto TestPortContext::open(TestPortConfig const& config, std::pmr::memory_resour
 }
 
 auto TestPortContext::tx_commit(uint64_t handle, size_t len) -> Status
-{
+{  // NOLINT(statusbar-block-statements): one frame captured whole, or refused
     if (handle >= pool_.size()) {
         return failure(NetError::invalid_handle);
+    }
+    if (refuse_commits_) {
+        free_list_.push_back(handle);
+        return failure(NetError::send_failed);
     }
 
     size_t const actual_len = (len > ETHERNET_PORT_MIN_FRAME_BUFFER) ? ETHERNET_PORT_MIN_FRAME_BUFFER : len;
@@ -118,6 +126,14 @@ auto TestPortContext::rx_release(uint64_t handle) -> Status
 auto TestPortContext::join_multicast(ieee::Eui48 const& mac) -> Status
 {
     joined_multicast_.push_back(mac);
+    return success();
+}
+
+auto TestPortContext::leave_multicast(ieee::Eui48 const& mac) -> Status
+{
+    if (auto const it = std::ranges::find(joined_multicast_, mac); it != joined_multicast_.end()) {
+        joined_multicast_.erase(it);
+    }
     return success();
 }
 
