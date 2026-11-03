@@ -115,6 +115,9 @@ struct AnyEthernetPortConfig
     XdpBindMode xdp_bind_mode{XdpBindMode::auto_};
     /// See XdpConfig::tx_launch_time.
     bool xdp_tx_launch_time{false};
+    /// See XdpConfig::pin_path: where the program is pinned, to be adopted by
+    /// the next open rather than attached afresh. Empty: no pinning.
+    std::string_view xdp_pin_path{};
 };
 
 class AnyEthernetPort
