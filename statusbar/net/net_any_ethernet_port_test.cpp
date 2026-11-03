@@ -224,6 +224,29 @@ TEST(any_ethernet_port, an_mmap_slot_given_back_is_the_next_one_handed_out)
 
 #endif  // __linux__
 
+// A test port carries frames in process: TX is captured with its launch time,
+// injected RX comes back, groups are joined and left, and no backend is named.
+TEST(any_ethernet_port, a_test_port_captures_tx_and_returns_injected_rx)
+{
+    AnyEthernetPort port;
+    EXPECT_TRUE(port.open_test({.hardware_address = ieee::Eui48{0x02, 0, 0, 0, 0, 1}}).has_value());
+    EXPECT_TRUE(port.valid() && !port.backend().has_value() && !port.tx_rx_independent());
+    auto slot = port.tx_start(1234);
+    EXPECT_TRUE(slot.has_value() && port.tx_commit(slot->handle, 60).has_value() && port.tx_flush().has_value());
+    auto* const test = port.as<TestPortContext>();
+    auto const sent = test->pop_tx();
+    EXPECT_TRUE(sent.has_value() && sent->frame.size() == 60 && sent->launch_time_ns == 1234);
+    EXPECT_EQ(test->tx_flushes(), size_t{1});
+    std::array<uint8_t, 64> const frame{0xAA};
+    EXPECT_TRUE(test->inject_rx(frame).has_value());
+    auto received = port.rx_start();
+    EXPECT_TRUE(received.has_value() && received->has_value() && (*received)->buffer[0] == 0xAA);
+    EXPECT_TRUE(port.rx_release((*received)->handle).has_value());
+    ieee::Eui48 const group{0x91, 0xE0, 0xF0, 0, 0, 1};
+    EXPECT_TRUE(port.join_multicast(group).has_value() && test->joined_multicast_groups().size() == 1);
+    EXPECT_TRUE(port.leave_multicast(group).has_value() && test->joined_multicast_groups().empty());
+}
+
 // The pin path reaches the xdp backend: one outside bpffs is refused as
 // such, before the interface is looked up or anything is attached.
 TEST(any_ethernet_port, the_xdp_backend_takes_the_pin_path)
