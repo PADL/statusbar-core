@@ -58,6 +58,14 @@ statusbar_add_module(
   net_xdp_avtp_rules_test.cpp
   net_xdp_equiv_test.cpp)
 
+# The rtnetlink reply parsers read kernel replies at offsets the replies
+# themselves state; the fuzzers feed them arbitrary bytes. Linux only, as the
+# parsers are.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_tc_qdisc_fuzzer.cpp)
+  add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_vlan_link_fuzzer.cpp)
+endif()
+
 add_executable(net_tcp_echo_example net_tcp_echo_example.cpp)
 target_link_libraries(net_tcp_echo_example PRIVATE statusbar)
 set_target_properties(net_tcp_echo_example

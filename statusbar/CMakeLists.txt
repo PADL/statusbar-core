@@ -4,6 +4,33 @@ include(${PROJECT_SOURCE_DIR}/cmake/module.cmake)
 # (statusbar_package_module_init in cmake/module.cmake).
 statusbar_package_module_init()
 
+# Helper: build a libFuzzer harness (Linux) or standalone driver (macOS) for a
+# core parser. The same shape as crypto's and avb's add_*_fuzzer, so the
+# package-level fuzz-smoke / fuzz-all targets find core's fuzzers as they find
+# theirs (every *_fuzzer executable under the build tree).
+function(add_core_fuzzer source_file)
+  if(NOT ENABLE_FUZZING)
+    return()
+  endif()
+  get_filename_component(FUZZ_NAME ${source_file} NAME_WE)
+  if(APPLE)
+    add_executable(${FUZZ_NAME} ${source_file})
+    target_link_libraries(${FUZZ_NAME} PRIVATE statusbar)
+    target_compile_options(${FUZZ_NAME} PRIVATE -fsanitize=address,undefined
+                                                -fno-omit-frame-pointer)
+    target_link_options(${FUZZ_NAME} PRIVATE -fsanitize=address,undefined)
+  else()
+    add_executable(${FUZZ_NAME} ${source_file})
+    target_link_libraries(${FUZZ_NAME} PRIVATE statusbar)
+    target_compile_options(
+      ${FUZZ_NAME} PRIVATE -fsanitize=fuzzer,address,undefined
+                           -fno-omit-frame-pointer)
+    target_link_options(
+      ${FUZZ_NAME} PRIVATE -fsanitize=fuzzer,address,undefined
+      ${FUZZER_EXTRA_LINK_OPTIONS})
+  endif()
+endfunction()
+
 # Module subdirectories — dependency order.
 add_subdirectory(status)
 add_subdirectory(safe_arith)
