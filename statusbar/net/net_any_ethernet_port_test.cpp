@@ -190,6 +190,23 @@ TEST(any_ethernet_port, rawnet_round_trips_a_frame_on_loopback)
 
 #endif  // __linux__
 
+// The pin path reaches the xdp backend: one outside bpffs is refused as
+// such, before the interface is looked up or anything is attached.
+TEST(any_ethernet_port, the_xdp_backend_takes_the_pin_path)
+{
+    AnyEthernetPort port;
+    auto const opened = port.open(
+        EthernetBackend::xdp,
+        AnyEthernetPortConfig{.interface_name = "lo", .ethertype = 0x22F0, .xdp_pin_path = "/tmp/statusbar-not-bpffs/lo"});
+    EXPECT_FALSE(opened.has_value());
+#if defined(__linux__) && defined(HAVE_XDP)
+    if (!opened) {
+        EXPECT_TRUE(opened.error() == XdpError::invalid_pin_path);
+    }
+#endif
+    EXPECT_FALSE(port.valid());
+}
+
 TEST(any_ethernet_port, a_ring_backend_shares_state_between_tx_and_rx_or_is_not_available)
 {
     AnyEthernetPort port;
