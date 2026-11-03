@@ -3,7 +3,7 @@
 // Copyright 2026 Jeff Koftinoff <jeff.koftinoff@statusbar.com>
 // SPDX-License-Identifier: MIT
 
-/// Launch times in commit order, and the TAI clock they are read against.
+/// Launch times in commit order, and the clocks they are read against.
 ///
 /// A NIC in launch-time mode (an offloaded `etf`, see net_tc_launch_time.hpp)
 /// holds each frame until the time the frame carries. The queue behind it is
@@ -25,8 +25,9 @@
 ///     the length of the step.
 ///
 /// `next()` runs on the real-time thread and does no allocation, no syscall
-/// and no locking. The counters are atomic because a soak test reads them from
-/// another thread while it runs.
+/// and no locking beyond its `now` (tai_now_ns is a vDSO read; a PHC read is a
+/// syscall a host may cache per tick). The counters are atomic because a soak
+/// test reads them from another thread while it runs.
 
 #include <atomic>
 #include <cstdint>
@@ -65,6 +66,16 @@ namespace statusbar::net {
     return (static_cast<std::uint64_t>(now.tv_sec) * 1'000'000'000ULL) + static_cast<std::uint64_t>(now.tv_nsec);
 }
 
+/// @p phc (a nullable callable such as ClockFn) read: the sending NIC's PHC, for a NIC taking launch
+/// times in its PHC's time (AF_XDP, xsk-tx-metadata.rst). 0 without a clock or on a failed read, as
+/// tai_now_ns gives on a failed read; the caller then sends untimed.
+template <typename Clock>
+[[nodiscard]] auto phc_now_ns(Clock const& phc) noexcept -> std::uint64_t
+{
+    std::int64_t const now = static_cast<bool>(phc) ? phc() : 0;
+    return now > 0 ? static_cast<std::uint64_t>(now) : 0;
+}
+
 /// Hands out launch times that never go backwards, and counts when it had to
 /// hold one.
 class LaunchOrder
@@ -97,6 +108,9 @@ class LaunchOrder
     ///        names both.
     [[nodiscard]] auto next(std::uint64_t const wanted_ns, std::uint64_t const now_ns) noexcept -> std::uint64_t
     {
+        if (wanted_ns != 0 && wanted_ns < now_ns && now_ns - wanted_ns < STEP_NS) {
+            count_late(now_ns - wanted_ns);  // a second or more behind is the clock stepping on
+        }
         std::uint64_t const asked = wanted_ns == 0 ? now_ns : wanted_ns;
         std::uint64_t const given = ordered(asked, now_ns);
         last_ns_ = given;
@@ -121,6 +135,13 @@ class LaunchOrder
     /// Times the clock stepped backwards under us.
     [[nodiscard]] auto steps() const noexcept -> std::uint64_t { return steps_.load(std::memory_order_relaxed); }
 
+    /// Frames whose wanted time had passed when committed; each keeps that time,
+    /// ordered as any other.
+    [[nodiscard]] auto launched_late() const noexcept -> std::uint64_t { return late_.load(std::memory_order_relaxed); }
+
+    /// The most a late frame's wanted time was behind now, in nanoseconds.
+    [[nodiscard]] auto max_late_ns() const noexcept -> std::uint64_t { return max_late_ns_.load(std::memory_order_relaxed); }
+
     /// Zero the counters. The ordering itself is kept, so this is safe to call
     /// on a live socket.
     auto reset() noexcept -> void
@@ -128,6 +149,8 @@ class LaunchOrder
         clamped_.store(0, std::memory_order_relaxed);
         max_clamp_ns_.store(0, std::memory_order_relaxed);
         steps_.store(0, std::memory_order_relaxed);
+        late_.store(0, std::memory_order_relaxed);
+        max_late_ns_.store(0, std::memory_order_relaxed);
     }
 
   private:
@@ -158,12 +181,22 @@ class LaunchOrder
         }
     }
 
+    auto count_late(std::uint64_t const behind) noexcept -> void
+    {
+        late_.fetch_add(1, std::memory_order_relaxed);
+        if (behind > max_late_ns_.load(std::memory_order_relaxed)) {
+            max_late_ns_.store(behind, std::memory_order_relaxed);
+        }
+    }
+
     /// Only next() touches this, and only from the real-time thread.
     std::uint64_t last_ns_{0};
 
     std::atomic<std::uint64_t> clamped_{0};
     std::atomic<std::uint64_t> max_clamp_ns_{0};
     std::atomic<std::uint64_t> steps_{0};
+    std::atomic<std::uint64_t> late_{0};
+    std::atomic<std::uint64_t> max_late_ns_{0};
 };
 
 }  // namespace statusbar::net
