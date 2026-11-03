@@ -111,6 +111,50 @@ TEST(rawnet_port, a_handle_that_was_never_handed_out_is_refused)
 
 #endif  // __linux__
 
+// The pin path reaches the xdp backend: one outside bpffs is refused as
+// such, before the interface is looked up or anything is attached.
+TEST(any_ethernet_port, the_xdp_backend_takes_the_pin_path)
+{
+    AnyEthernetPort port;
+    auto const opened = port.open(
+        EthernetBackend::xdp,
+        AnyEthernetPortConfig{.interface_name = "lo", .ethertype = 0x22F0, .xdp_pin_path = "/tmp/statusbar-not-bpffs/lo"});
+    EXPECT_FALSE(opened.has_value());
+#if defined(__linux__) && defined(HAVE_XDP)
+    if (!opened) {
+        EXPECT_TRUE(opened.error() == XdpError::invalid_pin_path);
+    }
+#endif
+    EXPECT_FALSE(port.valid());
+}
+
+TEST(any_ethernet_port, a_ring_backend_shares_state_between_tx_and_rx_or_is_not_available)
+{
+    AnyEthernetPort port;
+    for (auto const backend : {EthernetBackend::mmap, EthernetBackend::xdp}) {
+        auto const status = port.open(backend, {.interface_name = LOOPBACK, .ethertype = AVTP});
+        if (status.has_value()) {
+            // A privileged Linux run: the backend opened. It is one socket.
+            EXPECT_TRUE(port.valid());
+            EXPECT_TRUE(port.backend().has_value() && *port.backend() == backend);
+            EXPECT_FALSE(port.tx_rx_independent());
+            EXPECT_TRUE(port.describe().starts_with(ethernet_backend_name(backend)));
+        } else {
+            // Not this platform, not this build, or not this privilege: the
+            // port is closed, not half-open.
+            EXPECT_FALSE(port.valid());
+            EXPECT_FALSE(port.backend().has_value());
+            EXPECT_FALSE(port.tx_rx_independent());
+            std::printf(
+                "  note: %s did not open on %s: %s\n",
+                std::string{ethernet_backend_name(backend)}.c_str(),
+                LOOPBACK,
+                status.error().message().c_str());
+        }
+        port.close();
+    }
+}
+
 // The one port config stands for a config per backend, and a caller that
 // opens a backend itself gets the same translation the port applies.
 TEST(any_ethernet_port, the_backend_configs_follow_the_one_port_config)
