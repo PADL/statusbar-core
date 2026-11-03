@@ -188,6 +188,37 @@ TEST(any_ethernet_port, rawnet_round_trips_a_frame_on_loopback)
     EXPECT_FALSE(port.backend().has_value());
 }
 
+TEST(any_ethernet_port, an_mmap_slot_given_back_is_the_next_one_handed_out)
+{
+    // The kernel sends an AF_PACKET TX ring in order and stops at the first
+    // slot that is not a send request. A cancelled slot left behind the
+    // index is therefore a hole that holds every frame committed after it
+    // until the index has gone round the ring: a talker that cancels a slot
+    // whenever it has nothing to send would stall its TX for a whole ring.
+    MmapContext port;
+    auto const status = port.open({.interface_name = LOOPBACK, .ethertype = AVTP, .tx_queue_size = 4});
+    if (!status.has_value()) {
+        SKIP("needs CAP_NET_RAW (AF_PACKET open refused)");
+    }
+    auto const first = port.tx_start();
+    EXPECT_TRUE(first.has_value());
+    if (!first.has_value()) {
+        return;
+    }
+    EXPECT_TRUE(port.tx_cancel(first->handle).has_value());
+
+    // The slot given back is the one handed out next: no hole.
+    auto const again = port.tx_start();
+    EXPECT_TRUE(again.has_value());
+    if (again.has_value()) {
+        EXPECT_EQ(again->handle, first->handle);
+        EXPECT_TRUE(port.tx_cancel(again->handle).has_value());
+        // Only the slot last handed out, and only once.
+        EXPECT_FALSE(port.tx_cancel(again->handle).has_value());
+    }
+    port.close();
+}
+
 #endif  // __linux__
 
 TEST(any_ethernet_port, a_ring_backend_shares_state_between_tx_and_rx_or_is_not_available)

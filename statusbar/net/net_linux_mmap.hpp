@@ -199,8 +199,13 @@ class MmapContext
     /// @param frame_length Total frame size including Ethernet header (minimum 64 bytes)
     [[nodiscard]] auto tx_commit(uint64_t handle, size_t frame_length) -> Status;
 
-    /// Cancel a TX slot, returning it to available state.
-    /// @param handle Opaque slot handle from tx_start()
+    /// Cancel a TX slot, returning it to available state. It is the next
+    /// slot tx_start() hands out: the kernel sends the ring in order and
+    /// stops at the first slot that is not a send request, so a cancelled
+    /// slot left behind the index would hold every later frame until the
+    /// index came round to fill it.
+    /// @param handle The handle from the last tx_start(); any other is
+    ///        refused with MmapError::invalid_index.
     [[nodiscard]] auto tx_cancel(uint64_t handle) -> Status;
 
     /// Flush pending TX frames to the kernel.

@@ -314,14 +314,21 @@ auto MmapContext::tx_cancel(uint64_t handle) -> Status
 
     auto const index = static_cast<size_t>(handle);
 
-    if (index >= tx_req_.tp_frame_nr) {
+    // Only the slot tx_start() handed out last can be given back: any other
+    // index is a frame already committed, or no slot of the caller's at all.
+    if (index >= tx_req_.tp_frame_nr || handle != tx_slot_in_use_) {
         return failure(MmapError::invalid_index);
     }
 
     auto* hdr = tx_header_at(index);
 
-    // Return slot to available state
+    // Return slot to available state, and make it the next one handed out.
+    // The kernel sends the ring in order and stops at the first slot that is
+    // not a send request, so a slot left available behind the index is a
+    // hole: every frame committed after it waits until the index has gone
+    // round the whole ring and filled it.
     hdr->tp_status = TP_STATUS_AVAILABLE;
+    tx_index_ = index;
     tx_slot_in_use_ = UINT64_MAX;
 
     return success();
