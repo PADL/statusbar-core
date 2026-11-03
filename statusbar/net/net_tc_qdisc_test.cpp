@@ -575,6 +575,41 @@ TEST(tc_qdisc, parse_qdisc_round_trips_the_cbs_builder_including_its_slopes)
     EXPECT_TRUE(info->cbs.offload);
 }
 
+TEST(tc_qdisc, parse_qdisc_round_trips_the_etf_builder_including_its_flags)
+{
+    std::array<std::uint8_t, tc::MAX_REQUEST_SIZE> out{};
+    tc::EtfQdisc const etf{.parent = tc::make_handle(0x8001, 1), .delta_ns = 150000, .offload = true, .skip_sock_check = true};
+    auto const length = tc::build_replace_etf(out, IFINDEX, etf, SEQ);
+    EXPECT_TRUE(length.has_value());
+    if (!length) {
+        return;
+    }
+
+    auto const info = tc::parse_qdisc({out.data(), *length});
+    EXPECT_TRUE(info.has_value());
+    if (!info) {
+        return;
+    }
+    EXPECT_EQ(info->kind_name(), "etf");
+    EXPECT_TRUE(info->has_etf_params);
+    EXPECT_FALSE(info->has_cbs_params);
+    EXPECT_TRUE(info->etf == etf);
+}
+
+TEST(tc_qdisc, a_short_etf_parms_reports_no_etf_parameters)
+{
+    std::array<std::uint8_t, tc::MAX_REQUEST_SIZE> out{};
+    auto const length = tc::build_replace_etf(out, IFINDEX, tc::EtfQdisc{.parent = tc::make_handle(0x8001, 1)}, SEQ);
+    EXPECT_TRUE(length.has_value());
+    if (!length) {
+        return;
+    }
+    // TCA_ETF_PARMS is the last attribute: cut its payload short, and the nests around it with it.
+    std::size_t const cut = *length - 4;
+    auto const info = tc::parse_qdisc({out.data(), cut});
+    EXPECT_FALSE(info.has_value() && info->has_etf_params);
+}
+
 TEST(tc_qdisc, parse_qdisc_round_trips_the_kind_builder)
 {
     std::array<std::uint8_t, tc::MAX_REQUEST_SIZE> out{};
