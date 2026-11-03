@@ -59,6 +59,7 @@ auto xdp_config_from(AnyEthernetPortConfig const& config) -> XdpConfig
         .tx_launch_time = config.xdp_tx_launch_time,
         .bind_mode = config.xdp_bind_mode,
         .attach_mode = config.xdp_attach_mode,
+        .pin_path = config.xdp_pin_path,
     };
 }
 
