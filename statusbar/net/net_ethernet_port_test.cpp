@@ -35,6 +35,23 @@ static_assert(EthernetPort<XdpContext>, "XdpContext must satisfy EthernetPort");
 // TestPortContext — open/close lifecycle
 //
 
+TEST(test_port_tx, a_launch_time_set_after_the_start_is_the_frames)
+{
+    AnyEthernetPort port;
+    EXPECT_TRUE(port.open_test({}).has_value());
+    auto slot = port.tx_start();
+    EXPECT_TRUE(slot.has_value());
+    if (!slot) {
+        return;
+    }
+    EXPECT_TRUE(port.tx_set_launch_time(slot->handle, 5'000'000'000).has_value());
+    EXPECT_TRUE(port.tx_commit(slot->handle, 64).has_value());
+    auto const sent = port.as<TestPortContext>()->pop_tx();
+    EXPECT_TRUE(sent.has_value() && sent->launch_time_ns == 5'000'000'000);
+    EXPECT_FALSE(port.tx_set_launch_time(uint64_t{1} << 40U, 1).has_value());
+    EXPECT_FALSE(port.tx_set_launch_time(slot->handle, 1).has_value());  // committed: free again
+}
+
 TEST(test_port_tx, a_slot_buffer_is_held_by_the_port_and_a_copy_is_not)
 {
     TestPortContext port;
