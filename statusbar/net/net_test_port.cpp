@@ -15,6 +15,7 @@ void TestPortContext::close() noexcept
     pool_.clear();
     free_list_.clear();
     launch_times_.clear();
+    tx_started_.clear();
     rx_queue_.clear();
     tx_captures_.clear();
     joined_multicast_.clear();
@@ -25,7 +26,7 @@ void TestPortContext::close() noexcept
 }
 
 auto TestPortContext::open(TestPortConfig const& config, std::pmr::memory_resource* memory_resource) -> Status
-{
+{  // NOLINT(statusbar-block-statements): each of the port's vectors reset and sized in turn
     close();
 
     hardware_address_ = config.hardware_address;
@@ -34,6 +35,7 @@ auto TestPortContext::open(TestPortConfig const& config, std::pmr::memory_resour
 
     pool_ = std::pmr::vector<std::array<uint8_t, ETHERNET_PORT_MIN_FRAME_BUFFER>>(mem_resource_);
     launch_times_ = std::pmr::vector<int64_t>(mem_resource_);
+    tx_started_ = std::pmr::vector<uint8_t>(mem_resource_);
     free_list_ = std::pmr::vector<uint64_t>(mem_resource_);
     rx_queue_ = std::pmr::vector<RxEntry>(mem_resource_);
     tx_captures_ = std::pmr::vector<TxCapture>(mem_resource_);
@@ -42,6 +44,7 @@ auto TestPortContext::open(TestPortConfig const& config, std::pmr::memory_resour
     size_t const pool_size = config.frame_pool_size > 0 ? config.frame_pool_size : 256;
     pool_.resize(pool_size);
     launch_times_.resize(pool_size, 0);
+    tx_started_.resize(pool_size, 0);
 
     free_list_.reserve(pool_size);
     for (size_t i = pool_size; i > 0; --i) {
@@ -57,6 +60,7 @@ auto TestPortContext::tx_commit(uint64_t handle, size_t len) -> Status
     if (handle >= pool_.size()) {
         return failure(NetError::invalid_handle);
     }
+    tx_started_[static_cast<size_t>(handle)] = 0;
     if (refuse_commits_) {
         free_list_.push_back(handle);
         return failure(NetError::send_failed);
@@ -84,11 +88,20 @@ auto TestPortContext::tx_start(int64_t launch_time_ns) -> StatusValue<EthernetTx
     free_list_.pop_back();
 
     launch_times_[static_cast<size_t>(handle)] = launch_time_ns;
-
+    tx_started_[static_cast<size_t>(handle)] = 1;
     return success(EthernetTxSlot{
         .handle = handle,
         .buffer = make_span(pool_[static_cast<size_t>(handle)]),
     });
+}
+
+auto TestPortContext::tx_set_launch_time(uint64_t const handle, int64_t const launch_time_ns) -> Status
+{
+    if (handle >= tx_started_.size() || tx_started_[static_cast<size_t>(handle)] == 0) {
+        return failure(NetError::invalid_handle);  // only a frame started and not yet committed
+    }
+    launch_times_[static_cast<size_t>(handle)] = launch_time_ns;
+    return success();
 }
 
 auto TestPortContext::tx_cancel(uint64_t handle) -> Status
@@ -96,6 +109,7 @@ auto TestPortContext::tx_cancel(uint64_t handle) -> Status
     if (handle >= pool_.size()) {
         return failure(NetError::invalid_handle);
     }
+    tx_started_[static_cast<size_t>(handle)] = 0;
     free_list_.push_back(handle);
     return success();
 }
