@@ -105,6 +105,12 @@ struct AnyEthernetPortConfig
     /// Slots per ring (mmap TX and RX, xdp RX and TX; xdp's fill and
     /// completion rings get twice this).
     size_t ring_size{256};
+    /// Transitional, for the "told the time" migration: the RX clock is
+    /// CLOCK_MONOTONIC_RAW and not a choice (RxClock in
+    /// net_ethernet_port.hpp). The field stays so a config written when it
+    /// was one still compiles; open() refuses any other value with
+    /// invalid_argument. Goes when the migration is complete.
+    int rx_clock_id{CLOCK_MONOTONIC_RAW};
 
     // xdp only.
     uint32_t xdp_queue_id{0};
@@ -163,6 +169,15 @@ class AnyEthernetPort
     [[nodiscard]] auto rx_start(RxTimePoint now) -> StatusValue<std::optional<EthernetRxSlot>>;
     /// rx_start(now) with the RX clock read here.
     [[nodiscard]] auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>>;
+    /// Transitional, for the "told the time" migration: rx_start(now) told
+    /// a bare CLOCK_MONOTONIC_RAW nanosecond count, as
+    /// software_rx_timestamp_ns(CLOCK_MONOTONIC_RAW) reads it. The typed
+    /// form is the API; this keeps the bare-count pattern compiling until
+    /// the migration is complete, then goes.
+    [[nodiscard]] auto rx_start(int64_t now_ns) -> StatusValue<std::optional<EthernetRxSlot>>
+    {
+        return rx_start(RxTimePoint{RxClock::duration{now_ns}});
+    }
     [[nodiscard]] auto rx_release(uint64_t handle) -> Status;
 
     [[nodiscard]] auto join_multicast(ieee::Eui48 const& addr) -> Status;

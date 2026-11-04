@@ -67,6 +67,9 @@ auto xdp_config_from(AnyEthernetPortConfig const& config) -> XdpConfig
 auto AnyEthernetPort::open(EthernetBackend const backend, AnyEthernetPortConfig const& config) -> Status
 {
     close();
+    if (config.rx_clock_id != CLOCK_MONOTONIC_RAW) {
+        return failure(NetError::invalid_argument);  // the RX clock is not a choice: see the field
+    }
     auto status = open_backend(backend, config);
     if (!status) {
         close();
