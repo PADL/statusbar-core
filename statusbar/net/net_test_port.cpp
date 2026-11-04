@@ -5,6 +5,8 @@
 
 #include "statusbar/net/net_error.hpp"
 
+#include <cstdint>
+
 namespace statusbar::net {
 
 void TestPortContext::close() noexcept
@@ -144,6 +146,22 @@ auto TestPortContext::leave_multicast(ieee::Eui48 const& mac) -> Status
         joined_multicast_.erase(it);
     }
     return success();
+}
+
+auto TestPortContext::holds(std::span<uint8_t const> const bytes) const noexcept -> bool
+{
+    // The pool is one array of equal frames: the span's address within it, then within its frame.
+    if (bytes.empty() || pool_.empty()) {
+        return false;
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): an address compared, never dereferenced
+    auto const first = reinterpret_cast<std::uintptr_t>(pool_.front().data());
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): as above
+    auto const at = reinterpret_cast<std::uintptr_t>(bytes.data());
+    if (at < first || at - first >= pool_.size() * ETHERNET_PORT_MIN_FRAME_BUFFER) {
+        return false;
+    }
+    return ((at - first) % ETHERNET_PORT_MIN_FRAME_BUFFER) + bytes.size() <= ETHERNET_PORT_MIN_FRAME_BUFFER;
 }
 
 auto TestPortContext::pop_tx() -> std::optional<TxCapture>

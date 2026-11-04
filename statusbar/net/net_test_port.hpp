@@ -170,6 +170,10 @@ class TestPortContext
     /// Pop and return the oldest captured TX frame, or nullopt if none.
     [[nodiscard]] auto pop_tx() -> std::optional<TxCapture>;
 
+    /// Whether @p bytes lie within one of the port's frame buffers: what a caller wrote or read
+    /// there was not staged through a buffer of its own.
+    [[nodiscard]] auto holds(std::span<uint8_t const> bytes) const noexcept -> bool;
+
     /// tx_flush() calls since open().
     [[nodiscard]] auto tx_flushes() const noexcept -> size_t { return tx_flushes_; }
     /// begin_cycle() calls since open().

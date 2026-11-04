@@ -52,6 +52,21 @@ TEST(test_port_rx, a_told_receive_is_stamped_with_the_time_it_is_told)
 // TestPortContext — open/close lifecycle
 //
 
+TEST(test_port_tx, a_slot_buffer_is_held_by_the_port_and_a_copy_is_not)
+{
+    TestPortContext port;
+    EXPECT_TRUE(port.open({}).has_value());
+    auto slot = port.tx_start();
+    EXPECT_TRUE(slot.has_value());
+    if (!slot) {
+        return;
+    }
+    std::array<uint8_t, 64> elsewhere{};
+    EXPECT_TRUE(port.holds(slot->buffer.first(64)));
+    EXPECT_FALSE(port.holds(elsewhere));
+    EXPECT_FALSE(port.holds({}));
+}
+
 TEST(test_port_lifecycle, open_close)
 {
     TestPortContext port;
