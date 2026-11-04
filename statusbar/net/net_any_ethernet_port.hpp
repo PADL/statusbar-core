@@ -105,8 +105,6 @@ struct AnyEthernetPortConfig
     /// Slots per ring (mmap TX and RX, xdp RX and TX; xdp's fill and
     /// completion rings get twice this).
     size_t ring_size{256};
-    /// Clock for RX timestamps where the backend stamps in software.
-    int rx_clock_id{CLOCK_MONOTONIC_RAW};
 
     // xdp only.
     uint32_t xdp_queue_id{0};
@@ -159,6 +157,11 @@ class AnyEthernetPort
     [[nodiscard]] auto tx_cancel(uint64_t handle) -> Status;
     [[nodiscard]] auto tx_flush() -> Status;
 
+    /// The next received frame, stamped as the backend stamps: the kernel's
+    /// time where it gives one (mmap), else @p now, the RX clock as the
+    /// caller read it for this pass.
+    [[nodiscard]] auto rx_start(RxTimePoint now) -> StatusValue<std::optional<EthernetRxSlot>>;
+    /// rx_start(now) with the RX clock read here.
     [[nodiscard]] auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>>;
     [[nodiscard]] auto rx_release(uint64_t handle) -> Status;
 

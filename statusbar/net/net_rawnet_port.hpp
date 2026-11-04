@@ -63,8 +63,6 @@ struct RawnetPortConfig
     /// exists for stream egress, and bypass is what keeps its own frames
     /// off its RX socket. Off makes the egress visible to local capture.
     bool qdisc_bypass{true};
-    /// Clock for RX timestamps.
-    int rx_clock_id{CLOCK_MONOTONIC_RAW};
 };
 
 class RawnetPort
@@ -105,6 +103,10 @@ class RawnetPort
     [[nodiscard]] auto tx_flush() noexcept -> Status { return success(); }
 
     // RX
+    /// The next received frame, stamped @p now: the RX clock as the caller
+    /// read it for this pass.
+    [[nodiscard]] auto rx_start(RxTimePoint now) noexcept -> StatusValue<std::optional<EthernetRxSlot>>;
+    /// rx_start(now) with the RX clock read here.
     [[nodiscard]] auto rx_start() noexcept -> StatusValue<std::optional<EthernetRxSlot>>;
     [[nodiscard]] auto rx_release(uint64_t handle) noexcept -> Status;
 
@@ -127,7 +129,6 @@ class RawnetPort
     /// One recv into the slot, header rebuilt: the frame length, 0 when
     /// nothing was queued.
     [[nodiscard]] auto receive_frame(uint64_t handle) noexcept -> StatusValue<size_t>;
-    [[nodiscard]] auto now_ns() const noexcept -> int64_t;
 
     /// A pool of frame buffers. A slot is out between take() and
     /// give_back(); a handle that is not out - never issued, or already
@@ -173,7 +174,6 @@ class RawnetPort
     RawnetContext rx_{};
     Pool<TX_SLOTS> tx_pool_{};
     Pool<RX_SLOTS> rx_pool_{};
-    int rx_clock_id_{CLOCK_MONOTONIC_RAW};
 };
 
 static_assert(EthernetPort<RawnetPort>);

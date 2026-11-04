@@ -135,28 +135,24 @@ class LoopbackPortContext
 
     auto tx_flush() -> Status { return success(); }
 
-    auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
+    /// The next frame the peer committed, stamped @p now: the RX clock as
+    /// the caller read it for this pass (a loopback has no kernel to stamp).
+    auto rx_start(RxTimePoint const now) -> StatusValue<std::optional<EthernetRxSlot>>
     {
         auto& queue = is_side_a_ ? shared_->b_to_a : shared_->a_to_b;
         if (queue.empty()) {
             return std::optional<EthernetRxSlot>{std::nullopt};
         }
-
         if (free_list_.empty()) {
             return failure(NetError::buffer_full);
         }
-        auto const idx = free_list_.back();
-        free_list_.pop_back();
-
-        auto frame = queue.front();
+        auto const frame = queue.front();
         queue.pop_front();
-
-        auto const copy_len = std::min(frame.data.size(), pool_[idx].size());
-        span_copy(make_span(pool_[idx]), frame.data);
-
-        return std::optional<EthernetRxSlot>{EthernetRxSlot{
-            .handle = idx, .buffer = std::span<uint8_t const>{pool_[idx].data(), copy_len}, .timestamp_ns = frame.timestamp_ns}};
+        return std::optional<EthernetRxSlot>{copy_into_slot(frame, now)};
     }
+
+    /// rx_start(now) with the RX clock read here.
+    auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>> { return rx_start(rx_clock_now()); }
 
     auto rx_release(uint64_t handle) -> Status
     {
@@ -190,6 +186,19 @@ class LoopbackPortContext
     }
 
   private:
+    /// @p frame copied into the slot at the top of the free list, taken.
+    auto copy_into_slot(LoopbackSharedQueues::QueuedFrame const& frame, RxTimePoint const now) -> EthernetRxSlot
+    {
+        auto const idx = free_list_.back();
+        free_list_.pop_back();
+        auto const copy_len = std::min(frame.data.size(), pool_[idx].size());
+        span_copy(make_span(pool_[idx]), frame.data);
+        return EthernetRxSlot{
+            .handle = idx,
+            .buffer = std::span<uint8_t const>{pool_[idx].data(), copy_len},
+            .timestamp_ns = frame.timestamp_ns != 0 ? frame.timestamp_ns : rx_timestamp_ns(now)};
+    }
+
     ieee::Eui48 hardware_address_{};
     bool is_side_a_{true};
     bool valid_{false};

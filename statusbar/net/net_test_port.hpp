@@ -114,7 +114,10 @@ class TestPortContext
     //
 
     /// Start an RX operation. Returns nullopt if no frames are pending.
-    /// Pops the front frame from the RX queue and returns an EthernetRxSlot.
+    /// Pops the front frame from the RX queue and returns an EthernetRxSlot
+    /// carrying the stamp it was injected with, or @p now when that was 0.
+    [[nodiscard]] auto rx_start(RxTimePoint now) -> StatusValue<std::optional<EthernetRxSlot>>;
+    /// rx_start(now) with the RX clock read here.
     [[nodiscard]] auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>>;
 
     /// Release an RX slot back to the free list.

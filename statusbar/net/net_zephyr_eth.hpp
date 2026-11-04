@@ -24,6 +24,7 @@
 #include <span>
 
 struct net_if;
+struct net_pkt;
 
 namespace statusbar::net {
 
@@ -48,6 +49,10 @@ class ZephyrEthPort
     [[nodiscard]] auto tx_cancel(uint64_t handle) -> Status;
     [[nodiscard]] auto tx_flush() -> Status;
 
+    /// The next received frame, with the stack's stamp or @p now (the RX
+    /// clock as the caller read it for this pass) when the stack gave none.
+    [[nodiscard]] auto rx_start(RxTimePoint now) -> StatusValue<std::optional<EthernetRxSlot>>;
+    /// rx_start(now) with the RX clock read here.
     [[nodiscard]] auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>>;
     [[nodiscard]] auto rx_release(uint64_t handle) -> Status;
 
@@ -56,6 +61,13 @@ class ZephyrEthPort
     [[nodiscard]] auto end_cycle() -> Status;
 
   private:
+    /// @p pkt read into the one RX buffer and unreferenced: the slot, in use
+    /// until rx_release().
+    [[nodiscard]] auto take_packet(net_pkt* pkt, RxTimePoint now) -> StatusValue<std::optional<EthernetRxSlot>>;
+    /// @p pkt's first @p len bytes read into the RX buffer; the packet is
+    /// unreferenced either way.
+    [[nodiscard]] auto read_packet(net_pkt* pkt, size_t len) -> bool;
+
     net_if* iface_ = nullptr;
     ieee::Eui48 mac_{};
     unsigned int if_index_ = 0;

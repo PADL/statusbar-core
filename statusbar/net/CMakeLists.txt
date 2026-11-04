@@ -31,6 +31,7 @@ statusbar_add_module(
   statusbar-ieee
   statusbar-ip
   statusbar-pcap
+  statusbar-realtime
   statusbar-status
   statusbar-itc
   TESTS

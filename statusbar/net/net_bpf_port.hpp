@@ -55,9 +55,8 @@ namespace statusbar::net {
 struct BpfPortConfig
 {
     std::string_view interface_name;
-    uint16_t ethertype{0};                 ///< Kernel-level ethertype filter (0 = all)
-    size_t frame_pool_size{256};           ///< Number of internal frame buffers
-    int rx_clock_id{CLOCK_MONOTONIC_RAW};  ///< Clock for RX timestamps
+    uint16_t ethertype{0};        ///< Kernel-level ethertype filter (0 = all)
+    size_t frame_pool_size{256};  ///< Number of internal frame buffers
 };
 
 /// Cross-platform copy-based EthernetPort using BPF (macOS) or AF_PACKET (Linux).
@@ -151,6 +150,11 @@ class BpfPortContext
     // RX API
     //
 
+    /// The next received frame. Linux (AF_PACKET) stamps it @p now, the RX
+    /// clock as the caller read it for this pass; macOS keeps the BPF
+    /// header's stamp, the kernel's wall clock in microseconds.
+    [[nodiscard]] auto rx_start(RxTimePoint now) -> StatusValue<std::optional<EthernetRxSlot>>;
+    /// rx_start(now) with the RX clock read here.
     [[nodiscard]] auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>>;
 
     /// @param handle Opaque slot handle from rx_start()
@@ -181,6 +185,29 @@ class BpfPortContext
   private:
     void swap(BpfPortContext& other) noexcept;
 
+#if defined(__linux__)
+    /// One recv into the slot @p handle: the frame length, 0 when nothing
+    /// was queued.
+    [[nodiscard]] auto receive_frame(uint64_t handle) -> StatusValue<size_t>;
+    /// The slot at the top of the free list, taken, holding a frame of
+    /// @p length stamped @p now.
+    [[nodiscard]] auto take_slot(size_t length, RxTimePoint now) -> EthernetRxSlot;
+#elif defined(__APPLE__)
+    /// One packet of the BPF read buffer: where its frame starts, how much
+    /// of it was captured, and the kernel's stamp.
+    struct BpfPacket
+    {
+        uint8_t const* data;
+        size_t caplen;
+        int64_t timestamp_ns;
+    };
+    [[nodiscard]] auto buffered_bpf_header() const -> struct bpf_hdr const*;
+    [[nodiscard]] auto next_buffered_packet() -> std::optional<BpfPacket>;
+    [[nodiscard]] auto next_buffered_frame() -> std::optional<EthernetRxSlot>;
+    [[nodiscard]] auto copy_into_slot(BpfPacket const& packet) -> EthernetRxSlot;
+    [[nodiscard]] auto fill_read_buffer() -> StatusValue<bool>;
+#endif
+
     /// Allocate the internal frame pool and free list.
     /// @param pool_size Number of frame buffers to allocate
     void allocate_pool(size_t pool_size)
@@ -197,11 +224,6 @@ class BpfPortContext
     ieee::Eui48 hardware_address_{};
     unsigned int if_index_{0};
     uint16_t ethertype_{0};
-#if defined(CLOCK_MONOTONIC_RAW)
-    int rx_clock_id_{CLOCK_MONOTONIC_RAW};
-#else
-    int rx_clock_id_{0};
-#endif
 
     std::pmr::memory_resource* mem_resource_{std::pmr::get_default_resource()};
 

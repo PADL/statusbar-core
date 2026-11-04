@@ -16,12 +16,6 @@ namespace {
 /// seconds from it cannot underflow, so a test reads as it would in service.
 constexpr std::uint64_t T = 1'800'000'000ULL * 1'000'000'000ULL;
 
-/// A `now` that always answers `at`.
-[[nodiscard]] auto fixed(std::uint64_t const at)
-{
-    return [at] { return at; };
-}
-
 }  // namespace
 
 // A time that is already in the future of everything handed out goes through
@@ -29,8 +23,8 @@ constexpr std::uint64_t T = 1'800'000'000ULL * 1'000'000'000ULL;
 TEST(launch_order, a_time_after_the_last_one_passes_through)
 {
     LaunchOrder order;
-    EXPECT_EQ(order.next(T, fixed(T)), T);
-    EXPECT_EQ(order.next(T + 1'000'000, fixed(T)), T + 1'000'000);
+    EXPECT_EQ(order.next(T, T), T);
+    EXPECT_EQ(order.next(T + 1'000'000, T), T + 1'000'000);
     EXPECT_EQ(order.clamped(), std::uint64_t{0});
     EXPECT_EQ(order.steps(), std::uint64_t{0});
     EXPECT_EQ(order.max_clamp_ns(), std::uint64_t{0});
@@ -41,9 +35,9 @@ TEST(launch_order, a_time_after_the_last_one_passes_through)
 TEST(launch_order, a_time_before_the_last_one_is_held_at_it)
 {
     LaunchOrder order;
-    EXPECT_EQ(order.next(T, fixed(T)), T);
-    EXPECT_EQ(order.next(T - 300'000, fixed(T)), T);
-    EXPECT_EQ(order.next(T - 1'000, fixed(T)), T);
+    EXPECT_EQ(order.next(T, T), T);
+    EXPECT_EQ(order.next(T - 300'000, T), T);
+    EXPECT_EQ(order.next(T - 1'000, T), T);
 }
 
 // Zero means the caller has no departure for this frame: it goes at now, and
@@ -51,8 +45,8 @@ TEST(launch_order, a_time_before_the_last_one_is_held_at_it)
 TEST(launch_order, a_wanted_time_of_zero_is_sent_at_now)
 {
     LaunchOrder order;
-    EXPECT_EQ(order.next(0, fixed(T)), T);
-    EXPECT_EQ(order.next(T - 500'000, fixed(T)), T);  // held at the now it just used
+    EXPECT_EQ(order.next(0, T), T);
+    EXPECT_EQ(order.next(T - 500'000, T), T);  // held at the now it just used
 }
 
 // Two senders committing in the same tick land within a packet of each other,
@@ -61,11 +55,11 @@ TEST(launch_order, a_wanted_time_of_zero_is_sent_at_now)
 TEST(launch_order, a_clamp_under_one_packet_is_not_counted_but_a_longer_one_is)
 {
     LaunchOrder order;
-    EXPECT_EQ(order.next(T, fixed(T)), T);
-    EXPECT_EQ(order.next(T - 50'000, fixed(T)), T);
+    EXPECT_EQ(order.next(T, T), T);
+    EXPECT_EQ(order.next(T - 50'000, T), T);
     EXPECT_EQ(order.clamped(), std::uint64_t{0});
     EXPECT_EQ(order.max_clamp_ns(), std::uint64_t{0});
-    EXPECT_EQ(order.next(T - 200'000, fixed(T)), T);
+    EXPECT_EQ(order.next(T - 200'000, T), T);
     EXPECT_EQ(order.clamped(), std::uint64_t{1});
     EXPECT_EQ(order.max_clamp_ns(), std::uint64_t{200'000});
 }
@@ -74,10 +68,10 @@ TEST(launch_order, a_clamp_under_one_packet_is_not_counted_but_a_longer_one_is)
 TEST(launch_order, the_largest_clamp_is_the_one_remembered)
 {
     LaunchOrder order;
-    EXPECT_EQ(order.next(T, fixed(T)), T);
-    EXPECT_EQ(order.next(T - 800'000, fixed(T)), T);
+    EXPECT_EQ(order.next(T, T), T);
+    EXPECT_EQ(order.next(T - 800'000, T), T);
     EXPECT_EQ(order.max_clamp_ns(), std::uint64_t{800'000});
-    EXPECT_EQ(order.next(T - 300'000, fixed(T)), T);
+    EXPECT_EQ(order.next(T - 300'000, T), T);
     EXPECT_EQ(order.clamped(), std::uint64_t{2});
     EXPECT_EQ(order.max_clamp_ns(), std::uint64_t{800'000});
 }
@@ -89,8 +83,8 @@ TEST(launch_order, the_largest_clamp_is_the_one_remembered)
 TEST(launch_order, a_stale_frame_a_second_or_more_behind_is_still_held)
 {
     LaunchOrder order;
-    EXPECT_EQ(order.next(T, fixed(T)), T);
-    EXPECT_EQ(order.next(T - 1'200'000'000ULL, fixed(T)), T);
+    EXPECT_EQ(order.next(T, T), T);
+    EXPECT_EQ(order.next(T - 1'200'000'000ULL, T), T);
     EXPECT_EQ(order.steps(), std::uint64_t{0});
     EXPECT_EQ(order.clamped(), std::uint64_t{1});
     EXPECT_EQ(order.max_clamp_ns(), std::uint64_t{1'200'000'000ULL});
@@ -103,13 +97,13 @@ TEST(launch_order, a_stale_frame_a_second_or_more_behind_is_still_held)
 TEST(launch_order, a_backwards_jump_of_the_clock_is_a_step_not_a_clamp)
 {
     LaunchOrder order;
-    EXPECT_EQ(order.next(T, fixed(T)), T);
+    EXPECT_EQ(order.next(T, T), T);
     std::uint64_t const stepped = T - 3'000'000'000ULL;  // the clock now reads three seconds earlier
-    EXPECT_EQ(order.next(stepped, fixed(stepped)), stepped);
+    EXPECT_EQ(order.next(stepped, stepped), stepped);
     EXPECT_EQ(order.steps(), std::uint64_t{1});
     EXPECT_EQ(order.clamped(), std::uint64_t{0});
     // The new timebase is what the ordering now holds to.
-    EXPECT_EQ(order.next(stepped - 100'000, fixed(stepped)), stepped);
+    EXPECT_EQ(order.next(stepped - 100'000, stepped), stepped);
 }
 
 // The boundary itself: the clock a second behind the last time is a step,
@@ -117,15 +111,15 @@ TEST(launch_order, a_backwards_jump_of_the_clock_is_a_step_not_a_clamp)
 TEST(launch_order, the_step_threshold_is_one_second)
 {
     LaunchOrder under;
-    EXPECT_EQ(under.next(T, fixed(T)), T);
+    EXPECT_EQ(under.next(T, T), T);
     std::uint64_t const just_under = T - (LaunchOrder::STEP_NS - 1);
-    EXPECT_EQ(under.next(just_under, fixed(just_under)), T);
+    EXPECT_EQ(under.next(just_under, just_under), T);
     EXPECT_EQ(under.steps(), std::uint64_t{0});
 
     LaunchOrder at;
-    EXPECT_EQ(at.next(T, fixed(T)), T);
+    EXPECT_EQ(at.next(T, T), T);
     std::uint64_t const exactly = T - LaunchOrder::STEP_NS;
-    EXPECT_EQ(at.next(exactly, fixed(exactly)), exactly);
+    EXPECT_EQ(at.next(exactly, exactly), exactly);
     EXPECT_EQ(at.steps(), std::uint64_t{1});
 }
 
@@ -134,8 +128,8 @@ TEST(launch_order, the_step_threshold_is_one_second)
 TEST(launch_order, an_untimed_frame_whose_now_went_backwards_is_held)
 {
     LaunchOrder order;
-    EXPECT_EQ(order.next(T, fixed(T)), T);
-    EXPECT_EQ(order.next(0, fixed(T - 100'000)), T);
+    EXPECT_EQ(order.next(T, T), T);
+    EXPECT_EQ(order.next(0, T - 100'000), T);
     EXPECT_EQ(order.clamped(), std::uint64_t{0});  // a clamp under a packet
 }
 
@@ -144,14 +138,14 @@ TEST(launch_order, an_untimed_frame_whose_now_went_backwards_is_held)
 TEST(launch_order, reset_clears_the_counters_but_not_the_ordering)
 {
     LaunchOrder order;
-    EXPECT_EQ(order.next(T, fixed(T)), T);
-    EXPECT_EQ(order.next(T - 400'000, fixed(T)), T);
+    EXPECT_EQ(order.next(T, T), T);
+    EXPECT_EQ(order.next(T - 400'000, T), T);
     EXPECT_EQ(order.clamped(), std::uint64_t{1});
     order.reset();
     EXPECT_EQ(order.clamped(), std::uint64_t{0});
     EXPECT_EQ(order.max_clamp_ns(), std::uint64_t{0});
     EXPECT_EQ(order.steps(), std::uint64_t{0});
-    EXPECT_EQ(order.next(T - 400'000, fixed(T)), T);  // still ordered behind T
+    EXPECT_EQ(order.next(T - 400'000, T), T);  // still ordered behind T
 }
 
 // CLOCK_TAI, not CLOCK_REALTIME: a launch time is compared against the clock
@@ -164,6 +158,24 @@ TEST(launch_order, tai_now_is_a_plausible_monotonically_rising_tai_count)
     // After 2001 and before 2200, so a wrong clock or wrong units shows up.
     EXPECT_TRUE(first > 1'000'000'000ULL * 1'000'000'000ULL);
     EXPECT_TRUE(first < 7'000'000'000ULL * 1'000'000'000ULL);
+}
+
+// The told form is the ordering; the callable form is for a caller that
+// holds a clock rather than a time, and reads it exactly once per call.
+TEST(launch_order, the_callable_form_reads_its_clock_once_and_forwards)
+{
+    LaunchOrder order;
+    int reads = 0;
+    auto const clock = [&reads] {
+        ++reads;
+        return T;
+    };
+    EXPECT_EQ(order.next(0, clock), T);
+    EXPECT_EQ(reads, 1);
+    EXPECT_EQ(order.next(T - 300'000, clock), T);
+    EXPECT_EQ(reads, 2);
+    EXPECT_EQ(order.clamped(), std::uint64_t{1});
+    EXPECT_EQ(order.next(T + 1, tai_now_ns), T + 1);  // a free function is a clock too
 }
 
 TEST_MAIN(statusbar_net, net_launch_order_test)

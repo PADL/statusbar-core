@@ -77,7 +77,6 @@ void MmapContext::swap(MmapContext& other) noexcept
     std::swap(rx_ring_, other.rx_ring_);
     std::swap(rx_req_, other.rx_req_);
     std::swap(rx_index_, other.rx_index_);
-    std::swap(rx_clock_id_, other.rx_clock_id_);
 }
 
 auto MmapContext::open(MmapConfig const& config) -> Status
@@ -86,7 +85,6 @@ auto MmapContext::open(MmapConfig const& config) -> Status
     close();
 
     ethertype_ = config.ethertype;
-    rx_clock_id_ = config.rx_clock_id;
 
     // Create AF_PACKET socket with SOCK_RAW
     fd_ = ::socket(AF_PACKET, SOCK_RAW, htons(config.ethertype != 0 ? config.ethertype : ETH_P_ALL));
@@ -359,6 +357,11 @@ auto MmapContext::tx_flush() -> Status
 
 auto MmapContext::rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
 {
+    return rx_start(rx_clock_now());
+}
+
+auto MmapContext::rx_start(RxTimePoint const now) -> StatusValue<std::optional<EthernetRxSlot>>
+{
     if (!valid()) {
         return failure(MmapError::not_open);
     }
@@ -371,20 +374,13 @@ auto MmapContext::rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
         return success(std::optional<EthernetRxSlot>{});
     }
 
-    // Calculate timestamp from header
-    int64_t timestamp_ns = (static_cast<int64_t>(hdr->tp_sec) * 1'000'000'000) + static_cast<int64_t>(hdr->tp_nsec);
-
-    // If no hardware timestamp, use current time
-    if (timestamp_ns == 0) {
-        struct timespec ts;
-        clock_gettime(rx_clock_id_, &ts);
-        timestamp_ns = (static_cast<int64_t>(ts.tv_sec) * 1'000'000'000) + ts.tv_nsec;
-    }
+    // The kernel's stamp; a frame it did not stamp gets the caller's RX clock
+    int64_t const kernel_ns = (static_cast<int64_t>(hdr->tp_sec) * 1'000'000'000) + static_cast<int64_t>(hdr->tp_nsec);
 
     return success(std::optional<EthernetRxSlot>{EthernetRxSlot{
         .handle = static_cast<uint64_t>(rx_index_),
         .buffer = std::span<uint8_t const>(rx_payload(hdr), hdr->tp_len),
-        .timestamp_ns = timestamp_ns,
+        .timestamp_ns = kernel_ns != 0 ? kernel_ns : rx_timestamp_ns(now),
     }});
 }
 

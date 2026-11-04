@@ -8,6 +8,7 @@
 /// and TestPortContext all satisfy.
 
 #include "statusbar/ieee/ieee.hpp"
+#include "statusbar/realtime/realtime_clock.hpp"
 #include "statusbar/status/status.hpp"
 
 #include <algorithm>
@@ -121,8 +122,31 @@ struct EthernetRxSlot
 {
     uint64_t handle;                  ///< Opaque slot handle for rx_release()
     std::span<uint8_t const> buffer;  ///< Full Ethernet frame including 14-byte header
-    int64_t timestamp_ns;             ///< Capture timestamp in nanoseconds
+    int64_t timestamp_ns;             ///< Capture timestamp in nanoseconds: the kernel's where it gave one, else the RX clock
 };
+
+/// The clock a port stamps a received frame on when it stamps in software:
+/// CLOCK_MONOTONIC_RAW, the timing reference clock. It is not configurable:
+/// a stamp is compared with other stamps and with timer deadlines, all of
+/// which are on this clock. A backend whose kernel stamps the frame (mmap,
+/// the macOS BPF reader, Zephyr) keeps that stamp and falls back to this
+/// clock only when the kernel gave none.
+using RxClock = realtime::MonotonicRawClock;
+using RxTimePoint = RxClock::time_point;
+
+/// The RX clock now. rx_start() reads it once; a caller draining a port
+/// reads it once per pass and tells every rx_start(now) of the pass, so a
+/// pass costs one clock read however many frames it takes.
+[[nodiscard]] inline auto rx_clock_now() noexcept -> RxTimePoint
+{
+    return RxTimePoint{RxClock::duration{realtime::read_monotonic_raw_ns()}};
+}
+
+/// @p now as an EthernetRxSlot::timestamp_ns.
+[[nodiscard]] constexpr auto rx_timestamp_ns(RxTimePoint const now) noexcept -> int64_t
+{
+    return now.time_since_epoch().count();
+}
 
 /// Concept for zero-copy Ethernet frame TX/RX backends.
 ///
@@ -132,33 +156,39 @@ struct EthernetRxSlot
 /// rx_start() / rx_release() must be paired 1:1. Calling rx_start() again
 /// before releasing the previous slot is undefined behavior.
 ///
+/// rx_start(now) is told the RX clock (an RxTimePoint the caller read once
+/// for its pass) and stamps the frame from it where the kernel gave no
+/// stamp; rx_start() reads the clock once and forwards. A drain loop calls
+/// the told form.
+///
 /// launch_time_ns is in TAI nanoseconds for TSN/AVB hardware TX scheduling.
 template <typename T>
-concept EthernetPort =
-    requires(T& port, T const& cport, uint64_t handle, size_t len, int64_t launch_time_ns, ieee::Eui48 const& mac) {
-        // Lifecycle
-        { port.valid() } -> std::same_as<bool>;
-        { port.fd() } -> std::same_as<int>;
-        { cport.hardware_address() } -> std::same_as<ieee::Eui48 const&>;
-        { cport.interface_index() } -> std::same_as<unsigned int>;
+concept EthernetPort = requires(
+    T& port, T const& cport, uint64_t handle, size_t len, int64_t launch_time_ns, ieee::Eui48 const& mac, RxTimePoint now) {
+    // Lifecycle
+    { port.valid() } -> std::same_as<bool>;
+    { port.fd() } -> std::same_as<int>;
+    { cport.hardware_address() } -> std::same_as<ieee::Eui48 const&>;
+    { cport.interface_index() } -> std::same_as<unsigned int>;
 
-        // TX: start/commit/cancel/flush
-        { port.tx_start(launch_time_ns) } -> std::same_as<StatusValue<EthernetTxSlot>>;
-        { port.tx_commit(handle, len) } -> std::same_as<Status>;
-        { port.tx_cancel(handle) } -> std::same_as<Status>;
-        { port.tx_flush() } -> std::same_as<Status>;
+    // TX: start/commit/cancel/flush
+    { port.tx_start(launch_time_ns) } -> std::same_as<StatusValue<EthernetTxSlot>>;
+    { port.tx_commit(handle, len) } -> std::same_as<Status>;
+    { port.tx_cancel(handle) } -> std::same_as<Status>;
+    { port.tx_flush() } -> std::same_as<Status>;
 
-        // RX: start/release
-        { port.rx_start() } -> std::same_as<StatusValue<std::optional<EthernetRxSlot>>>;
-        { port.rx_release(handle) } -> std::same_as<Status>;
+    // RX: start (told the RX clock, and asking) / release
+    { port.rx_start(now) } -> std::same_as<StatusValue<std::optional<EthernetRxSlot>>>;
+    { port.rx_start() } -> std::same_as<StatusValue<std::optional<EthernetRxSlot>>>;
+    { port.rx_release(handle) } -> std::same_as<Status>;
 
-        // Multicast
-        { port.join_multicast(mac) } -> std::same_as<Status>;
+    // Multicast
+    { port.join_multicast(mac) } -> std::same_as<Status>;
 
-        // Per-cycle housekeeping
-        { port.begin_cycle() } -> std::same_as<void>;
-        { port.end_cycle() } -> std::same_as<Status>;
-    };
+    // Per-cycle housekeeping
+    { port.begin_cycle() } -> std::same_as<void>;
+    { port.end_cycle() } -> std::same_as<Status>;
+};
 
 // Guard-based RAII wrappers layered on top of the handle-based EthernetPort API.
 // These are zero-allocation stack values that auto-cancel/release on destruction.
@@ -299,10 +329,11 @@ template <EthernetPort Port>
 
 /// Acquire an RX guard from a port. Returns nullopt if no frame is available.
 /// @param port The EthernetPort to receive from
+/// @param now The RX clock, read once by the caller for its whole pass
 template <EthernetPort Port>
-[[nodiscard]] auto rx_guard(Port& port) -> StatusValue<std::optional<EthernetRxGuard<Port>>>
+[[nodiscard]] auto rx_guard(Port& port, RxTimePoint const now) -> StatusValue<std::optional<EthernetRxGuard<Port>>>
 {
-    auto result = port.rx_start();
+    auto result = port.rx_start(now);
     if (!result) {
         return failure(result.error());
     }
@@ -313,6 +344,13 @@ template <EthernetPort Port>
         return success(std::optional<EthernetRxGuard<Port>>{std::nullopt});
     }
     return success(std::optional<EthernetRxGuard<Port>>{EthernetRxGuard<Port>{port, *slot_opt}});
+}
+
+/// rx_guard(port, now) with the RX clock read once here.
+template <EthernetPort Port>
+[[nodiscard]] auto rx_guard(Port& port) -> StatusValue<std::optional<EthernetRxGuard<Port>>>
+{
+    return rx_guard(port, rx_clock_now());
 }
 
 /// Send a single frame using a callback to fill the buffer.

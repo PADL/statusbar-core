@@ -13,6 +13,7 @@
 #include <expected>
 #include <optional>
 #include <span>
+#include <type_traits>
 #include <vector>
 
 using namespace statusbar;
@@ -852,6 +853,68 @@ TEST(classifier_safety, ip_rule_on_non_ip_ethertype_does_not_match)
     frame[12] = 0x22;
     frame[13] = 0xF0;  // arbitrary non-IP ethertype
     EXPECT_EQ(tc.classify(frame), FrameAction::forward_tap);
+}
+
+//
+// Told the time: rx_start(now) and rx_guard(port, now)
+//
+
+static_assert(std::is_same_v<RxTimePoint, realtime::MonotonicRawClock::time_point>, "the RX clock is CLOCK_MONOTONIC_RAW");
+
+namespace {
+
+constexpr int64_t TOLD_NS = 123'456'789;
+constexpr RxTimePoint TOLD{RxClock::duration{TOLD_NS}};
+
+auto open_with_one_frame(TestPortContext& port, int64_t const injected_ns) -> void
+{
+    (void)port.open({.frame_pool_size = 4});
+    std::array<uint8_t, 64> const frame{};
+    EXPECT_TRUE(port.inject_rx(frame, injected_ns).has_value());
+}
+
+}  // namespace
+
+TEST(test_port_rx, told_time_stamps_a_frame_injected_without_one)
+{
+    TestPortContext port;
+    open_with_one_frame(port, 0);
+    auto rx = port.rx_start(TOLD);
+    EXPECT_TRUE(rx.has_value() && rx->has_value());
+    EXPECT_EQ((*rx)->timestamp_ns, TOLD_NS);
+    EXPECT_TRUE(port.rx_release((*rx)->handle).has_value());
+}
+
+TEST(test_port_rx, told_time_does_not_replace_an_injected_stamp)
+{
+    TestPortContext port;
+    open_with_one_frame(port, 99999);
+    auto rx = port.rx_start(TOLD);
+    EXPECT_TRUE(rx.has_value() && rx->has_value());
+    EXPECT_EQ((*rx)->timestamp_ns, 99999);
+    EXPECT_TRUE(port.rx_release((*rx)->handle).has_value());
+}
+
+TEST(test_port_rx, asking_form_reads_the_raw_clock)
+{
+    TestPortContext port;
+    open_with_one_frame(port, 0);
+    auto const before = rx_clock_now();
+    auto rx = port.rx_start();
+    auto const after = rx_clock_now();
+    EXPECT_TRUE(rx.has_value() && rx->has_value());
+    EXPECT_TRUE((*rx)->timestamp_ns >= rx_timestamp_ns(before));
+    EXPECT_TRUE((*rx)->timestamp_ns <= rx_timestamp_ns(after));
+    EXPECT_TRUE(port.rx_release((*rx)->handle).has_value());
+}
+
+TEST(test_port_rx, rx_guard_told_the_time_forwards_it)
+{
+    TestPortContext port;
+    open_with_one_frame(port, 0);
+    auto guard = rx_guard(port, TOLD);
+    EXPECT_TRUE(guard.has_value() && guard->has_value());
+    EXPECT_EQ((*guard)->timestamp_ns(), TOLD_NS);
 }
 
 TEST_MAIN(statusbar_net, net_ethernet_port_test)

@@ -32,7 +32,6 @@ auto rawnet_config_from(AnyEthernetPortConfig const& config) -> RawnetPortConfig
         .interface_name = config.interface_name,
         .ethertype = config.ethertype,
         .priority = config.priority,
-        .rx_clock_id = config.rx_clock_id,
     };
 }
 
@@ -44,7 +43,6 @@ auto mmap_config_from(AnyEthernetPortConfig const& config) -> MmapConfig
         .priority = config.priority < 0 ? 0U : static_cast<uint32_t>(config.priority),
         .rx_queue_size = config.ring_size,
         .tx_queue_size = config.ring_size,
-        .rx_clock_id = config.rx_clock_id,
     };
 }
 
@@ -58,7 +56,6 @@ auto xdp_config_from(AnyEthernetPortConfig const& config) -> XdpConfig
         .tx_ring_size = config.ring_size,
         .fill_ring_size = config.ring_size * 2,
         .completion_ring_size = config.ring_size * 2,
-        .rx_clock_id = config.rx_clock_id,
         .tx_launch_time = config.xdp_tx_launch_time,
         .bind_mode = config.xdp_bind_mode,
         .attach_mode = config.xdp_attach_mode,
@@ -204,9 +201,14 @@ auto AnyEthernetPort::tx_flush() -> Status
     return on_port(port_, [&](auto& backend) -> Status { return backend.tx_flush(); });
 }
 
+auto AnyEthernetPort::rx_start(RxTimePoint const now) -> StatusValue<std::optional<EthernetRxSlot>>
+{
+    return on_port(port_, [&](auto& backend) -> StatusValue<std::optional<EthernetRxSlot>> { return backend.rx_start(now); });
+}
+
 auto AnyEthernetPort::rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
 {
-    return on_port(port_, [&](auto& backend) -> StatusValue<std::optional<EthernetRxSlot>> { return backend.rx_start(); });
+    return rx_start(rx_clock_now());
 }
 
 auto AnyEthernetPort::rx_release(uint64_t const handle) -> Status

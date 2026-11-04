@@ -19,7 +19,6 @@ auto RawnetPort::open(RawnetPortConfig const& config) noexcept -> Status
         close();
         return status;
     }
-    rx_clock_id_ = config.rx_clock_id;
     return success();
 }
 
@@ -86,6 +85,11 @@ auto RawnetPort::tx_cancel(uint64_t const handle) noexcept -> Status
 
 auto RawnetPort::rx_start() noexcept -> StatusValue<std::optional<EthernetRxSlot>>
 {
+    return rx_start(rx_clock_now());
+}
+
+auto RawnetPort::rx_start(RxTimePoint const now) noexcept -> StatusValue<std::optional<EthernetRxSlot>>
+{
     if (!rx_.valid()) {
         return failure(NetError::not_connected);
     }
@@ -101,7 +105,7 @@ auto RawnetPort::rx_start() noexcept -> StatusValue<std::optional<EthernetRxSlot
     return success(std::optional<EthernetRxSlot>{EthernetRxSlot{
         .handle = *handle,
         .buffer = make_const_span(rx_pool_.buffers[*handle]).first(*frame_length),
-        .timestamp_ns = now_ns(),
+        .timestamp_ns = rx_timestamp_ns(now),
     }});
 }
 
@@ -120,13 +124,6 @@ auto RawnetPort::receive_frame(uint64_t const handle) noexcept -> StatusValue<si
     }
     header.ethertype = rx_.ethertype();
     return success(ieee::store_unchecked(std::span<uint8_t>{buffer}, header) + static_cast<size_t>(*received));
-}
-
-auto RawnetPort::now_ns() const noexcept -> int64_t
-{
-    struct timespec ts{};
-    ::clock_gettime(static_cast<clockid_t>(rx_clock_id_), &ts);
-    return (static_cast<int64_t>(ts.tv_sec) * 1'000'000'000LL) + ts.tv_nsec;
 }
 
 auto RawnetPort::rx_release(uint64_t const handle) noexcept -> Status

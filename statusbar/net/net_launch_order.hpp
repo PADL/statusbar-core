@@ -31,6 +31,7 @@
 #include <atomic>
 #include <cstdint>
 #include <ctime>
+#include <type_traits>
 
 namespace statusbar::net {
 
@@ -84,22 +85,31 @@ class LaunchOrder
     /// other, or the FIFO would stall behind every one of them.
     static constexpr std::uint64_t STEP_NS = 1'000'000'000;
 
-    /// The time to give a frame whose departure is @p wanted_ns, or `now()`
+    /// The time to give a frame whose departure is @p wanted_ns, or @p now_ns
     /// when @p wanted_ns is 0 (the caller has no departure for it). Never
     /// before the time last handed out, unless the clock stepped back.
     ///
-    /// @param now Callable returning the current TAI nanosecond count, e.g.
-    ///        `tai_now_ns`. Taken as a parameter so a test can drive it, and
-    ///        read on every call: it is what tells a stale frame from a clock
-    ///        that stepped.
-    template <typename Now>
-    [[nodiscard]] auto next(std::uint64_t const wanted_ns, Now const& now) noexcept -> std::uint64_t
+    /// @param now_ns The launch-time clock as the caller read it for this
+    ///        commit: it is what tells a stale frame from a clock that
+    ///        stepped. Told, not asked (see "told the time"): a nanosecond
+    ///        count like @p wanted_ns, because the clock is whichever one
+    ///        the NIC keeps - CLOCK_TAI, or a PHC - and no one clock tag
+    ///        names both.
+    [[nodiscard]] auto next(std::uint64_t const wanted_ns, std::uint64_t const now_ns) noexcept -> std::uint64_t
     {
-        std::uint64_t const now_ns = now();
         std::uint64_t const asked = wanted_ns == 0 ? now_ns : wanted_ns;
         std::uint64_t const given = ordered(asked, now_ns);
         last_ns_ = given;
         return given;
+    }
+
+    /// next(wanted_ns, now()) for a caller that holds a clock rather than a
+    /// time, e.g. `tai_now_ns`; the clock is read once per call.
+    template <typename Now>
+        requires std::is_invocable_r_v<std::uint64_t, Now const&>
+    [[nodiscard]] auto next(std::uint64_t const wanted_ns, Now const& now) noexcept -> std::uint64_t
+    {
+        return next(wanted_ns, now());
     }
 
     /// Frames held at the previous time by more than one packet.

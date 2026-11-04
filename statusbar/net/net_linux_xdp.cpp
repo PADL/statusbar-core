@@ -1333,7 +1333,6 @@ auto XdpContext::open(XdpConfig const& config) -> Status
     // Step 7: Store budget config + initial fill
     budget_.rx_drain_max = config.rx_drain_max;
     budget_.completion_drain_max = config.completion_drain_max;
-    budget_.rx_clock_id = config.rx_clock_id;
     tx_frame_reserve_ = detail::effective_tx_reserve(config.tx_frame_reserve, config.umem_frame_count);
 
     auto fill_status = fill_replenish();
@@ -1646,34 +1645,35 @@ auto XdpContext::tx_complete() -> Status
 
 auto XdpContext::rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
 {
+    return rx_start(rx_clock_now());
+}
+
+auto XdpContext::rx_start(RxTimePoint const now) -> StatusValue<std::optional<EthernetRxSlot>>
+{
     if (budget_.rx_drain_max > 0 && budget_.rx_cycle_count >= budget_.rx_drain_max) {
         ++stats_.rx_budget_hit_count;
         return std::optional<EthernetRxSlot>{};
     }
-
     uint32_t idx = 0;
     if (xsk_ring_cons__peek(&rings_.rx, 1, &idx) == 0) {
         return std::optional<EthernetRxSlot>{};
     }
+    return std::optional<EthernetRxSlot>{take_rx_desc(idx, now)};
+}
 
+auto XdpContext::take_rx_desc(uint32_t const idx, RxTimePoint const now) -> EthernetRxSlot
+{
     auto const* desc = xsk_ring_cons__rx_desc(&rings_.rx, idx);
-
-    struct timespec ts{};
-    (void)::clock_gettime(budget_.rx_clock_id, &ts);
-    int64_t const timestamp_ns = (static_cast<int64_t>(ts.tv_sec) * 1'000'000'000) + ts.tv_nsec;
-
-    EthernetRxSlot slot{
+    EthernetRxSlot const slot{
         .handle = desc->addr,
         .buffer = umem_.readable_span(desc->addr, desc->len),
-        .timestamp_ns = timestamp_ns,
+        .timestamp_ns = rx_timestamp_ns(now),
     };
-
     // Release ring slot — UMEM frame remains valid until rx_release(handle)
     xsk_ring_cons__release(&rings_.rx, 1);
     ++budget_.rx_cycle_count;
     ++stats_.rx_count;
-
-    return std::optional<EthernetRxSlot>{slot};
+    return slot;
 }
 
 auto XdpContext::fill_replenish() -> Status

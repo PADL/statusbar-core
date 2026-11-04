@@ -51,10 +51,6 @@ void BpfPortContext::swap(BpfPortContext& other) noexcept
     ethertype_ = other.ethertype_;
     other.ethertype_ = tmp_et;
 
-    auto tmp_clk = rx_clock_id_;
-    rx_clock_id_ = other.rx_clock_id_;
-    other.rx_clock_id_ = tmp_clk;
-
     pool_.swap(other.pool_);
     free_list_.swap(other.free_list_);
     launch_times_.swap(other.launch_times_);
@@ -144,7 +140,6 @@ void BpfPortContext::swap(BpfPortContext& other) noexcept
     hardware_address_ = mac;
     if_index_ = idx;
     ethertype_ = config.ethertype;
-    rx_clock_id_ = config.rx_clock_id;
 
     mem_resource_ = memory_resource != nullptr ? memory_resource : std::pmr::get_default_resource();
     pool_ = std::pmr::vector<std::array<uint8_t, ETHERNET_PORT_MIN_FRAME_BUFFER>>(mem_resource_);
@@ -208,47 +203,44 @@ void BpfPortContext::close() noexcept
     return success();
 }
 
-[[nodiscard]] auto BpfPortContext::rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
+[[nodiscard]] auto BpfPortContext::rx_start(RxTimePoint const now) -> StatusValue<std::optional<EthernetRxSlot>>
 {
     if (fd_ < 0) {
         return failure(NetError::not_connected);
     }
-
     if (free_list_.empty()) {
         return failure(NetError::buffer_full);
     }
+    auto const received = receive_frame(free_list_.back());
+    if (!received || *received == 0) {
+        return received ? success(std::optional<EthernetRxSlot>{}) : failure(received.error());
+    }
+    return success(std::optional<EthernetRxSlot>{take_slot(*received, now)});
+}
 
-    uint64_t const handle = free_list_.back();
+auto BpfPortContext::receive_frame(uint64_t const handle) -> StatusValue<size_t>
+{
     auto& buf = pool_[static_cast<size_t>(handle)];
-
     ssize_t n = 0;
     do {
         n = ::recv(fd_, buf.data(), buf.size(), 0);
     } while (n < 0 && errno == EINTR);
-
     if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-            return success(std::optional<EthernetRxSlot>{});
-        }
-        return failure(std::error_code(errno, std::system_category()));
+        bool const nothing = errno == EAGAIN || errno == EWOULDBLOCK;
+        return nothing ? success(size_t{0}) : failure(std::error_code(errno, std::system_category()));
     }
+    return success(static_cast<size_t>(n));
+}
 
-    if (n == 0) {
-        return success(std::optional<EthernetRxSlot>{});
-    }
-
+auto BpfPortContext::take_slot(size_t const length, RxTimePoint const now) -> EthernetRxSlot
+{
+    uint64_t const handle = free_list_.back();
     free_list_.pop_back();
-
-    // Get timestamp
-    struct timespec ts{};
-    ::clock_gettime(rx_clock_id_, &ts);
-    int64_t const timestamp_ns = (static_cast<int64_t>(ts.tv_sec) * 1'000'000'000LL) + ts.tv_nsec;
-
-    return success(std::optional<EthernetRxSlot>{EthernetRxSlot{
+    return EthernetRxSlot{
         .handle = handle,
-        .buffer = make_const_span(buf).first(static_cast<size_t>(n)),
-        .timestamp_ns = timestamp_ns,
-    }});
+        .buffer = make_const_span(pool_[static_cast<size_t>(handle)]).first(length),
+        .timestamp_ns = rx_timestamp_ns(now),
+    };
 }
 
 [[nodiscard]] auto BpfPortContext::join_multicast(ieee::Eui48 const& addr) -> Status
@@ -404,7 +396,6 @@ void BpfPortContext::close() noexcept
     hardware_address_ = mac;
     if_index_ = idx;
     ethertype_ = config.ethertype;
-    rx_clock_id_ = config.rx_clock_id;
     bpf_buf_len_ = buf_len;
 
     mem_resource_ = memory_resource != nullptr ? memory_resource : std::pmr::get_default_resource();
@@ -469,88 +460,99 @@ void BpfPortContext::close() noexcept
     return success();
 }
 
-[[nodiscard]] auto BpfPortContext::rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
+[[nodiscard]] auto BpfPortContext::rx_start(RxTimePoint const now) -> StatusValue<std::optional<EthernetRxSlot>>
 {
     if (fd_ < 0) {
         return failure(NetError::not_connected);
     }
-
     if (free_list_.empty()) {
         return failure(NetError::buffer_full);
     }
-
-    // Check if we have buffered data from a previous read
-    while (bpf_read_offset_ < bpf_read_length_) {
-        // Verify the BPF header itself fits in the remaining buffer before
-        // reinterpret_casting and dereferencing it.
-        if (bpf_read_length_ - bpf_read_offset_ < sizeof(struct bpf_hdr)) {
-            break;
-        }
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) — macOS BPF packet walker
-        auto* bh = reinterpret_cast<struct bpf_hdr*>(bpf_read_buffer_.data() + bpf_read_offset_);
-
-        // Verify the header-declared frame fits in the remaining buffer.
-        size_t const total = static_cast<size_t>(bh->bh_hdrlen) + static_cast<size_t>(bh->bh_caplen);
-        if (total > bpf_read_length_ - bpf_read_offset_) {
-            break;
-        }
-
-        uint8_t const* frame_data = bpf_read_buffer_.data() + bpf_read_offset_ + bh->bh_hdrlen;
-        uint32_t const caplen = bh->bh_caplen;
-
-        // Advance to next packet. Guard against the corrupt-header case where
-        // the aligned step is zero — without this the loop would spin forever.
-        size_t const advance = BPF_WORDALIGN(total);
-        if (advance == 0) {
-            break;
-        }
-        bpf_read_offset_ += advance;
-
-        if (caplen < 14) {
-            continue;  // Skip runt frames
-        }
-
-        // Copy frame into a pool buffer
-        uint64_t const handle = free_list_.back();
-        free_list_.pop_back();
-
-        auto& buf = pool_[static_cast<size_t>(handle)];
-        size_t const copy_len = (caplen > ETHERNET_PORT_MIN_FRAME_BUFFER) ? ETHERNET_PORT_MIN_FRAME_BUFFER : caplen;
-        std::copy_n(frame_data, copy_len, buf.data());
-
-        // Timestamp from BPF header
-        int64_t const timestamp_ns = (static_cast<int64_t>(bh->bh_tstamp.tv_sec) * 1'000'000'000LL) +
-            (static_cast<int64_t>(bh->bh_tstamp.tv_usec) * 1'000LL);
-
-        return success(std::optional<EthernetRxSlot>{EthernetRxSlot{
-            .handle = handle,
-            .buffer = make_const_span(buf).first(copy_len),
-            .timestamp_ns = timestamp_ns,
-        }});
+    // What a previous read left in the buffer comes first
+    if (auto const slot = next_buffered_frame()) {
+        return success(std::optional<EthernetRxSlot>{*slot});
     }
+    auto const filled = fill_read_buffer();
+    if (!filled || !*filled) {
+        return filled ? success(std::optional<EthernetRxSlot>{}) : failure(filled.error());
+    }
+    // The buffer refilled: walk it (one level, the buffer is spent before
+    // the next read)
+    return rx_start(now);
+}
 
-    // Need to read more data from BPF
+/// The BPF header at the read offset, when a whole packet follows it;
+/// nullptr when the buffer is spent or its next header is corrupt, which
+/// ends the buffer rather than spinning the walk forever.
+auto BpfPortContext::buffered_bpf_header() const -> struct bpf_hdr const*
+{
+    size_t const remaining = bpf_read_length_ - bpf_read_offset_;
+    if (remaining < sizeof(struct bpf_hdr)) {
+        return nullptr;
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) — macOS BPF packet walker
+    auto const* bh = reinterpret_cast<struct bpf_hdr const*>(bpf_read_buffer_.data() + bpf_read_offset_);
+    size_t const total = static_cast<size_t>(bh->bh_hdrlen) + static_cast<size_t>(bh->bh_caplen);
+    return (total > remaining || BPF_WORDALIGN(total) == 0) ? nullptr : bh;
+}
+
+/// The packet at the read offset, the offset moved past it; nothing when
+/// no whole packet remains.
+auto BpfPortContext::next_buffered_packet() -> std::optional<BpfPacket>
+{
+    auto const* bh = buffered_bpf_header();
+    if (bh == nullptr) {
+        return std::nullopt;
+    }
+    BpfPacket const packet{
+        .data = bpf_read_buffer_.data() + bpf_read_offset_ + bh->bh_hdrlen,
+        .caplen = bh->bh_caplen,
+        .timestamp_ns = (static_cast<int64_t>(bh->bh_tstamp.tv_sec) * 1'000'000'000LL) +
+            (static_cast<int64_t>(bh->bh_tstamp.tv_usec) * 1'000LL),
+    };
+    bpf_read_offset_ += BPF_WORDALIGN(static_cast<size_t>(bh->bh_hdrlen) + static_cast<size_t>(bh->bh_caplen));
+    return packet;
+}
+
+/// The next whole frame in the read buffer, copied into a pool slot, or
+/// nothing when the buffer is spent. A runt is skipped.
+auto BpfPortContext::next_buffered_frame() -> std::optional<EthernetRxSlot>
+{
+    while (auto const packet = next_buffered_packet()) {
+        if (packet->caplen >= ieee::protocols::ETHERNET_HEADER_SIZE) {
+            return copy_into_slot(*packet);
+        }
+    }
+    return std::nullopt;
+}
+
+/// @p packet copied into the slot at the top of the free list, taken, with
+/// the kernel's stamp.
+auto BpfPortContext::copy_into_slot(BpfPacket const& packet) -> EthernetRxSlot
+{
+    uint64_t const handle = free_list_.back();
+    free_list_.pop_back();
+    auto& buf = pool_[static_cast<size_t>(handle)];
+    size_t const copy_len = std::min(packet.caplen, ETHERNET_PORT_MIN_FRAME_BUFFER);
+    std::copy_n(packet.data, copy_len, buf.data());
+    return EthernetRxSlot{.handle = handle, .buffer = make_const_span(buf).first(copy_len), .timestamp_ns = packet.timestamp_ns};
+}
+
+/// One read of the BPF device into the read buffer: true with the buffer
+/// refilled, false when nothing was queued.
+auto BpfPortContext::fill_read_buffer() -> StatusValue<bool>
+{
     ssize_t n = 0;
     do {
         n = ::read(fd_, bpf_read_buffer_.data(), bpf_read_buffer_.size());
     } while (n < 0 && errno == EINTR);
-
     if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-            return success(std::optional<EthernetRxSlot>{});
-        }
-        return failure(std::error_code(errno, std::system_category()));
+        bool const nothing = errno == EAGAIN || errno == EWOULDBLOCK;
+        return nothing ? success(false) : failure(std::error_code(errno, std::system_category()));
     }
-
-    if (n == 0) {
-        return success(std::optional<EthernetRxSlot>{});
-    }
-
     bpf_read_offset_ = 0;
     bpf_read_length_ = static_cast<size_t>(n);
-
-    // Process the newly read data (recursive call to handle the buffer)
-    return rx_start();
+    return success(n > 0);
 }
 
 [[nodiscard]] auto BpfPortContext::join_multicast(ieee::Eui48 const& addr) -> Status
@@ -620,7 +622,7 @@ void BpfPortContext::close() noexcept
     return failure(NetError::not_supported);
 }
 
-[[nodiscard]] auto BpfPortContext::rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
+[[nodiscard]] auto BpfPortContext::rx_start(RxTimePoint) -> StatusValue<std::optional<EthernetRxSlot>>
 {
     return failure(NetError::not_supported);
 }
@@ -631,5 +633,10 @@ void BpfPortContext::close() noexcept
 }
 
 #endif
+
+[[nodiscard]] auto BpfPortContext::rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
+{
+    return rx_start(rx_clock_now());
+}
 
 }  // namespace statusbar::net

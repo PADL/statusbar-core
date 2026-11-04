@@ -92,6 +92,11 @@ auto TestPortContext::tx_cancel(uint64_t handle) -> Status
 
 auto TestPortContext::rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
 {
+    return rx_start(rx_clock_now());
+}
+
+auto TestPortContext::rx_start(RxTimePoint const now) -> StatusValue<std::optional<EthernetRxSlot>>
+{
     if (rx_queue_.empty()) {
         return success(std::optional<EthernetRxSlot>{});
     }
@@ -102,7 +107,7 @@ auto TestPortContext::rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
     return success(std::optional<EthernetRxSlot>{EthernetRxSlot{
         .handle = entry.pool_index,
         .buffer = make_const_span(pool_[static_cast<size_t>(entry.pool_index)]).first(entry.frame_length),
-        .timestamp_ns = entry.timestamp_ns,
+        .timestamp_ns = entry.timestamp_ns != 0 ? entry.timestamp_ns : rx_timestamp_ns(now),
     }});
 }
 

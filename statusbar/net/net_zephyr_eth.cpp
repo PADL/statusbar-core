@@ -3,6 +3,8 @@
 
 #include "statusbar/net/net_zephyr_eth.hpp"
 
+#include <algorithm>
+
 #if defined(__ZEPHYR__)
 
 #    include <cstddef>
@@ -106,6 +108,11 @@ auto ZephyrEthPort::tx_flush() -> Status
 
 auto ZephyrEthPort::rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
 {
+    return rx_start(rx_clock_now());
+}
+
+auto ZephyrEthPort::rx_start(RxTimePoint const now) -> StatusValue<std::optional<EthernetRxSlot>>
+{
     if (rx_in_use_) {
         return failure(std::errc::device_or_resource_busy);
     }
@@ -113,23 +120,30 @@ auto ZephyrEthPort::rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
     if (pkt == nullptr) {
         return std::optional<EthernetRxSlot>{std::nullopt};
     }
+    return take_packet(pkt, now);
+}
 
-    int64_t const ts = static_cast<int64_t>(net_pkt_timestamp_ns(pkt));
-    size_t len = net_pkt_get_len(pkt);
-    if (len > rx_buf_.storage.size()) {
-        len = rx_buf_.storage.size();
+auto ZephyrEthPort::take_packet(net_pkt* const pkt, RxTimePoint const now) -> StatusValue<std::optional<EthernetRxSlot>>
+{
+    int64_t const stack_ns = static_cast<int64_t>(net_pkt_timestamp_ns(pkt));
+    size_t const len = std::min(static_cast<size_t>(net_pkt_get_len(pkt)), rx_buf_.storage.size());
+    if (!read_packet(pkt, len)) {
+        return failure(std::errc::io_error);
     }
+    rx_buf_.length = len;
+    rx_in_use_ = true;
+    return std::optional<EthernetRxSlot>{EthernetRxSlot{
+        .handle = kSlotHandle,
+        .buffer = std::span<uint8_t const>(rx_buf_.storage.data(), len),
+        .timestamp_ns = stack_ns != 0 ? stack_ns : rx_timestamp_ns(now)}};
+}
+
+auto ZephyrEthPort::read_packet(net_pkt* const pkt, size_t const len) -> bool
+{
     net_pkt_cursor_init(pkt);
     int const r = net_pkt_read(pkt, rx_buf_.storage.data(), len);
     net_pkt_unref(pkt);
-    if (r != 0) {
-        return failure(std::errc::io_error);
-    }
-
-    rx_buf_.length = len;
-    rx_in_use_ = true;
-    return std::optional<EthernetRxSlot>{
-        EthernetRxSlot{.handle = kSlotHandle, .buffer = std::span<uint8_t const>(rx_buf_.storage.data(), len), .timestamp_ns = ts}};
+    return r == 0;
 }
 
 auto ZephyrEthPort::rx_release(uint64_t handle) -> Status

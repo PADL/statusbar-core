@@ -2037,6 +2037,20 @@ TEST(net_loopback, rx_start_empty_returns_nullopt)
     EXPECT_FALSE(rx->has_value());  // nullopt — no frames pending
 }
 
+TEST(net_loopback, rx_start_told_the_time_stamps_the_frame_with_it)
+{
+    LoopbackPortConfig cfg{.frame_pool_size = 4};
+    auto [a, b] = create_loopback_pair(cfg);
+    auto slot = a.tx_start(0);
+    EXPECT_TRUE(a.tx_commit(slot->handle, ETHERNET_PORT_MIN_FRAME_BUFFER).has_value());
+
+    RxTimePoint const told{RxClock::duration{987'654'321}};
+    auto rx = b.rx_start(told);
+    EXPECT_TRUE(rx.has_value() && rx->has_value());
+    EXPECT_EQ((*rx)->timestamp_ns, int64_t{987'654'321});
+    EXPECT_TRUE(b.rx_release((*rx)->handle).has_value());
+}
+
 TEST(net_loopback, bidirectional_tx_rx)
 {
     LoopbackPortConfig cfg{.frame_pool_size = 8};

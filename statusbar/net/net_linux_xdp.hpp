@@ -297,7 +297,6 @@ struct XdpConfig
     unsigned int tap_ifindex{0};
     size_t rx_drain_max{32};
     size_t completion_drain_max{64};
-    int rx_clock_id{CLOCK_MONOTONIC_RAW};
     /// Register the UMEM with room for AF_XDP TX metadata, so each frame can
     /// carry a launch time (XdpContext::tx_set_launch_time). The NIC must be
     /// in launch-time mode for the time to mean anything - an offloaded `etf`
@@ -480,7 +479,6 @@ struct CycleBudget
 {
     size_t rx_drain_max{0};
     size_t completion_drain_max{64};
-    int rx_clock_id{0};
     size_t rx_cycle_count{0};
 };
 
@@ -1766,6 +1764,10 @@ class XdpContext
         return failure(XdpError::tx_flush_failed);
     }
 
+    /// The next received frame, stamped @p now: the RX clock as the caller
+    /// read it for this pass. Nothing once the cycle's RX budget is spent.
+    [[nodiscard]] auto rx_start(RxTimePoint now) -> StatusValue<std::optional<EthernetRxSlot>>;
+    /// rx_start(now) with the RX clock read here.
     [[nodiscard]] auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>>;
 
     /// @param handle UMEM frame address from rx_start()
@@ -1876,6 +1878,10 @@ class XdpContext
     detail::BpfState bpf_;
     detail::RingSet rings_;
     detail::InterfaceId interface_;
+    /// The frame at RX ring entry @p idx as a slot stamped @p now, the ring
+    /// entry released: the UMEM frame stays valid until rx_release(handle).
+    [[nodiscard]] auto take_rx_desc(uint32_t idx, RxTimePoint now) -> EthernetRxSlot;
+
     detail::CycleBudget budget_;
     Stats stats_{};
     XdpProgram program_;
@@ -2012,6 +2018,10 @@ class XdpContext
     [[nodiscard]] auto tx_cancel(uint64_t) -> Status { return failure(XdpError::not_supported_on_platform); }
     [[nodiscard]] auto tx_flush() -> Status { return failure(XdpError::not_supported_on_platform); }
 
+    [[nodiscard]] auto rx_start(RxTimePoint) -> StatusValue<std::optional<EthernetRxSlot>>
+    {
+        return failure(XdpError::not_supported_on_platform);
+    }
     [[nodiscard]] auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
     {
         return failure(XdpError::not_supported_on_platform);

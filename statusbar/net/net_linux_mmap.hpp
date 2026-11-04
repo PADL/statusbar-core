@@ -90,12 +90,11 @@ class MmapErrorCategory : public std::error_category
 /// Configuration for MmapContext
 struct MmapConfig
 {
-    std::string_view interface_name;       ///< Network interface name (e.g., "eth0")
-    uint16_t ethertype{0};                 ///< Ethertype filter (0 = all)
-    uint32_t priority{0};                  ///< Socket priority for QoS
-    size_t rx_queue_size{256};             ///< Number of RX frame slots (sized for burst headroom)
-    size_t tx_queue_size{256};             ///< Number of TX frame slots (sized for burst headroom)
-    int rx_clock_id{CLOCK_MONOTONIC_RAW};  ///< Clock for RX timestamps when no hardware timestamp
+    std::string_view interface_name;  ///< Network interface name (e.g., "eth0")
+    uint16_t ethertype{0};            ///< Ethertype filter (0 = all)
+    uint32_t priority{0};             ///< Socket priority for QoS
+    size_t rx_queue_size{256};        ///< Number of RX frame slots (sized for burst headroom)
+    size_t tx_queue_size{256};        ///< Number of TX frame slots (sized for burst headroom)
 };
 
 }  // namespace statusbar::net
@@ -218,6 +217,11 @@ class MmapContext
 
     /// Start an RX operation, returning received frame data if available.
     /// Returns std::nullopt wrapped in StatusValue if no frame is ready.
+    /// The slot carries the kernel's stamp (tp_sec/tp_nsec); a frame the
+    /// kernel did not stamp gets @p now, the RX clock as the caller read it
+    /// for this pass.
+    [[nodiscard]] auto rx_start(RxTimePoint now) -> StatusValue<std::optional<EthernetRxSlot>>;
+    /// rx_start(now) with the RX clock read here.
     [[nodiscard]] auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>>;
 
     /// Release an RX slot back to the kernel for reuse.
@@ -303,9 +307,6 @@ class MmapContext
     void* rx_ring_{nullptr};
     tpacket_req rx_req_{};
     size_t rx_index_{0};
-
-    // Clock ID for RX fallback timestamps
-    int rx_clock_id_{CLOCK_MONOTONIC_RAW};
 };
 
 #else  // !__linux__
@@ -333,6 +334,10 @@ class MmapContext
     [[nodiscard]] auto tx_commit(uint64_t, size_t) -> Status { return failure(MmapError::not_supported_on_platform); }
     [[nodiscard]] auto tx_cancel(uint64_t) -> Status { return failure(MmapError::not_supported_on_platform); }
     [[nodiscard]] auto tx_flush() -> Status { return failure(MmapError::not_supported_on_platform); }
+    [[nodiscard]] auto rx_start(RxTimePoint) -> StatusValue<std::optional<EthernetRxSlot>>
+    {
+        return failure(MmapError::not_supported_on_platform);
+    }
     [[nodiscard]] auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
     {
         return failure(MmapError::not_supported_on_platform);
