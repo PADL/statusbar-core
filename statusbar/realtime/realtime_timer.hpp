@@ -44,6 +44,12 @@ class Timer : public TimerBase
     using event_type = TimerEvent<clock_type>;
     using callback_type = TimerCallback<clock_type>;
 
+    /// Whether the adapter's reference clock is CLOCK_MONOTONIC_RAW. Then
+    /// deadlines are RAW instants and each wait sleeps early on
+    /// CLOCK_MONOTONIC and spins on RAW (TimerBase::wait_until_raw_deadline);
+    /// otherwise they are CLOCK_MONOTONIC instants slept to directly.
+    static constexpr bool raw_reference = reference_is_raw_v<ClockAdapterT>;
+
     /// Construct a realtime timer.
     /// The caller is responsible for validating @p config (see validate_timer_config)
     /// before construction; passing an invalid config produces undefined behavior.
@@ -74,13 +80,34 @@ class Timer : public TimerBase
   protected:
     /// The two deadlines that drive each tick: @p scheduled_time_ns is the
     /// canonical target in the adapter's clock domain (used for event data
-    /// and stats); @p mono_deadline_ns is the monotonic clock instant we
-    /// actually sleep to.
+    /// and stats); @p reference_deadline_ns is the same instant on the
+    /// reference clock we actually wait on: CLOCK_MONOTONIC_RAW when
+    /// raw_reference, CLOCK_MONOTONIC otherwise.
     struct Deadline
     {
         int64_t scheduled_time_ns;
-        int64_t mono_deadline_ns;
+        int64_t reference_deadline_ns;
     };
+
+    /// The adapter-domain instant on the reference clock.
+    [[nodiscard]] auto to_reference_ns(int64_t scheduled_time_ns) const -> int64_t
+    {
+        if constexpr (raw_reference) {
+            return adapter_.to_raw_ns(scheduled_time_ns);
+        } else {
+            return adapter_.to_monotonic_ns(scheduled_time_ns);
+        }
+    }
+
+    /// Wait for a reference-clock deadline the way that clock needs.
+    [[nodiscard]] auto wait_until_reference_deadline(int64_t reference_deadline_ns) noexcept -> WaitResult
+    {
+        if constexpr (raw_reference) {
+            return wait_until_raw_deadline(reference_deadline_ns);
+        } else {
+            return wait_until_deadline(reference_deadline_ns);
+        }
+    }
 
     /// Block until the clock adapter reports healthy (for non-monotonic clocks
     /// like gPTP that need to synchronise before producing valid timestamps).
@@ -99,7 +126,7 @@ class Timer : public TimerBase
     [[nodiscard]] auto resync_mono_deadline(int64_t next_wake_count) const -> Deadline
     {
         int64_t const scheduled_time_ns = cycle_number_to_ns(next_wake_count, config_.period_ns);
-        return {.scheduled_time_ns = scheduled_time_ns, .mono_deadline_ns = adapter_.to_monotonic_ns(scheduled_time_ns)};
+        return {.scheduled_time_ns = scheduled_time_ns, .reference_deadline_ns = to_reference_ns(scheduled_time_ns)};
     }
 
     /// Periodic drift correction: every resync_interval_cycles wakes, return
@@ -118,18 +145,19 @@ class Timer : public TimerBase
     }
 
     /// Advance the loop-carried wake state by (skipped_counts + 1) periods.
-    /// Increments both the adapter-domain scheduled_time and the monotonic
+    /// Increments both the adapter-domain scheduled_time and the reference
     /// deadline by the same ns delta — this is the key optimisation that
     /// avoids re-running the adapter's slope conversion every tick (the tiny
     /// accumulated drift is fixed up by the periodic resync in run_loop).
-    auto advance_schedule(WaitResult const& wait, int64_t& next_wake_count, int64_t& scheduled_time_ns, int64_t& mono_deadline_ns)
-        const noexcept -> void
+    auto advance_schedule(
+        WaitResult const& wait, int64_t& next_wake_count, int64_t& scheduled_time_ns, int64_t& reference_deadline_ns) const noexcept
+        -> void
     {
         int64_t const periods_to_advance = wait.skipped_counts + 1;
         int64_t const advance_ns = cycle_number_to_ns(periods_to_advance, config_.period_ns);
         next_wake_count += periods_to_advance;
         scheduled_time_ns += advance_ns;
-        mono_deadline_ns += advance_ns;
+        reference_deadline_ns += advance_ns;
     }
 
     /// Construct the per-wake event, invoke the user callback, measure its
@@ -150,9 +178,9 @@ class Timer : public TimerBase
                 .skipped_counts = wait.skipped_counts,
             };
 
-            int64_t const callback_start_ns = read_monotonic_ns();
+            int64_t const callback_start_ns = read_monotonic_raw_ns();
             callback_(event, stats_.snapshot());
-            int64_t const callback_end_ns = read_monotonic_ns();
+            int64_t const callback_end_ns = read_monotonic_raw_ns();
             duration_ns_raw = callback_end_ns - callback_start_ns;
         }
         stats_.update_with_duration(wait.error_ns, duration_ns_raw, wait.skipped_counts);
@@ -160,6 +188,9 @@ class Timer : public TimerBase
 
     auto run_loop() -> void override
     {
+        if constexpr (raw_reference) {
+            prime_raw_line();
+        }
         // Calculate starting wake count based on current time in the adapter's clock domain.
         // start_offset_cycles (default 2) schedules the first wake far enough in the future
         // that thread setup latency can't leave us past the deadline before we even sleep.
@@ -171,10 +202,10 @@ class Timer : public TimerBase
         Deadline deadline = resync_mono_deadline(next_wake_count);
 
         while (should_run()) {
-            WaitResult const wait = wait_until_deadline(deadline.mono_deadline_ns);
+            WaitResult const wait = wait_until_reference_deadline(deadline.reference_deadline_ns);
             invoke_callback(deadline.scheduled_time_ns, next_wake_count, wait);
 
-            advance_schedule(wait, next_wake_count, deadline.scheduled_time_ns, deadline.mono_deadline_ns);
+            advance_schedule(wait, next_wake_count, deadline.scheduled_time_ns, deadline.reference_deadline_ns);
             deadline = maybe_resync_mono_deadline(next_wake_count, deadline);
         }
     }

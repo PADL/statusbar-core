@@ -898,4 +898,71 @@ TEST(realtime_monotonic, is_monotonic)
 // Main test runner
 //
 
+//
+// Raw-reference timer: schedules and measures on CLOCK_MONOTONIC_RAW
+//
+
+namespace {
+
+constexpr int64_t RAW_PERIOD_NS = 2'000'000;
+
+/// What the timer thread reported, read back once it has stopped.
+struct RawRun
+{
+    std::atomic<int> wakes{0};
+    std::atomic<int64_t> first_scheduled_ns{0};
+    std::atomic<int64_t> last_scheduled_ns{0};
+    std::atomic<int64_t> worst_error_ns{0};
+
+    auto observe(TimerEvent<MonotonicRawClock> const& event) -> void
+    {
+        if (wakes.fetch_add(1, std::memory_order_relaxed) == 0) {
+            first_scheduled_ns.store(event.scheduled_time_ns(), std::memory_order_relaxed);
+        }
+        last_scheduled_ns.store(event.scheduled_time_ns(), std::memory_order_relaxed);
+        worst_error_ns.store(std::max(worst_error_ns.load(std::memory_order_relaxed), event.error_ns()), std::memory_order_relaxed);
+    }
+};
+
+/// Run a raw-reference timer until it has woken @p wanted times (or 500 ms
+/// have passed) and hand back the line its thread fitted.
+auto run_raw_timer(RawRun& run, int wanted) -> MonotonicRawLine::RateOffset
+{
+    TimerConfig const config{.period_ns = RAW_PERIOD_NS, .cpu = -1, .stack_prefault_bytes = 0};
+    Timer<MonotonicRawClockAdapter> timer(config, [&run](auto const& event, auto const&) { run.observe(event); });
+    timer.start();
+    for (int i = 0; i < 500 && run.wakes.load(std::memory_order_relaxed) < wanted; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    timer.stop();
+    return timer.raw_line().consume();
+}
+
+}  // namespace
+
+TEST(realtime_timer_raw, the_adapter_decides_which_wait_the_timer_takes)
+{
+    static_assert(Timer<MonotonicRawClockAdapter>::raw_reference);
+    static_assert(!Timer<>::raw_reference);
+    static_assert(std::is_same_v<Timer<MonotonicRawClockAdapter>::time_point, MonotonicRawClock::time_point>);
+}
+
+TEST(realtime_timer_raw, a_raw_reference_timer_wakes_on_period_boundaries_of_the_raw_clock)
+{
+    RawRun run;
+    auto const line = run_raw_timer(run, 10);
+    int const wakes = run.wakes.load(std::memory_order_relaxed);
+    EXPECT_TRUE(wakes >= 10);
+    // Scheduled times are RAW instants on period boundaries, advancing a
+    // period per wake.
+    EXPECT_EQ(run.last_scheduled_ns.load(std::memory_order_relaxed) % RAW_PERIOD_NS, int64_t{0});
+    EXPECT_TRUE(run.last_scheduled_ns.load() - run.first_scheduled_ns.load() >= (wakes - 1) * RAW_PERIOD_NS);
+    // The thread primed its RAW->MONOTONIC line before the first deadline.
+    EXPECT_TRUE(line.rate > 0.8 && line.rate < 1.2);
+    EXPECT_NE(line.offset_ns, int64_t{0});
+    // The wake error is measured on RAW. This runs without SCHED_FIFO on a
+    // shared box, so only a gross bound is asserted.
+    EXPECT_TRUE(run.worst_error_ns.load(std::memory_order_relaxed) < 50'000'000);
+}
+
 TEST_MAIN(statusbar_realtime, realtime_timer_test)

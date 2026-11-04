@@ -21,7 +21,7 @@ auto build_histogram_arg_specs(stats::AtomicHistogramConfig& config) -> args::Ar
 }
 
 auto build_timer_arg_specs(TimerConfig& config) -> args::ArgumentSpecs
-{
+{  // NOLINT(statusbar-block-statements) one table of specs, one per config field, read top to bottom
     args::ArgumentSpecs specs;
     specs.add<int64_t>("period_ns", "Wake period in nanoseconds", config.period_ns, [&](auto v) -> void { config.period_ns = v; });
     specs.add<int64_t>("compensation_ns", "Compensation in nanoseconds", config.compensation_ns, [&](auto v) -> void {
@@ -58,6 +58,16 @@ auto build_timer_arg_specs(TimerConfig& config) -> args::ArgumentSpecs
         "Wakes between mono-deadline resyncs that correct accumulated slope drift (0 = never)",
         config.resync_interval_cycles,
         [&](auto v) -> void { config.resync_interval_cycles = v; });
+    specs.add<int64_t>(
+        "raw_spin_guard_ns",
+        "Raw-reference timers: wake this early on CLOCK_MONOTONIC, then spin on CLOCK_MONOTONIC_RAW to the deadline",
+        config.raw_spin_guard_ns,
+        [&](auto v) -> void { config.raw_spin_guard_ns = v; });
+    specs.add<int64_t>(
+        "raw_line_sample_interval_ns",
+        "Raw-reference timers: RAW->MONOTONIC line re-sample interval in ns (0 = once at start)",
+        config.raw_line_sample_interval_ns,
+        [&](auto v) -> void { config.raw_line_sample_interval_ns = v; });
 
     // Merge histogram specs with prefixes
     specs.merge(build_histogram_arg_specs(config.error_histogram), "error_histogram.");

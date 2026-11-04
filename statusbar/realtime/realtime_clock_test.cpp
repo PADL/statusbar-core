@@ -658,4 +658,94 @@ TEST(gptp_adapter, synchronization_lost)
 // Test Runner
 //
 
+//
+// MonotonicRawClock and MonotonicRawClockAdapter Tests
+//
+
+TEST(monotonic_raw_clock, is_its_own_clock_type)
+{
+    static_assert(is_clock_v<MonotonicRawClock>);
+    static_assert(is_monotonic_raw_clock_v<MonotonicRawClock>);
+    static_assert(!is_monotonic_raw_clock_v<MonotonicClock>);
+    static_assert(!is_monotonic_clock_v<MonotonicRawClock>);
+    static_assert(MonotonicRawClockType<MonotonicRawClock>);
+    static_assert(!std::is_same_v<MonotonicRawClock::time_point, MonotonicClock::time_point>);
+    static_assert(std::is_signed_v<MonotonicRawClock::rep>);
+}
+
+TEST(monotonic_raw_adapter, satisfies_the_adapter_concept_and_says_it_is_raw)
+{
+    static_assert(ClockAdapterType<MonotonicRawClockAdapter>);
+    static_assert(reference_is_raw_v<MonotonicRawClockAdapter>);
+    static_assert(!reference_is_raw_v<MonotonicClockAdapter>);
+    static_assert(std::is_same_v<MonotonicRawClockAdapter::clock_type, MonotonicRawClock>);
+}
+
+TEST(monotonic_raw_adapter, now_reads_the_raw_clock_and_is_always_healthy)
+{
+    MonotonicRawClockAdapter adapter;
+    EXPECT_TRUE(adapter.is_healthy());
+    EXPECT_EQ(adapter.epoch(), 0U);
+    auto const before = read_monotonic_raw_ns();
+    auto const now = adapter.now();
+    auto const after = read_monotonic_raw_ns();
+    EXPECT_TRUE(now.healthy);
+    EXPECT_TRUE(MonotonicRawClock::to_ns(now.time) >= before);
+    EXPECT_TRUE(MonotonicRawClock::to_ns(now.time) <= after);
+    EXPECT_EQ(adapter.to_raw_ns(42), int64_t{42});
+    EXPECT_EQ(adapter.from_raw_ns(42), int64_t{42});
+}
+
+TEST(monotonic_raw_adapter, converts_to_monotonic_through_the_line_it_is_given)
+{
+    MonotonicRawLine line;
+    line.publish({.rate = 1.0, .offset_ns = 1'000});
+    MonotonicRawClockAdapter adapter{&line};
+    EXPECT_EQ(adapter.to_monotonic_ns(10), int64_t{1'010});
+    EXPECT_EQ(adapter.from_monotonic_ns(1'010), int64_t{10});
+    auto const mono = adapter.to_monotonic(MonotonicRawClock::from_ns(10));
+    static_assert(std::is_same_v<decltype(mono), TimeConversion<MonotonicClock> const>);
+    EXPECT_EQ(MonotonicClock::to_ns(mono.time), int64_t{1'010});
+}
+
+TEST(monotonic_raw_adapter, without_a_line_it_applies_the_live_offset)
+{
+    MonotonicRawClockAdapter adapter;
+    int64_t const raw_now = read_monotonic_raw_ns();
+    int64_t const mono_now = read_monotonic_ns();
+    // Converting "now" gives "now" on the other clock, give or take the reads.
+    EXPECT_TRUE(std::llabs(adapter.to_monotonic_ns(raw_now) - mono_now) < 1'000'000);
+    EXPECT_TRUE(std::llabs(adapter.from_monotonic_ns(mono_now) - raw_now) < 1'000'000);
+}
+
+namespace {
+
+/// A gPTP source that says it maps to RAW: a ClockAdapter on it forwards
+/// to_raw_ns/from_raw_ns and reports reference_is_raw.
+struct RawGptpSource
+{
+    static constexpr bool reference_is_raw = true;
+    [[nodiscard]] auto now_ns() const noexcept -> int64_t { return 5'000; }
+    [[nodiscard]] auto to_monotonic_ns(int64_t ns) const noexcept -> int64_t { return ns + 100; }
+    [[nodiscard]] auto from_monotonic_ns(int64_t ns) const noexcept -> int64_t { return ns - 100; }
+    [[nodiscard]] auto to_raw_ns(int64_t ns) const noexcept -> int64_t { return ns + 1; }
+    [[nodiscard]] auto from_raw_ns(int64_t ns) const noexcept -> int64_t { return ns - 1; }
+    [[nodiscard]] auto is_healthy() const noexcept -> bool { return true; }
+    [[nodiscard]] auto epoch() const noexcept -> uint64_t { return 0; }
+};
+
+}  // namespace
+
+TEST(clock_adapter, forwards_a_raw_reference_source)
+{
+    static_assert(RawReferenceClockSource<RawGptpSource>);
+    static_assert(!RawReferenceClockSource<MockClockSource>);
+    RawGptpSource source;
+    ClockAdapter<GptpClock0, RawGptpSource> adapter{source};
+    static_assert(reference_is_raw_v<decltype(adapter)>);
+    EXPECT_EQ(adapter.to_raw_ns(10), int64_t{11});
+    EXPECT_EQ(adapter.from_raw_ns(11), int64_t{10});
+    static_assert(!reference_is_raw_v<ClockAdapter<GptpClock0, MockClockSource>>);
+}
+
 TEST_MAIN(statusbar_realtime, realtime_clock_test)

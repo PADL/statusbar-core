@@ -5,7 +5,11 @@
 
 /// Realtime Clock Types Module
 /// Provides type-safe clock definitions for different time domains:
-/// - MonotonicClock: Native system monotonic clock (CLOCK_MONOTONIC)
+/// - MonotonicRawClock: CLOCK_MONOTONIC_RAW, the timing reference clock
+///   (raw hardware counter, immune to NTP/phc2sys frequency slew)
+/// - MonotonicClock: Native system monotonic clock (CLOCK_MONOTONIC), the
+///   clock the kernel sleeps on; its rate is slewed, so it is for sleeping,
+///   not for timing
 /// - GptpClock<N>: gPTP clock domains (epochless, rate may differ from monotonic)
 /// - GpsClock: GPS time domain
 /// - TaiClock: TAI time domain
@@ -34,6 +38,11 @@ namespace statusbar::realtime {
 
 /// Tag type for monotonic clock (the reference clock for all conversions)
 struct MonotonicClockTag
+{};
+
+/// Tag type for the raw monotonic clock (CLOCK_MONOTONIC_RAW), the timing
+/// reference: stamps, deadlines and measurements live here.
+struct MonotonicRawClockTag
 {};
 
 /// Tag type for gPTP clock domains (parameterized by domain ID)
@@ -90,6 +99,13 @@ struct Clock
 /// Maps directly to CLOCK_MONOTONIC on Linux, mach_absolute_time on macOS.
 /// This is the only clock that can be read without a time bridge.
 using MonotonicClock = Clock<MonotonicClockTag>;
+
+/// Raw monotonic clock - CLOCK_MONOTONIC_RAW, read with read_monotonic_raw_ns().
+/// The raw hardware counter: NTP and phc2sys slew CLOCK_MONOTONIC's rate but
+/// never this one, so timing, stamps and deadlines use it. The kernel cannot
+/// sleep on it; a deadline here is reached by sleeping early on
+/// CLOCK_MONOTONIC through a MonotonicRawLine and spinning the last stretch.
+using MonotonicRawClock = Clock<MonotonicRawClockTag>;
 
 /// gPTP clock for a specific domain.
 /// gPTP clocks are epochless (start at 0 when the grandmaster boots) and
@@ -161,6 +177,35 @@ struct is_monotonic_clock<MonotonicClock> : std::true_type
 template <typename T>
 inline constexpr bool is_monotonic_clock_v = is_monotonic_clock<T>::value;
 
+/// Check if a type is the raw monotonic clock
+template <typename T>
+struct is_monotonic_raw_clock : std::false_type
+{};
+
+template <>
+struct is_monotonic_raw_clock<MonotonicRawClock> : std::true_type
+{};
+
+template <typename T>
+inline constexpr bool is_monotonic_raw_clock_v = is_monotonic_raw_clock<T>::value;
+
+/// Whether a clock source or adapter says its reference clock is
+/// CLOCK_MONOTONIC_RAW (a `static constexpr bool reference_is_raw`). A type
+/// that says nothing maps to CLOCK_MONOTONIC, as the originals did.
+template <typename T>
+struct reference_is_raw : std::false_type
+{};
+
+template <typename T>
+    requires requires {
+        { T::reference_is_raw } -> std::convertible_to<bool>;
+    }
+struct reference_is_raw<T> : std::bool_constant<T::reference_is_raw>
+{};
+
+template <typename T>
+inline constexpr bool reference_is_raw_v = reference_is_raw<T>::value;
+
 /// Get the domain ID from a gPTP clock type (compile-time)
 template <typename T>
 struct gptp_domain_id;
@@ -190,6 +235,10 @@ concept GptpClockType = is_gptp_clock_v<T>;
 /// Concept for the monotonic clock
 template <typename T>
 concept MonotonicClockType = is_monotonic_clock_v<T>;
+
+/// Concept for the raw monotonic clock
+template <typename T>
+concept MonotonicRawClockType = is_monotonic_raw_clock_v<T>;
 
 //
 // Time Point Conversion Result
@@ -248,6 +297,17 @@ concept ClockSource = requires(T const& t, int64_t ns) {
     { t.from_monotonic_ns(ns) } -> std::convertible_to<int64_t>;
     { t.is_healthy() } -> std::convertible_to<bool>;
     { t.epoch() } -> std::convertible_to<uint64_t>;
+};
+
+/// A ClockSource whose reference clock is CLOCK_MONOTONIC_RAW: it declares
+/// `reference_is_raw` and maps its domain to and from RAW nanoseconds. A
+/// Timer driven by such a source sleeps early on CLOCK_MONOTONIC and spins
+/// on RAW to the exact deadline (see MonotonicRawLine) instead of trusting
+/// the slewed clock.
+template <typename T>
+concept RawReferenceClockSource = ClockSource<T> && reference_is_raw_v<T> && requires(T const& t, int64_t ns) {
+    { t.to_raw_ns(ns) } -> std::convertible_to<int64_t>;
+    { t.from_raw_ns(ns) } -> std::convertible_to<int64_t>;
 };
 
 //
@@ -400,6 +460,28 @@ class ClockAdapter
     /// @param mono_ns Monotonic time in nanoseconds
     [[nodiscard]] auto from_monotonic_ns(int64_t mono_ns) const noexcept { return source_->from_monotonic_ns(mono_ns); }
 
+    // Raw reference (only when Source is a RawReferenceClockSource)
+
+    /// Whether the source maps to CLOCK_MONOTONIC_RAW; a Timer on this
+    /// adapter then takes the RAW-authoritative wait.
+    static constexpr bool reference_is_raw = RawReferenceClockSource<Source>;
+
+    /// Convert this clock's nanoseconds to CLOCK_MONOTONIC_RAW nanoseconds
+    /// @param clock_ns Time in this clock's domain in nanoseconds
+    [[nodiscard]] auto to_raw_ns(int64_t clock_ns) const noexcept -> int64_t
+        requires RawReferenceClockSource<Source>
+    {
+        return source_->to_raw_ns(clock_ns);
+    }
+
+    /// Convert CLOCK_MONOTONIC_RAW nanoseconds to this clock's nanoseconds
+    /// @param raw_ns Raw monotonic time in nanoseconds
+    [[nodiscard]] auto from_raw_ns(int64_t raw_ns) const noexcept -> int64_t
+        requires RawReferenceClockSource<Source>
+    {
+        return source_->from_raw_ns(raw_ns);
+    }
+
     // gPTP Domain Information (only available when Source is GptpClockSource)
 
     /// Get gPTP domain information (grandmaster ID, quality, etc.)
@@ -510,6 +592,76 @@ class MonotonicClockAdapter
 };
 
 //
+// Raw Monotonic Clock Adapter (the timing reference, no bridge needed)
+//
+
+class MonotonicRawLine;
+
+/// Adapter for MonotonicRawClock: reads CLOCK_MONOTONIC_RAW directly, always
+/// healthy. The adapter new timers should default to: a Timer on it schedules
+/// and measures on the slew-immune clock, sleeping early on CLOCK_MONOTONIC
+/// and spinning on RAW to each deadline.
+///
+/// to_monotonic_ns()/from_monotonic_ns() convert through the MonotonicRawLine
+/// given at construction. Without one they apply the offset between the two
+/// clocks at the moment of the call, which ignores any slew over the span
+/// converted: good enough for a one-off conversion, not for a schedule. The
+/// Timer never uses them on this adapter; its TimerBase keeps its own line.
+class MonotonicRawClockAdapter
+{
+  public:
+    using clock_type = MonotonicRawClock;
+    using time_point = MonotonicRawClock::time_point;
+    using duration = MonotonicRawClock::duration;
+
+    static constexpr bool reference_is_raw = true;
+
+    explicit MonotonicRawClockAdapter(MonotonicRawLine const* line = nullptr) noexcept
+        : line_{line}
+    {}
+
+    /// Get current raw monotonic time (direct read, always healthy)
+    [[nodiscard]] auto now() const noexcept -> TimeConversion<MonotonicRawClock>;
+
+    /// Convert to monotonic through the line (see class note)
+    /// @param tp Raw monotonic time point
+    [[nodiscard]] auto to_monotonic(time_point tp) const noexcept -> TimeConversion<MonotonicClock>
+    {
+        return TimeConversion<MonotonicClock>{
+            .time = MonotonicClock::from_ns(to_monotonic_ns(MonotonicRawClock::to_ns(tp))), .epoch = 0, .healthy = true};
+    }
+
+    /// Convert from monotonic through the line (see class note)
+    /// @param tp Monotonic time point
+    [[nodiscard]] auto from_monotonic(MonotonicClock::time_point tp) const noexcept -> TimeConversion<MonotonicRawClock>
+    {
+        return TimeConversion<MonotonicRawClock>{
+            .time = MonotonicRawClock::from_ns(from_monotonic_ns(MonotonicClock::to_ns(tp))), .epoch = 0, .healthy = true};
+    }
+
+    [[nodiscard]] static constexpr auto is_healthy() noexcept -> bool { return true; }
+    [[nodiscard]] static constexpr auto epoch() noexcept -> uint64_t { return 0; }
+
+    /// Get raw nanoseconds for timer integration (CLOCK_MONOTONIC_RAW)
+    [[nodiscard]] auto now_ns() const noexcept -> int64_t;
+
+    /// Convert to CLOCK_MONOTONIC nanoseconds (see class note)
+    [[nodiscard]] auto to_monotonic_ns(int64_t raw_ns) const noexcept -> int64_t;
+
+    /// Convert from CLOCK_MONOTONIC nanoseconds (see class note)
+    [[nodiscard]] auto from_monotonic_ns(int64_t mono_ns) const noexcept -> int64_t;
+
+    /// Convert to CLOCK_MONOTONIC_RAW nanoseconds (identity)
+    [[nodiscard]] static constexpr auto to_raw_ns(int64_t ns) noexcept { return ns; }
+
+    /// Convert from CLOCK_MONOTONIC_RAW nanoseconds (identity)
+    [[nodiscard]] static constexpr auto from_raw_ns(int64_t ns) noexcept { return ns; }
+
+  private:
+    MonotonicRawLine const* line_;
+};
+
+//
 // Concept for Clock Adapters
 //
 
@@ -540,5 +692,23 @@ inline auto MonotonicClockAdapter::now_ns() const noexcept -> int64_t
 {
     return read_monotonic_ns();
 }
+
+//
+// MonotonicRawClockAdapter Implementation
+//
+
+inline auto MonotonicRawClockAdapter::now() const noexcept -> TimeConversion<MonotonicRawClock>
+{
+    return TimeConversion<MonotonicRawClock>{
+        .time = MonotonicRawClock::from_ns(read_monotonic_raw_ns()), .epoch = 0, .healthy = true};
+}
+
+inline auto MonotonicRawClockAdapter::now_ns() const noexcept -> int64_t
+{
+    return read_monotonic_raw_ns();
+}
+
+// to_monotonic_ns()/from_monotonic_ns() need the full MonotonicRawLine and
+// live in realtime_monotonic_raw_line.cpp.
 
 }  // namespace statusbar::realtime

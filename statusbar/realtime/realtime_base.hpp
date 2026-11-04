@@ -79,10 +79,17 @@ inline void save_file(char const* src, std::string const& dst)
     ::close(fd);
 }
 
+/// CLOCK_MONOTONIC_RAW in nanoseconds: the raw hardware counter, immune to
+/// the NTP/phc2sys frequency slew on CLOCK_MONOTONIC. The timing reference
+/// clock; see read_monotonic_raw_ns() for the public spelling.
 inline auto now_monotonic_raw_ns() noexcept -> int64_t
 {
     timespec ts{};
+#if defined(CLOCK_MONOTONIC_RAW)
+    ::clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+#else
     ::clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
     return (static_cast<int64_t>(ts.tv_sec) * 1000000000LL) + ts.tv_nsec;
 }
 
@@ -557,6 +564,10 @@ inline auto mach_to_ns(uint64_t const mach) -> uint64_t
 }
 #endif
 
+/// CLOCK_MONOTONIC in nanoseconds (mach_absolute_time on macOS). This is
+/// the clock the kernel sleeps on, and NTP or phc2sys slews its rate: use
+/// it for sleeping, not for timing. Timing, stamps and deadlines take
+/// read_monotonic_raw_ns().
 inline auto read_monotonic_ns() noexcept -> int64_t
 {
 #if defined(__linux__)
@@ -568,6 +579,14 @@ inline auto read_monotonic_ns() noexcept -> int64_t
     uint64_t const mach_now = mach_absolute_time();
     return static_cast<int64_t>(mach_to_ns(mach_now));
 #endif
+}
+
+/// CLOCK_MONOTONIC_RAW in nanoseconds: the timing reference clock, immune
+/// to frequency slew. Not sleepable; a deadline on it is reached by sleeping
+/// early on CLOCK_MONOTONIC through a MonotonicRawLine and spinning here.
+inline auto read_monotonic_raw_ns() noexcept -> int64_t
+{
+    return detail::now_monotonic_raw_ns();
 }
 
 //

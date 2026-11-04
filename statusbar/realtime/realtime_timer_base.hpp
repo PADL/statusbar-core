@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "statusbar/itc/itc_stop_token.hpp"
+#include "statusbar/realtime/realtime_monotonic_raw_line.hpp"
 #include "statusbar/realtime/realtime_timer_config.hpp"
 #include "statusbar/stats/stats.hpp"
 
@@ -44,6 +45,10 @@ class TimerBase
     [[nodiscard]] auto compensation_ns() const noexcept -> int64_t { return config_.compensation_ns; }
     [[nodiscard]] auto cpu() const noexcept -> int { return config_.cpu; }
     [[nodiscard]] auto is_busy_wait() const noexcept -> bool { return config_.busy_wait; }
+
+    /// The RAW->MONOTONIC line this timer's thread keeps for its own sleeps
+    /// (see wait_until_raw_deadline). Identity until the thread's first wait.
+    [[nodiscard]] auto raw_line() const noexcept -> MonotonicRawLine const& { return raw_line_; }
 
   protected:
     /// Derived class supplies the timing loop body.
@@ -97,13 +102,47 @@ class TimerBase
     /// across compensation settings.
     auto wait_until_deadline(int64_t mono_deadline_ns) noexcept -> WaitResult;
 
+    /// Wait until a CLOCK_MONOTONIC_RAW deadline, the RAW-authoritative way:
+    /// convert the (compensated) deadline to CLOCK_MONOTONIC through the
+    /// timer's own line, sleep until a guard before it, then spin on RAW to
+    /// the exact instant. The guard is config_.raw_spin_guard_ns (or
+    /// busy_wait_threshold_ns in busy_wait mode) plus the slew the line says
+    /// the sleep could accrue, so the sleep never overshoots. Error and
+    /// skipped-cycle counts are measured on RAW against the uncompensated
+    /// @p raw_deadline_ns. Re-samples the line when it is due.
+    auto wait_until_raw_deadline(int64_t raw_deadline_ns) noexcept -> WaitResult;
+
+    /// Give the line a rate before the schedule is seeded: two samples a
+    /// millisecond apart. A raw-reference run loop calls this first, so the
+    /// millisecond is spent before the first deadline exists rather than
+    /// inside the first wait. wait_until_raw_deadline primes on its own if
+    /// this was skipped.
+    auto prime_raw_line() noexcept -> void;
+
     TimerConfig config_;
     stats::AtomicWakeStats stats_;
     statusbar::itc::StopToken* shutdown_token_{nullptr};
     std::thread timer_thread_;
 
   private:
+    /// Error and skipped-period count for a wake @p error_ns past its deadline.
+    [[nodiscard]] auto wait_result(int64_t error_ns) const noexcept -> WaitResult;
+
+    /// Prime the line if it never was, else re-sample it once
+    /// raw_line_sample_interval_ns has passed.
+    auto track_raw_line(int64_t raw_now_ns) noexcept -> void;
+
+    /// The coarse part of a RAW wait: sleep on CLOCK_MONOTONIC until the
+    /// guard before @p target_raw_ns, or not at all if that is already here.
+    auto sleep_early_for_raw(int64_t target_raw_ns) noexcept -> void;
+
+    /// The exact part of a RAW wait. @return the RAW time at which it ended.
+    [[nodiscard]] static auto spin_until_raw(int64_t target_raw_ns) noexcept -> int64_t;
+
     std::atomic<bool> running_{false};
+    MonotonicRawLine raw_line_;
+    MonotonicRawTracker raw_tracker_{raw_line_};
+    int64_t raw_line_sampled_ns_{0};
 };
 
 /// Return the cycle number that contains @p time_ns for a timer of period

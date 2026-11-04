@@ -7,6 +7,7 @@ statusbar_add_module(
   SOURCES
   realtime_base.cpp
   realtime_base_impl.cpp
+  realtime_monotonic_raw_line.cpp
   realtime_timer_base.cpp
   realtime_timer_impl.cpp
   realtime_tripwire.cpp
@@ -20,6 +21,7 @@ statusbar_add_module(
   TESTS
   realtime_base_test.cpp
   realtime_clock_test.cpp
+  realtime_monotonic_raw_line_test.cpp
   realtime_stats_test.cpp
   realtime_timer_test.cpp
   realtime_tripwire_test.cpp)
