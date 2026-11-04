@@ -98,6 +98,15 @@ struct MmapConfig
     int rx_clock_id{CLOCK_MONOTONIC_RAW};  ///< Clock for RX timestamps when no hardware timestamp
 };
 
+/// The slot a cancel of @p handle gives back, which the next tx_start() then hands out again: only
+/// the slot last started (@p in_use) and neither committed nor cancelled; nullopt refuses any other.
+/// The kernel sends the ring in order and stops at an unsent slot, so a cancel must leave no hole.
+[[nodiscard]] constexpr auto tx_cancel_index(uint64_t const handle, uint64_t const in_use, size_t const frames) noexcept
+    -> std::optional<size_t>
+{
+    return handle == in_use && handle < frames ? std::optional<size_t>{static_cast<size_t>(handle)} : std::nullopt;
+}
+
 }  // namespace statusbar::net
 
 /// Register MmapError as an error code enum

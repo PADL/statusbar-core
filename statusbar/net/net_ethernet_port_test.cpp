@@ -49,6 +49,19 @@ TEST(test_port_rx, a_told_receive_is_stamped_with_the_time_it_is_told)
 }
 
 //
+// MmapContext — a cancel leaves no unsent slot ahead of the next start
+//
+
+TEST(mmap_tx, only_the_slot_last_started_is_cancelled_and_started_again)
+{
+    EXPECT_TRUE(tx_cancel_index(4, 4, 8) == std::optional<size_t>{4});  // the next start hands out slot 4
+    EXPECT_TRUE(tx_cancel_index(7, 7, 8) == std::optional<size_t>{7});  // across the wrap alike
+    EXPECT_FALSE(tx_cancel_index(2, 4, 8).has_value());                 // not the slot last started
+    EXPECT_FALSE(tx_cancel_index(4, UINT64_MAX, 8).has_value());        // a second cancel, or after the commit
+    EXPECT_FALSE(tx_cancel_index(9, 9, 8).has_value());                 // past the ring
+}
+
+//
 // TestPortContext — open/close lifecycle
 //
 

@@ -308,22 +308,13 @@ auto MmapContext::tx_commit(uint64_t handle, size_t frame_length) -> Status
 
 auto MmapContext::tx_cancel(uint64_t handle) -> Status
 {
-    if (!valid()) {
-        return failure(MmapError::not_open);
+    auto const index = tx_cancel_index(handle, tx_slot_in_use_, tx_req_.tp_frame_nr);
+    if (!valid() || !index) {
+        return failure(valid() ? MmapError::invalid_index : MmapError::not_open);
     }
-
-    auto const index = static_cast<size_t>(handle);
-
-    if (index >= tx_req_.tp_frame_nr) {
-        return failure(MmapError::invalid_index);
-    }
-
-    auto* hdr = tx_header_at(index);
-
-    // Return slot to available state
-    hdr->tp_status = TP_STATUS_AVAILABLE;
+    tx_header_at(*index)->tp_status = TP_STATUS_AVAILABLE;
+    tx_index_ = *index;  // the next tx_start() hands it out again: no hole in the ring
     tx_slot_in_use_ = UINT64_MAX;
-
     return success();
 }
 
