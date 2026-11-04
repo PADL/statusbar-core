@@ -17,6 +17,13 @@ namespace statusbar::sm {
 // Time Types
 //
 
+/// The control plane's clock: std::chrono::steady_clock (CLOCK_MONOTONIC on
+/// Linux), deliberately. The protocol state machines run timers of hundreds of
+/// milliseconds and the reactor polls on this clock, so NTP/phc2sys slew is
+/// harmless here. Timing, stamps and deadlines live on CLOCK_MONOTONIC_RAW
+/// (realtime::MonotonicRawClock) instead; do not "fix" this one to match. A
+/// state machine is told its time (the TimePoint parameters); it never reads
+/// this clock itself.
 using Clock = std::chrono::steady_clock;
 using TimePoint = Clock::time_point;
 
