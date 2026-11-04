@@ -10,6 +10,8 @@
 #include "statusbar/ieee/ieee.hpp"
 #include "statusbar/status/status.hpp"
 
+#include <time.h>
+
 #include <algorithm>
 #include <array>
 #include <concepts>
@@ -21,6 +23,15 @@
 #include <span>
 
 namespace statusbar::net {
+
+/// @p clock_id's time in ns: what rx_start() reads to stamp a received frame in software, and what a
+/// caller of rx_start(now) reads once for a batch of frames.
+[[nodiscard]] inline auto software_rx_timestamp_ns(int const clock_id) noexcept -> int64_t
+{
+    struct timespec ts{};
+    (void)::clock_gettime(static_cast<clockid_t>(clock_id), &ts);
+    return (static_cast<int64_t>(ts.tv_sec) * 1'000'000'000LL) + ts.tv_nsec;
+}
 
 /// VLAN tag matching mode (shared between TrafficClassifier and XDP filter rules)
 /// Relocated from net_linux_xdp.cppm to be available cross-platform.

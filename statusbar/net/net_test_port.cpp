@@ -114,6 +114,15 @@ auto TestPortContext::rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
     }});
 }
 
+auto TestPortContext::rx_start(int64_t const now_ns) -> StatusValue<std::optional<EthernetRxSlot>>
+{
+    auto slot = rx_start();
+    if (slot && *slot) {
+        (*slot)->timestamp_ns = now_ns;
+    }
+    return slot;
+}
+
 auto TestPortContext::rx_release(uint64_t handle) -> Status
 {
     if (handle >= pool_.size()) {

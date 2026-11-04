@@ -167,6 +167,10 @@ class AnyEthernetPort
     [[nodiscard]] auto tx_flush() -> Status;
 
     [[nodiscard]] auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>>;
+    /// The next received frame, stamped @p now_ns where the backend stamps in software (xdp,
+    /// rawnet, test): a caller draining a batch reads the clock once. mmap and BPF stamp as
+    /// rx_start() does (mmap's kernel time, read from rx_clock_id when there is none).
+    [[nodiscard]] auto rx_start(int64_t now_ns) -> StatusValue<std::optional<EthernetRxSlot>>;
     [[nodiscard]] auto rx_release(uint64_t handle) -> Status;
 
     [[nodiscard]] auto join_multicast(ieee::Eui48 const& addr) -> Status;

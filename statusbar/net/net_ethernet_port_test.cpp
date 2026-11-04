@@ -31,6 +31,24 @@ static_assert(EthernetPort<XdpContext>, "XdpContext must satisfy EthernetPort");
 #endif
 
 //
+// RX stamps: told (rx_start(now)) and asking (rx_start())
+//
+
+TEST(test_port_rx, a_told_receive_is_stamped_with_the_time_it_is_told)
+{
+    AnyEthernetPort port;
+    EXPECT_TRUE(port.open_test({}).has_value());
+    std::array<uint8_t, 64> const frame{};
+    EXPECT_TRUE(port.as<TestPortContext>()->inject_rx(frame, 7).has_value());
+    EXPECT_TRUE(port.as<TestPortContext>()->inject_rx(frame, 7).has_value());
+    auto const told = port.rx_start(1'234);
+    EXPECT_TRUE(told && *told && (*told)->timestamp_ns == 1'234);
+    auto const asked = port.rx_start();
+    EXPECT_TRUE(asked && *asked && (*asked)->timestamp_ns == 7);  // the test port's own stamp
+    EXPECT_TRUE(software_rx_timestamp_ns(CLOCK_MONOTONIC_RAW) > 0);
+}
+
+//
 // TestPortContext — open/close lifecycle
 //
 

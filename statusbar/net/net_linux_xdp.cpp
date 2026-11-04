@@ -1491,6 +1491,17 @@ auto XdpContext::tx_complete() -> Status
 
 auto XdpContext::rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
 {
+    return rx_next([this] { return software_rx_timestamp_ns(budget_.rx_clock_id); });
+}
+
+auto XdpContext::rx_start(int64_t const now_ns) -> StatusValue<std::optional<EthernetRxSlot>>
+{
+    return rx_next([now_ns] { return now_ns; });
+}
+
+template <typename Stamp>
+auto XdpContext::rx_next(Stamp const& stamp) -> StatusValue<std::optional<EthernetRxSlot>>
+{  // NOLINT(statusbar-block-statements): one RX descriptor's budget, peek, stamp and release, kept whole
     if (budget_.rx_drain_max > 0 && budget_.rx_cycle_count >= budget_.rx_drain_max) {
         ++stats_.rx_budget_hit_count;
         return std::optional<EthernetRxSlot>{};
@@ -1503,14 +1514,10 @@ auto XdpContext::rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
 
     auto const* desc = xsk_ring_cons__rx_desc(&rings_.rx, idx);
 
-    struct timespec ts{};
-    (void)::clock_gettime(budget_.rx_clock_id, &ts);
-    int64_t const timestamp_ns = (static_cast<int64_t>(ts.tv_sec) * 1'000'000'000) + ts.tv_nsec;
-
     EthernetRxSlot slot{
         .handle = desc->addr,
         .buffer = umem_.readable_span(desc->addr, desc->len),
-        .timestamp_ns = timestamp_ns,
+        .timestamp_ns = stamp(),  // read only once a frame is there
     };
 
     // Release ring slot — UMEM frame remains valid until rx_release(handle)

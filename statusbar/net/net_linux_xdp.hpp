@@ -1862,7 +1862,10 @@ class XdpContext
         return failure(XdpError::tx_flush_failed);
     }
 
+    /// The next received frame, stamped from rx_clock_id: rx_start(now) with the clock read here.
     [[nodiscard]] auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>>;
+    /// The next received frame, stamped @p now_ns: a caller draining a batch reads the clock once.
+    [[nodiscard]] auto rx_start(int64_t now_ns) -> StatusValue<std::optional<EthernetRxSlot>>;
 
     /// @param handle UMEM frame address from rx_start()
     [[nodiscard]] auto rx_release(uint64_t handle) -> Status
@@ -1955,6 +1958,9 @@ class XdpContext
     [[nodiscard]] auto napi_busy_poll() const noexcept -> bool { return napi_busy_poll_.on(); }
 
   private:
+    /// The next received frame, stamped by @p stamp (a callable read only once a frame is there).
+    template <typename Stamp>
+    [[nodiscard]] auto rx_next(Stamp const& stamp) -> StatusValue<std::optional<EthernetRxSlot>>;
     /// Whether tx_flush() kicks, consuming the pending flag (detail::tx_kick_due()).
     [[nodiscard]] auto tx_kick_due() noexcept -> bool
     {
@@ -2134,6 +2140,10 @@ class XdpContext
     [[nodiscard]] auto tx_flush() -> Status { return failure(XdpError::not_supported_on_platform); }
 
     [[nodiscard]] auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
+    {
+        return failure(XdpError::not_supported_on_platform);
+    }
+    [[nodiscard]] auto rx_start(int64_t) -> StatusValue<std::optional<EthernetRxSlot>>
     {
         return failure(XdpError::not_supported_on_platform);
     }

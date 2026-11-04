@@ -105,7 +105,10 @@ class RawnetPort
     [[nodiscard]] auto tx_flush() noexcept -> Status { return success(); }
 
     // RX
+    /// The next received frame, stamped from rx_clock_id: rx_start(now) with the clock read here.
     [[nodiscard]] auto rx_start() noexcept -> StatusValue<std::optional<EthernetRxSlot>>;
+    /// The next received frame, stamped @p now (ns): a caller draining a batch reads the clock once.
+    [[nodiscard]] auto rx_start(int64_t now) noexcept -> StatusValue<std::optional<EthernetRxSlot>>;
     [[nodiscard]] auto rx_release(uint64_t handle) noexcept -> Status;
 
     // Multicast, on the receive socket.
@@ -128,6 +131,9 @@ class RawnetPort
     /// nothing was queued.
     [[nodiscard]] auto receive_frame(uint64_t handle) noexcept -> StatusValue<size_t>;
     [[nodiscard]] auto now_ns() const noexcept -> int64_t;
+    /// The next received frame, stamped by @p stamp (a callable read only once a frame is there).
+    template <typename Stamp>
+    [[nodiscard]] auto rx_next(Stamp const& stamp) noexcept -> StatusValue<std::optional<EthernetRxSlot>>;
 
     /// A pool of frame buffers. A slot is out between take() and
     /// give_back(); a handle that is not out - never issued, or already

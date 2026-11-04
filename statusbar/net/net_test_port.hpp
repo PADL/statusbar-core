@@ -120,6 +120,8 @@ class TestPortContext
     /// Start an RX operation. Returns nullopt if no frames are pending.
     /// Pops the front frame from the RX queue and returns an EthernetRxSlot.
     [[nodiscard]] auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>>;
+    /// rx_start(), the frame stamped @p now_ns instead of its injected time.
+    [[nodiscard]] auto rx_start(int64_t now_ns) -> StatusValue<std::optional<EthernetRxSlot>>;
 
     /// Release an RX slot back to the free list.
     /// @param handle Opaque pool index from rx_start()

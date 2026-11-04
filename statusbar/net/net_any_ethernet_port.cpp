@@ -219,6 +219,17 @@ auto AnyEthernetPort::rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
     return on_port(port_, [&](auto& backend) -> StatusValue<std::optional<EthernetRxSlot>> { return backend.rx_start(); });
 }
 
+auto AnyEthernetPort::rx_start(int64_t const now_ns) -> StatusValue<std::optional<EthernetRxSlot>>
+{
+    return on_port(port_, [&](auto& backend) -> StatusValue<std::optional<EthernetRxSlot>> {
+        if constexpr (requires { backend.rx_start(now_ns); }) {
+            return backend.rx_start(now_ns);
+        } else {
+            return backend.rx_start();  // a backend that stamps its frames itself (mmap's kernel time)
+        }
+    });
+}
+
 auto AnyEthernetPort::rx_release(uint64_t const handle) -> Status
 {
     return on_port(port_, [&](auto& backend) -> Status { return backend.rx_release(handle); });
