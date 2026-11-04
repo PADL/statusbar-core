@@ -165,6 +165,9 @@ class AnyEthernetPort
     [[nodiscard]] auto tx_commit(uint64_t handle, size_t frame_length) -> Status;
     [[nodiscard]] auto tx_cancel(uint64_t handle) -> Status;
     [[nodiscard]] auto tx_flush() -> Status;
+    /// The launch time of frame @p handle, started and not yet committed: what tx_start() took,
+    /// set after the fact (xdp, and the test port). not_supported on a backend without launch time.
+    [[nodiscard]] auto tx_set_launch_time(uint64_t handle, int64_t launch_time_ns) -> Status;
 
     [[nodiscard]] auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>>;
     /// The next received frame, stamped @p now_ns where the backend stamps in software (xdp,

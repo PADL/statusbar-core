@@ -106,6 +106,9 @@ class TestPortContext
     /// @param handle Opaque pool index from tx_start()
     [[nodiscard]] auto tx_cancel(uint64_t handle) -> Status;
 
+    /// The launch time of frame @p handle, started and not yet committed, as XdpContext's.
+    [[nodiscard]] auto tx_set_launch_time(uint64_t handle, int64_t launch_time_ns) -> Status;
+
     /// No-op flush (all TX is synchronous in TestPortContext).
     [[nodiscard]] auto tx_flush() -> Status
     {
@@ -213,6 +216,9 @@ class TestPortContext
 
     /// Per-slot launch times (indexed by pool index)
     std::pmr::vector<int64_t> launch_times_{mem_resource_};
+
+    /// Per-slot: started by tx_start() and neither committed nor cancelled (tx_set_launch_time).
+    std::pmr::vector<uint8_t> tx_started_{mem_resource_};
 
     /// Free list — stack of available pool indices
     std::pmr::vector<uint64_t> free_list_{mem_resource_};
