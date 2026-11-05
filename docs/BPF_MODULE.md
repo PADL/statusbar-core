@@ -121,7 +121,11 @@ int main()
 - For timing-sensitive use on Darwin, prefer the per-packet
   `bpf_time_ns` (`bh_tstamp`) over the per-batch
   `monotonic_clock_time_ns`. On Linux the two fields are identical and
-  only as precise as one user-space `clock_gettime` per `recv()`.
+  only as precise as one user-space `clock_gettime` per `recv()`, and
+  that reading is `CLOCK_MONOTONIC`: the one remaining exception to the
+  `CLOCK_MONOTONIC_RAW` timing-reference policy in core (see
+  [TIME_POLICY.md](TIME_POLICY.md)); its stamps are only ever compared
+  with each other.
 - The Linux backend filters by EtherType at socket-creation time;
   changing the EtherType requires a new device.
 - `bpf_filter_max_packet` (512 KiB) exceeds the 16 KiB `bpf_buffer_size`

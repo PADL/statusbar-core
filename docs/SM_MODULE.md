@@ -39,7 +39,9 @@ types below are grouped to match.
   `enum_count` traits; `enum_name<V>` / `type_name<T>` /
   `function_name<F>` constexpr reflections on `std::source_location`;
   `EnumNamesFor<E, Count>`; `FixedString<Capacity>`.
-- **:core** — `Clock` / `TimePoint`; `Transition<Context, StateEnum>`
+- **:core** — `Clock` / `TimePoint` (`std::chrono::steady_clock`, the
+  control-plane clock, deliberately not `CLOCK_MONOTONIC_RAW`: a machine
+  is told its `TimePoint` and never reads the clock itself); `Transition<Context, StateEnum>`
   (next state + action pointer + reflected name + valid flag);
   `Transitions<Def>` helper exposing `action<Fn>()` and `transition()`;
   `TransitionTable<Def>` indexed by `[state][event]`; `NullObserver`;
@@ -115,6 +117,12 @@ int main() {
   an action ran. A self-transition that runs an action still notifies
   (the observer sees `old_state == new_state`); only a no-op self-loop
   (same state, no action) is invisible to the observer.
+- A machine is **told the time**: `handle_event(ctx, event, now)` and
+  `start(ctx, now)` take the `TimePoint` of the frame or tick being
+  handled, and every action receives it. The defaulted `Clock::now()`
+  argument is for setup and edge calls that own no tick; production
+  drivers (reactor handlers, timers) always pass the time they were
+  told. See core's [TIME_POLICY.md](TIME_POLICY.md).
 - Actions have signature `void(Context&, TimePoint)`. The name shown in
   DOT/Markdown comes from `function_name<Fn>`, which parses
   `std::source_location::current().function_name()` for both Clang and

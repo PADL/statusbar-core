@@ -10,8 +10,10 @@ runtime allocations, built around a `poll()`-driven reactor.
 A single-threaded `MessageReactor` owns a set of `Pollable` ports,
 calls `poll()` once per cycle, and dispatches `on_ready` /
 `on_writable` / `tick` callbacks with a nanosecond timestamp from
-an injected clock. Buffers and queue capacities are fixed at
-construction — nothing on the hot path allocates.
+an injected clock: the control-plane clock (`monotonic_ns` is
+`std::chrono::steady_clock`, the same clock as `sm::Clock`), read once
+per cycle and told to every port. Buffers and queue capacities are
+fixed at construction — nothing on the hot path allocates.
 
 The socket layer adds RAII (`FileDescriptor`), an IPv4/IPv6 address
 abstraction (`SocketAddress`) including link-local scope, factory
@@ -38,9 +40,9 @@ emits cBPF for kernel-side filtering.
 - `ServerConfig` — `bind_host` / `port` / `max_clients` / `dscp` from a `config::Config` via `from_config()`; `is_valid_dscp(dscp)` validates the QoS field.
 - `NotificationPipe` — pipe-based reactor wakeup; `notify(code)` is safe from any thread.
 - `RawnetContext` — Layer-2 socket; `open(iface, ethertype, multicast_mac)` configures `AF_PACKET` (Linux) or BPF (macOS); `MAX_ETHERNET_FRAME_SIZE` / `MAX_ETHERNET_PAYLOAD` / `VLAN_TAG_SIZE` live in this header.
-- `EthernetPort` (concept) — zero-copy TX/RX contract satisfied by `TestPortContext`, `LoopbackPortContext`, `BpfPortContext`, `MmapContext`, `XdpContext`, `RawnetPort` and `AnyEthernetPort`; `EthernetTxGuard` / `EthernetRxGuard` provide scoped slot acquisition. `MmapContext`, `XdpContext` and `RawnetPort` also `leave_multicast()`.
+- `EthernetPort` (concept) — zero-copy TX/RX contract satisfied by `TestPortContext`, `LoopbackPortContext`, `BpfPortContext`, `MmapContext`, `XdpContext`, `RawnetPort` and `AnyEthernetPort`; `EthernetTxGuard` / `EthernetRxGuard` provide scoped slot acquisition. `MmapContext`, `XdpContext` and `RawnetPort` also `leave_multicast()`. The RX clock is `RxClock` = `realtime::MonotonicRawClock` (`CLOCK_MONOTONIC_RAW`), not configurable: `rx_start(RxTimePoint now)` is told it and stamps the frame from it where the kernel gave no stamp (mmap, the macOS BPF reader and Zephyr keep the kernel's); `rx_start()` reads it once and forwards. A drain loop reads `rx_clock_now()` once per pass and tells every `rx_start(now)` of the pass.
 - `RawnetPort` — the `EthernetPort` shape of a `RawnetContext` pair: a transmit-only socket with `PACKET_QDISC_BYPASS` and a receive socket, as the stream entities have always run them. Copy-based, one syscall per frame; its TX and RX are independent sockets and may be driven from two threads. The RX frame comes back with a rebuilt 14-byte header (the socket strips it, and any 802.1Q tag).
-- `AnyEthernetPort` — one `EthernetPort` whose backend is chosen at runtime: `EthernetBackend::rawnet`, `mmap` or `xdp`, parsed from a config string by `parse_ethernet_backend` (`ETHERNET_BACKEND_CHOICES` is the usage text). Holds the chosen backend in a variant and forwards every operation of the concept; `tx_rx_independent()` says whether a sender thread and a receiver thread may share it without serialising (only rawnet), `describe()` is the startup-log line ("xdp (native, zero-copy)"), `as<XdpContext>()` reaches the backend for what only it offers. A backend this platform lacks fails to open with its own `not_supported_on_platform`.
+- `AnyEthernetPort` — one `EthernetPort` whose backend is chosen at runtime: `EthernetBackend::rawnet`, `mmap` or `xdp`, parsed from a config string by `parse_ethernet_backend` (`ETHERNET_BACKEND_CHOICES` is the usage text). Holds the chosen backend in a variant and forwards every operation of the concept; `tx_rx_independent()` says whether a sender thread and a receiver thread may share it without serialising (only rawnet), `describe()` is the startup-log line ("xdp (native, zero-copy)"), `as<XdpContext>()` reaches the backend for what only it offers. A backend this platform lacks fails to open with its own `not_supported_on_platform`. `AnyEthernetPortConfig::rx_clock_id` is transitional: the RX clock is no longer a choice and `open()` refuses any value but `CLOCK_MONOTONIC_RAW`; it, `rx_start(int64_t now_ns)` and `software_rx_timestamp_ns()` stay only until an external tree written against the earlier API has rebased.
 - `TrafficClassifier` / `TcamClassifier` — rule-based steering; `ClassifierRule` for the linear matcher, `CompiledRule<32>` / `CompiledRule<64>` for the TCAM matcher (built via `ClassifierRuleBuilder`).
 
 ## Quick example
@@ -106,9 +108,11 @@ int main() {
 - `RawnetContext` needs `CAP_NET_RAW` on Linux; root or BPF device access on macOS. AF_XDP needs a kernel with `CONFIG_XDP_SOCKETS` (≥ 5.4), libbpf, libxdp, and an XDP-capable driver — otherwise `XdpContext` compiles as a stub. A driver without native XDP (the Raspberry Pi 5's `macb`, for one) gets generic attach and a copy-mode bind, which `attach_mode()` and `zero_copy()` report.
 - `SocketAddress::from_string` takes host *and* port plus a socket type (`SocketStream` / `SocketDatagram`) — the type drives `getaddrinfo` hints.
 - `NetError::would_block` is the expected end-of-drain on nonblocking `recv` / `send` — treat as success, not failure.
+- **Two clocks, told.** The reactor's `now_ns` is control-plane time (`steady_clock`); an `EthernetRxSlot::timestamp_ns` is on `CLOCK_MONOTONIC_RAW`. Neither is read by the code that handles a frame: the reactor tells its ports, a drain tells its port. See [TIME_POLICY.md](TIME_POLICY.md).
 
 ## Further reading
 
+- [TIME_POLICY.md](TIME_POLICY.md) — the RX-stamp contract and the reactor's clock in the wider time-handling policy.
 - [`ieee`](IEEE_MODULE.md) — wire types (`Eui48`, `EthernetFrame`, EtherType constants) used by `RawnetContext` and the classifiers.
 - [`itc`](ITC_MODULE.md) — `StopToken` / `install_stop_signal()` that stops `MessageReactor::run`.
 - [`bpf`](BPF_MODULE.md) — historical pointer; the working libbpf / libxdp / XDP code now lives here under `net_linux_xdp.*` and `net_cbpf_emit.hpp`.
