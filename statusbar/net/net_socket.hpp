@@ -316,6 +316,46 @@ using FileDescriptor = ::statusbar::FileDescriptor;
     return success();
 }
 
+/// Whether `group` is in IPv4's source-specific multicast range, 232.0.0.0/8 (RFC 4607 Section 1), where a
+/// receiver joins for one source and an any-source join may get nothing.
+[[nodiscard]] constexpr auto is_source_specific_group(ip::IPv4Address const& group) noexcept -> bool
+{
+    return group.octet(0) == 232;
+}
+
+/// `address` as the sockaddr_storage the protocol-independent multicast options take (RFC 3678 Section 5).
+[[nodiscard]] inline auto ipv4_sockaddr_storage(ip::IPv4Address const& address) noexcept -> sockaddr_storage
+{
+    sockaddr_in in{};
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+    in.sin_len = sizeof(in);  // the BSD stacks refuse a source-specific join without it
+#endif
+    in.sin_family = AF_INET;
+    in.sin_addr.s_addr = htonl(address.to_uint32());
+    sockaddr_storage storage{};
+    std::memcpy(&storage, &in, sizeof(in));
+    return storage;
+}
+
+/// Join IPv4 multicast `group` for datagrams from `source` alone, an IGMPv3 INCLUDE join (RFC 4607 Section 4.1), on
+/// the interface with index `interface_index` (0: the routing table's choice): the source-specific join_group().
+/// MCAST_JOIN_SOURCE_GROUP (RFC 3678 Section 5.2) takes the index on Linux, Darwin and the BSDs alike.
+[[nodiscard]] inline auto join_source_group(
+    int fd, ip::IPv4Address const& group, ip::IPv4Address const& source, unsigned int interface_index) noexcept -> Status
+{
+    if (!group.is_multicast() || source.is_multicast() || source.is_unspecified()) {
+        return failure(std::errc::invalid_argument);
+    }
+    group_source_req request{};
+    request.gsr_interface = interface_index;
+    request.gsr_group = ipv4_sockaddr_storage(group);
+    request.gsr_source = ipv4_sockaddr_storage(source);
+    if (::setsockopt(fd, IPPROTO_IP, MCAST_JOIN_SOURCE_GROUP, &request, sizeof(request)) != 0) {
+        return failure(errno_code());
+    }
+    return success();
+}
+
 /// Prepare an IPv4 socket to send multicast: out of the interface with index
 /// `interface_index` (0: the routing table's choice), with TTL `ttl`, and
 /// looped back to local listeners when `loop`.
@@ -447,6 +487,22 @@ using FileDescriptor = ::statusbar::FileDescriptor;
         return failure(socket.error());
     }
     if (auto const joined = join_group(socket->get(), group, interface_index); !joined) {
+        return failure(joined.error());
+    }
+    return socket;
+}
+
+/// open_group_membership() for `group` from `source` alone (join_source_group()): what keeps an AF_XDP receiver's
+/// source-specific group (is_source_specific_group()) forwarded by an IGMPv3 snooping switch.
+[[nodiscard]] inline auto open_source_group_membership(
+    ip::IPv4Address const& group, ip::IPv4Address const& source, unsigned int interface_index) noexcept
+    -> StatusValue<FileDescriptor>
+{
+    auto socket = make_udp_socket();
+    if (!socket) {
+        return failure(socket.error());
+    }
+    if (auto const joined = join_source_group(socket->get(), group, source, interface_index); !joined) {
         return failure(joined.error());
     }
     return socket;
