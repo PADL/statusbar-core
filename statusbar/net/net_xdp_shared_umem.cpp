@@ -47,6 +47,16 @@ auto XdpFrameLedger::lent(uint64_t const addr) const noexcept -> bool
     return (loans_[frame_of(addr)].load(std::memory_order_acquire) & ~OWNER_DONE) != 0;
 }
 
+auto XdpFrameLedger::reclaim(size_t const frame) noexcept -> bool
+{
+    auto& loans = loans_[frame];
+    if ((loans.fetch_or(OWNER_DONE, std::memory_order_acq_rel) & ~OWNER_DONE) != 0) {
+        return false;  // a transmit points into it: its completion sends it home
+    }
+    loans.store(0, std::memory_order_relaxed);
+    return true;
+}
+
 auto XdpFrameLedger::give_back(uint64_t const addr) noexcept -> bool
 {
     auto& loans = loans_[frame_of(addr)];
