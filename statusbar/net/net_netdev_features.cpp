@@ -153,6 +153,8 @@ auto parse_dev(std::span<uint8_t const> const message, uint16_t const family_id)
                     return parse_scalar(payload, ifindex.emplace());
                 case DEV_XDP_FEATURES:
                     return parse_scalar(payload, device.xdp_features);
+                case DEV_XDP_ZC_MAX_SEGS:
+                    return parse_scalar(payload, device.xdp_zc_max_segs);
                 case DEV_XSK_FEATURES:
                     return parse_scalar(payload, device.xsk.flags);
                 default:
@@ -217,6 +219,14 @@ auto query_xsk_features(int const ifindex) -> StatusValue<XskFeatures>
     NetdevClient client;
     return client.open().and_then([&] { return client.features(ifindex); }).transform([](DeviceFeatures const& device) {
         return device.xsk;
+    });
+}
+
+auto xdp_zc_max_segs(int const ifindex) -> StatusValue<uint32_t>
+{
+    NetdevClient client;
+    return client.open().and_then([&] { return client.features(ifindex); }).transform([](DeviceFeatures const& device) {
+        return device.xdp_zc_max_segs;
     });
 }
 

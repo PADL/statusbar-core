@@ -39,6 +39,7 @@ inline constexpr uint8_t FAMILY_VERSION = 1;
 inline constexpr uint8_t CMD_DEV_GET = 1;
 inline constexpr uint16_t DEV_IFINDEX = 1;
 inline constexpr uint16_t DEV_XDP_FEATURES = 3;
+inline constexpr uint16_t DEV_XDP_ZC_MAX_SEGS = 4;
 inline constexpr uint16_t DEV_XDP_RX_METADATA_FEATURES = 5;
 inline constexpr uint16_t DEV_XSK_FEATURES = 6;
 /// NETDEV_XSK_FLAGS_*: the AF_XDP TX metadata a driver honours.
@@ -65,7 +66,8 @@ struct XskFeatures
 struct DeviceFeatures
 {
     int ifindex{0};
-    uint64_t xdp_features{0};  ///< NETDEV_XDP_ACT_* (XDP_ACT_XSK_ZEROCOPY among them)
+    uint64_t xdp_features{0};     ///< NETDEV_XDP_ACT_* (XDP_ACT_XSK_ZEROCOPY among them)
+    uint32_t xdp_zc_max_segs{1};  ///< buffers one AF_XDP zero-copy frame may span (1: no multi-buffer, or not reported)
     XskFeatures xsk{};
 
     auto operator==(DeviceFeatures const&) const noexcept -> bool = default;
@@ -148,6 +150,9 @@ class NetdevClient
 /// Whether `ifindex`'s driver honours AF_XDP launch times (tx-launch-time-fifo): one query, to ask
 /// once and hand to every user (stream socket, shaper). Errors: query_xsk_features()'s.
 [[nodiscard]] auto launch_time_supported(int ifindex) -> StatusValue<bool>;
+/// The buffers one AF_XDP zero-copy frame on `ifindex` may span (xdp-zc-max-segs; 1 without multi-buffer):
+/// one query. Errors: NetdevClient::open()'s and features()'s.
+[[nodiscard]] auto xdp_zc_max_segs(int ifindex) -> StatusValue<uint32_t>;
 
 }  // namespace statusbar::net::netdev
 

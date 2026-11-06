@@ -176,6 +176,24 @@ TEST(netdev_features, absent_xsk_features_mean_none)
     EXPECT_TRUE(device && device->xdp_features == 0x7f);
 }
 
+// xdp-zc-max-segs is the device's multi-buffer zero-copy depth: 1 as the igc reply has it, 15 once its
+// driver chains descriptors (IEEE 802.3 frames of a header and held payloads, Documentation/networking/af_xdp.rst).
+TEST(netdev_features, zero_copy_max_segments_are_reported)
+{
+    if (!LITTLE) {
+        SKIP("the canned replies are little-endian");
+    }
+    auto reply = DEV_REPLY;
+    auto const one = parse_dev(reply, NETDEV_ID);
+    EXPECT_TRUE(one && one->xdp_zc_max_segs == 1);
+    reply[44] = 15;  // the xdp-zc-max-segs attribute's value
+    auto const fifteen = parse_dev(reply, NETDEV_ID);
+    EXPECT_TRUE(fifteen && fifteen->xdp_zc_max_segs == 15);
+    reply[42] = 0x02;  // the attribute becomes pad: none reported, one buffer
+    auto const none = parse_dev(reply, NETDEV_ID);
+    EXPECT_TRUE(none && none->xdp_zc_max_segs == 1);
+}
+
 TEST(netdev_features, rx_metadata_features_are_not_xsk_features)
 {
     if (!LITTLE) {
