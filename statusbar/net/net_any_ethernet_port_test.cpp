@@ -14,6 +14,7 @@
 #include "statusbar/net/net_error.hpp"
 #include "statusbar/test/test.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -258,6 +259,35 @@ TEST(any_ethernet_port, a_test_port_captures_tx_and_returns_injected_rx)
     ieee::Eui48 const group{0x91, 0xE0, 0xF0, 0, 0, 1};
     EXPECT_TRUE(port.join_multicast(group).has_value() && test->joined_multicast_groups().size() == 1);
     EXPECT_TRUE(port.leave_multicast(group).has_value() && test->joined_multicast_groups().empty());
+}
+
+// The test port sends a frame from several buffers as one, as a multi-buffer AF_XDP socket does: its own
+// slot's header, then each buffer where it lies; past its tx_segments() a gather is refused, the slot freed.
+TEST(any_ethernet_port, a_test_port_captures_a_gathered_frame_whole)
+{
+    AnyEthernetPort port;
+    EXPECT_TRUE(port.open_test({.frame_pool_size = 2, .tx_segments = 3}).has_value());
+    EXPECT_EQ(port.tx_segments(), size_t{3});
+    std::array<uint8_t, 4> const first{1, 2, 3, 4};
+    std::array<uint8_t, 3> const second{5, 6, 7};
+    std::array<std::span<uint8_t const>, 2> const rest{first, second};
+    auto slot = port.tx_start();
+    EXPECT_TRUE(slot.has_value());
+    slot->buffer[0] = 0xAA;
+    slot->buffer[1] = 0xBB;
+    EXPECT_TRUE(port.tx_commit_gather(slot->handle, 2, rest, 42).has_value());
+    auto* const test = port.as<TestPortContext>();
+    auto const sent = test->pop_tx();
+    std::array<uint8_t, 9> const whole{0xAA, 0xBB, 1, 2, 3, 4, 5, 6, 7};
+    EXPECT_TRUE(sent && sent->frame.size() == whole.size() && std::equal(whole.begin(), whole.end(), sent->frame.data()));
+    EXPECT_TRUE(sent && sent->launch_time_ns == 42);
+    EXPECT_TRUE(test->last_gather().size() == 2 && test->last_gather()[0].data() == first.data());
+    std::array<std::span<uint8_t const>, 3> const too_many{first, second, first};
+    auto again = port.tx_start();
+    EXPECT_FALSE(port.tx_commit_gather(again->handle, 2, too_many).has_value());
+    EXPECT_TRUE(port.tx_start().has_value() && port.tx_start().has_value());  // both slots free again
+    EXPECT_TRUE(port.tx_commit_gather(std::nullopt, 0, rest).has_value());    // no header of its own
+    EXPECT_EQ(test->tx_gathers(), size_t{2});
 }
 
 // The pin path reaches the xdp backend: one outside bpffs is refused as
