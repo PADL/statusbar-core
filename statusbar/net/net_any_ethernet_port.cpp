@@ -63,6 +63,9 @@ auto xdp_config_for(AnyEthernetPortConfig const& config) -> XdpConfig
         .bind_mode = config.xdp_bind_mode,
         .attach_mode = config.xdp_attach_mode,
         .pin_path = config.xdp_pin_path,
+        .shared_umem = config.xdp_shared_umem,
+        .umem_share = config.xdp_umem_share,
+        .tx_scatter_gather = config.xdp_scatter_gather,
     };
 }
 

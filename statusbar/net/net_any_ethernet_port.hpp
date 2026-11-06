@@ -129,6 +129,11 @@ struct AnyEthernetPortConfig
     /// UMEM frames past the default that received frames may stay held in (an rx_start() not yet
     /// rx_release()d), so that holding them never starves the fill ring or the transmit reserve.
     size_t xdp_rx_hold_frames{0};
+    /// See XdpConfig::shared_umem, umem_share and tx_scatter_gather: a UMEM shared with sockets on other
+    /// devices, this port's share of it, and multi-buffer transmit (tx_commit_gather()).
+    XdpSharedUmem* xdp_shared_umem{nullptr};
+    size_t xdp_umem_share{0};
+    bool xdp_scatter_gather{false};
 };
 
 /// The XdpConfig the xdp backend opens with for @p config: its rings, the default UMEM grown by
