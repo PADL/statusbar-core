@@ -3,10 +3,9 @@
 // Copyright 2026 Jeff Koftinoff <jeff.koftinoff@statusbar.com>
 // SPDX-License-Identifier: MIT
 
-/// One UMEM that AF_XDP sockets on several devices bind (XDP_SHARED_UMEM, Documentation/networking/af_xdp.rst):
-/// each socket owns a share of its frames, and any socket may transmit from a frame of any share (a frame
-/// gathered from a held received one). XdpFrameLedger counts those loans, so that a frame returns to its own
-/// share only once its owner and every transmit pointing into it are done with it.
+/// One UMEM bound by AF_XDP sockets on several devices (XDP_SHARED_UMEM), each owning a share of its frames, any
+/// sending from any share's (a held received frame gathered); XdpFrameLedger counts those loans, so a frame goes
+/// home only once its owner and every transmit pointing into it are done with it.
 
 #include "statusbar/status/status.hpp"
 
@@ -52,6 +51,18 @@ class XdpFrameLedger
     /// frame is free now and `completer` owns it. The last loan of another share's frame done is queued for
     /// its owner (take_returns()). The completing socket's thread.
     [[nodiscard]] auto complete(uint64_t addr, size_t completer) noexcept -> bool;
+    /// Share `share`'s socket opens afresh: each frame of it no transmit points into to `free`, the rest left to
+    /// their completions (queued home), what the old socket was owed forgotten. Before it receives.
+    template <typename Free>
+    void reopen(size_t const share, Free const& free) noexcept
+    {
+        take_returns(share, [](uint64_t) {});  // freed below with the rest
+        for (size_t frame = share * frames_per_share_; frame < (share + 1) * frames_per_share_; ++frame) {
+            if (reclaim(frame)) {
+                free(uint64_t{frame} * frame_size_);
+            }
+        }
+    }
     /// Each frame another share's completions freed for `share`, oldest first, to `free` (uint64_t frame
     /// address). The owner's thread.
     template <typename Free>
@@ -91,6 +102,8 @@ class XdpFrameLedger
 
     static constexpr uint32_t OWNER_DONE = 0x8000'0000U;
 
+    /// reopen() of frame `frame`: true (cleared) when no transmit points into it, else its owner marked done.
+    [[nodiscard]] auto reclaim(size_t frame) noexcept -> bool;
     /// A frame free again after `completer`'s completion: true when `completer` owns it, else queued for its owner.
     [[nodiscard]] auto send_home(uint64_t addr, size_t completer) noexcept -> bool;
 
@@ -142,6 +155,9 @@ class XdpSharedUmem
     /// The headroom and TX metadata length it was registered with: every socket on it takes the same.
     [[nodiscard]] auto headroom() const noexcept -> size_t { return headroom_; }
     [[nodiscard]] auto tx_metadata_len() const noexcept -> size_t { return tx_metadata_len_; }
+    /// Whether the first socket bound it with XDP_USE_SG: the kernel binds every other socket on it so.
+    [[nodiscard]] auto scatter_gather() const noexcept -> bool { return scatter_gather_; }
+    void set_scatter_gather(bool const on) noexcept { scatter_gather_ = on; }
     /// The first socket registered the area as `umem` with `headroom` and `tx_metadata_len`; it is deleted with
     /// this object. Control thread.
     void set_registered(xsk_umem* const umem, size_t const headroom, size_t const tx_metadata_len) noexcept
@@ -161,6 +177,7 @@ class XdpSharedUmem
     xsk_umem* umem_{nullptr};
     size_t headroom_{0};
     size_t tx_metadata_len_{0};
+    bool scatter_gather_{false};
 };
 
 }  // namespace statusbar::net

@@ -5,6 +5,7 @@
 
 #include "statusbar/test/test.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -99,6 +100,25 @@ TEST(xdp_frame_ledger, a_shares_every_frame_can_be_queued_at_once)
         sent.push_back((i - 1) * FRAME);
     }
     EXPECT_TRUE(returns_of(ledger, 0) == sent);
+}
+
+// A share opened afresh frees every frame no transmit points into, once each; a frame still lent comes home at
+// its completion, and what the old socket was owed is not freed twice.
+TEST(xdp_frame_ledger, a_reopened_share_frees_what_is_not_lent_once)
+{
+    XdpFrameLedger ledger{PER_SHARE, 2, FRAME};
+    ledger.lend(1 * FRAME);  // in flight on share 1's socket
+    ledger.lend(2 * FRAME);
+    EXPECT_FALSE(ledger.give_back(2 * FRAME));
+    EXPECT_FALSE(ledger.complete(2 * FRAME, 1));  // queued for share 0, which then closes
+    std::vector<uint64_t> freed;
+    ledger.reopen(0, [&freed](uint64_t const addr) { freed.push_back(addr); });
+    EXPECT_EQ(freed.size(), PER_SHARE - 1);  // all but the frame still lent
+    EXPECT_TRUE(std::ranges::find(freed, uint64_t{1 * FRAME}) == freed.end());
+    EXPECT_TRUE(std::ranges::count(freed, uint64_t{2 * FRAME}) == 1);
+    EXPECT_TRUE(returns_of(ledger, 0).empty());
+    EXPECT_FALSE(ledger.complete(1 * FRAME, 1));  // the old owner's done: home through the queue
+    EXPECT_TRUE(returns_of(ledger, 0) == std::vector<uint64_t>{1 * FRAME});
 }
 
 #if defined(__linux__) && defined(HAVE_XDP)
