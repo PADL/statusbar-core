@@ -14,6 +14,7 @@
 #    include "statusbar/status/status.hpp"
 
 #    include <array>
+#    include <cerrno>
 #    include <cstddef>
 #    include <cstdint>
 #    include <optional>
@@ -81,6 +82,30 @@ template <typename Visit>
         at += align4(len);
     }
     return success();
+}
+
+/// Call `visit` (message) -> std::optional<Status> for each message of `datagram`, each cut to its
+/// nlmsg_len: the first result `visit` gives, bad_message for a message that overruns, else nullopt.
+template <typename Visit>
+[[nodiscard]] auto walk_messages(std::span<uint8_t const> const datagram, Visit const& visit) -> std::optional<Status>
+{
+    for (size_t at = 0; at + MESSAGE_HEADER <= datagram.size();) {
+        auto const length = load<uint32_t>(datagram, at);
+        if (length < MESSAGE_HEADER || length > datagram.size() - at) {
+            return failure(bad_message());
+        }
+        if (auto result = visit(datagram.subspan(at, length))) {
+            return result;
+        }
+        at += align4(length);
+    }
+    return std::nullopt;
+}
+
+/// Whether `error` (an errno) is momentary: a request refused with it is asked again.
+[[nodiscard]] constexpr auto transient_error(int const error) noexcept -> bool
+{
+    return error == ENOBUFS || error == EAGAIN || error == EBUSY || error == EINTR;
 }
 
 /// The payload of the first attribute whose masked type is `type`, nullopt when none is;
@@ -175,19 +200,12 @@ class Socket
         std::span<uint8_t const> const reply, uint32_t const seq, size_t const request_size, OnReply const& on_reply)
         -> std::optional<Status>
     {
-        for (size_t offset = 0; offset + MESSAGE_HEADER <= reply.size();) {
-            auto const length = load<uint32_t>(reply, offset);
-            if (length < MESSAGE_HEADER || length > reply.size() - offset) {
-                return failure(bad_message());
+        return walk_messages(reply, [&](std::span<uint8_t const> const message) -> std::optional<Status> {
+            if (load<uint32_t>(message, 8) != seq || load<uint32_t>(message, 12) != portid_) {
+                return std::nullopt;
             }
-            if (load<uint32_t>(reply, offset + 8) == seq && load<uint32_t>(reply, offset + 12) == portid_) {
-                if (auto done = deliver(reply.subspan(offset, length), request_size, on_reply)) {
-                    return done;
-                }
-            }
-            offset += align4(length);
-        }
-        return std::nullopt;
+            return deliver(message, request_size, on_reply);
+        });
     }
 
     /// One message of the request: its end_status(), else `on_reply`'s failure, else nullopt.
