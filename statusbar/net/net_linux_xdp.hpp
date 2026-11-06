@@ -106,6 +106,7 @@ enum class XdpError
     launch_time_not_supported,
     invalid_umem_geometry,
     tx_gather_not_supported,
+    frame_not_held,
 };
 
 class XdpErrorCategory : public std::error_category
@@ -1023,6 +1024,19 @@ inline void pause_for_busy_bind() noexcept
     }
 }
 
+/// A closing socket on a shared UMEM waits for its transmits in slices of this: 100 us, 50 at most (5 ms).
+inline constexpr long settle_pause_ns = 100'000;
+inline constexpr int settle_slices = 50;
+
+/// One slice of a closing socket's wait for its completions. Control thread.
+inline void pause_for_settle() noexcept
+{
+    struct timespec remaining{};
+    remaining.tv_nsec = settle_pause_ns;
+    while (::nanosleep(&remaining, &remaining) != 0 && errno == EINTR) {
+    }
+}
+
 /// Whether the kernel bound this XSK socket zero-copy. Asked of the socket
 /// rather than inferred: with XdpBindMode::auto_ the answer is the driver's,
 /// and nothing we passed in tells us which way it went.
@@ -1045,6 +1059,46 @@ struct RingSet
     struct xsk_ring_prod tx{};
     struct xsk_ring_cons rx{};
 };
+
+/// XdpSharedUmem's registration: the libxdp UMEM over its area, and a socket of the UMEM's own bound on the first
+/// share's queue, whose fill and completion rings every socket on that queue shares (the kernel keeps one pool a
+/// queue, and a UMEM's socket must stay bound). Never in an xsk_map: it neither sends nor receives.
+struct UmemAnchor
+{
+    struct xsk_umem* umem{nullptr};
+    struct xsk_socket* xsk{nullptr};
+    RingSet rings;  ///< fill and comp the queue's; rx and tx the anchor's own, idle
+    size_t headroom{0};
+    size_t tx_metadata_len{0};
+    unsigned int ifindex{0};
+    uint32_t queue_id{0};
+    bool scatter_gather{false};  ///< bound with XDP_USE_SG: so is every socket on the UMEM
+    bool zero_copy{false};
+};
+
+/// The anchor socket's own RX and TX rings, never used: the smallest the kernel binds.
+inline constexpr uint32_t anchor_ring_size = 8;
+
+/// Where a socket on a shared UMEM binds, for the anchor the first one makes.
+struct AnchorBinding
+{
+    std::string_view interface_name;
+    unsigned int ifindex{0};
+    uint32_t queue_id{0};
+    uint16_t bind_flags{0};  ///< XDP_ZEROCOPY / XDP_COPY, XDP_USE_NEED_WAKEUP, XDP_USE_SG
+    XdpBindMode bind_mode{XdpBindMode::auto_};
+    size_t bind_busy_retries{0};
+};
+
+/// A UMEM area of `size` bytes mapped, prefaulted and kept from forks; nullptr with errno set.
+[[nodiscard]] auto map_umem_area(size_t size) noexcept -> uint8_t*;
+/// Every page of `area` touched, so the first frame costs no fault on the real-time path.
+void prefault(uint8_t* area, size_t size) noexcept;
+/// What a refused bind is reported as: queue_busy for EBUSY, zero_copy_unavailable for a driver without it
+/// asked for it, else xsk_creation_failed.
+[[nodiscard]] auto bind_refusal(int ret, XdpBindMode mode) noexcept -> XdpError;
+/// fill and comp as the anchor's, their cached indexes read afresh, for a socket joining the anchor's queue.
+void adopt_queue_rings(RingSet& rings, UmemAnchor const& anchor) noexcept;
 
 /// Owns the mmap'd UMEM region, frame config, and free list.
 /// RAII — destructor calls close().
@@ -1185,9 +1239,9 @@ class UmemRegion
         RingSet& rings,
         size_t tx_metadata_len = 0) -> StatusValue<struct xsk_umem*>;
 
-    /// The area of @p shared, registered here with @p rings unless another socket did (with the same @p headroom
-    /// and @p tx_metadata_len, else invalid_umem_geometry); the free list holds share @p share's frames not lent.
-    /// close() leaves the area to @p shared, and the registration too while another socket binds it.
+    /// The area of @p shared, its registration made here (the anchor bound at @p binding) unless a socket already
+    /// did (then @p headroom and @p tx_metadata_len must be its, else invalid_umem_geometry); the free list holds
+    /// share @p share's frames the kernel does not hold. On the anchor's queue @p rings receives its fill and comp.
     [[nodiscard]] auto attach(
         XdpSharedUmem& shared,
         size_t share,
@@ -1195,26 +1249,36 @@ class UmemRegion
         size_t fill_ring_size,
         size_t comp_ring_size,
         RingSet& rings,
-        size_t tx_metadata_len) -> StatusValue<struct xsk_umem*>;
-    /// register_shared() by the first socket: the area registered, with @p rings, and kept by @p shared.
-    [[nodiscard]] auto register_first(XdpSharedUmem& shared, size_t fill_ring_size, size_t comp_ring_size, RingSet& rings)
+        size_t tx_metadata_len,
+        AnchorBinding const& binding) -> StatusValue<struct xsk_umem*>;
+    /// attach() by the first socket: the area registered and the anchor bound at @p binding, kept by @p shared.
+    [[nodiscard]] auto anchor(XdpSharedUmem& shared, size_t fill_ring_size, size_t comp_ring_size, AnchorBinding const& binding)
         -> Status;
-    /// attach()'s share: its area, and its frames on the free list.
-    void adopt_share(XdpSharedUmem& shared, size_t share);
-    /// attach()'s registration: the first socket on @p shared registers its area; the rest check theirs.
+    /// anchor()'s one bind attempt: the UMEM registered afresh over the area (a failed bind leaves the rings
+    /// set up on it) and the anchor socket bound; libxdp's return.
+    [[nodiscard]] auto bind_anchor(
+        XdpSharedUmem& shared, UmemAnchor& anchor, size_t fill_ring_size, size_t comp_ring_size, AnchorBinding const& binding)
+        -> int;
+    /// allocate()'s area of its own: @p total_size bytes mapped, the geometry accepted; false, nothing mapped, when not.
+    [[nodiscard]] auto map_own(size_t total_size, size_t frame_size, size_t headroom) noexcept -> bool;
+    /// anchor()'s refusal: the registration, if made, deleted; what @p ret says, or the registration's own.
+    [[nodiscard]] auto unanchor(UmemAnchor& anchor, int ret, XdpBindMode mode) noexcept -> XdpError;
+    /// attach()'s share: its area, its frames on the free list, and the anchor's rings on its queue.
+    void adopt_share(XdpSharedUmem& shared, size_t share, RingSet& rings, AnchorBinding const& binding);
+    /// attach()'s registration: the first socket on @p shared anchors it; the rest check theirs against it.
     [[nodiscard]] auto register_shared(
         XdpSharedUmem& shared,
         size_t headroom,
         size_t fill_ring_size,
         size_t comp_ring_size,
-        RingSet& rings,
-        size_t tx_metadata_len) -> Status;
+        size_t tx_metadata_len,
+        AnchorBinding const& binding) -> Status;
     /// The shared UMEM attach() bound, or nullptr.
     [[nodiscard]] auto shared() const noexcept -> XdpSharedUmem* { return shared_; }
     /// The share of it this region owns.
     [[nodiscard]] auto share() const noexcept -> size_t { return share_; }
-    /// Whether attach() registered the shared area (this socket binds it first).
-    [[nodiscard]] auto first_on_share() const noexcept -> bool { return first_; }
+    /// Whether the socket is on the anchor's queue, so its pool (fill and completion rings) outlives it.
+    [[nodiscard]] auto anchor_queue() const noexcept -> bool { return anchor_queue_; }
 
     /// A fresh UMEM over the same area, for a bind retried after EBUSY: a failed bind leaves the
     /// first UMEM's fill and completion rings set up on its descriptor, which refuses them again.
@@ -1241,9 +1305,6 @@ class UmemRegion
     /// syscalls of its own that would overwrite the one worth reporting.
     [[nodiscard]] auto create_errno() const noexcept -> int { return create_errno_; }
 
-    /// reregister() once the old registration is gone: a fresh one on the same area, the shared UMEM's again.
-    [[nodiscard]] auto recreate(size_t fill_ring_size, size_t comp_ring_size, RingSet& rings) noexcept
-        -> StatusValue<struct xsk_umem*>;
     /// Create the umem itself, with or without TX metadata. Separated so the
     /// two libxdp entry points - only one of which can set tx_metadata_len -
     /// are chosen in one place.
@@ -1305,7 +1366,7 @@ class UmemRegion
         std::swap(free_list_, other.free_list_);
         std::swap(shared_, other.shared_);
         std::swap(share_, other.share_);
-        std::swap(first_, other.first_);
+        std::swap(anchor_queue_, other.anchor_queue_);
     }
 
     struct xsk_umem* umem_{nullptr};
@@ -1318,7 +1379,7 @@ class UmemRegion
     UmemFreeList free_list_;
     XdpSharedUmem* shared_{nullptr};
     size_t share_{0};
-    bool first_{false};
+    bool anchor_queue_{false};
 };
 
 /// RAII wrapper for a loaded bpf_object*.
@@ -1570,6 +1631,18 @@ class BpfState
             return failure(XdpError::not_open);
         }
         if (bpf_map_update_elem(xsk_map_fd_, &queue_id, &xsk_fd, BPF_ANY) != 0) {
+            return failure(XdpError::bpf_map_update_failed);
+        }
+        return success();
+    }
+
+    /// The xsk_map entry for `queue_id` cleared, so nothing is steered to the socket there any more.
+    [[nodiscard]] auto unregister_xsk(uint32_t queue_id) -> Status
+    {
+        if (xsk_map_fd_ < 0) {
+            return failure(XdpError::not_open);
+        }
+        if (bpf_map_delete_elem(xsk_map_fd_, &queue_id) != 0) {
             return failure(XdpError::bpf_map_update_failed);
         }
         return success();
@@ -1843,6 +1916,9 @@ class XdpContext
         if (!metadata.empty()) {
             detail::write_launch_time(metadata, launch_time_ns);
         }
+        if (auto* const shared = umem_.shared(); shared != nullptr) {
+            shared->ledger().hold(*addr);
+        }
         return EthernetTxSlot{
             .handle = *addr,
             .buffer = umem_.writable_span(*addr),
@@ -1856,7 +1932,7 @@ class XdpContext
     /// @param handle UMEM frame address from tx_start()
     [[nodiscard]] auto tx_cancel(uint64_t handle) -> Status
     {
-        umem_.free_frame(handle);
+        give_back(handle);
         return success();
     }
 
@@ -1908,10 +1984,7 @@ class XdpContext
     ///        points into (tx_commit_gather()) goes back at that transmit's completion instead.
     [[nodiscard]] auto rx_release(uint64_t handle) -> Status
     {
-        auto* const shared = umem_.shared();
-        if (shared == nullptr || shared->ledger().give_back(handle)) {
-            umem_.free_frame(handle);
-        }
+        give_back(handle);
         return success();
     }
 
@@ -1922,9 +1995,10 @@ class XdpContext
     /// UMEM; then the driver's xdp_zc_max_segs in zero-copy, XDP_COPY_MAX_SEGMENTS in copy mode.
     [[nodiscard]] auto tx_segments() const noexcept -> size_t { return tx_segments_; }
 
-    /// One frame in several buffers (XDP_PKT_CONTD): @p handle's first @p length bytes (nullopt: none), then @p rest,
-    /// each within one frame of the shared UMEM and lent (XdpFrameLedger) until completed; timed as tx_set_launch_time().
-    /// Errors: not_open; tx_gather_not_supported (past tx_segments(), or outside the UMEM); tx_ring_full. Frees @p handle on failure.
+    /// One frame in several buffers (XDP_PKT_CONTD): @p handle's first @p length bytes (nullopt: none), then @p rest, each
+    /// within one frame of the shared UMEM and lent (XdpFrameLedger) until completed; timed as tx_set_launch_time(), in
+    /// @p handle's frame only. Errors: not_open; tx_gather_not_supported (past tx_segments(), a buffer the kernel would
+    /// refuse, a time with no frame of the sender's); frame_not_held (a buffer given back); tx_ring_full. Frees @p handle on failure.
     [[nodiscard]] auto tx_commit_gather(
         std::optional<uint64_t> handle, size_t length, std::span<std::span<uint8_t const> const> rest, int64_t launch_time_ns = 0)
         -> Status;
@@ -2053,6 +2127,8 @@ class XdpContext
         std::swap(tx_frame_reserve_, other.tx_frame_reserve_);
         std::swap(tx_segments_, other.tx_segments_);
         std::swap(tx_only_, other.tx_only_);
+        std::swap(queue_id_, other.queue_id_);
+        std::swap(tx_in_flight_, other.tx_in_flight_);
         bool const mine = tx_pending_.load(std::memory_order_relaxed);
         tx_pending_.store(other.tx_pending_.load(std::memory_order_relaxed), std::memory_order_relaxed);
         other.tx_pending_.store(mine, std::memory_order_relaxed);
@@ -2085,6 +2161,10 @@ class XdpContext
     size_t tx_segments_{1};
     /// XdpConfig::tx_only, as open() took it.
     bool tx_only_{false};
+    /// XdpConfig::queue_id, as open() took it.
+    uint32_t queue_id_{0};
+    /// TX descriptors submitted whose completions have not been reaped.
+    uint32_t tx_in_flight_{0};
     /// The descriptors of one gathered frame: its UMEM addresses and lengths, in order.
     [[nodiscard]] auto gather_descriptors(
         std::optional<uint64_t> handle,
@@ -2094,21 +2174,35 @@ class XdpContext
     /// Submit `pieces` as one frame's descriptors, the first's options `first_options`, each lent piece lent.
     [[nodiscard]] auto submit_gather(std::span<std::pair<uint64_t, uint32_t> const> pieces, bool own_first, uint32_t first_options)
         -> Status;
-    /// Whether this socket on a shared UMEM sends multi-buffer frames: as asked (@p asked) if it bound first, else
-    /// as the first did; false without a shared UMEM.
-    [[nodiscard]] auto shared_gather(bool asked) noexcept -> bool;
     /// Return a completed address to its frame's owner: lent, through the ledger; else this socket's own.
     void complete_frame(uint64_t addr) noexcept;
-    /// Each of @p pieces' UMEM address and length into @p out: false for one outside the UMEM or across a frame.
+    /// Each of @p pieces' UMEM address and length into @p out: false for one outside the UMEM, across a frame, or
+    /// where the kernel's descriptor check (xp_aligned_validate_desc, with the TX metadata length) would refuse it.
     [[nodiscard]] auto locate(
         std::span<std::span<uint8_t const> const> pieces, std::span<std::pair<uint64_t, uint32_t>> out) const noexcept -> bool;
-    /// One frame submitted: counted, and a kick owed.
-    [[nodiscard]] auto note_submitted() noexcept -> Status;
-    /// @p launch_time_ns in the TX metadata below the first buffer at @p addr: its descriptor's options.
-    [[nodiscard]] auto time_first(uint64_t addr, int64_t launch_time_ns) noexcept -> uint32_t;
-    /// @p pieces' descriptors from TX ring entry @p idx, every piece but an own first lent.
+    /// @p count descriptors submitted: counted, in flight, and a kick owed.
+    [[nodiscard]] auto note_submitted(uint32_t count) noexcept -> Status;
+    /// @p launch_time_ns in the TX metadata of the sender's own first frame @p handle: its descriptor's options;
+    /// nullopt for a time with no frame to carry it (none of the sender's, or a UMEM without metadata).
+    [[nodiscard]] auto time_first(std::optional<uint64_t> handle, int64_t launch_time_ns) noexcept -> std::optional<uint32_t>;
+    /// Every piece but an own first lent to this socket: false, the loans undone, for one its owner gave back.
+    [[nodiscard]] auto lend_pieces(std::span<std::pair<uint64_t, uint32_t> const> pieces, bool own_first) noexcept -> bool;
+    /// The first @p count of @p pieces' loans returned, as their completions would.
+    void unlend_pieces(std::span<std::pair<uint64_t, uint32_t> const> pieces, bool own_first, size_t count) noexcept;
+    /// @p pieces' descriptors from TX ring entry @p idx, an own first in the kernel's hands.
     void write_gather(
         uint32_t idx, std::span<std::pair<uint64_t, uint32_t> const> pieces, bool own_first, uint32_t first_options) noexcept;
+    /// One frame's descriptor at TX ring entry @p idx: @p frame_length bytes of @p handle, timed as its metadata says.
+    void write_single(uint32_t idx, uint64_t handle, size_t frame_length) noexcept;
+    /// The RX ring entry consumed: released to the kernel, and counted.
+    void consume_rx_slot() noexcept;
+    /// The frame @p addr back from the caller: freed, unless a transmit still points into it (then its completion frees it).
+    void give_back(uint64_t addr) noexcept;
+    /// What a closing socket on a shared UMEM owes the others: its transmits completed (a bounded wait), on the
+    /// anchor's queue what the kernel delivered released, and the loans still out undone. Control thread.
+    void settle_shared() noexcept;
+    /// settle_shared()'s receive side: nothing more steered here, then the RX ring drained.
+    void drain_rx_at_close() noexcept;
     /// fill_replenish() of a socket that receives: free frames into the fill ring, the driver woken if it asks.
     [[nodiscard]] auto fill_from_free_list() -> Status;
     /// Frames are in the TX ring that the kernel has not been kicked for.
@@ -2167,6 +2261,12 @@ inline constexpr bool xdp_tx_metadata_built = false;
 }  // namespace detail
 
 #else  // !(__linux__ && HAVE_XDP)
+
+namespace detail {
+/// No registration off Linux.
+struct UmemAnchor
+{};
+}  // namespace detail
 
 // ──────────────────────────────────────────────
 // XdpContext — stub for non-Linux or without libbpf/libxdp
