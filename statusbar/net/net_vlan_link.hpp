@@ -53,10 +53,11 @@ namespace statusbar::net::vlan {
 
 #if defined(__linux__)
 
-/// Covers every request this module builds. The largest is the create:
-/// 16 (nlmsghdr) + 16 (ifinfomsg) + 8 (IFLA_LINK) + 20 (IFLA_IFNAME, padded)
-/// + 24 (IFLA_LINKINFO nesting the kind and the VLAN id) = 80 bytes for a
-/// 15-byte name. A request therefore lives on the stack with no allocation.
+/// Covers every request this module builds. The larger of the two is the
+/// create: 16 (nlmsghdr) + 16 (ifinfomsg) + 8 (IFLA_LINK) + 20
+/// (IFLA_IFNAME, padded) + 24 (IFLA_LINKINFO nesting the kind and the
+/// VLAN id) = 80 bytes for a 15-byte name. A request therefore lives on
+/// the stack with no allocation.
 inline constexpr std::size_t MAX_REQUEST_SIZE = 128;
 
 /// IFNAMSIZ - 1: the kernel's limit on a link name, not counting the
