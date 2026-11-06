@@ -3,8 +3,11 @@
 
 #include "statusbar/net/net_test_port.hpp"
 
+#include "statusbar/buffer/span_utils.hpp"
 #include "statusbar/net/net_error.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 
 namespace statusbar::net {
@@ -21,6 +24,8 @@ void TestPortContext::close() noexcept
     joined_multicast_.clear();
     refuse_commits_ = false;
     tx_flushes_ = 0;
+    tx_gathers_ = 0;
+    last_gather_.clear();
     cycles_begun_ = 0;
     cycles_ended_ = 0;
 }
@@ -40,6 +45,8 @@ auto TestPortContext::open(TestPortConfig const& config, std::pmr::memory_resour
     rx_queue_ = std::pmr::vector<RxEntry>(mem_resource_);
     tx_captures_ = std::pmr::vector<TxCapture>(mem_resource_);
     joined_multicast_ = std::pmr::vector<ieee::Eui48>(mem_resource_);
+    last_gather_ = std::pmr::vector<std::span<uint8_t const>>(mem_resource_);
+    tx_segments_ = std::max<size_t>(config.tx_segments, 1);
 
     size_t const pool_size = config.frame_pool_size > 0 ? config.frame_pool_size : 256;
     pool_.resize(pool_size);
@@ -76,6 +83,65 @@ auto TestPortContext::tx_commit(uint64_t handle, size_t len) -> Status
 
     free_list_.push_back(handle);
     return success();
+}
+
+auto TestPortContext::tx_commit_gather(
+    std::optional<uint64_t> const handle,
+    size_t const len,
+    std::span<std::span<uint8_t const> const> const rest,
+    int64_t const launch_time_ns) -> Status
+{
+    if (handle && *handle >= pool_.size()) {
+        return failure(NetError::invalid_handle);
+    }
+    TxCapture capture;
+    capture.launch_time_ns = launch_time_ns != 0 ? launch_time_ns : (handle ? launch_times_[static_cast<size_t>(*handle)] : 0);
+    auto const status = gather_into(capture, handle, len, rest);
+    if (handle) {
+        (void)tx_cancel(*handle);  // the slot back to the free list, sent or not
+    }
+    return status.transform([&] { record_gather(capture, rest); });
+}
+
+void TestPortContext::record_gather(TxCapture const& capture, std::span<std::span<uint8_t const> const> const rest)
+{
+    tx_captures_.push_back(capture);
+    last_gather_.assign(rest.begin(), rest.end());
+    ++tx_gathers_;
+}
+
+auto TestPortContext::gather_into(
+    TxCapture& capture,
+    std::optional<uint64_t> const handle,
+    size_t const len,
+    std::span<std::span<uint8_t const> const> const rest) const -> Status
+{
+    size_t const pieces = rest.size() + (handle ? 1 : 0);
+    if (pieces == 0 || pieces > tx_segments_ || refuse_commits_) {
+        return failure(refuse_commits_ ? NetError::send_failed : NetError::invalid_argument);
+    }
+    size_t const total =
+        std::ranges::fold_left(rest, handle ? len : 0, [](size_t sum, auto const piece) { return sum + piece.size(); });
+    if (total > ETHERNET_PORT_MIN_FRAME_BUFFER) {
+        return failure(NetError::buffer_full);
+    }
+    concatenate(
+        capture, handle ? make_const_span(pool_[static_cast<size_t>(*handle)]).first(len) : std::span<uint8_t const>{}, rest);
+    return success();
+}
+
+void TestPortContext::concatenate(
+    TxCapture& capture, std::span<uint8_t const> const head, std::span<std::span<uint8_t const> const> const rest)
+{
+    std::array<uint8_t, ETHERNET_PORT_MIN_FRAME_BUFFER> bytes{};
+    std::span<uint8_t> out{bytes};
+    span_copy(out.first(head.size()), head);
+    out = out.subspan(head.size());
+    for (auto const piece : rest) {
+        span_copy(out.first(piece.size()), piece);
+        out = out.subspan(piece.size());
+    }
+    capture.frame.assign(bytes.data(), bytes.size() - out.size());
 }
 
 auto TestPortContext::tx_start(int64_t launch_time_ns) -> StatusValue<EthernetTxSlot>

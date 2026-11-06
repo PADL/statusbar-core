@@ -179,6 +179,14 @@ class AnyEthernetPort
     /// The launch time of frame @p handle, started and not yet committed: what tx_start() took,
     /// set after the fact (xdp, and the test port). not_supported on a backend without launch time.
     [[nodiscard]] auto tx_set_launch_time(uint64_t handle, int64_t launch_time_ns) -> Status;
+    /// Buffers one frame may be sent in (tx_commit_gather()): the backend's (xdp, the test port), else 1.
+    [[nodiscard]] auto tx_segments() const noexcept -> size_t;
+    /// One frame of the first @p length bytes of @p handle from tx_start() (nullopt: none), then @p rest, sent
+    /// without copying them (XdpContext::tx_commit_gather()); the test port captures them as one frame.
+    /// not_supported on any other backend; @p handle freed on failure.
+    [[nodiscard]] auto tx_commit_gather(
+        std::optional<uint64_t> handle, size_t length, std::span<std::span<uint8_t const> const> rest, int64_t launch_time_ns = 0)
+        -> Status;
 
     /// The next received frame, stamped as the backend stamps: the kernel's
     /// time where it gives one (mmap), else @p now, the RX clock as the
