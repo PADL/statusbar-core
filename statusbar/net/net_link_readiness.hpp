@@ -58,10 +58,10 @@ class LinkReadiness
         : ifindex_{ifindex}
     {}
 
-    /// One message, read at @p now_ns: the interface's RTM_NEWLINK, an IPv4 address change or a qdisc change; any
-    /// other message is ignored. Errors: bad_message for a malformed one (nothing changes), no_such_device for the
-    /// interface's RTM_DELLINK.
-    [[nodiscard]] auto apply(std::span<uint8_t const> message, int64_t now_ns) -> Status;
+    /// One message, read at @p now_ns: the interface's RTM_NEWLINK (true), an IPv4 address change or a qdisc change
+    /// (false); any other message is ignored (false). Errors: bad_message for a malformed one (nothing changes),
+    /// no_such_device for the interface's RTM_DELLINK.
+    [[nodiscard]] auto apply(std::span<uint8_t const> message, int64_t now_ns) -> StatusValue<bool>;
     /// Forget the addresses, before a dump reports them afresh.
     void forget_addresses() noexcept { address_count_ = 0; }
     /// Notifications were lost at @p now_ns (an overrun): a qdisc change may have gone unseen, so one is assumed
@@ -131,10 +131,14 @@ class LinkWatch
 
     /// One recv() into buffer_ (length_ octets when delivered).
     [[nodiscard]] auto receive() -> StatusValue<Received>;
+    /// A datagram cut short: lost; the interface's own link report cut again after asking: message_size.
+    [[nodiscard]] auto cut() noexcept -> StatusValue<Received>;
     [[nodiscard]] auto deliver(std::span<uint8_t const> datagram, int64_t now_ns) -> Status;
     [[nodiscard]] auto deliver_one(std::span<uint8_t const> message, int64_t now_ns) -> Status;
-    /// The requests a message answers: a dump done or refused, a whole link report after a cut.
-    void track_requests(std::span<uint8_t const> message) noexcept;
+    /// readiness_.apply(): a whole link report answers the ask after a cut.
+    [[nodiscard]] auto apply(std::span<uint8_t const> message, int64_t now_ns) -> Status;
+    /// A message ending the address dump, done or refused.
+    void track_dump(std::span<uint8_t const> message) noexcept;
     /// Notifications were lost: a change is assumed, and the link and the addresses are asked for again.
     void lose_notifications(int64_t now_ns) noexcept;
     /// Ask for the link, then for the IPv4 addresses (start_dump()).
@@ -146,7 +150,7 @@ class LinkWatch
     FileDescriptor fd_{};
     LinkReadiness readiness_;
     bool lost_{false};                     ///< notifications lost since the last request
-    bool cut_{false};                      ///< a datagram cut short since the last whole link report
+    bool cut_{false};                      ///< the link's report cut short since the last whole one
     bool asked_after_cut_{false};          ///< the link asked for again since that cut
     bool dump_running_{false};             ///< an RTM_GETADDR dump not yet done
     bool dump_wanted_{false};              ///< an RTM_GETADDR dump to start once none runs
