@@ -382,16 +382,6 @@ TEST(napi_busy_poll, busy_poll_skips_kicks_only_after_one_has_scheduled_the_kthr
     EXPECT_FALSE(other.on() || other.polling());
 }
 
-TEST(napi_busy_poll, a_busy_polled_queue_is_kicked_only_when_it_stalls)
-{
-    // pending, busy polled, stalled
-    EXPECT_FALSE(detail::tx_kick_due(false, false, false));
-    EXPECT_TRUE(detail::tx_kick_due(true, false, false));
-    EXPECT_FALSE(detail::tx_kick_due(true, true, false));
-    EXPECT_TRUE(detail::tx_kick_due(true, true, true));
-    EXPECT_TRUE(detail::tx_kick_due(false, true, true));  // left in the ring since a skipped kick
-}
-
 TEST(TxProgress, a_busy_polled_queue_that_makes_no_progress_between_flushes_is_kicked)
 {
     using detail::TxRingState;

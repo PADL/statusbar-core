@@ -209,15 +209,8 @@ struct Root
     return std::optional<std::uint32_t>{(*found)->handle};
 }
 
-/// Lay @p root unless it is already ours.
-///
-/// A stale root is deleted first. The kernel takes a replace under a handle
-/// the interface already has as a change to the qdisc holding it, and
-/// mqprio has no change operation, so that request is refused with EINVAL
-/// and our own older root would stay forever. A foreign root has a
-/// different handle, and a replace under ours grafts over it in one request
-/// - except a foreign mqprio or taprio, which is deleted first
-/// (remove_other_tc_root()).
+/// Lay @p root unless it is already ours: a stale root of ours, or a foreign mqprio or taprio, is
+/// deleted first (NET_MODULE.md, "Notes & caveats": mqprio takes no change or in-place replace).
 [[nodiscard]] auto ensure_root(TcControl& tc, int const ifindex, MqprioQdisc const& root, Root const& seen) -> Status
 {
     if (seen.state == RootState::ours) {
