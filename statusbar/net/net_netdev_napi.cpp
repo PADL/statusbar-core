@@ -11,9 +11,11 @@
 #    include <sched.h>
 
 #    include <algorithm>
+#    include <array>
 #    include <cerrno>
 #    include <cstddef>
 #    include <system_error>
+#    include <tuple>
 
 #    include <linux/netlink.h>
 #    include <sys/types.h>
@@ -325,16 +327,44 @@ namespace {
     return success();
 }
 
+/// The threaded mode of each of `napis`, as reported (disabled where the kernel reports none).
+using NapiModes = std::array<NapiThreaded, std::tuple_size_v<decltype(QueueNapis::ids)>>;
+
+/// Each of `napis`' mode into `modes`, before any is changed.
+[[nodiscard]] auto read_each(NapiClient& client, QueueNapis const& napis, NapiModes& modes) -> Status
+{
+    for (size_t i = 0; i < napis.count; ++i) {
+        auto const napi = client.napi(napis.ids[i]);
+        if (!napi) {
+            return forward_failure(napi);
+        }
+        modes[i] = napi->threaded.value_or(NapiThreaded::disabled);
+    }
+    return success();
+}
+
+/// Each of `napis` back to its mode in `modes`, as far as the kernel lets it.
+void restore_each(NapiClient& client, QueueNapis const& napis, NapiModes const& modes)
+{
+    for (size_t i = 0; i < napis.count; ++i) {
+        (void)client.set_threaded(napis.ids[i], modes[i]);
+    }
+}
+
 /// `napis` threaded in `mode`: their kthreads made (enabled: woken by the interrupt only) and pinned to `cpu`
-/// before they may spin; all set disabled again on a failure.
+/// before they may spin; each put back in the mode it had on a failure.
 [[nodiscard]] auto thread_each(NapiClient& client, QueueNapis& napis, NapiThreaded const mode, int const cpu) -> Status
 {
+    NapiModes before{};
+    if (auto const read = read_each(client, napis, before); !read) {
+        return read;
+    }
     auto const status =
         set_each(client, napis, NapiThreaded::enabled).and_then([&] { return pin_each(client, napis, cpu); }).and_then([&] {
             return set_each(client, napis, mode);
         });
     if (!status) {
-        (void)set_each(client, napis, NapiThreaded::disabled);
+        restore_each(client, napis, before);
     }
     return status;
 }
