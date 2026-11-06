@@ -180,23 +180,29 @@ struct LocalListener
     uint64_t ino{0};
 };
 
-/// The staged name "<dir>/.XXXXXX/s" beside @p path is this much longer than <dir>.
-constexpr size_t STAGED_SUFFIX = sizeof("/.XXXXXX/s") - 1;
+/// The staged name "<path>.staging/s" is this much longer than @p path.
+constexpr size_t STAGED_SUFFIX = sizeof(".staging/s") - 1;
 
-/// Whether the staged name beside @p path fits sun_path: not for a short basename near the limit.
+/// Whether the staged name of @p path fits sun_path: not for a path near the limit.
 [[nodiscard]] auto staged_name_fits(std::string const& path) noexcept -> bool
 {
-    auto const slash = path.rfind('/');
-    size_t const dir = slash == std::string::npos ? 1 : slash;
-    return dir + STAGED_SUFFIX < sizeof(sockaddr_un::sun_path);
+    return path.size() + STAGED_SUFFIX < sizeof(sockaddr_un::sun_path);
 }
 
-/// A fresh private (0700) directory "<dir>/.XXXXXX" beside @p path, to stage its socket in.
+/// Remove the staged name and its directory, whatever became of them.
+void remove_staged(std::string const& staged, std::string const& dir) noexcept
+{
+    (void)::unlink(staged.c_str());
+    (void)::rmdir(dir.c_str());
+}
+
+/// A fresh private (0700) directory "<path>.staging" to stage the socket in, one a run that crashed
+/// left swept first; bind_failed when it cannot be made (a directory of that name holding more).
 [[nodiscard]] auto make_private_dir(std::string const& path) -> StatusValue<std::string>
 {
-    auto const slash = path.rfind('/');
-    std::string dir = (slash == std::string::npos ? std::string{"."} : path.substr(0, slash)) + "/.XXXXXX";
-    if (::mkdtemp(dir.data()) == nullptr) {
+    std::string dir = path + ".staging";
+    remove_staged(dir + "/s", dir);
+    if (::mkdir(dir.c_str(), 0700) < 0) {
         return failure(NetError::bind_failed);
     }
     return dir;
@@ -246,13 +252,6 @@ constexpr size_t STAGED_SUFFIX = sizeof("/.XXXXXX/s") - 1;
     return claim_staged(staged, std::move(*sock));
 }
 
-/// Remove the staged name and its directory, whatever became of them.
-void remove_staged(std::string const& staged, std::string const& dir) noexcept
-{
-    (void)::unlink(staged.c_str());
-    (void)::rmdir(dir.c_str());
-}
-
 /// The listener staged in @p dir, hard-linked to @p path. link(), like
 /// bind(), neither follows nor replaces what is at the path. The staged name
 /// and its directory are removed either way.
@@ -287,9 +286,9 @@ void remove_staged(std::string const& staged, std::string const& dir) noexcept
     return failure(NetError::bind_failed);
 }
 
-/// Bind, chmod and listen in a private directory, then link into place, so
-/// the socket never answers at its path before its mode is final and a path
-/// swapped for a symlink is never followed by chmod().
+/// Bind, chmod and listen in a private directory, then link into place: the socket never answers
+/// at its path before its mode is final, and a symlink swapped in at the path is never followed by
+/// chmod(). A path too long for its staged name is refused (invalid_address), not bound in place.
 auto create_local_listener(SocketAddress const& addr, TcpServerOptions const& options) -> StatusValue<LocalListener>
 {
     std::string const path{addr.path()};
@@ -302,7 +301,7 @@ auto create_local_listener(SocketAddress const& addr, TcpServerOptions const& op
         return failure(cleared.error());
     }
     if (!staged_name_fits(path)) {
-        return listen_staged(path, sock_type, options);  // bound in place: the mode follows the bind
+        return failure(NetError::invalid_address);
     }
     return make_private_dir(path).and_then([&](std::string const& dir) { return link_staged(dir, path, sock_type, options); });
 }

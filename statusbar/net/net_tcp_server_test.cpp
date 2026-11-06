@@ -10,10 +10,12 @@
 #include <unistd.h>
 
 #include <array>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -761,9 +763,9 @@ TEST(net_tcp_server_local, the_socket_is_staged_privately_and_linked_into_place)
     (void)::rmdir(dir.c_str());
 }
 
-// A path that fits sun_path when its staged name beside it would not (a short
-// basename near the limit) is bound in place, with its mode.
-TEST(net_tcp_server_local, a_path_too_long_to_stage_beside_is_bound_in_place)
+// A path that fits sun_path when its staged name would not (near the limit) is refused, not bound in
+// place where it would answer before its mode was set.
+TEST(net_tcp_server_local, a_path_too_long_to_stage_is_refused)
 {
     std::string top = "/tmp/sb_pool_long_XXXXXX";
     EXPECT_TRUE(::mkdtemp(top.data()) != nullptr);
@@ -779,12 +781,40 @@ TEST(net_tcp_server_local, a_path_too_long_to_stage_beside_is_bound_in_place)
         options.unix_mode = 0600;
         TcpConnectionPool pool{*addr, 2, handler, options};
         pool_ptr = &pool;
-        EXPECT_TRUE(pool.valid());
+        EXPECT_FALSE(pool.valid());
         struct stat st{};
-        EXPECT_TRUE(::lstat(path.c_str(), &st) == 0 && S_ISSOCK(st.st_mode) && (st.st_mode & 0777U) == 0600U);
+        EXPECT_TRUE(::lstat(path.c_str(), &st) < 0 && errno == ENOENT);
     }
     (void)::rmdir(dir.c_str());
     (void)::rmdir(top.c_str());
+}
+
+// The staging directory a run that crashed between the bind and the link left behind, with its
+// socket in it, is swept before the next run stages there.
+TEST(net_tcp_server_local, a_staging_directory_left_by_a_crash_is_swept)
+{
+    std::string dir = "/tmp/sb_pool_sweep_XXXXXX";
+    EXPECT_TRUE(::mkdtemp(dir.data()) != nullptr);
+    std::string const path = dir + "/s.sock";
+    std::string const staging = path + ".staging";
+    EXPECT_EQ(::mkdir(staging.c_str(), 0700), 0);
+    {
+        std::ofstream left{staging + "/s"};
+        left << "a stale socket";
+    }
+    auto const addr = SocketAddress::local(path);
+    EXPECT_TRUE(addr.has_value());
+    {
+        TcpConnectionPool* pool_ptr = nullptr;
+        EchoHandler handler{pool_ptr};
+        TcpConnectionPool pool{*addr, 2, handler, TcpServerOptions{}};
+        pool_ptr = &pool;
+        EXPECT_TRUE(pool.valid());
+        struct stat st{};
+        EXPECT_TRUE(::lstat(staging.c_str(), &st) < 0 && errno == ENOENT);
+        EXPECT_TRUE(::lstat(path.c_str(), &st) == 0 && S_ISSOCK(st.st_mode));
+    }
+    (void)::rmdir(dir.c_str());
 }
 
 TEST(net_tcp_server_local, without_a_mode_the_umask_result_stands)
