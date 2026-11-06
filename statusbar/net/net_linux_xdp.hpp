@@ -1970,6 +1970,9 @@ class XdpContext
     /// Whether this socket's frames can carry a launch time, i.e. the UMEM
     /// was registered with room for TX metadata (XdpConfig::tx_launch_time).
     [[nodiscard]] auto tx_launch_time() const noexcept -> bool { return umem_.tx_metadata_len() != 0; }
+    /// The TX metadata below each descriptor's address, in octets (0 without launch time): what a buffer
+    /// sent first must leave free below it in its frame.
+    [[nodiscard]] auto tx_metadata_len() const noexcept -> size_t { return umem_.tx_metadata_len(); }
 
     /// Send the frame at @p handle at @p launch_time_ns on the sending NIC's
     /// PHC (xsk-tx-metadata.rst), rather than as soon as the NIC can.
@@ -2260,6 +2263,7 @@ class XdpContext
     [[nodiscard]] auto stats() const noexcept -> Stats const& { return stats_; }
 
     [[nodiscard]] auto tx_launch_time() const noexcept -> bool { return false; }
+    [[nodiscard]] auto tx_metadata_len() const noexcept -> size_t { return 0; }
 
     [[nodiscard]] auto tx_set_launch_time(uint64_t, int64_t) noexcept -> Status
     {
