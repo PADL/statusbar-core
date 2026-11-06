@@ -116,6 +116,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   include(CheckCXXSourceCompiles)
   include(CMakePushCheckState)
   cmake_push_check_state(RESET)
+  set(_statusbar_try_compile_type "${CMAKE_TRY_COMPILE_TARGET_TYPE}")
   set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
   check_cxx_source_compiles(
     "#include <linux/netdev.h>
@@ -134,6 +135,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     static_assert(NETDEV_NAPI_THREADED_BUSY_POLL != 0);"
     STATUSBAR_HAVE_NETDEV_NAPI_BUSY_POLL)
   cmake_pop_check_state()
+  set(CMAKE_TRY_COMPILE_TARGET_TYPE "${_statusbar_try_compile_type}")
+  unset(_statusbar_try_compile_type)
   foreach(_have XSK_FEATURES XSK_LAUNCH_TIME QUEUE_NAPI NAPI_BUSY_POLL)
     if(STATUSBAR_HAVE_NETDEV_${_have})
       target_compile_definitions(statusbar-net PRIVATE HAVE_NETDEV_${_have}=1)
