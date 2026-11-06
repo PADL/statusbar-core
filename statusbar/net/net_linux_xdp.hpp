@@ -1739,6 +1739,10 @@ class XdpContext
     /// half-the-UMEM cap. Zero before open().
     [[nodiscard]] auto tx_frame_reserve() const noexcept -> size_t { return tx_frame_reserve_; }
 
+    /// Bytes per UMEM frame (XdpConfig::umem_frame_size), 0 before open(): a handle divided by it
+    /// is its frame's index.
+    [[nodiscard]] auto umem_frame_size() const noexcept -> size_t { return umem_.frame_size(); }
+
     /// The program in force, and its pins.
     [[nodiscard]] auto program() const noexcept -> XdpProgram const& { return program_; }
 
@@ -2095,6 +2099,7 @@ class XdpContext
     [[nodiscard]] auto attach_mode() const noexcept -> XdpAttachMode { return XdpAttachMode::native; }
     [[nodiscard]] auto bind_retries() const noexcept -> size_t { return 0; }
     [[nodiscard]] auto tx_frame_reserve() const noexcept -> size_t { return 0; }
+    [[nodiscard]] auto umem_frame_size() const noexcept -> size_t { return 0; }
 
     [[nodiscard]] auto program() const noexcept -> XdpProgram const& { return program_; }
     [[nodiscard]] auto pinned() const noexcept -> bool { return false; }
