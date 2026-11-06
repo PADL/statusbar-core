@@ -319,6 +319,17 @@ TEST(any_ethernet_port, the_xdp_umem_grows_by_the_frames_a_receiver_holds)
     EXPECT_EQ(held.tx_frame_reserve, XdpConfig{}.tx_frame_reserve);
 }
 
+// A port on a UMEM shared with another device's takes its share, and multi-buffer transmit, as given.
+TEST(any_ethernet_port, the_xdp_backend_takes_a_shared_umem_and_its_share)
+{
+    auto const plain = xdp_config_for({.interface_name = "lo"});
+    EXPECT_TRUE(plain.shared_umem == nullptr && !plain.tx_scatter_gather);
+    auto* const umem = reinterpret_cast<XdpSharedUmem*>(uintptr_t{0x1000});  // NOLINT(performance-no-int-to-ptr): only compared
+    auto const shared =
+        xdp_config_for({.interface_name = "lo", .xdp_shared_umem = umem, .xdp_umem_share = 1, .xdp_scatter_gather = true});
+    EXPECT_TRUE(shared.shared_umem == umem && shared.umem_share == 1 && shared.tx_scatter_gather);
+}
+
 TEST(any_ethernet_port, a_ring_backend_shares_state_between_tx_and_rx_or_is_not_available)
 {
     AnyEthernetPort port;
