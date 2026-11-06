@@ -96,7 +96,7 @@ struct Clock
 //
 
 /// Monotonic clock - the native reference clock for the timer system.
-/// Maps directly to CLOCK_MONOTONIC on Linux, mach_absolute_time on macOS.
+/// Maps directly to CLOCK_MONOTONIC on Linux and on macOS (clock_gettime).
 /// This is the only clock that can be read without a time bridge.
 using MonotonicClock = Clock<MonotonicClockTag>;
 

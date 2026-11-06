@@ -18,6 +18,18 @@ types they name live in core's [`realtime`](REALTIME_MODULE.md),
 | GPS, TAI | `realtime::GpsClock`, `realtime::TaiClock` | Media-clock rate tracking and TAI arithmetic. |
 | `CLOCK_REALTIME` | plain `int64_t` | Wall-clock output only (log lines, LTC, scene stamps). Never compared with the clocks above. |
 
+The first two rows mean the same thing on macOS as on Linux: both are read
+with `clock_gettime`, both keep counting through a system sleep, and only
+`CLOCK_MONOTONIC` is slewed. The one platform difference is the sleep
+primitive, and it lives in a single place, `realtime::sleep_until_monotonic_ns()`:
+`clock_nanosleep(TIMER_ABSTIME)` on Linux, a relative `mach_wait_until` on
+macOS, because Mach's own counter (`mach_absolute_time`, which is
+`CLOCK_UPTIME_RAW`) stops while the machine sleeps and must never carry an
+absolute deadline. `std::chrono::steady_clock` is `CLOCK_MONOTONIC_RAW` on
+macOS libc++, so it is not a `CLOCK_MONOTONIC` value there either: a
+"monotonic" nanosecond count for a sleep or a line comes from
+`realtime::read_monotonic_ns()`, never from `steady_clock`.
+
 Each domain is a distinct `Clock<Tag>` with its own `time_point`, so mixing
 two domains is a compile error. Crossing a domain is an explicit conversion
 through an adapter or a bridge, done once, at the edge.

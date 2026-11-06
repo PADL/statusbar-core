@@ -20,33 +20,9 @@
 #include <cstdint>
 #include <cstring>
 
-#if defined(__linux__)
-#    include <ctime>
-#elif defined(__APPLE__)
-#    include <mach/mach_time.h>
-#endif
-
 namespace statusbar::realtime {
 
 namespace {
-
-#if defined(__linux__)
-/// Build a timespec for clock_nanosleep(TIMER_ABSTIME) from a monotonic
-/// nanosecond deadline. A non-positive deadline (already missed, or clock
-/// skew during shutdown) is clamped to {0, 0}, which makes the call return
-/// immediately rather than failing with EINVAL — the original split via
-/// `tv_sec = ns/1e9, tv_nsec = ns%1e9` produced a negative tv_nsec for
-/// negative ns (C++ truncates toward zero), and EINVAL is not in the
-/// EINTR-only retry loop, so the call would silently return failure and the
-/// caller would spin.
-[[nodiscard]] inline auto ns_to_abs_timespec(int64_t ns) noexcept -> struct timespec
-{
-    if (ns <= 0) {
-        return {.tv_sec = 0, .tv_nsec = 0};
-    }
-    return {.tv_sec = static_cast<time_t>(ns / 1'000'000'000LL), .tv_nsec = static_cast<long>(ns % 1'000'000'000LL)};
-}
-#endif
 
 /// Recursively grow the stack in 4096-byte chunks, writing each chunk so the
 /// kernel commits a physical page for every stack page the chunks span. This
@@ -200,21 +176,13 @@ auto TimerBase::prepare_thread() -> bool
 
 auto TimerBase::wait_until_absolute(int64_t deadline_ns) noexcept -> int64_t
 {
-#if defined(__linux__)
-    // Use clock_nanosleep with absolute deadline for maximum precision
-    struct timespec const deadline = ns_to_abs_timespec(deadline_ns);
-
+    // A signal that cuts the sleep short is not a wake: sleep again to the
+    // same deadline. Any other failure returns at once and the caller sees
+    // the early wake in the error it is handed.
     int sleep_result = 0;
     do {
-        sleep_result = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, nullptr);
+        sleep_result = sleep_until_monotonic_ns(deadline_ns);
     } while (sleep_result == EINTR);
-
-#elif defined(__APPLE__)
-    uint64_t const mach_deadline = static_cast<uint64_t>(ns_to_mach(static_cast<uint64_t>(deadline_ns)));
-    mach_wait_until(mach_deadline);
-#else
-#    error "Unsupported platform"
-#endif
 
     int64_t const actual_ns = read_monotonic_ns();
     return actual_ns - deadline_ns;
@@ -306,19 +274,7 @@ auto TimerBase::wait_until_busy(int64_t deadline_ns, int64_t threshold_ns) noexc
 
     // If we have more than threshold time remaining, sleep first
     if (remaining_ns > threshold_ns) {
-        int64_t const sleep_until_ns = deadline_ns - threshold_ns;
-
-#if defined(__linux__)
-        struct timespec const sleep_deadline = ns_to_abs_timespec(sleep_until_ns);
-        int sleep_result = 0;
-        do {
-            sleep_result = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &sleep_deadline, nullptr);
-        } while (sleep_result == EINTR);
-
-#elif defined(__APPLE__)
-        uint64_t const mach_sleep_deadline = static_cast<uint64_t>(ns_to_mach(static_cast<uint64_t>(sleep_until_ns)));
-        mach_wait_until(mach_sleep_deadline);
-#endif
+        (void)wait_until_absolute(deadline_ns - threshold_ns);
     }
 
     // Busy-wait for remaining time (or all time if period < threshold)

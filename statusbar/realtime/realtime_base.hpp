@@ -543,42 +543,33 @@ inline void set_current_thread_name(std::string_view name) noexcept
     return result.success;
 }
 
+[[nodiscard]] constexpr auto timespec_to_ns(int64_t const tv_sec, int64_t const tv_nsec) noexcept
+{
+    return (tv_sec * 1'000'000'000LL) + tv_nsec;
+}
+
 #if defined(__APPLE__)
+/// Nanoseconds to mach_absolute_time ticks, for the relative wait in
+/// sleep_until_monotonic_ns(). Mach's own counter stops while the machine
+/// sleeps (it is CLOCK_UPTIME_RAW), so it never carries an absolute deadline.
 inline auto ns_to_mach(uint64_t const ns) -> uint64_t
 {
     mach_timebase_info_data_t tb;
     mach_timebase_info(&tb);
     return ns * tb.denom / tb.numer;
 }
-
-inline auto mach_to_ns(uint64_t const mach) -> uint64_t
-{
-    mach_timebase_info_data_t tb;
-    mach_timebase_info(&tb);
-    return mach * tb.numer / tb.denom;
-}
-#else
-[[nodiscard]] constexpr auto timespec_to_ns(int64_t const tv_sec, int64_t const tv_nsec) noexcept
-{
-    return (tv_sec * 1'000'000'000LL) + tv_nsec;
-}
 #endif
 
-/// CLOCK_MONOTONIC in nanoseconds (mach_absolute_time on macOS). This is
-/// the clock the kernel sleeps on, and NTP or phc2sys slews its rate: use
-/// it for sleeping, not for timing. Timing, stamps and deadlines take
-/// read_monotonic_raw_ns().
+/// CLOCK_MONOTONIC in nanoseconds, read with clock_gettime on every
+/// platform (macOS has had it since 10.12, with the same meaning as Linux:
+/// it keeps counting through a system sleep and NTP slews its rate). This
+/// is the clock the kernel sleeps on: use it for sleeping, not for timing.
+/// Timing, stamps and deadlines take read_monotonic_raw_ns().
 inline auto read_monotonic_ns() noexcept -> int64_t
 {
-#if defined(__linux__)
-    timespec ts;
+    timespec ts{};
     ::clock_gettime(CLOCK_MONOTONIC, &ts);
-    int64_t const time_mono = timespec_to_ns(ts.tv_sec, ts.tv_nsec);
-    return time_mono;
-#elif defined(__APPLE__)
-    uint64_t const mach_now = mach_absolute_time();
-    return static_cast<int64_t>(mach_to_ns(mach_now));
-#endif
+    return timespec_to_ns(ts.tv_sec, ts.tv_nsec);
 }
 
 /// CLOCK_MONOTONIC_RAW in nanoseconds: the timing reference clock, immune
@@ -587,6 +578,32 @@ inline auto read_monotonic_ns() noexcept -> int64_t
 inline auto read_monotonic_raw_ns() noexcept -> int64_t
 {
     return detail::now_monotonic_raw_ns();
+}
+
+/// Sleep until an absolute CLOCK_MONOTONIC deadline, the one kernel sleep
+/// primitive every sleeper goes through. Returns 0 when the deadline has
+/// passed (a missed or non-positive deadline returns at once rather than
+/// failing with EINVAL), EINTR when a signal cut the sleep short on Linux,
+/// or the errno of a failed clock_nanosleep. On macOS there is no
+/// clock_nanosleep, so the wait is relative: the remaining nanoseconds are
+/// handed to mach_wait_until from mach_absolute_time, which is a different
+/// counter (it stops in system sleep) but the same rate over one wait.
+inline auto sleep_until_monotonic_ns(int64_t const deadline_ns) noexcept -> int
+{
+    int64_t const remaining_ns = deadline_ns - read_monotonic_ns();
+    if (remaining_ns <= 0) {
+        return 0;
+    }
+#if defined(__linux__)
+    timespec const deadline{
+        .tv_sec = static_cast<time_t>(deadline_ns / 1'000'000'000LL), .tv_nsec = static_cast<long>(deadline_ns % 1'000'000'000LL)};
+    return ::clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, nullptr);
+#elif defined(__APPLE__)
+    (void)::mach_wait_until(::mach_absolute_time() + ns_to_mach(static_cast<uint64_t>(remaining_ns)));
+    return 0;
+#else
+#    error "Unsupported platform"
+#endif
 }
 
 //
