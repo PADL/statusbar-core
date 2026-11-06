@@ -209,4 +209,18 @@ TEST(launch_order, phc_now_stamps_untimed_frames_and_is_zero_without_a_clock)
     EXPECT_EQ(phc_now_ns(clock), std::uint64_t{0});
 }
 
+// No clock reading (0): an untimed frame stays untimed and a timed one is only ordered; it is not
+// taken for a clock stepping back, so the order and the counters are kept.
+TEST(launch_order, a_failed_clock_read_neither_steps_nor_reorders)
+{
+    LaunchOrder order;
+    EXPECT_EQ(order.next(T, T), T);
+    EXPECT_EQ(order.next(0, 0), std::uint64_t{0});
+    EXPECT_EQ(order.next(T - 300'000, 0), T);  // held, not handed out earlier
+    EXPECT_EQ(order.next(T + 125'000, 0), T + 125'000);
+    EXPECT_EQ(order.steps(), std::uint64_t{0});
+    EXPECT_EQ(order.launched_late(), std::uint64_t{0});
+    EXPECT_EQ(order.next(T + 100'000, T), T + 125'000);
+}
+
 TEST_MAIN(statusbar_net, net_launch_order_test)
