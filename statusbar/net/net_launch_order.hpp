@@ -29,6 +29,7 @@
 /// syscall a host may cache per tick). The counters are atomic because a soak
 /// test reads them from another thread while it runs.
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <ctime>
@@ -105,9 +106,12 @@ class LaunchOrder
     ///        stepped. Told, not asked (see "told the time"): a nanosecond
     ///        count like @p wanted_ns, because the clock is whichever one
     ///        the NIC keeps - CLOCK_TAI, or a PHC - and no one clock tag
-    ///        names both.
+    ///        names both. 0 is no reading (a failed tai_now_ns or phc_now_ns).
     [[nodiscard]] auto next(std::uint64_t const wanted_ns, std::uint64_t const now_ns) noexcept -> std::uint64_t
     {
+        if (now_ns == 0) {
+            return without_now(wanted_ns);
+        }
         if (wanted_ns != 0 && wanted_ns < now_ns && now_ns - wanted_ns < STEP_NS) {
             count_late(now_ns - wanted_ns);  // a second or more behind is the clock stepping on
         }
@@ -154,6 +158,17 @@ class LaunchOrder
     }
 
   private:
+    /// next() with no clock reading: an untimed frame stays untimed (0), a timed one is held at the
+    /// last time handed out, and nothing is counted, since nothing says how late or stepped it is.
+    [[nodiscard]] auto without_now(std::uint64_t const wanted_ns) noexcept -> std::uint64_t
+    {
+        if (wanted_ns == 0) {
+            return 0;
+        }
+        last_ns_ = std::max(wanted_ns, last_ns_);
+        return last_ns_;
+    }
+
     /// @p asked, held at the last time handed out where it must be, with the
     /// counters moved on.
     [[nodiscard]] auto ordered(std::uint64_t const asked, std::uint64_t const now_ns) noexcept -> std::uint64_t
