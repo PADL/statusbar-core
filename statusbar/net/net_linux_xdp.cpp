@@ -94,6 +94,8 @@ auto XdpErrorCategory::message(int ev) const -> std::string
             return "The UMEM frame size or headroom is not one the kernel will register";
         case XdpError::tx_gather_not_supported:
             return "The socket cannot send a frame in that many buffers (no XDP_USE_SG, or past xdp_zc_max_segs)";
+        case XdpError::frame_not_held:
+            return "A buffer to send lies in a frame its owner has given back";
         default:
             return "Unknown XDP error";
     }
@@ -710,6 +712,50 @@ namespace {
 
 }  // namespace
 
+auto detail::map_umem_area(size_t const size) noexcept -> uint8_t*
+{
+    void* const area = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+    if (area == MAP_FAILED) {
+        return nullptr;
+    }
+    (void)::madvise(area, size, MADV_DONTFORK);
+    prefault(static_cast<uint8_t*>(area), size);
+    return static_cast<uint8_t*>(area);
+}
+
+void detail::prefault(uint8_t* const area, size_t const size) noexcept
+{
+    auto const page_size = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+    uint8_t volatile* const p = area;
+    for (size_t i = 0; i < size; i += page_size) {
+        (void)p[i];
+    }
+}
+
+auto detail::bind_refusal(int const ret, XdpBindMode const mode) noexcept -> XdpError
+{
+    // Told apart from every other reason the socket would not open: a driver without zero-copy is a fact about
+    // the hardware, and the caller may well want to open again in copy mode. A queue still busy once the retries
+    // are spent sends an operator looking for the process holding it.
+    if (-ret == EBUSY) {
+        return XdpError::queue_busy;
+    }
+    bool const refused_zero_copy = mode == XdpBindMode::zero_copy && (-ret == EOPNOTSUPP || -ret == EINVAL);
+    return refused_zero_copy ? XdpError::zero_copy_unavailable : XdpError::xsk_creation_failed;
+}
+
+void detail::adopt_queue_rings(RingSet& rings, UmemAnchor const& anchor) noexcept
+{
+    // The structs are copies (libxdp keeps the anchor's); the cached indexes are the last user's, so each is
+    // read again from the ring as xsk_create_umem_rings() first set it.
+    rings.fill = anchor.rings.fill;
+    rings.comp = anchor.rings.comp;
+    rings.fill.cached_prod = *rings.fill.producer;
+    rings.fill.cached_cons = *rings.fill.consumer + rings.fill.size;
+    rings.comp.cached_prod = *rings.comp.producer;
+    rings.comp.cached_cons = *rings.comp.consumer;
+}
+
 auto detail::UmemRegion::allocate(
     size_t frame_count,
     size_t frame_size,
@@ -720,40 +766,31 @@ auto detail::UmemRegion::allocate(
     size_t tx_metadata_len) -> StatusValue<struct xsk_umem*>
 {
     close();
-
-    frame_size_ = frame_size;
-    headroom_ = headroom;
-
-    size_t const total_size = frame_count * frame_size;
-    area_ = static_cast<uint8_t*>(
-        ::mmap(nullptr, total_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0));
-    if (area_ == MAP_FAILED) {
-        area_ = nullptr;
-        frame_size_ = 0;
-        headroom_ = 0;
+    if (!map_own(frame_count * frame_size, frame_size, headroom)) {
         return failure(XdpError::umem_creation_failed);
     }
-    area_size_ = total_size;
-
-    (void)::madvise(area_, total_size, MADV_DONTFORK);
-    {
-        size_t const page_size = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
-        uint8_t volatile* p = area_;
-        for (size_t i = 0; i < total_size; i += page_size) {
-            (void)p[i];
-        }
-    }
-
     tx_metadata_len_ = tx_metadata_len;
-    if (!create_umem(total_size, frame_size, headroom, fill_ring_size, comp_ring_size, rings)) {
+    if (!create_umem(area_size_, frame_size, headroom, fill_ring_size, comp_ring_size, rings)) {
         XdpError const refusal = create_refusal();
         close();
         return failure(refusal);
     }
-
     free_list_ = UmemFreeList(frame_count, frame_size);
-
     return umem_;
+}
+
+auto detail::UmemRegion::map_own(size_t const total_size, size_t const frame_size, size_t const headroom) noexcept -> bool
+{
+    frame_size_ = frame_size;
+    headroom_ = headroom;
+    area_ = detail::map_umem_area(total_size);
+    if (area_ == nullptr) {
+        frame_size_ = 0;
+        headroom_ = 0;
+        return false;
+    }
+    area_size_ = total_size;
+    return true;
 }
 
 auto detail::UmemRegion::attach(
@@ -763,31 +800,38 @@ auto detail::UmemRegion::attach(
     size_t const fill_ring_size,
     size_t const comp_ring_size,
     RingSet& rings,
-    size_t const tx_metadata_len) -> StatusValue<struct xsk_umem*>
+    size_t const tx_metadata_len,
+    AnchorBinding const& binding) -> StatusValue<struct xsk_umem*>
 {
     close();
-    auto const& ledger = shared.ledger();
-    if (share >= ledger.shares()) {
+    if (share >= shared.ledger().shares()) {
         return failure(XdpError::invalid_umem_geometry);
     }
-    if (auto const registered = register_shared(shared, headroom, fill_ring_size, comp_ring_size, rings, tx_metadata_len);
+    if (auto const registered = register_shared(shared, headroom, fill_ring_size, comp_ring_size, tx_metadata_len, binding);
         !registered) {
         return failure(registered.error());
     }
-    take_share(shared, share);
+    take_share(shared, share, rings, binding);
+    shared.bound();
     return umem_;
 }
 
-void detail::UmemRegion::take_share(XdpSharedUmem& shared, size_t const share)
+void detail::UmemRegion::take_share(XdpSharedUmem& shared, size_t const share, RingSet& rings, AnchorBinding const& binding)
 {  // NOLINT(statusbar-block-statements): one share's fields adopted together
     auto const& ledger = shared.ledger();
+    auto const& anchor = *shared.anchor();
     shared_ = &shared;
     share_ = share;
     area_ = shared.area();
     frame_size_ = ledger.frame_size();
+    anchor_queue_ = anchor.ifindex == binding.ifindex && anchor.queue_id == binding.queue_id;
+    if (anchor_queue_) {
+        adopt_queue_rings(rings, anchor);
+    }
     free_list_ = UmemFreeList(ledger.frames_per_share(), frame_size_, nullptr, share * ledger.frames_per_share());
     free_list_.clear();
-    shared.ledger().reopen(share, [this](uint64_t const addr) { free_list_.push(addr); });  // not what is still lent
+    shared.ledger().reopen(
+        share, [this](uint64_t const addr) { free_list_.push(addr); });  // not what the kernel or a transmit holds
 }
 
 auto detail::UmemRegion::register_shared(
@@ -795,56 +839,94 @@ auto detail::UmemRegion::register_shared(
     size_t const headroom,
     size_t const fill_ring_size,
     size_t const comp_ring_size,
-    RingSet& rings,
-    size_t const tx_metadata_len) -> Status
+    size_t const tx_metadata_len,
+    AnchorBinding const& binding) -> Status
 {
     headroom_ = headroom;
     tx_metadata_len_ = tx_metadata_len;
-    if (shared.registered() != nullptr) {
+    if (auto const* const anchor = shared.anchor(); anchor != nullptr) {
         // The rest bind the first's registration, as it was made.
-        bool const same = shared.headroom() == headroom && shared.tx_metadata_len() == tx_metadata_len;
-        umem_ = same ? shared.registered() : nullptr;
+        bool const same = anchor->headroom == headroom && anchor->tx_metadata_len == tx_metadata_len;
+        umem_ = same ? anchor->umem : nullptr;
         return same ? success() : failure(XdpError::invalid_umem_geometry);
     }
-    return register_first(shared, fill_ring_size, comp_ring_size, rings);
+    return anchor(shared, fill_ring_size, comp_ring_size, binding);
 }
 
-auto detail::UmemRegion::register_first(
-    XdpSharedUmem& shared, size_t const fill_ring_size, size_t const comp_ring_size, RingSet& rings) -> Status
+auto detail::UmemRegion::anchor(
+    XdpSharedUmem& shared, size_t const fill_ring_size, size_t const comp_ring_size, AnchorBinding const& binding) -> Status
 {
+    auto anchor = std::make_unique<UmemAnchor>();
     area_ = shared.area();
-    first_ = create_umem(shared.size(), shared.ledger().frame_size(), headroom_, fill_ring_size, comp_ring_size, rings);
-    if (!first_) {
-        area_ = nullptr;
-        return failure(create_refusal());
+    // EBUSY is the queue its last owner has not yet given back (a restart): retried, each try on a fresh registration.
+    int const ret = detail::retry_while_busy(
+        binding.bind_busy_retries,
+        [&] { return bind_anchor(shared, *anchor, fill_ring_size, comp_ring_size, binding); },
+        detail::pause_for_busy_bind);
+    if (ret != 0) {
+        return failure(unanchor(*anchor, ret, binding.bind_mode));
     }
-    shared.set_registered(umem_, headroom_, tx_metadata_len_);
+    shared.set_anchor(std::move(anchor));
     return success();
+}
+
+auto detail::UmemRegion::unanchor(UmemAnchor& anchor, int const ret, XdpBindMode const mode) noexcept -> XdpError
+{
+    bool const registered = anchor.umem != nullptr;
+    if (registered) {
+        (void)xsk_umem__delete(anchor.umem);
+    }
+    umem_ = nullptr;
+    area_ = nullptr;
+    return registered ? detail::bind_refusal(ret, mode) : create_refusal();
+}
+
+auto detail::UmemRegion::bind_anchor(
+    XdpSharedUmem& shared,
+    UmemAnchor& anchor,
+    size_t const fill_ring_size,
+    size_t const comp_ring_size,
+    AnchorBinding const& binding) -> int
+{  // NOLINT(statusbar-block-statements): the registration and the bind, one after the other
+    if (anchor.umem != nullptr) {
+        (void)xsk_umem__delete(anchor.umem);  // the failed bind's rings go with it
+        anchor.umem = nullptr;
+        anchor.rings = {};
+    }
+    if (!create_umem(shared.size(), frame_size_, headroom_, fill_ring_size, comp_ring_size, anchor.rings)) {
+        return -ECANCELED;  // not EBUSY: reported as the registration's refusal
+    }
+    anchor.umem = umem_;
+    anchor.headroom = headroom_;
+    anchor.tx_metadata_len = tx_metadata_len_;
+    anchor.ifindex = binding.ifindex;
+    anchor.queue_id = binding.queue_id;
+    anchor.scatter_gather = (binding.bind_flags & XDP_USE_SG) != 0;
+    struct xsk_socket_config cfg{};
+    cfg.rx_size = anchor_ring_size;
+    cfg.tx_size = anchor_ring_size;
+    cfg.libxdp_flags = XSK_LIBXDP_FLAGS__INHIBIT_PROG_LOAD;
+    cfg.bind_flags = binding.bind_flags;
+    std::string const ifname{binding.interface_name};
+    int const ret =
+        xsk_socket__create(&anchor.xsk, ifname.c_str(), binding.queue_id, anchor.umem, &anchor.rings.rx, &anchor.rings.tx, &cfg);
+    anchor.zero_copy = ret == 0 && detail::socket_has_zero_copy(xsk_socket__fd(anchor.xsk));
+    return ret;
 }
 
 auto detail::UmemRegion::reregister(size_t fill_ring_size, size_t comp_ring_size, RingSet& rings) noexcept
     -> StatusValue<struct xsk_umem*>
 {
-    if (shared_ != nullptr && !first_) {
-        return umem_;  // another socket's registration: each bind attempt makes fresh rings of its own
+    if (shared_ != nullptr) {
+        return umem_;  // the anchor's registration: each bind attempt makes fresh rings of its own
     }
     if (xsk_umem__delete(umem_) != 0) {
         return failure(XdpError::umem_creation_failed);  // still in use: kept for close()
     }
     umem_ = nullptr;
     rings = {};
-    return recreate(fill_ring_size, comp_ring_size, rings);
-}
-
-auto detail::UmemRegion::recreate(size_t const fill_ring_size, size_t const comp_ring_size, RingSet& rings) noexcept
-    -> StatusValue<struct xsk_umem*>
-{
-    if (!create_umem(
-            shared_ != nullptr ? shared_->size() : area_size_, frame_size_, headroom_, fill_ring_size, comp_ring_size, rings)) {
+    if (!create_umem(area_size_, frame_size_, headroom_, fill_ring_size, comp_ring_size, rings)) {
         return failure(create_refusal());
-    }
-    if (shared_ != nullptr) {
-        shared_->set_registered(umem_, headroom_, tx_metadata_len_);
     }
     return umem_;
 }
@@ -889,18 +971,21 @@ void detail::UmemRegion::close() noexcept
     if (umem_ != nullptr && shared_ == nullptr) {
         (void)xsk_umem__delete(umem_);
     }
-    if (umem_ != nullptr && shared_ != nullptr && first_ && shared_->registered() == umem_ && xsk_umem__delete(umem_) == 0) {
-        shared_->set_registered(nullptr, 0, 0);  // no other socket bound it (else EBUSY): the next one registers afresh
-    }
     umem_ = nullptr;
     if (area_ != nullptr && shared_ == nullptr) {
         ::munmap(area_, area_size_);
+    }
+    if (shared_ != nullptr && !anchor_queue_) {
+        shared_->ledger().pool_gone(share_);  // the queue's pool went with the socket
+    }
+    if (shared_ != nullptr) {
+        shared_->unbound();  // the last socket takes the registration with it
     }
     area_ = nullptr;
     area_size_ = 0;
     shared_ = nullptr;
     share_ = 0;
-    first_ = false;
+    anchor_queue_ = false;
     frame_size_ = 0;
     headroom_ = 0;
     tx_metadata_len_ = 0;
@@ -1319,10 +1404,22 @@ auto XdpContext::open(XdpConfig const& config) -> Status
     // every reason as one EINVAL, which open() would pass on as "UMEM
     // creation failed" and tell a caller nothing about which knob is wrong.
     auto const page_size = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
-    if (!detail::umem_geometry_is_valid(config.umem_frame_size, headroom, page_size)) {
+    size_t const frame_size = config.shared_umem != nullptr ? config.shared_umem->ledger().frame_size() : config.umem_frame_size;
+    if (!detail::umem_geometry_is_valid(frame_size, headroom, page_size)) {
         close();
         return failure(XdpError::invalid_umem_geometry);
     }
+    // Multi-buffer only where it binds: a driver without zero-copy multi-buffer refuses XDP_USE_SG in zero-copy.
+    bool const gather = config.tx_scatter_gather && detail::binds_gather(config.bind_mode, interface_.index);
+    uint16_t const bind_flags = detail::bind_flags(config.bind_mode) | XDP_USE_NEED_WAKEUP | (gather ? XDP_USE_SG : 0U);
+    detail::AnchorBinding const binding{
+        .interface_name = config.interface_name,
+        .ifindex = interface_.index,
+        .queue_id = config.queue_id,
+        .bind_flags = bind_flags,
+        .bind_mode = config.bind_mode,
+        .bind_busy_retries = config.bind_busy_retries,
+    };
     auto umem_result = config.shared_umem != nullptr ? umem_.attach(
                                                            *config.shared_umem,
                                                            config.umem_share,
@@ -1330,7 +1427,8 @@ auto XdpContext::open(XdpConfig const& config) -> Status
                                                            config.fill_ring_size,
                                                            config.completion_ring_size,
                                                            rings_,
-                                                           tx_metadata_len)
+                                                           tx_metadata_len,
+                                                           binding)
                                                      : umem_.allocate(
                                                            config.umem_frame_count,
                                                            config.umem_frame_size,
@@ -1392,11 +1490,10 @@ auto XdpContext::open(XdpConfig const& config) -> Status
     // it needs a kick to notice a new fill or TX submission, and sleeps
     // otherwise instead of polling the rings. tx_flush() and the fill path
     // both honour the flag.
-    // Multi-buffer only where it binds: a driver without zero-copy multi-buffer refuses XDP_USE_SG in zero-copy.
-    bool const gather = config.tx_scatter_gather && detail::binds_gather(config.bind_mode, interface_.index);
-    xsk_cfg.bind_flags = detail::bind_flags(config.bind_mode) | XDP_USE_NEED_WAKEUP | (gather ? XDP_USE_SG : 0U);
-    // A socket on a UMEM another one registered shares it (XDP_SHARED_UMEM), with fill and completion rings of its own.
-    bool const sharing = umem_.shared() != nullptr && !umem_.first_on_share();
+    xsk_cfg.bind_flags = bind_flags;
+    // A socket on a shared UMEM binds its anchor's registration (XDP_SHARED_UMEM): on another queue with fill and
+    // completion rings of its own, on the anchor's queue with the anchor's.
+    bool const sharing = umem_.shared() != nullptr;
 
     std::string const ifname_str(config.interface_name);
     // EBUSY is a queue its last owner has not yet given back (a restart): retried.
@@ -1435,18 +1532,8 @@ auto XdpContext::open(XdpConfig const& config) -> Status
         return failure(refusal);
     }
     if (ret != 0) {
-        bool const refused_zero_copy = config.bind_mode == XdpBindMode::zero_copy && (-ret == EOPNOTSUPP || -ret == EINVAL);
         close();
-        // Told apart from every other reason the socket would not open: a
-        // driver without zero-copy is a fact about the hardware, and the
-        // caller may well want to open again in copy mode. A queue that is
-        // still busy once the retries are spent is told apart too - that
-        // one sends an operator looking for the process holding it, which
-        // "XSK socket creation failed" would not.
-        if (-ret == EBUSY) {
-            return failure(XdpError::queue_busy);
-        }
-        return failure(refused_zero_copy ? XdpError::zero_copy_unavailable : XdpError::xsk_creation_failed);
+        return failure(detail::bind_refusal(ret, config.bind_mode));
     }
     bind_retries_ = pauses;
     zero_copy_ = detail::socket_has_zero_copy(xsk_socket__fd(xsk_));
@@ -1499,7 +1586,9 @@ auto XdpContext::open(XdpConfig const& config) -> Status
     size_t const frames = umem_.shared() != nullptr ? umem_.shared()->ledger().frames_per_share() : config.umem_frame_count;
     tx_frame_reserve_ = detail::effective_tx_reserve(config.tx_frame_reserve, frames);
     tx_only_ = config.tx_only;
-    tx_segments_ = detail::gather_segments(shared_gather(gather), zero_copy_, interface_.index);
+    queue_id_ = config.queue_id;
+    bool const gathers = umem_.shared() != nullptr && umem_.shared()->scatter_gather();  // as the anchor bound
+    tx_segments_ = detail::gather_segments(gathers, zero_copy_, interface_.index);
 
     auto fill_status = fill_replenish();
     if (!fill_status) {
@@ -1512,6 +1601,7 @@ auto XdpContext::open(XdpConfig const& config) -> Status
 
 void XdpContext::close() noexcept
 {  // NOLINT(statusbar-block-statements): every member back to a closed context's, one reset
+    settle_shared();
     if (xsk_ != nullptr) {
         xsk_socket__delete(xsk_);
         xsk_ = nullptr;
@@ -1526,6 +1616,10 @@ void XdpContext::close() noexcept
     tx_progress_ = {};
     bind_retries_ = 0;
     tx_frame_reserve_ = 0;
+    tx_segments_ = 1;
+    tx_only_ = false;
+    queue_id_ = 0;
+    tx_in_flight_ = 0;
     interface_ = {};
     rings_ = {};
     budget_ = {};
@@ -1598,10 +1692,20 @@ auto XdpContext::tx_commit(uint64_t handle, size_t frame_length) -> Status
         // list so we do not leak it — without this, every tx_ring_full
         // event consumed one UMEM frame permanently until umem_exhausted
         // saturated.
-        umem_.free_frame(handle);
+        give_back(handle);
         ++stats_.tx_ring_full_count;
         return failure(XdpError::tx_ring_full);
     }
+    write_single(idx, handle, frame_length);
+    if (auto* const shared = umem_.shared(); shared != nullptr) {
+        shared->ledger().to_kernel(handle);
+    }
+    xsk_ring_prod__submit(&rings_.tx, 1);
+    return note_submitted(1);
+}
+
+void XdpContext::write_single(uint32_t const idx, uint64_t const handle, size_t const frame_length) noexcept
+{
     struct xdp_desc* desc = xsk_ring_prod__tx_desc(&rings_.tx, idx);
     desc->addr = handle + umem_.headroom();
     desc->len = static_cast<uint32_t>(frame_length);
@@ -1609,13 +1713,6 @@ auto XdpContext::tx_commit(uint64_t handle, size_t frame_length) -> Status
     // option the kernel never reads the metadata, so a frame that asked for
     // nothing costs nothing.
     desc->options = detail::frame_wants_metadata(umem_.tx_metadata_span(handle)) ? detail::xdp_desc_tx_metadata : 0;
-    xsk_ring_prod__submit(&rings_.tx, 1);
-    ++stats_.tx_count;
-    // The kernel does not know about it until tx_flush() kicks, and that is
-    // what makes the kick needed rather than skippable. Release: a kicker
-    // that sees the flag sees the submit above.
-    tx_pending_.store(true, std::memory_order_release);
-    return success();
 }
 
 auto XdpContext::tx_complete() -> Status
@@ -1627,6 +1724,7 @@ auto XdpContext::tx_complete() -> Status
     }
     if (completed > 0) {
         xsk_ring_cons__release(&rings_.comp, completed);
+        tx_in_flight_ -= std::min(tx_in_flight_, completed);
     }
     return success();
 }
@@ -1634,12 +1732,59 @@ auto XdpContext::tx_complete() -> Status
 void XdpContext::complete_frame(uint64_t const addr) noexcept
 {
     auto* const shared = umem_.shared();
-    if (shared == nullptr || !shared->ledger().lent(addr)) {
-        umem_.free_frame(addr);  // a frame of this socket's own (tx_start())
+    if (shared == nullptr) {
+        umem_.free_frame(addr);
         return;
     }
-    if (shared->ledger().complete(addr, umem_.share())) {
-        umem_.free_frame(addr);  // the last loan of a frame of this share: free here, else queued for its owner
+    auto& ledger = shared->ledger();
+    size_t const share = umem_.share();
+    if (ledger.lent_by(addr, share) != 0) {
+        if (ledger.complete(addr, share)) {
+            umem_.free_frame(addr);  // the last loan of a frame of this share: free here, else queued for its owner
+        }
+        return;
+    }
+    // A frame of this share sent whole (tx_start()); a loan a closed socket on this queue forgot is nothing now.
+    if (ledger.share_of(addr) == share && ledger.in_kernel(addr)) {
+        ledger.from_kernel(addr);
+        umem_.free_frame(addr);
+    }
+}
+
+void XdpContext::give_back(uint64_t const addr) noexcept
+{
+    auto* const shared = umem_.shared();
+    if (shared == nullptr || shared->ledger().give_back(addr)) {
+        umem_.free_frame(addr);  // else a transmit still points into it: its completion frees it
+    }
+}
+
+void XdpContext::settle_shared() noexcept
+{
+    auto* const shared = umem_.shared();
+    if (shared == nullptr || xsk_ == nullptr) {
+        return;
+    }
+    // What is in the TX ring completes within the wait at line rate; a launch time ahead of it does not, and
+    // its loans are forgotten below (the frames go home) rather than waited for.
+    (void)tx_flush();
+    for (int slice = 0; slice < detail::settle_slices && tx_in_flight_ != 0; ++slice) {
+        detail::pause_for_settle();
+        (void)tx_complete();
+    }
+    if (umem_.anchor_queue() && !tx_only_) {
+        drain_rx_at_close();  // the queue's pool outlives the socket: what it delivered is this share's to free
+    }
+    shared->ledger().forget(umem_.share());
+}
+
+void XdpContext::drain_rx_at_close() noexcept
+{
+    (void)bpf_.unregister_xsk(queue_id_);  // nothing more is steered here
+    budget_ = {};
+    for (auto slot = rx_start(); slot && *slot; slot = rx_start()) {
+        give_back((*slot)->handle);
+        budget_.rx_cycle_count = 0;
     }
 }
 
@@ -1651,23 +1796,25 @@ auto XdpContext::tx_commit_gather(
 {
     std::array<std::pair<uint64_t, uint32_t>, MAX_GATHER> pieces{};
     auto const count = valid() ? gather_descriptors(handle, length, rest, pieces) : std::nullopt;
-    if (!count) {
+    auto const options = count ? time_first(handle, launch_time_ns) : std::nullopt;
+    if (!options) {
         if (handle) {
-            umem_.free_frame(*handle);
+            give_back(*handle);
         }
         return failure(!valid() ? XdpError::not_open : XdpError::tx_gather_not_supported);
     }
-    uint32_t const options = time_first(pieces[0].first, launch_time_ns);
-    return submit_gather(std::span{pieces}.first(*count), handle.has_value(), options);
+    return submit_gather(std::span{pieces}.first(*count), handle.has_value(), *options);
 }
 
-auto XdpContext::time_first(uint64_t const addr, int64_t const launch_time_ns) noexcept -> uint32_t
+auto XdpContext::time_first(std::optional<uint64_t> const handle, int64_t const launch_time_ns) noexcept -> std::optional<uint32_t>
 {
-    // The launch time lives below the first buffer: in a frame of ours, or in the first piece's own headroom.
-    auto metadata = umem_.tx_metadata_span(addr - umem_.headroom());
-    if (!metadata.empty()) {
-        detail::write_launch_time(metadata, launch_time_ns);
+    // The launch time lives below the first buffer, in a frame of the sender's own: never written into another
+    // share's. Without one, or without metadata, a time is refused as tx_set_launch_time() refuses it.
+    auto metadata = handle ? umem_.tx_metadata_span(*handle) : std::span<uint8_t>{};
+    if (metadata.empty()) {
+        return launch_time_ns == 0 ? std::optional<uint32_t>{0} : std::nullopt;
     }
+    detail::write_launch_time(metadata, launch_time_ns);
     return detail::frame_wants_metadata(metadata) ? detail::xdp_desc_tx_metadata : 0;
 }
 
@@ -1692,10 +1839,14 @@ auto XdpContext::locate(std::span<std::span<uint8_t const> const> const pieces, 
     const noexcept -> bool
 {
     auto const* const shared = umem_.shared();
+    size_t const chunk = umem_.frame_size();
+    size_t const metadata = umem_.tx_metadata_len();
     for (size_t i = 0; i < pieces.size(); ++i) {
         auto const addr = shared->address_of(pieces[i].data(), pieces[i].size());
-        if (!addr) {
-            return false;  // outside the UMEM, or across a frame
+        // The kernel reads the metadata length below every descriptor and refuses one that would not fit
+        // its chunk with it (xp_aligned_validate_desc): the same check here, before a silent drop there.
+        if (!addr || *addr % chunk < metadata || (*addr % chunk) + pieces[i].size() > chunk) {
+            return false;
         }
         out[i] = {*addr, static_cast<uint32_t>(pieces[i].size())};
     }
@@ -1705,24 +1856,55 @@ auto XdpContext::locate(std::span<std::span<uint8_t const> const> const pieces, 
 auto XdpContext::submit_gather(
     std::span<std::pair<uint64_t, uint32_t> const> const pieces, bool const own_first, uint32_t const first_options) -> Status
 {
-    uint32_t idx = 0;
-    auto const n = static_cast<uint32_t>(pieces.size());
-    if (xsk_ring_prod__reserve(&rings_.tx, n, &idx) != n) {
+    if (!lend_pieces(pieces, own_first)) {
         if (own_first) {
-            umem_.free_frame(pieces[0].first);
+            give_back(pieces[0].first);
+        }
+        return failure(XdpError::frame_not_held);
+    }
+    uint32_t idx = 0;
+    if (xsk_ring_prod__reserve(&rings_.tx, static_cast<uint32_t>(pieces.size()), &idx) != pieces.size()) {
+        unlend_pieces(pieces, own_first, pieces.size());
+        if (own_first) {
+            give_back(pieces[0].first);
         }
         ++stats_.tx_ring_full_count;
         return failure(XdpError::tx_ring_full);
     }
     write_gather(idx, pieces, own_first, first_options);
-    xsk_ring_prod__submit(&rings_.tx, n);
-    return note_submitted();
+    xsk_ring_prod__submit(&rings_.tx, static_cast<uint32_t>(pieces.size()));
+    return note_submitted(static_cast<uint32_t>(pieces.size()));
 }
 
-auto XdpContext::note_submitted() noexcept -> Status
+auto XdpContext::lend_pieces(std::span<std::pair<uint64_t, uint32_t> const> const pieces, bool const own_first) noexcept -> bool
+{
+    auto& ledger = umem_.shared()->ledger();
+    for (size_t i = own_first ? 1 : 0; i < pieces.size(); ++i) {
+        if (!ledger.lend(pieces[i].first, umem_.share())) {
+            unlend_pieces(pieces, own_first, i);
+            return false;
+        }
+    }
+    return true;
+}
+
+void XdpContext::unlend_pieces(
+    std::span<std::pair<uint64_t, uint32_t> const> const pieces, bool const own_first, size_t const count) noexcept
+{
+    auto& ledger = umem_.shared()->ledger();
+    for (size_t i = own_first ? 1 : 0; i < count; ++i) {
+        if (ledger.complete(pieces[i].first, umem_.share())) {
+            umem_.free_frame(pieces[i].first);  // given back meanwhile, and this share's: free here
+        }
+    }
+}
+
+auto XdpContext::note_submitted(uint32_t const count) noexcept -> Status
 {
     ++stats_.tx_count;
-    // A kicker that sees the flag sees the submit (tx_flush()).
+    tx_in_flight_ += count;
+    // The kernel does not know about it until tx_flush() kicks, and that is what makes the kick needed rather
+    // than skippable. Release: a kicker that sees the flag sees the submit.
     tx_pending_.store(true, std::memory_order_release);
     return success();
 }
@@ -1733,11 +1915,10 @@ void XdpContext::write_gather(
     bool const own_first,
     uint32_t const first_options) noexcept
 {
-    auto& ledger = umem_.shared()->ledger();
+    if (own_first) {
+        umem_.shared()->ledger().to_kernel(pieces[0].first);
+    }
     for (size_t i = 0; i < pieces.size(); ++i) {
-        if (i != 0 || !own_first) {
-            ledger.lend(pieces[i].first);  // until its completion
-        }
         struct xdp_desc* const desc = xsk_ring_prod__tx_desc(&rings_.tx, idx + static_cast<uint32_t>(i));
         desc->addr = pieces[i].first;
         desc->len = pieces[i].second;
@@ -1748,18 +1929,6 @@ void XdpContext::write_gather(
 auto XdpContext::rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
 {
     return rx_start(rx_clock_now());
-}
-
-auto XdpContext::shared_gather(bool const asked) noexcept -> bool
-{
-    auto* const shared = umem_.shared();
-    if (shared == nullptr) {
-        return false;  // gathers only from a shared UMEM
-    }
-    if (umem_.first_on_share()) {
-        shared->set_scatter_gather(asked);  // as the first bound it, so the kernel binds the rest
-    }
-    return shared->scatter_gather();
 }
 
 auto XdpContext::rx_start(RxTimePoint const now) -> StatusValue<std::optional<EthernetRxSlot>>
@@ -1786,11 +1955,19 @@ auto XdpContext::take_rx_desc(uint32_t const idx, RxTimePoint const now) -> Ethe
         .buffer = umem_.readable_span(desc->addr, desc->len),
         .timestamp_ns = rx_timestamp_ns(now),
     };
+    if (auto* const shared = umem_.shared(); shared != nullptr) {
+        shared->ledger().hold(desc->addr);  // out of the kernel, in the caller's hands: lendable until released
+    }
+    consume_rx_slot();
+    return slot;
+}
+
+void XdpContext::consume_rx_slot() noexcept
+{
     // Release ring slot — UMEM frame remains valid until rx_release(handle)
     xsk_ring_cons__release(&rings_.rx, 1);
     ++budget_.rx_cycle_count;
     ++stats_.rx_count;
-    return slot;
 }
 
 auto XdpContext::fill_replenish() -> Status
@@ -1822,10 +1999,14 @@ auto XdpContext::fill_from_free_list() -> Status
     uint32_t idx = 0;
     auto reserved = xsk_ring_prod__reserve(&rings_.fill, want, &idx);
     uint32_t filled = 0;
+    auto* const shared = umem_.shared();
     for (uint32_t i = 0; i < reserved; ++i) {
         auto addr = umem_.alloc_frame();
         if (!addr) {
             break;
+        }
+        if (shared != nullptr) {
+            shared->ledger().to_kernel(*addr);
         }
         *xsk_ring_prod__fill_addr(&rings_.fill, idx + i) = *addr;
         ++filled;
