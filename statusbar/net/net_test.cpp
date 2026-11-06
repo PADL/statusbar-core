@@ -824,6 +824,95 @@ TEST(net_multicast, set_multicast_send_reports_an_unknown_interface)
 #endif
 }
 
+TEST(net_unicast, set_unicast_send_pins_the_interface_and_sets_the_ttl_and_clears_both)
+{
+#if defined(__linux__)
+    auto socket = make_udp_socket();
+    EXPECT_TRUE(socket.has_value());
+    if (socket) {
+        auto const loopback_index = ::if_nametoindex("lo");
+        EXPECT_NE(loopback_index, 0U);
+        int default_ttl = -1;
+        socklen_t ttl_length = sizeof(default_ttl);
+        EXPECT_EQ(::getsockopt(socket->get(), IPPROTO_IP, IP_TTL, &default_ttl, &ttl_length), 0);
+        EXPECT_TRUE(set_unicast_send(socket->get(), AF_INET, loopback_index, 7).has_value());
+        uint32_t index = 0;
+        socklen_t index_length = sizeof(index);
+        EXPECT_EQ(::getsockopt(socket->get(), IPPROTO_IP, IP_UNICAST_IF, &index, &index_length), 0);
+        EXPECT_EQ(ntohl(index), loopback_index);
+        int ttl = -1;
+        EXPECT_EQ(::getsockopt(socket->get(), IPPROTO_IP, IP_TTL, &ttl, &ttl_length), 0);
+        EXPECT_EQ(ttl, 7);
+        // 0 and 0: the route and the default again, nothing kept from before
+        EXPECT_TRUE(set_unicast_send(socket->get(), AF_INET, 0, 0).has_value());
+        EXPECT_EQ(::getsockopt(socket->get(), IPPROTO_IP, IP_UNICAST_IF, &index, &index_length), 0);
+        EXPECT_EQ(index, 0U);
+        EXPECT_EQ(::getsockopt(socket->get(), IPPROTO_IP, IP_TTL, &ttl, &ttl_length), 0);
+        EXPECT_EQ(ttl, default_ttl);
+    }
+#else
+    EXPECT_TRUE(true);
+#endif
+}
+
+TEST(net_unicast, set_unicast_send_pins_an_ipv6_socket_too)
+{
+#if defined(__linux__)
+    FileDescriptor const socket{::socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
+    if (socket.get() < 0) {
+        EXPECT_TRUE(true);  // no IPv6 here
+        return;
+    }
+    auto const loopback_index = ::if_nametoindex("lo");
+    EXPECT_NE(loopback_index, 0U);
+    EXPECT_TRUE(set_unicast_send(socket.get(), AF_INET6, loopback_index, 9).has_value());
+    uint32_t index = 0;
+    socklen_t index_length = sizeof(index);
+    EXPECT_EQ(::getsockopt(socket.get(), IPPROTO_IPV6, IPV6_UNICAST_IF, &index, &index_length), 0);
+    EXPECT_EQ(ntohl(index), loopback_index);
+    int hops = -1;
+    socklen_t hops_length = sizeof(hops);
+    EXPECT_EQ(::getsockopt(socket.get(), IPPROTO_IPV6, IPV6_UNICAST_HOPS, &hops, &hops_length), 0);
+    EXPECT_EQ(hops, 9);
+#else
+    EXPECT_TRUE(true);
+#endif
+}
+
+TEST(net_unicast, set_unicast_send_reports_an_unknown_interface)
+{
+#if defined(__linux__)
+    auto socket = make_udp_socket();
+    EXPECT_TRUE(socket.has_value());
+    if (socket) {
+        EXPECT_FALSE(set_unicast_send(socket->get(), AF_INET, NoSuchInterface, 1).has_value());
+    }
+#else
+    EXPECT_TRUE(true);
+#endif
+}
+
+TEST(net_unicast, set_priority_sets_an_unprivileged_priority_after_the_dscp)
+{
+#if defined(__linux__)
+    auto socket = make_udp_socket();
+    EXPECT_TRUE(socket.has_value());
+    if (socket) {
+        EXPECT_TRUE(set_dscp(socket->get(), AF_INET, 34).has_value());
+        EXPECT_TRUE(set_priority(socket->get(), 3).has_value());
+        int priority = -1;
+        socklen_t length = sizeof(priority);
+        EXPECT_EQ(::getsockopt(socket->get(), SOL_SOCKET, SO_PRIORITY, &priority, &length), 0);
+        EXPECT_EQ(priority, 3);
+        EXPECT_TRUE(set_priority(socket->get(), 0).has_value());
+        EXPECT_EQ(::getsockopt(socket->get(), SOL_SOCKET, SO_PRIORITY, &priority, &length), 0);
+        EXPECT_EQ(priority, 0);
+    }
+#else
+    EXPECT_TRUE(true);
+#endif
+}
+
 TEST(net_multicast, a_datagram_sent_to_a_joined_group_arrives)
 {
     statusbar::ip::IPv4Address const group(239, 69, 1, 2);
