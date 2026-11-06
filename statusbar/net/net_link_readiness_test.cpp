@@ -310,6 +310,22 @@ TEST(net_link_readiness, lost_notifications_assume_a_change_and_keep_a_loss)
     EXPECT_EQ(reset_wait_state(cycled, policy, 4000 * MS), ResetWaitState::waiting);  // the address not back
 }
 
+TEST(net_link_readiness, apply_says_which_message_was_the_link_report)
+{
+    if (!LITTLE) {
+        SKIP("the messages are little-endian bytes");
+    }
+    LinkReadiness link{3};
+    auto const reported = link.apply(link_report(true, 7), 0);
+    EXPECT_TRUE(reported && *reported);
+    auto const address = link.apply(NEWADDR, 0);
+    EXPECT_TRUE(address && !*address);
+    auto const qdisc = link.apply(NEWQDISC, 0);
+    EXPECT_TRUE(qdisc && !*qdisc);
+    auto const other = link.apply(patched(NEWLINK, 20, 4), 0);  // ifindex 4's
+    EXPECT_TRUE(other && !*other);
+}
+
 TEST(net_link_readiness, the_interface_removed_is_refused)
 {
     if (!LITTLE) {

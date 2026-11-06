@@ -86,6 +86,20 @@ TEST(net_carrier_watch, other_links_and_messages_are_none)
     EXPECT_TRUE(bridge && !*bridge);
 }
 
+TEST(net_carrier_watch, a_dellink_removes_the_link_in_af_unspec_alone)
+{
+    if (!LITTLE) {
+        SKIP("the messages are little-endian bytes");
+    }
+    EXPECT_TRUE(is_link_removed(patched(4, 0x11), 3));
+    EXPECT_FALSE(is_link_removed(patched(4, 0x11), 4));
+    EXPECT_FALSE(is_link_removed(NEWLINK, 3));
+    auto bridge = patched(4, 0x11);
+    bridge[16] = AF_BRIDGE;  // the port leaving its bridge: the link stays
+    EXPECT_FALSE(is_link_removed(bridge, 3));
+    EXPECT_FALSE(is_link_removed(std::span{bridge}.first(20), 3));
+}
+
 TEST(net_carrier_watch, a_malformed_newlink_is_refused)
 {
     EXPECT_FALSE(parse_link_carrier(patched(32, 0x06), 3).has_value());             // carrier of 2 octets
