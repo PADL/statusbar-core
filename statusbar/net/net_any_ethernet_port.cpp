@@ -221,6 +221,37 @@ auto AnyEthernetPort::tx_set_launch_time(uint64_t const handle, int64_t const la
     });
 }
 
+auto AnyEthernetPort::tx_segments() const noexcept -> size_t
+{
+    return std::visit(
+        [](auto const& backend) -> size_t {
+            if constexpr (requires { backend.tx_segments(); }) {
+                return backend.tx_segments();
+            } else {
+                return 1;
+            }
+        },
+        port_);
+}
+
+auto AnyEthernetPort::tx_commit_gather(
+    std::optional<uint64_t> const handle,
+    size_t const length,
+    std::span<std::span<uint8_t const> const> const rest,
+    int64_t const launch_time_ns) -> Status
+{
+    return on_port(port_, [&](auto& backend) -> Status {
+        if constexpr (requires { backend.tx_commit_gather(handle, length, rest, launch_time_ns); }) {
+            return backend.tx_commit_gather(handle, length, rest, launch_time_ns);
+        } else {
+            if (handle) {
+                (void)backend.tx_cancel(*handle);
+            }
+            return failure(NetError::not_supported);  // a backend that copies every frame
+        }
+    });
+}
+
 auto AnyEthernetPort::tx_flush() -> Status
 {
     return on_port(port_, [&](auto& backend) -> Status { return backend.tx_flush(); });
