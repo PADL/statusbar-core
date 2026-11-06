@@ -20,9 +20,13 @@ struct xsk_umem;
 
 namespace statusbar::net {
 
-/// Per UMEM frame: whether its owner is done with it, and how many transmits point into it; and, per pair of
-/// shares, the frames one share's completions hand back to another. Real-time safe: no allocation after
-/// construction, no locks. A frame's owner is the one thread that drives its share's socket.
+namespace detail {
+struct UmemAnchor;
+}
+
+/// Per UMEM frame: whether its owner has it in hand, how many transmits point into it and whose, and whether the
+/// kernel holds it; and, per pair of shares, the frames one share's completions hand back to another. Real-time
+/// safe: no allocation after construction, no locks. A frame's owner is the one thread that drives its share's socket.
 class XdpFrameLedger
 {
   public:
@@ -39,38 +43,62 @@ class XdpFrameLedger
     /// The share owning the frame UMEM address `addr` lies in.
     [[nodiscard]] auto share_of(uint64_t const addr) const noexcept -> size_t { return frame_of(addr) / frames_per_share_; }
 
-    /// A transmit now points into the frame at `addr` (any offset within it). The sending socket's thread.
-    void lend(uint64_t addr) noexcept;
-    /// Whether a transmit still points into the frame at `addr`: a completed address that is not lent
-    /// is the sending socket's own frame. The completing socket's thread.
+    /// The owner has the frame at `addr` in hand (received, or taken to send), out of the kernel: a transmit
+    /// may point into it from now until give_back(). The owner's thread.
+    void hold(uint64_t addr) noexcept;
+    /// A transmit of share `lender`'s socket points into the frame at `addr` (any offset within it) until its
+    /// completion: false, nothing recorded, once the owner has given the frame back. The lender's thread.
+    [[nodiscard]] auto lend(uint64_t addr, size_t lender) noexcept -> bool;
+    /// Whether a transmit still points into the frame at `addr`.
     [[nodiscard]] auto lent(uint64_t addr) const noexcept -> bool;
-    /// The owner is done with the frame at `addr` (its receiver released it): true when no transmit
-    /// points into it, so it is free now; else the last completion frees it. The owner's thread.
+    /// How many transmits of share `lender`'s socket point into the frame at `addr`. The lender's thread.
+    [[nodiscard]] auto lent_by(uint64_t addr, size_t lender) const noexcept -> size_t;
+    /// The owner is done with the frame at `addr`: true when no transmit points into it, so it is free now;
+    /// else the last completion frees it. The owner's thread.
     [[nodiscard]] auto give_back(uint64_t addr) noexcept -> bool;
-    /// A transmit pointing into the frame at `addr` completed on share `completer`'s socket: true when the
-    /// frame is free now and `completer` owns it. The last loan of another share's frame done is queued for
-    /// its owner (take_returns()). The completing socket's thread.
+    /// A transmit of share `completer`'s socket pointing into the frame at `addr` completed: true when the frame
+    /// is free now and `completer` owns it; another share's frame freed is queued for its owner (take_returns()).
+    /// Nothing, false, without a loan of `completer`'s on it. The completer's thread.
     [[nodiscard]] auto complete(uint64_t addr, size_t completer) noexcept -> bool;
-    /// Share `share`'s socket opens afresh: each frame of it no transmit points into to `free`, the rest left to
-    /// their completions (queued home), what the old socket was owed forgotten. Before it receives.
+    /// Every loan share `lender`'s socket still has undone, as its completions would (frames go home, its own
+    /// to reopen()). When that socket closes; its thread stopped.
+    void forget(size_t lender) noexcept;
+
+    /// The frame at `addr` went into the kernel (the fill ring, or the TX ring sent whole), out of the owner's
+    /// hands; it comes back through the RX or completion ring. The owner's thread.
+    void to_kernel(uint64_t addr) noexcept;
+    /// Whether the frame at `addr` is in the kernel (to_kernel(), not hold()ed or completed since).
+    [[nodiscard]] auto in_kernel(uint64_t addr) const noexcept -> bool { return in_kernel_[frame_of(addr)] != 0; }
+    /// The kernel let go of the frame at `addr` (a frame of this share's own completed). The owner's thread.
+    void from_kernel(uint64_t const addr) noexcept { in_kernel_[frame_of(addr)] = 0; }
+    /// Share `share`'s socket's pool is gone with it (its queue's fill and completion rings): the kernel holds
+    /// none of its frames. Control thread, the socket closed.
+    void pool_gone(size_t share) noexcept;
+
+    /// Share `share`'s socket opens afresh: each frame of it the kernel does not hold and no transmit points
+    /// into to `free` (uint64_t frame address), once; the rest come through their completions. Before it receives.
     template <typename Free>
     void reopen(size_t const share, Free const& free) noexcept
     {
-        take_returns(share, [](uint64_t) {});  // freed below with the rest
         for (size_t frame = share * frames_per_share_; frame < (share + 1) * frames_per_share_; ++frame) {
-            if (reclaim(frame)) {
+            if (in_kernel_[frame] == 0 && reclaim(frame)) {
                 free(uint64_t{frame} * frame_size_);
             }
         }
+        take_returns(share, free);  // after the reclaim pass: a frame queued meanwhile is freed here, once
     }
     /// Each frame another share's completions freed for `share`, oldest first, to `free` (uint64_t frame
     /// address). The owner's thread.
     template <typename Free>
     void take_returns(size_t const share, Free const& free) noexcept
     {
+        auto const returned = [this, &free](uint64_t const addr) {
+            loans_[frame_of(addr)].store(0, std::memory_order_relaxed);  // queued no more
+            free(addr);
+        };
         for (size_t from = 0; from < shares_; ++from) {
             if (from != share) {
-                returns_[(from * MAX_SHARES) + share].drain(free);
+                returns_[(from * MAX_SHARES) + share].drain(returned);
             }
         }
     }
@@ -100,24 +128,38 @@ class XdpFrameLedger
         std::atomic<uint64_t> tail_{0};
     };
 
-    static constexpr uint32_t OWNER_DONE = 0x8000'0000U;
+    /// The owner has the frame in hand.
+    static constexpr uint32_t HOLDS = 0x8000'0000U;
+    /// Freed by another share's completion, in that share's queue to the owner.
+    static constexpr uint32_t QUEUED = 0x4000'0000U;
+    /// The transmits pointing into the frame.
+    static constexpr uint32_t LOANS = 0x3FFF'FFFFU;
 
-    /// reopen() of frame `frame`: true (cleared) when no transmit points into it, else its owner marked done.
+    /// The owner lets go of frame `frame`: true when nothing points into it (free now); false when a transmit
+    /// does (its completion frees it) or another share's completion already queued it.
     [[nodiscard]] auto reclaim(size_t frame) noexcept -> bool;
-    /// A frame free again after `completer`'s completion: true when `completer` owns it, else queued for its owner.
-    [[nodiscard]] auto send_home(uint64_t addr, size_t completer) noexcept -> bool;
+    /// `count` loans of share `completer`'s on the frame at `addr` returned: true when the frame is free now and
+    /// `completer` owns it; another share's frame freed is queued for its owner.
+    [[nodiscard]] auto release(uint64_t addr, uint32_t count, size_t completer) noexcept -> bool;
 
     [[nodiscard]] auto frame_of(uint64_t const addr) const noexcept -> size_t { return static_cast<size_t>(addr / frame_size_); }
+    [[nodiscard]] auto lent_by_index(size_t const frame, size_t const lender) const noexcept -> size_t
+    {
+        return (frame * MAX_SHARES) + lender;
+    }
 
     size_t frames_per_share_;
     size_t shares_;
     size_t frame_size_;
-    std::unique_ptr<std::atomic<uint32_t>[]> loans_;        ///< per frame: OWNER_DONE, and the transmits pointing into it
+    std::unique_ptr<std::atomic<uint32_t>[]> loans_;        ///< per frame: HOLDS, QUEUED, and the transmits pointing into it
+    std::unique_ptr<uint16_t[]> lent_by_;                   ///< per frame and lender, the lender's thread's own
+    std::unique_ptr<uint8_t[]> in_kernel_;                  ///< per frame, the owner's thread's own
     std::array<Returns, MAX_SHARES * MAX_SHARES> returns_;  ///< [from * MAX_SHARES + to]
 };
 
-/// The UMEM area itself, mapped once, and the libxdp UMEM the first socket registers on it; sockets name it
-/// in XdpConfig::shared_umem with their share. Outlives every socket bound to it. Linux with AF_XDP only.
+/// The UMEM area itself, mapped once, and its registration: the libxdp UMEM the first socket makes, with a
+/// socket of the UMEM's own bound on that first socket's queue, whose fill and completion rings every socket
+/// there shares. Sockets name it in XdpConfig::shared_umem with their share. Outlives every socket bound to it.
 class XdpSharedUmem
 {
   public:
@@ -150,34 +192,31 @@ class XdpSharedUmem
     /// The UMEM address of `bytes` if they lie wholly within one frame of the area; else nullopt.
     [[nodiscard]] auto address_of(uint8_t const* bytes, size_t length) const noexcept -> std::optional<uint64_t>;
 
-    /// The libxdp UMEM the first socket registered on the area (nullptr before), for the rest to share.
-    [[nodiscard]] auto registered() const noexcept -> xsk_umem* { return umem_; }
-    /// The headroom and TX metadata length it was registered with: every socket on it takes the same.
-    [[nodiscard]] auto headroom() const noexcept -> size_t { return headroom_; }
-    [[nodiscard]] auto tx_metadata_len() const noexcept -> size_t { return tx_metadata_len_; }
-    /// Whether the first socket bound it with XDP_USE_SG: the kernel binds every other socket on it so.
-    [[nodiscard]] auto scatter_gather() const noexcept -> bool { return scatter_gather_; }
-    void set_scatter_gather(bool const on) noexcept { scatter_gather_ = on; }
-    /// The first socket registered the area as `umem` with `headroom` and `tx_metadata_len`; it is deleted with
-    /// this object. Control thread.
-    void set_registered(xsk_umem* const umem, size_t const headroom, size_t const tx_metadata_len) noexcept
-    {
-        umem_ = umem;
-        headroom_ = headroom;
-        tx_metadata_len_ = tx_metadata_len;
-    }
+    /// The registration (the first socket's, kept until the last socket closes), or nullptr. Control thread.
+    [[nodiscard]] auto anchor() noexcept -> detail::UmemAnchor* { return anchor_.get(); }
+    [[nodiscard]] auto anchor() const noexcept -> detail::UmemAnchor const* { return anchor_.get(); }
+    /// The libxdp UMEM registered on the area (nullptr before the first socket, and after the last).
+    [[nodiscard]] auto registered() const noexcept -> xsk_umem*;
+    /// Whether the registration binds XDP_USE_SG: the kernel binds every socket on it so.
+    [[nodiscard]] auto scatter_gather() const noexcept -> bool;
+    /// The first socket registered the area: `anchor` is kept until the last socket closes. Control thread.
+    void set_anchor(std::unique_ptr<detail::UmemAnchor> anchor) noexcept;
+    /// One more socket binds the registration. Control thread.
+    void bound() noexcept { ++bound_; }
+    /// A socket closed: the last to go takes the registration with it. Control thread.
+    void unbound() noexcept;
 
   private:
     /// Whether create() takes the geometry: 1 to MAX_SHARES shares of frames XdpConfig would register.
     [[nodiscard]] static auto geometry_is_valid(size_t frames_per_share, size_t shares, size_t frame_size) noexcept -> bool;
+    /// The registration deleted: every socket is closed, so the kernel holds no frame of any share.
+    void release_anchor() noexcept;
 
     uint8_t* area_;
     size_t size_;
     XdpFrameLedger ledger_;
-    xsk_umem* umem_{nullptr};
-    size_t headroom_{0};
-    size_t tx_metadata_len_{0};
-    bool scatter_gather_{false};
+    std::unique_ptr<detail::UmemAnchor> anchor_;
+    size_t bound_{0};
 };
 
 }  // namespace statusbar::net
