@@ -35,6 +35,10 @@ struct LinkCarrier
 /// bad_message when it is truncated or an attribute overruns.
 [[nodiscard]] auto parse_link_carrier(std::span<uint8_t const> message, int ifindex) -> StatusValue<std::optional<LinkCarrier>>;
 
+/// Whether `message` is an RTM_DELLINK of `ifindex` in AF_UNSPEC: the link is gone (a bridge's view of its
+/// port, AF_BRIDGE, is not).
+[[nodiscard]] auto is_link_removed(std::span<uint8_t const> message, int ifindex) noexcept -> bool;
+
 /// An RTM_GETLINK of `ifindex` into `out` (the kernel answers with one RTM_NEWLINK): its length.
 /// Errors: invalid_argument for an ifindex of 0 or less, the builder's when `out` is too small.
 [[nodiscard]] auto build_get_link(std::span<uint8_t> out, int ifindex, uint32_t seq) -> StatusValue<size_t>;
