@@ -133,15 +133,14 @@ auto TestPortContext::gather_into(
 void TestPortContext::concatenate(
     TxCapture& capture, std::span<uint8_t const> const head, std::span<std::span<uint8_t const> const> const rest)
 {
-    std::array<uint8_t, ETHERNET_PORT_MIN_FRAME_BUFFER> bytes{};
-    std::span<uint8_t> out{bytes};
+    std::span<uint8_t> out{capture.frame.storage};
     span_copy(out.first(head.size()), head);
     out = out.subspan(head.size());
     for (auto const piece : rest) {
         span_copy(out.first(piece.size()), piece);
         out = out.subspan(piece.size());
     }
-    capture.frame.assign(bytes.data(), bytes.size() - out.size());
+    capture.frame.length = capture.frame.storage.size() - out.size();
 }
 
 auto TestPortContext::tx_start(int64_t launch_time_ns) -> StatusValue<EthernetTxSlot>
