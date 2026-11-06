@@ -277,6 +277,18 @@ TEST(any_ethernet_port, the_xdp_backend_takes_the_pin_path)
     EXPECT_FALSE(port.valid());
 }
 
+// Frames a receiver holds come on top of the default UMEM, so neither the fill ring nor the
+// transmit reserve gives them up.
+TEST(any_ethernet_port, the_xdp_umem_grows_by_the_frames_a_receiver_holds)
+{
+    auto const plain = xdp_config_for({.interface_name = "lo", .ring_size = 128});
+    auto const held = xdp_config_for({.interface_name = "lo", .ring_size = 128, .xdp_rx_hold_frames = 512});
+    EXPECT_EQ(plain.umem_frame_count, XdpConfig{}.umem_frame_count);
+    EXPECT_EQ(held.umem_frame_count, XdpConfig{}.umem_frame_count + 512);
+    EXPECT_EQ(held.fill_ring_size, size_t{256});
+    EXPECT_EQ(held.tx_frame_reserve, XdpConfig{}.tx_frame_reserve);
+}
+
 TEST(any_ethernet_port, a_ring_backend_shares_state_between_tx_and_rx_or_is_not_available)
 {
     AnyEthernetPort port;
