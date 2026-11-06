@@ -66,12 +66,6 @@ static_assert(
     return status ? StatusValue<LinkCarrier>{link} : failure(status.error());
 }
 
-/// Whether @p error (a negative errno) is momentary: the request is not refused for good.
-[[nodiscard]] constexpr auto transient_error(int32_t const error) noexcept -> bool
-{
-    return error == -ENOBUFS || error == -EAGAIN || error == -EBUSY || error == -EINTR;
-}
-
 /// True for an NLMSG_ERROR answering our RTM_GETLINK with an error that lasts (ENODEV: no such link).
 [[nodiscard]] auto is_error_reply(std::span<uint8_t const> const message) noexcept -> bool
 {
@@ -80,17 +74,17 @@ static_assert(
         return false;
     }
     auto const error = load<int32_t>(message, netlink::MESSAGE_HEADER);
-    return load<uint32_t>(message, offsetof(nlmsghdr, nlmsg_seq)) == REQUEST_SEQ && error != 0 && !transient_error(error);
-}
-
-/// True for an RTM_DELLINK of @p ifindex: the link is gone.
-[[nodiscard]] auto is_link_removed(std::span<uint8_t const> const message, int const ifindex) noexcept -> bool
-{
-    return message.size() >= LINK_HEADER && load<uint16_t>(message, offsetof(nlmsghdr, nlmsg_type)) == RTM_DELLINK &&
-        load<int32_t>(message, netlink::MESSAGE_HEADER + offsetof(ifinfomsg, ifi_index)) == ifindex;
+    return load<uint32_t>(message, offsetof(nlmsghdr, nlmsg_seq)) == REQUEST_SEQ && error != 0 && !netlink::transient_error(-error);
 }
 
 }  // namespace
+
+auto is_link_removed(std::span<uint8_t const> const message, int const ifindex) noexcept -> bool
+{
+    return message.size() >= LINK_HEADER && load<uint16_t>(message, offsetof(nlmsghdr, nlmsg_type)) == RTM_DELLINK &&
+        message[netlink::MESSAGE_HEADER + offsetof(ifinfomsg, ifi_family)] == AF_UNSPEC &&
+        load<int32_t>(message, netlink::MESSAGE_HEADER + offsetof(ifinfomsg, ifi_index)) == ifindex;
+}
 
 auto parse_link_carrier(std::span<uint8_t const> const message, int const ifindex) -> StatusValue<std::optional<LinkCarrier>>
 {
@@ -193,14 +187,11 @@ auto CarrierWatch::request_link() noexcept -> Status
 
 void CarrierWatch::deliver(std::span<uint8_t const> const datagram)
 {
-    for (size_t at = 0; at + netlink::MESSAGE_HEADER <= datagram.size();) {
-        auto const length = load<uint32_t>(datagram, at);
-        if (length < netlink::MESSAGE_HEADER || length > datagram.size() - at) {
-            return;
-        }
-        report(datagram.subspan(at, length));
-        at += netlink::align4(length);
-    }
+    // A message that overruns ends the datagram; what came before it was reported.
+    (void)netlink::walk_messages(datagram, [this](std::span<uint8_t const> const message) -> std::optional<Status> {
+        report(message);
+        return std::nullopt;
+    });
 }
 
 void CarrierWatch::report(std::span<uint8_t const> const message)
