@@ -343,10 +343,9 @@ struct XdpConfig
     /// Zero gives the old behaviour: receive may take everything, and a
     /// receive-only context loses nothing by it.
     size_t tx_frame_reserve{xdp_default_tx_frame_reserve};
-    /// Bind to this shared UMEM's area instead of a UMEM of the context's own (XDP_SHARED_UMEM, across
-    /// devices), owning share `umem_share` of its frames; umem_frame_count, umem_frame_size and
-    /// umem_headroom are then the share's. Every socket on it runs in the first's mode (zero-copy or copy,
-    /// multi-buffer or not). Outlives the context.
+    /// Bind this UMEM, shared across devices (XDP_SHARED_UMEM), owning share `umem_share` of its frames, which
+    /// replace umem_frame_count and umem_frame_size. Every socket on it binds in the first's mode (zero-copy or
+    /// copy, multi-buffer or not). Outlives the context.
     XdpSharedUmem* shared_umem{nullptr};
     size_t umem_share{0};
     /// Bind with XDP_USE_SG, so a frame may be sent from several buffers (tx_commit_gather()); refused by a
@@ -454,6 +453,8 @@ class UmemFreeList
 
     [[nodiscard]] auto available() const noexcept -> size_t { return top_; }
     [[nodiscard]] auto overflow_count() const noexcept -> size_t { return overflow_count_; }
+    /// Empty, its room kept (push() to fill it).
+    void clear() noexcept { top_ = 0; }
 
   private:
     std::pmr::vector<uint64_t> stack_;
@@ -1184,10 +1185,9 @@ class UmemRegion
         RingSet& rings,
         size_t tx_metadata_len = 0) -> StatusValue<struct xsk_umem*>;
 
-    /// The area of @p shared instead of one of its own: registered here, with @p rings as its fill and
-    /// completion rings, unless another socket registered it first (with the same @p headroom and
-    /// @p tx_metadata_len, else invalid_umem_geometry); the free list holds share @p share's frames.
-    /// close() leaves the area and the registration to @p shared.
+    /// The area of @p shared, registered here with @p rings unless another socket did (with the same @p headroom
+    /// and @p tx_metadata_len, else invalid_umem_geometry); the free list holds share @p share's frames not lent.
+    /// close() leaves the area to @p shared, and the registration too while another socket binds it.
     [[nodiscard]] auto attach(
         XdpSharedUmem& shared,
         size_t share,
@@ -1241,6 +1241,9 @@ class UmemRegion
     /// syscalls of its own that would overwrite the one worth reporting.
     [[nodiscard]] auto create_errno() const noexcept -> int { return create_errno_; }
 
+    /// reregister() once the old registration is gone: a fresh one on the same area, the shared UMEM's again.
+    [[nodiscard]] auto recreate(size_t fill_ring_size, size_t comp_ring_size, RingSet& rings) noexcept
+        -> StatusValue<struct xsk_umem*>;
     /// Create the umem itself, with or without TX metadata. Separated so the
     /// two libxdp entry points - only one of which can set tx_metadata_len -
     /// are chosen in one place.
@@ -1919,12 +1922,9 @@ class XdpContext
     /// UMEM; then the driver's xdp_zc_max_segs in zero-copy, XDP_COPY_MAX_SEGMENTS in copy mode.
     [[nodiscard]] auto tx_segments() const noexcept -> size_t { return tx_segments_; }
 
-    /// Put one frame on the TX ring in several buffers (XDP_PKT_CONTD): the first @p length bytes of
-    /// frame @p handle from tx_start() (nullopt: none, the first of @p rest carries the headers), then
-    /// each of @p rest, which must lie in the shared UMEM, within one frame each. The frames they lie in
-    /// stay lent (XdpFrameLedger) until the completion ring returns them. @p launch_time_ns as
-    /// tx_set_launch_time(), on the first buffer. Errors: not_open; tx_gather_not_supported past
-    /// tx_segments() buffers; invalid_addr for a piece outside the UMEM; tx_ring_full. @p handle is freed on failure.
+    /// One frame in several buffers (XDP_PKT_CONTD): @p handle's first @p length bytes (nullopt: none), then @p rest,
+    /// each within one frame of the shared UMEM and lent (XdpFrameLedger) until completed; timed as tx_set_launch_time().
+    /// Errors: not_open; tx_gather_not_supported (past tx_segments(), or outside the UMEM); tx_ring_full. Frees @p handle on failure.
     [[nodiscard]] auto tx_commit_gather(
         std::optional<uint64_t> handle, size_t length, std::span<std::span<uint8_t const> const> rest, int64_t launch_time_ns = 0)
         -> Status;
@@ -2094,6 +2094,9 @@ class XdpContext
     /// Submit `pieces` as one frame's descriptors, the first's options `first_options`, each lent piece lent.
     [[nodiscard]] auto submit_gather(std::span<std::pair<uint64_t, uint32_t> const> pieces, bool own_first, uint32_t first_options)
         -> Status;
+    /// Whether this socket on a shared UMEM sends multi-buffer frames: as asked (@p asked) if it bound first, else
+    /// as the first did; false without a shared UMEM.
+    [[nodiscard]] auto shared_gather(bool asked) noexcept -> bool;
     /// Return a completed address to its frame's owner: lent, through the ledger; else this socket's own.
     void complete_frame(uint64_t addr) noexcept;
     /// Each of @p pieces' UMEM address and length into @p out: false for one outside the UMEM or across a frame.
