@@ -46,7 +46,9 @@ auto mmap_config_from(AnyEthernetPortConfig const& config) -> MmapConfig
     };
 }
 
-auto xdp_config_from(AnyEthernetPortConfig const& config) -> XdpConfig
+}  // namespace
+
+auto xdp_config_for(AnyEthernetPortConfig const& config) -> XdpConfig
 {
     return XdpConfig{
         .interface_name = config.interface_name,
@@ -56,14 +58,13 @@ auto xdp_config_from(AnyEthernetPortConfig const& config) -> XdpConfig
         .tx_ring_size = config.ring_size,
         .fill_ring_size = config.ring_size * 2,
         .completion_ring_size = config.ring_size * 2,
+        .umem_frame_count = XdpConfig{}.umem_frame_count + config.xdp_rx_hold_frames,
         .tx_launch_time = config.xdp_tx_launch_time,
         .bind_mode = config.xdp_bind_mode,
         .attach_mode = config.xdp_attach_mode,
         .pin_path = config.xdp_pin_path,
     };
 }
-
-}  // namespace
 
 auto AnyEthernetPort::open(EthernetBackend const backend, AnyEthernetPortConfig const& config) -> Status
 {
@@ -86,7 +87,7 @@ auto AnyEthernetPort::open_backend(EthernetBackend const backend, AnyEthernetPor
         case EthernetBackend::mmap:
             return port_.emplace<MmapContext>().open(mmap_config_from(config));
         case EthernetBackend::xdp:
-            return port_.emplace<XdpContext>().open(xdp_config_from(config));
+            return port_.emplace<XdpContext>().open(xdp_config_for(config));
     }
     return failure(NetError::invalid_argument);
 }

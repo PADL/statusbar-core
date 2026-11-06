@@ -126,7 +126,14 @@ struct AnyEthernetPortConfig
     /// See XdpConfig::pin_path: where the program is pinned, to be adopted by
     /// the next open rather than attached afresh. Empty: no pinning.
     std::string_view xdp_pin_path{};
+    /// UMEM frames past the default that received frames may stay held in (an rx_start() not yet
+    /// rx_release()d), so that holding them never starves the fill ring or the transmit reserve.
+    size_t xdp_rx_hold_frames{0};
 };
+
+/// The XdpConfig the xdp backend opens with for @p config: its rings, the default UMEM grown by
+/// xdp_rx_hold_frames, and the xdp fields as given.
+[[nodiscard]] auto xdp_config_for(AnyEthernetPortConfig const& config) -> XdpConfig;
 
 class AnyEthernetPort
 {
