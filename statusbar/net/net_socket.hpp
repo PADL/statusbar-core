@@ -155,7 +155,8 @@ using FileDescriptor = ::statusbar::FileDescriptor;
 }
 
 /// Set the DSCP (Differentiated Services Code Point) value on a socket
-/// Works for both IPv4 and IPv6 sockets on macOS and Linux
+/// Works for both IPv4 and IPv6 sockets on macOS and Linux. On Linux IP_TOS also resets SO_PRIORITY to the one
+/// the TOS maps to (rt_tos2priority): set_priority() afterwards, not before.
 /// @param fd The socket file descriptor
 /// @param family The address family (AF_INET or AF_INET6)
 /// @param dscp The DSCP value (0-63, 6 bits). Will be shifted into TOS/Traffic Class field.
@@ -182,7 +183,8 @@ using FileDescriptor = ::statusbar::FileDescriptor;
 }
 
 /// Set the DSCP value using the raw TOS/Traffic Class byte
-/// This preserves any ECN bits if needed
+/// This preserves any ECN bits if needed. On Linux IP_TOS also resets SO_PRIORITY to the one the TOS maps to:
+/// set_priority() afterwards, not before.
 /// @param fd The socket file descriptor
 /// @param family The address family (AF_INET or AF_INET6)
 /// @param tos The full TOS/Traffic Class byte (DSCP << 2 | ECN)
@@ -352,6 +354,70 @@ using FileDescriptor = ::statusbar::FileDescriptor;
     if (::setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &looped, sizeof(looped)) != 0) {
         return failure(errno_code());
     }
+    return success();
+}
+
+/// The interface unicast leaves by on an IPv4 or IPv6 (`family`) socket: `interface_index`, or 0 for the route
+/// again. Linux: IP_UNICAST_IF / IPV6_UNICAST_IF (both take the index in network order), refused (EINVAL) on a
+/// socket bound to a device with SO_BINDTODEVICE; macOS and BSD: IP_BOUND_IF / IPV6_BOUND_IF.
+[[nodiscard]] inline auto set_unicast_interface(int fd, int family, unsigned int interface_index) noexcept -> Status
+{
+#if defined(__linux__)
+    uint32_t const index = htonl(interface_index);
+    bool const set = family == AF_INET6 ? ::setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_IF, &index, sizeof(index)) == 0
+                                        : ::setsockopt(fd, IPPROTO_IP, IP_UNICAST_IF, &index, sizeof(index)) == 0;
+    return set ? success() : failure(errno_code());
+#elif defined(IP_BOUND_IF) && defined(IPV6_BOUND_IF)
+    int const index = static_cast<int>(interface_index);
+    bool const set = family == AF_INET6 ? ::setsockopt(fd, IPPROTO_IPV6, IPV6_BOUND_IF, &index, sizeof(index)) == 0
+                                        : ::setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &index, sizeof(index)) == 0;
+    return set ? success() : failure(errno_code());
+#else
+    (void)fd;
+    (void)family;
+    return interface_index == 0 ? success() : failure(std::errc::operation_not_supported);
+#endif
+}
+
+/// The hop limit of unicast from an IPv4 or IPv6 (`family`) socket: `ttl`, or 0 for the host's default again
+/// (IP_TTL / IPV6_UNICAST_HOPS).
+[[nodiscard]] inline auto set_unicast_hops(int fd, int family, uint8_t ttl) noexcept -> Status
+{
+#if defined(__linux__)
+    int const hops = ttl != 0 ? ttl : -1;  // -1: the default
+#else
+    int const hops = ttl != 0 ? ttl : family == AF_INET6 ? -1 : IPDEFTTL;
+#endif
+    bool const set = family == AF_INET6 ? ::setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &hops, sizeof(hops)) == 0
+                                        : ::setsockopt(fd, IPPROTO_IP, IP_TTL, &hops, sizeof(hops)) == 0;
+    return set ? success() : failure(errno_code());
+}
+
+/// Send unicast from an IPv4 or IPv6 (`family`) socket out of interface `interface_index`, whatever the route
+/// prefers (0: the route; set_unicast_interface(), so not on a socket bound to a device), with hop limit `ttl` (0:
+/// the host's default; set_unicast_hops()). Both are set either way, so a reconfigured socket keeps nothing from
+/// before. The unicast counterpart of set_multicast_send().
+[[nodiscard]] inline auto set_unicast_send(int fd, int family, unsigned int interface_index, uint8_t ttl) noexcept -> Status
+{
+    if (auto pinned = set_unicast_interface(fd, family, interface_index); !pinned) {
+        return pinned;
+    }
+    return set_unicast_hops(fd, family, ttl);
+}
+
+/// The socket's priority (SO_PRIORITY, Linux), which an mqprio root maps to a traffic class: 0 to 6 for anyone, 7
+/// to 15 with CAP_NET_ADMIN or CAP_NET_RAW (EPERM otherwise). Call after set_dscp() or set_tos(): on Linux IP_TOS
+/// resets the priority to the one the TOS maps to (rt_tos2priority). Elsewhere a no-op.
+[[nodiscard]] inline auto set_priority(int fd, int priority) noexcept -> Status
+{
+#if defined(__linux__)
+    if (::setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &priority, sizeof(priority)) != 0) {
+        return failure(errno_code());
+    }
+#else
+    (void)fd;
+    (void)priority;
+#endif
     return success();
 }
 

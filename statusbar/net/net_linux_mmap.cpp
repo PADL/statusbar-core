@@ -4,6 +4,7 @@
 #include "statusbar/net/net_linux_mmap.hpp"
 
 #include "statusbar/net/net_posix_util.hpp"
+#include "statusbar/net/net_socket.hpp"
 
 namespace statusbar::net {
 
@@ -107,7 +108,7 @@ void MmapContext::swap(MmapContext& other) noexcept
 }
 
 auto MmapContext::open(MmapConfig const& config) -> Status
-{
+{  // NOLINT(statusbar-block-statements): one socket opened and set up option by option, in order
     // Close any existing context
     close();
 
@@ -152,8 +153,7 @@ auto MmapContext::open(MmapConfig const& config) -> Status
 
     // Set socket priority if requested
     if (config.priority > 0) {
-        int prio = static_cast<int>(config.priority);
-        if (::setsockopt(fd_, SOL_SOCKET, SO_PRIORITY, &prio, sizeof(prio)) < 0) {
+        if (auto const set = set_priority(fd_, static_cast<int>(config.priority)); !set) {
             close();
             return failure(MmapError::set_priority_failed);
         }
