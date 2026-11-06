@@ -545,14 +545,6 @@ class TxProgress
     TxRingState last_{};
 };
 
-/// Whether tx_flush() kicks: for frames committed since the last kick, except
-/// on a zero-copy queue whose NAPI kthread busy polls and sends unkicked,
-/// which is kicked only when it has @p stalled.
-[[nodiscard]] constexpr auto tx_kick_due(bool const pending, bool const busy_polled, bool const stalled) noexcept -> bool
-{
-    return busy_polled ? stalled : pending;
-}
-
 /// @p rule as a BPF rules_map slot. There a min_frame_size of 0 ends the
 /// table, while TcamClassifier reads 0 as any frame of the window, so 0
 /// becomes the window's size: shorter frames are passed before any rule.
@@ -1828,28 +1820,9 @@ class XdpContext
         return ret < 0 && detail::transient_kick_errno(errno);
     }
 
-    /// Tell the kernel there are frames in the TX ring, when there are.
-    ///
-    /// The kick is skipped when nothing has been submitted since the last one
-    /// got through: "nothing submitted" is the one thing it is always safe
-    /// to skip on, and it is the common case for a sender ticking faster
-    /// than it sends. A healthy sender therefore skips most kicks, which
-    /// makes a *low* skip ratio in the counters a signal in itself. The
-    /// socket is bound with XDP_USE_NEED_WAKEUP, so a driver that is awake
-    /// anyway may not need the kick - it is sent regardless when frames are
-    /// pending, which costs a syscall and never a frame.
-    ///
-    /// A kick refused with EAGAIN and friends leaves the frames pending, so
-    /// the next call tries again rather than counting them as delivered.
-    ///
-    /// May be called from a thread other than the one committing frames (a
-    /// kicker that spares the sender the syscall): the pending flag is
-    /// claimed before the kick and re-armed if the kick is refused, so a
-    /// commit that lands between the claim and the syscall sets it again
-    /// and the next kick carries that frame. Only this method and
-    /// tx_commit share state, through that flag and the TX ring's indexes,
-    /// read with acquire. One thread flushes at a time: the flush counters
-    /// and the busy-poll progress are the flusher's alone.
+    /// Tell the kernel there are frames in the TX ring, when there are: skipped when nothing was
+    /// committed since the last kick got through, tried again after a refusal. One thread flushes at
+    /// a time, the committing one or a kicker beside it (see NET_MODULE.md, "TX kicks").
     [[nodiscard]] auto tx_flush() -> Status
     {
         if (!tx_kick_due()) {
@@ -1985,7 +1958,8 @@ class XdpContext
     [[nodiscard]] auto napi_busy_poll() const noexcept -> bool { return napi_busy_poll_.on(); }
 
   private:
-    /// Whether tx_flush() kicks, consuming the pending flag (detail::tx_kick_due()).
+    /// Whether tx_flush() kicks, consuming the pending flag: for frames committed since the last kick,
+    /// except on a zero-copy queue whose NAPI kthread busy polls, kicked only when it has stalled.
     [[nodiscard]] auto tx_kick_due() noexcept -> bool
     {
         bool const busy_polled = zero_copy_ && napi_busy_poll_.polling();
@@ -1994,7 +1968,7 @@ class XdpContext
         if (busy_polled && !stalled) {
             return false;  // the flag stays set: a kick is owed if busy poll stops before the kthread sends
         }
-        return detail::tx_kick_due(tx_pending_.exchange(false, std::memory_order_acq_rel), busy_polled, stalled);
+        return tx_pending_.exchange(false, std::memory_order_acq_rel) || stalled;
     }
 
     /// The TX ring's state, read with the producer's and the kernel's own
