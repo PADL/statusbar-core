@@ -1,11 +1,9 @@
 // Copyright 2026 Jeff Koftinoff <jeff.koftinoff@statusbar.com>
 // SPDX-License-Identifier: MIT
 
-/// Two transmit-only AF_XDP sockets on two veth pairs, binding one UMEM (XDP_SHARED_UMEM across devices)
-/// with multi-buffer transmit (XDP_USE_SG), in copy mode: a frame gathered by one from a header of its own
-/// and a payload in the other's share leaves whole, and the payload's frame goes back to its owner only
-/// once its owner and the completion are both done with it. Needs root (a user namespace's will do);
-/// skips without it.
+/// Transmit-only copy-mode AF_XDP sockets on two veth pairs sharing one UMEM (XDP_SHARED_UMEM, XDP_USE_SG): a frame
+/// gathered from another share's payload leaves whole and the payload's frame goes home; the registration follows
+/// its sockets. Needs root (a user namespace's will do); skips without it.
 
 #include "statusbar/net/net_linux_xdp.hpp"
 #include "statusbar/net/net_socket.hpp"
@@ -189,6 +187,35 @@ TEST(xdp_gather_veth, a_frame_gathered_from_another_shares_payload_leaves_whole_
     complete_until(sender, [&] { return !umem.value()->ledger().lent(held->handle); });
     (void)owner.fill_replenish();
     EXPECT_EQ(owner.free_frames(), owner_free + 1);
+}
+
+// The first socket on a shared UMEM registers it; one that fails to open, or closes with no other bound, gives the
+// registration up, so the next registers afresh; while another is bound it stays.
+TEST(xdp_gather_veth, a_failed_first_socket_gives_up_the_shared_registration)
+{
+    if (::geteuid() != 0) {
+        SKIP("needs root (veth pairs, AF_XDP)");
+    }
+    VethPair const a{"xgthrc0", "xgthrc1"};
+    VethPair const b{"xgthrd0", "xgthrd1"};
+    auto umem = XdpSharedUmem::create(PER_SHARE, 2);
+    EXPECT_TRUE(a.ok() && b.ok() && umem.has_value());
+    if (!a.ok() || !b.ok() || !umem) {
+        return;
+    }
+    XdpContext failed;
+    EXPECT_FALSE(failed.open(config_on("xgthr-none", **umem, 0)).has_value());  // no such interface: before registering
+    auto bad = config_on("xgthrc0", **umem, 0);
+    bad.queue_id = 99;  // registered, then the bind refused
+    EXPECT_FALSE(failed.open(bad).has_value());
+    EXPECT_TRUE(umem.value()->registered() == nullptr);
+    XdpContext first;
+    XdpContext second;
+    EXPECT_TRUE(first.open(config_on("xgthrc0", **umem, 0)).has_value());
+    EXPECT_TRUE(second.open(config_on("xgthrd0", **umem, 1)).has_value());
+    first.close();
+    EXPECT_TRUE(umem.value()->registered() != nullptr);  // the second still binds it
+    second.close();
 }
 
 #endif  // __linux__ && HAVE_XDP
