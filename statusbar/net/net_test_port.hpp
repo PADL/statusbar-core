@@ -30,6 +30,8 @@ struct TestPortConfig
     ieee::Eui48 hardware_address{};
     unsigned int interface_index{1};
     size_t frame_pool_size{256};
+    /// Buffers one frame may be sent in (tx_commit_gather()), as a multi-buffer AF_XDP socket's.
+    size_t tx_segments{1};
 };
 
 /// Pure userspace Ethernet port for use in unit tests.
@@ -108,6 +110,20 @@ class TestPortContext
 
     /// The launch time of frame @p handle, started and not yet committed, as XdpContext's.
     [[nodiscard]] auto tx_set_launch_time(uint64_t handle, int64_t launch_time_ns) -> Status;
+
+    /// Buffers one frame may be sent in: TestPortConfig::tx_segments.
+    [[nodiscard]] auto tx_segments() const noexcept -> size_t { return tx_segments_; }
+
+    /// Capture one frame of the first @p len bytes of slot @p handle (nullopt: none), then each of @p rest,
+    /// as XdpContext sends one from several buffers, timed @p launch_time_ns (0: the slot's). invalid_argument
+    /// past tx_segments() buffers, buffer_full past a frame buffer; @p handle back to the free list either way.
+    [[nodiscard]] auto tx_commit_gather(
+        std::optional<uint64_t> handle, size_t len, std::span<std::span<uint8_t const> const> rest, int64_t launch_time_ns = 0)
+        -> Status;
+    /// tx_commit_gather() calls captured since open().
+    [[nodiscard]] auto tx_gathers() const noexcept -> size_t { return tx_gathers_; }
+    /// The buffers of the last captured gather after its first, as given (where they lay).
+    [[nodiscard]] auto last_gather() const noexcept -> std::span<std::span<uint8_t const> const> { return last_gather_; }
 
     /// No-op flush (all TX is synchronous in TestPortContext).
     [[nodiscard]] auto tx_flush() -> Status
@@ -202,9 +218,20 @@ class TestPortContext
         int64_t timestamp_ns;
     };
 
+    /// A captured gather recorded, @p rest its buffers past its first.
+    void record_gather(TxCapture const& capture, std::span<std::span<uint8_t const> const> rest);
+    /// @p head then each of @p rest, one after another, as @p capture's frame (which they fit).
+    static void concatenate(TxCapture& capture, std::span<uint8_t const> head, std::span<std::span<uint8_t const> const> rest);
+    /// tx_commit_gather()'s frame into @p capture: the slot's first @p len bytes, then @p rest.
+    [[nodiscard]] auto gather_into(
+        TxCapture& capture, std::optional<uint64_t> handle, size_t len, std::span<std::span<uint8_t const> const> rest) const
+        -> Status;
+
     bool valid_{false};
     bool refuse_commits_{false};
     size_t tx_flushes_{0};
+    size_t tx_segments_{1};
+    size_t tx_gathers_{0};
     size_t cycles_begun_{0};
     size_t cycles_ended_{0};
     ieee::Eui48 hardware_address_{};
@@ -232,6 +259,9 @@ class TestPortContext
 
     /// Multicast groups registered via join_multicast()
     std::pmr::vector<ieee::Eui48> joined_multicast_{mem_resource_};
+
+    /// The last gather's buffers past its first (last_gather())
+    std::pmr::vector<std::span<uint8_t const>> last_gather_{mem_resource_};
 };
 
 /// Verify TestPortContext satisfies the EthernetPort concept at compile time

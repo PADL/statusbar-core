@@ -46,7 +46,9 @@ auto mmap_config_from(AnyEthernetPortConfig const& config) -> MmapConfig
     };
 }
 
-auto xdp_config_from(AnyEthernetPortConfig const& config) -> XdpConfig
+}  // namespace
+
+auto xdp_config_for(AnyEthernetPortConfig const& config) -> XdpConfig
 {
     return XdpConfig{
         .interface_name = config.interface_name,
@@ -56,14 +58,16 @@ auto xdp_config_from(AnyEthernetPortConfig const& config) -> XdpConfig
         .tx_ring_size = config.ring_size,
         .fill_ring_size = config.ring_size * 2,
         .completion_ring_size = config.ring_size * 2,
+        .umem_frame_count = XdpConfig{}.umem_frame_count + config.xdp_rx_hold_frames,
         .tx_launch_time = config.xdp_tx_launch_time,
         .bind_mode = config.xdp_bind_mode,
         .attach_mode = config.xdp_attach_mode,
         .pin_path = config.xdp_pin_path,
+        .shared_umem = config.xdp_shared_umem,
+        .umem_share = config.xdp_umem_share,
+        .tx_scatter_gather = config.xdp_scatter_gather,
     };
 }
-
-}  // namespace
 
 auto AnyEthernetPort::open(EthernetBackend const backend, AnyEthernetPortConfig const& config) -> Status
 {
@@ -86,7 +90,7 @@ auto AnyEthernetPort::open_backend(EthernetBackend const backend, AnyEthernetPor
         case EthernetBackend::mmap:
             return port_.emplace<MmapContext>().open(mmap_config_from(config));
         case EthernetBackend::xdp:
-            return port_.emplace<XdpContext>().open(xdp_config_from(config));
+            return port_.emplace<XdpContext>().open(xdp_config_for(config));
     }
     return failure(NetError::invalid_argument);
 }
@@ -216,6 +220,37 @@ auto AnyEthernetPort::tx_set_launch_time(uint64_t const handle, int64_t const la
             return backend.tx_set_launch_time(handle, launch_time_ns);
         } else {
             return failure(NetError::not_supported);  // a backend without launch time
+        }
+    });
+}
+
+auto AnyEthernetPort::tx_segments() const noexcept -> size_t
+{
+    return std::visit(
+        [](auto const& backend) -> size_t {
+            if constexpr (requires { backend.tx_segments(); }) {
+                return backend.tx_segments();
+            } else {
+                return 1;
+            }
+        },
+        port_);
+}
+
+auto AnyEthernetPort::tx_commit_gather(
+    std::optional<uint64_t> const handle,
+    size_t const length,
+    std::span<std::span<uint8_t const> const> const rest,
+    int64_t const launch_time_ns) -> Status
+{
+    return on_port(port_, [&](auto& backend) -> Status {
+        if constexpr (requires { backend.tx_commit_gather(handle, length, rest, launch_time_ns); }) {
+            return backend.tx_commit_gather(handle, length, rest, launch_time_ns);
+        } else {
+            if (handle) {
+                (void)backend.tx_cancel(*handle);
+            }
+            return failure(NetError::not_supported);  // a backend that copies every frame
         }
     });
 }

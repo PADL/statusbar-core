@@ -14,6 +14,7 @@
 #include "statusbar/net/net_error.hpp"
 #include "statusbar/test/test.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -260,6 +261,35 @@ TEST(any_ethernet_port, a_test_port_captures_tx_and_returns_injected_rx)
     EXPECT_TRUE(port.leave_multicast(group).has_value() && test->joined_multicast_groups().empty());
 }
 
+// The test port sends a frame from several buffers as one, as a multi-buffer AF_XDP socket does: its own
+// slot's header, then each buffer where it lies; past its tx_segments() a gather is refused, the slot freed.
+TEST(any_ethernet_port, a_test_port_captures_a_gathered_frame_whole)
+{
+    AnyEthernetPort port;
+    EXPECT_TRUE(port.open_test({.frame_pool_size = 2, .tx_segments = 3}).has_value());
+    EXPECT_EQ(port.tx_segments(), size_t{3});
+    std::array<uint8_t, 4> const first{1, 2, 3, 4};
+    std::array<uint8_t, 3> const second{5, 6, 7};
+    std::array<std::span<uint8_t const>, 2> const rest{first, second};
+    auto slot = port.tx_start();
+    EXPECT_TRUE(slot.has_value());
+    slot->buffer[0] = 0xAA;
+    slot->buffer[1] = 0xBB;
+    EXPECT_TRUE(port.tx_commit_gather(slot->handle, 2, rest, 42).has_value());
+    auto* const test = port.as<TestPortContext>();
+    auto const sent = test->pop_tx();
+    std::array<uint8_t, 9> const whole{0xAA, 0xBB, 1, 2, 3, 4, 5, 6, 7};
+    EXPECT_TRUE(sent && sent->frame.size() == whole.size() && std::equal(whole.begin(), whole.end(), sent->frame.data()));
+    EXPECT_TRUE(sent && sent->launch_time_ns == 42);
+    EXPECT_TRUE(test->last_gather().size() == 2 && test->last_gather()[0].data() == first.data());
+    std::array<std::span<uint8_t const>, 3> const too_many{first, second, first};
+    auto again = port.tx_start();
+    EXPECT_FALSE(port.tx_commit_gather(again->handle, 2, too_many).has_value());
+    EXPECT_TRUE(port.tx_start().has_value() && port.tx_start().has_value());  // both slots free again
+    EXPECT_TRUE(port.tx_commit_gather(std::nullopt, 0, rest).has_value());    // no header of its own
+    EXPECT_EQ(test->tx_gathers(), size_t{2});
+}
+
 // The pin path reaches the xdp backend: one outside bpffs is refused as
 // such, before the interface is looked up or anything is attached.
 TEST(any_ethernet_port, the_xdp_backend_takes_the_pin_path)
@@ -275,6 +305,29 @@ TEST(any_ethernet_port, the_xdp_backend_takes_the_pin_path)
     }
 #endif
     EXPECT_FALSE(port.valid());
+}
+
+// Frames a receiver holds come on top of the default UMEM, so neither the fill ring nor the
+// transmit reserve gives them up.
+TEST(any_ethernet_port, the_xdp_umem_grows_by_the_frames_a_receiver_holds)
+{
+    auto const plain = xdp_config_for({.interface_name = "lo", .ring_size = 128});
+    auto const held = xdp_config_for({.interface_name = "lo", .ring_size = 128, .xdp_rx_hold_frames = 512});
+    EXPECT_EQ(plain.umem_frame_count, XdpConfig{}.umem_frame_count);
+    EXPECT_EQ(held.umem_frame_count, XdpConfig{}.umem_frame_count + 512);
+    EXPECT_EQ(held.fill_ring_size, size_t{256});
+    EXPECT_EQ(held.tx_frame_reserve, XdpConfig{}.tx_frame_reserve);
+}
+
+// A port on a UMEM shared with another device's takes its share, and multi-buffer transmit, as given.
+TEST(any_ethernet_port, the_xdp_backend_takes_a_shared_umem_and_its_share)
+{
+    auto const plain = xdp_config_for({.interface_name = "lo"});
+    EXPECT_TRUE(plain.shared_umem == nullptr && !plain.tx_scatter_gather);
+    auto* const umem = reinterpret_cast<XdpSharedUmem*>(uintptr_t{0x1000});  // NOLINT(performance-no-int-to-ptr): only compared
+    auto const shared =
+        xdp_config_for({.interface_name = "lo", .xdp_shared_umem = umem, .xdp_umem_share = 1, .xdp_scatter_gather = true});
+    EXPECT_TRUE(shared.shared_umem == umem && shared.umem_share == 1 && shared.tx_scatter_gather);
 }
 
 TEST(any_ethernet_port, a_ring_backend_shares_state_between_tx_and_rx_or_is_not_available)

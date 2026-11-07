@@ -30,6 +30,7 @@ statusbar_add_module(
   net_vlan_link.cpp
   net_test_port.cpp
   net_traffic_classifier.cpp
+  net_xdp_shared_umem.cpp
   DEPS
   statusbar-buffer
   statusbar-config
@@ -54,6 +55,8 @@ statusbar_add_module(
   net_linux_xdp_test.cpp
   net_netdev_features_test.cpp
   net_netdev_napi_test.cpp
+  net_xdp_shared_umem_test.cpp
+  net_xdp_gather_veth_test.cpp
   net_netlink_test.cpp
   net_interface_info_test.cpp
   net_launch_order_test.cpp
