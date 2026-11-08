@@ -107,26 +107,18 @@ auto rss_indirection(std::string_view const interface_name) -> StatusValue<RssIn
     return RssIndirection(words.begin() + IndirHeaderWords, words.end());
 }
 
-namespace {
-
-/// How many RX queues the interface has, or 0 if it would not say. Not an
-/// error: the count is only used to refuse a queue that cannot exist, and a
-/// driver that will not report it still checks the write itself.
-[[nodiscard]] auto read_rx_queue_count(std::string_view const interface_name) -> uint32_t
+auto rx_queue_count(std::string_view const interface_name) -> StatusValue<uint32_t>
 {
     ethtool_rxnfc rings{};
     rings.cmd = ETHTOOL_GRXRINGS;
     ifreq request{};
     set_ifr_data(request, &rings);
     if (auto const status = ifreq_ioctl(interface_name, SIOCETHTOOL, request); !status) {
-        return 0;
+        return failure(status.error());
     }
-    // data is a __u64; a queue count that does not fit in 32 bits is not a
-    // thing, and clamping keeps the comparison honest if one ever appears.
+    // data is a __u64; a queue count that does not fit in 32 bits is not a thing
     return rings.data > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(rings.data);
 }
-
-}  // namespace
 
 auto set_rss_indirection(std::string_view const interface_name, std::span<uint32_t const> const table) -> Status
 {
@@ -141,7 +133,7 @@ auto set_rss_indirection_all(std::string_view const interface_name, uint32_t con
     if (!current) {
         return failure(current.error());
     }
-    auto plan = detail::plan_rss_steer(*current, read_rx_queue_count(interface_name), queue_id);
+    auto plan = detail::plan_rss_steer(*current, rx_queue_count(interface_name).value_or(0), queue_id);
     if (!plan) {
         return failure(plan.error());
     }
@@ -154,6 +146,11 @@ auto set_rss_indirection_all(std::string_view const interface_name, uint32_t con
 }
 
 #else  // !__linux__
+
+auto rx_queue_count(std::string_view const) -> StatusValue<uint32_t>
+{
+    return failure(std::make_error_code(std::errc::operation_not_supported));
+}
 
 auto rss_indirection(std::string_view const) -> StatusValue<RssIndirection>
 {

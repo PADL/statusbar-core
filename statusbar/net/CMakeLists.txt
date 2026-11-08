@@ -23,6 +23,7 @@ statusbar_add_module(
   net_rawnet_port.cpp
   net_ring_buffer_base.cpp
   net_rss.cpp
+  net_rx_flow.cpp
   net_tap_bridge.cpp
   net_tc_launch_time.cpp
   net_tc_qdisc.cpp
@@ -62,6 +63,7 @@ statusbar_add_module(
   net_tc_launch_time_test.cpp
   net_tc_qdisc_test.cpp
   net_rss_test.cpp
+  net_rx_flow_test.cpp
   net_tcam_classifier_test.cpp
   net_tcp_server_test.cpp
   net_test.cpp
@@ -84,6 +86,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_carrier_watch_fuzzer.cpp)
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_netlink_fuzzer.cpp)
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_link_readiness_fuzzer.cpp)
+  add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_rx_flow_fuzzer.cpp)
 endif()
 
 add_executable(net_tcp_echo_example net_tcp_echo_example.cpp)
