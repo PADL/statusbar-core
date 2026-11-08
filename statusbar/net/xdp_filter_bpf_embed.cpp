@@ -8,11 +8,9 @@
 
 #if defined(__linux__) && defined(HAVE_XDP)
 
-// The object's SHA-256: it changes this TU's text when the object changes, which a compiler
-// cache sees though it does not hash #embed'ded files.
+// The object's SHA-256, xdp_filter_bpf_o_sha256: it changes this TU's text when the object
+// changes, which a compiler cache sees though it does not hash #embed'ded files.
 #    include "xdp_filter_bpf_hash.h"
-
-extern char const xdp_filter_bpf_o_sha256[] = XDP_FILTER_BPF_SHA256;
 
 // extern is required: in C++, const at namespace scope implies internal linkage.
 extern unsigned char const xdp_filter_bpf_o[] = {
