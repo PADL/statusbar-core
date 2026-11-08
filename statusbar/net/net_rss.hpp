@@ -42,6 +42,10 @@ using RssIndirection = std::vector<uint32_t>;
 /// @param interface_name The interface to read, 1 to IFNAMSIZ-1 bytes
 [[nodiscard]] auto rss_indirection(std::string_view interface_name) -> StatusValue<RssIndirection>;
 
+/// How many RX queues the interface has (ETHTOOL_GRXRINGS). No privilege.
+/// @param interface_name The interface to read
+[[nodiscard]] auto rx_queue_count(std::string_view interface_name) -> StatusValue<uint32_t>;
+
 /// Point every RSS hash bucket of `interface_name` at `queue_id`, and return
 /// the table as it was.
 ///
