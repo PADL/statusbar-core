@@ -45,7 +45,7 @@ struct Ipv4AddressChange
 /// Whether `message` is an RTM_NEWQDISC or RTM_DELQDISC of `ifindex`.
 [[nodiscard]] auto is_qdisc_change(std::span<uint8_t const> message, int ifindex) noexcept -> bool;
 
-/// One interface's link as the rtnetlink messages applied so far report it, judged against its last qdisc change.
+/// One interface's link as the rtnetlink messages applied so far report it, checked against its last qdisc change.
 /// Allocation-free.
 class LinkReadiness
 {
