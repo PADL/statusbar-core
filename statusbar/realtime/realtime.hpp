@@ -9,6 +9,7 @@
 #include "statusbar/realtime/realtime_anytimer.hpp"
 #include "statusbar/realtime/realtime_base.hpp"
 #include "statusbar/realtime/realtime_clock.hpp"
+#include "statusbar/realtime/realtime_cpu_idle.hpp"
 #include "statusbar/realtime/realtime_monotonic_raw_line.hpp"
 #include "statusbar/realtime/realtime_timer.hpp"
 #include "statusbar/realtime/realtime_timer_base.hpp"
