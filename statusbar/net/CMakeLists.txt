@@ -10,6 +10,7 @@ statusbar_add_module(
   net_bpf_port.cpp
   net_carrier_watch.cpp
   net_error.cpp
+  net_ethtool_stats.cpp
   net_interface_info.cpp
   net_link_readiness.cpp
   net_linux_mmap.cpp
@@ -48,6 +49,7 @@ statusbar_add_module(
   net_zephyr_eth_concept_test.cpp
   net_compiled_rule_test.cpp
   net_ethernet_port_test.cpp
+  net_ethtool_stats_test.cpp
   net_group_membership_test.cpp
   net_link_monitor_test.cpp
   net_link_readiness_test.cpp
@@ -78,6 +80,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_vlan_link_fuzzer.cpp)
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_netdev_features_fuzzer.cpp)
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_netdev_napi_fuzzer.cpp)
+  add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_ethtool_stats_fuzzer.cpp)
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_carrier_watch_fuzzer.cpp)
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_netlink_fuzzer.cpp)
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_link_readiness_fuzzer.cpp)
