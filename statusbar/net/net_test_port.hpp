@@ -52,6 +52,14 @@ class TestPortContext
         int64_t launch_time_ns;
     };
 
+    /// One join_multicast() (@p joined) or leave_multicast() call, as record_memberships() logs it.
+    struct MembershipChange
+    {
+        ieee::Eui48 group;
+        bool joined;
+        [[nodiscard]] auto operator==(MembershipChange const&) const noexcept -> bool = default;
+    };
+
     TestPortContext() = default;
 
     ~TestPortContext() { close(); }
@@ -188,6 +196,10 @@ class TestPortContext
     /// Refuse every tx_commit() (NetError::send_failed, the slot freed) until called with false.
     void refuse_commits(bool const refuse) noexcept { refuse_commits_ = refuse; }
 
+    /// Append every later join and leave to @p log until close() (nullptr stops it sooner). The caller
+    /// owns @p log, which outlives the port: a test reads what a port left before it closed.
+    void record_memberships(std::vector<MembershipChange>* const log) noexcept { membership_log_ = log; }
+
     /// Returns the list of multicast groups joined so far.
     [[nodiscard]] auto joined_multicast_groups() const noexcept -> std::span<ieee::Eui48 const>
     {
@@ -195,6 +207,9 @@ class TestPortContext
     }
 
   private:
+    /// Log a join or leave of @p group when record_memberships() named a log.
+    void note_membership(ieee::Eui48 const& group, bool joined);
+
     struct RxEntry
     {
         uint64_t pool_index;
@@ -232,6 +247,9 @@ class TestPortContext
 
     /// Multicast groups registered via join_multicast()
     std::pmr::vector<ieee::Eui48> joined_multicast_{mem_resource_};
+
+    /// The caller's log of joins and leaves (record_memberships()), or nullptr.
+    std::vector<MembershipChange>* membership_log_{nullptr};
 };
 
 /// Verify TestPortContext satisfies the EthernetPort concept at compile time
