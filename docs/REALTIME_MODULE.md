@@ -15,6 +15,8 @@ The module header groups four layers:
    `SCHED_FIFO` / `SCHED_RR`, CPU affinity, capability diagnostics,
    shutdown-signal wiring. Each operation has a `bool` legacy form, an
    `_ex` form returning `RealtimeResult`, and a `_logged` form.
+   `realtime_cpu_idle.hpp` reads a CPU's idle states and limits their exit
+   latency through PM QoS, returning `Status`.
 2. **Clock types** (`realtime_clock.hpp`, `realtime_monotonic_raw_line.hpp`)
    — `MonotonicRawClock` (`CLOCK_MONOTONIC_RAW`, the timing reference:
    stamps, deadlines, measurements), `MonotonicClock` (`CLOCK_MONOTONIC`,
@@ -43,6 +45,7 @@ error reporting stays allocation-free (raw `errno` + static
 
 - `RealtimeResult` — allocation-free result with `errno`, static `error_message`, `log_if_failed()`.
 - `RealtimeCapabilities` — snapshot from `check_realtime_capabilities()` (root, PREEMPT_RT, isolated CPUs).
+- `CpuSysfs` / `CpuIdleState` — a CPU's SMT siblings, cpuidle states and PM QoS resume-latency limit under `/sys/devices/system/cpu` (or an injected root); `parse_cpu_list()` reads a sysfs CPU list.
 - `MonotonicRawClock` / `MonotonicClock` / `GptpClock<DomainId>` / `GpsClock` / `TaiClock` — distinct `Clock<Tag>` instantiations; `ClockType` concept gates templates. `MonotonicRawClock` is the timing reference; `MonotonicClock` exists to sleep on.
 - `MonotonicRawClockAdapter` — reads `CLOCK_MONOTONIC_RAW` directly; the adapter a `Timer` keyed on the reference clock uses.
 - `MonotonicRawLine` / `MonotonicRawRateOffset` — the RAW<->MONOTONIC line: one writer samples both clocks and publishes `rate`/`offset_ns` through a seqlock; any sleeper reads it wait-free to convert a RAW deadline into a coarse MONOTONIC one.
@@ -85,6 +88,7 @@ int main()
 
 - `statusbar/realtime/realtime.hpp` — module header; consumers `#include` this.
 - `realtime_base.hpp` — `RealtimeResult`, memory locking, scheduling, affinity, diagnostics, shutdown signals.
+- `realtime_cpu_idle.hpp` — `CpuSysfs`, `CpuIdleState`, `parse_cpu_list()`, `CPU_SYSFS`.
 - `realtime_clock.hpp` — `Clock<Tag>`, concrete clock aliases, `ClockType` concepts, `TimeConversion<Clock>`, `read_monotonic_raw_ns()`.
 - `realtime_monotonic_raw_line.hpp` — `MonotonicRawLine`, `MonotonicRawRateOffset`.
 - `realtime_timer.hpp` (+ `_base.hpp` / `_config.hpp` / `_event.hpp`) — `Timer<ClockAdapterT>`, `TimerBase`, `TimerConfig`, `TimerEvent<ClockT>`, `TimerCallback<ClockT>`.
@@ -110,6 +114,7 @@ int main()
 - **Tripwire ordering.** `trigger()` / `observe()` run on the RT thread; the monitor reads coherent snapshots via `consume_event()`. First-wins latch — do not poll `has_fired()` from the monitor.
 - **ftrace.** `TraceController` touches `/sys/kernel/tracing` and needs root; with `TraceConfig::enable_tracing = false` the tripwire still fires but no kernel trace is captured.
 - **Shutdown wiring.** `realtime::shutdown_token()` returns the same `itc::StopToken&` as `itc::install_stop_signal()`. `setup_shutdown_signal_handlers()` wires `SIGINT`/`SIGTERM`/`SIGPIPE` into it; `handle_shutdown_signal()` is signal-safe.
+- **Idle-state limits.** `CpuSysfs::set_resume_latency_limit()` writes `cpuN/power/pm_qos_resume_latency_us`: the governor then picks only idle states whose exit latency is at most the limit (Documentation/admin-guide/pm/cpuidle.rst, "Power Management Quality of Service for CPUs"). A written 0 means no limit, so a 0 limit is written as `n/a`. Writing needs root; a start-up call, never from an RT thread. A CPU without cpuidle reports `no_such_file_or_directory` from `idle_states()`.
 - **Clock domains do not implicitly convert.** Conversion needs a `ClockAdapter` and a runtime time-bridge. `MonotonicRawClock` and `MonotonicClock` are the clocks readable without one, and only the former is for timing.
 
 ## Further reading
