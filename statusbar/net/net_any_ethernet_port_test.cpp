@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <span>
 #include <thread>
+#include <vector>
 
 using namespace statusbar;
 using namespace statusbar::net;
@@ -245,6 +246,24 @@ TEST(any_ethernet_port, a_test_port_captures_tx_and_returns_injected_rx)
     ieee::Eui48 const group{0x91, 0xE0, 0xF0, 0, 0, 1};
     EXPECT_TRUE(port.join_multicast(group).has_value() && test->joined_multicast_groups().size() == 1);
     EXPECT_TRUE(port.leave_multicast(group).has_value() && test->joined_multicast_groups().empty());
+}
+
+// A test port's joins and leaves go to a log its caller owns, which outlives
+// the port: what a port left before it closed stays readable
+TEST(any_ethernet_port, a_test_ports_membership_log_outlives_the_port)
+{
+    std::vector<TestPortContext::MembershipChange> log;
+    ieee::Eui48 const group{0x91, 0xE0, 0xF0, 0, 0, 2};
+    {
+        AnyEthernetPort port;
+        EXPECT_TRUE(port.open_test({.hardware_address = ieee::Eui48{0x02, 0, 0, 0, 0, 1}}).has_value());
+        port.as<TestPortContext>()->record_memberships(&log);
+        EXPECT_TRUE(port.join_multicast(group).has_value() && port.leave_multicast(group).has_value());
+        port.close();
+    }
+    EXPECT_TRUE(
+        (log ==
+         std::vector<TestPortContext::MembershipChange>{{.group = group, .joined = true}, {.group = group, .joined = false}}));
 }
 
 // The pin path reaches the xdp backend: one outside bpffs is refused as
