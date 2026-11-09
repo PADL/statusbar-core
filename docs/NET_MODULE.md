@@ -101,6 +101,7 @@ int main() {
 - `statusbar/net/net_rss.hpp` — ethtool RSS indirection: read a NIC's table, steer every bucket to one queue (`RssSteering` puts the table back when it goes out of scope), with a recorder double for tests.
 - `statusbar/net/net_rx_flow.hpp` — ethtool RX classifier rules: one EtherType or one VLAN priority steered to an RX queue (`RxFlowRule`, `RxFlowPlan`), and `RxFlowSteering`, which installs a plan's rules with an RSS table that keeps the other traffic off their queues and removes both again; `RxFlowControl` is the seam, `RxFlowEthtool` the NIC, `RxFlowRecorder` (`net_rx_flow_recorder.hpp`) the test double.
 - `statusbar/net/net_netdev_napi.hpp`, `net_carrier_watch.hpp`, `net_link_readiness.hpp` — `netdev::NapiClient`, `CarrierWatch` and `LinkWatch` (Linux-only; not in `net.hpp`).
+- `statusbar/net/net_ethtool_stats.hpp` — a driver's statistics (`ethtool -S`: `ethtool_stats`) and the per-queue packet counters among them (`queue_packets`), under igb/igc/ixgbe/ice's, i40e's and mlx5's names.
 
 ## Dependencies
 
