@@ -24,6 +24,7 @@ void TestPortContext::forget_traffic() noexcept
     rx_queue_.clear();
     tx_captures_.clear();
     joined_multicast_.clear();
+    membership_log_ = nullptr;
     reset_test_controls();
 }
 
@@ -160,6 +161,7 @@ auto TestPortContext::rx_release(uint64_t handle) -> Status
 auto TestPortContext::join_multicast(ieee::Eui48 const& mac) -> Status
 {
     joined_multicast_.push_back(mac);
+    note_membership(mac, true);
     return success();
 }
 
@@ -168,7 +170,15 @@ auto TestPortContext::leave_multicast(ieee::Eui48 const& mac) -> Status
     if (auto const it = std::ranges::find(joined_multicast_, mac); it != joined_multicast_.end()) {
         joined_multicast_.erase(it);
     }
+    note_membership(mac, false);
     return success();
+}
+
+void TestPortContext::note_membership(ieee::Eui48 const& group, bool const joined)
+{
+    if (membership_log_ != nullptr) {
+        membership_log_->push_back({.group = group, .joined = joined});
+    }
 }
 
 auto TestPortContext::holds(std::span<uint8_t const> const bytes) const noexcept -> bool
