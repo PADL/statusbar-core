@@ -15,6 +15,8 @@ The module header groups four layers:
    `SCHED_FIFO` / `SCHED_RR`, CPU affinity, capability diagnostics,
    shutdown-signal wiring. Each operation has a `bool` legacy form, an
    `_ex` form returning `RealtimeResult`, and a `_logged` form.
+   `realtime_cpu_idle.hpp` reads a CPU's idle states and limits their exit
+   latency through PM QoS, returning `Status`.
 2. **Clock types** (`realtime_clock.hpp`, `realtime_monotonic_raw_line.hpp`)
    — `MonotonicRawClock` (`CLOCK_MONOTONIC_RAW`, the timing reference:
    stamps, deadlines, measurements), `MonotonicClock` (`CLOCK_MONOTONIC`,
@@ -53,6 +55,7 @@ error reporting stays allocation-free (raw `errno` + static
 
 - `RealtimeResult` — allocation-free result with `errno`, static `error_message`, `log_if_failed()`.
 - `RealtimeCapabilities` — snapshot from `check_realtime_capabilities()` (root, PREEMPT_RT, isolated CPUs).
+- `CpuSysfs` / `CpuIdleState` — a CPU's SMT siblings, cpuidle states and PM QoS resume-latency limit under `/sys/devices/system/cpu` (or an injected root); `parse_cpu_list()` reads a sysfs CPU list.
 - `MonotonicRawClock` / `MonotonicClock` / `GptpClock<DomainId>` / `UtcClock` / `TaiClock` — distinct `Clock<Tag>` instantiations; `ClockType` concept gates templates. `MonotonicRawClock` is the timing reference; `MonotonicClock` exists to sleep on.
 - `Nanoseconds` — the one duration type every clock counts in, so a period can be added to a schedule in any domain.
 - `read_monotonic_raw()` / `read_monotonic()` / `sleep_until_monotonic()` — the typed clock reads and the typed sleep; the `_ns` forms beside them in `realtime_clock.hpp` are the bare counts underneath.
@@ -111,6 +114,7 @@ int main()
 
 - `statusbar/realtime/realtime.hpp` — module header; consumers `#include` this.
 - `realtime_base.hpp` — `RealtimeResult`, memory locking, scheduling, affinity, diagnostics, shutdown signals.
+- `realtime_cpu_idle.hpp` — `CpuSysfs`, `CpuIdleState`, `parse_cpu_list()`, `CPU_SYSFS`.
 - `realtime_clock.hpp` — `Clock<Tag>`, concrete clock aliases, `Nanoseconds`, the `ClockType` concept, the declarations of the clock reads and the sleep, `ClockQuality`, `BoundedTime`, `ClockSource`, `ClockAdapter`, `MonotonicRawClockAdapter`, `ClockAdapterType`. No operating-system includes.
 - `realtime_clock.cpp` — the platform's clock reads and sleep; the one file to port.
 - `realtime_utc_clock.hpp` — `UtcClockQualityTracker`.
@@ -142,6 +146,7 @@ int main()
 - **Tripwire ordering.** `trigger()` / `observe()` run on the RT thread; the monitor reads coherent snapshots via `consume_event()`. First-wins latch — do not poll `has_fired()` from the monitor.
 - **ftrace.** `TraceController` touches `/sys/kernel/tracing` and needs root; with `TraceConfig::enable_tracing = false` the tripwire still fires but no kernel trace is captured.
 - **Shutdown wiring.** `realtime::shutdown_token()` returns the same `itc::StopToken&` as `itc::install_stop_signal()`. `setup_shutdown_signal_handlers()` wires `SIGINT`/`SIGTERM`/`SIGPIPE` into it; `handle_shutdown_signal()` is signal-safe.
+- **Idle-state limits.** `CpuSysfs::set_resume_latency_limit()` writes `cpuN/power/pm_qos_resume_latency_us`: the governor then picks only idle states whose exit latency is at most the limit (Documentation/admin-guide/pm/cpuidle.rst, "Power Management Quality of Service for CPUs"). A written 0 means no limit, so a 0 limit is written as `n/a`. Writing needs root; a start-up call, never from an RT thread. A CPU without cpuidle reports `no_such_file_or_directory` from `idle_states()`.
 - **Clock domains do not implicitly convert.** Conversion needs a `ClockAdapter` and a runtime time-bridge, or the `MonotonicRawLine` between the two local clocks. `MonotonicRawClock` and `MonotonicClock` are the clocks readable without a bridge, and only the former is for timing.
 - **Every timer waits on RAW.** There is no `CLOCK_MONOTONIC`-scheduled timer: `CLOCK_MONOTONIC` appears only inside the wait, as the clock the coarse sleep is made on.
 - **Coasting, not a health flag.** A source that has lost its master keeps its rate and offset, and its `ClockQuality` grows from the last sync at its drift bound. A timer waits for the first sync only; after that it keeps its schedule and tells each wake the accuracy. The user of the time compares the accuracy with its own limit. Two things stay hard events: a source that never synchronized is unbounded, and a new timeline changes the `epoch`.

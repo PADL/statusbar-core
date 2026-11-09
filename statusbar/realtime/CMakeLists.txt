@@ -8,6 +8,7 @@ statusbar_add_module(
   realtime_base.cpp
   realtime_base_impl.cpp
   realtime_clock.cpp
+  realtime_cpu_idle.cpp
   realtime_monotonic_raw_line.cpp
   realtime_timer_base.cpp
   realtime_timer_impl.cpp
@@ -23,6 +24,7 @@ statusbar_add_module(
   realtime_accuracy_limit_test.cpp
   realtime_base_test.cpp
   realtime_clock_test.cpp
+  realtime_cpu_idle_test.cpp
   realtime_monotonic_raw_line_test.cpp
   realtime_stats_test.cpp
   realtime_timer_test.cpp
@@ -46,3 +48,5 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # libgcc_s).
   target_link_options(realtime_timer_example PRIVATE -static-libgcc)
 endif()
+
+add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/realtime_cpu_list_fuzzer.cpp)
