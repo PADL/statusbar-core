@@ -196,7 +196,7 @@ void LinkReadiness::apply_link(LinkCarrier const& link) noexcept
 
 void LinkReadiness::apply_qdisc_change(int64_t const now_ns) noexcept
 {
-    // A reset is judged from the latest change: one before it does not count, but a carrier down now does.
+    // A reset is checked against the latest change only: one before it does not count, but a carrier down now does.
     qdisc_change_ns_ = now_ns;
     baseline_down_count_ = baseline_down_count_.transform([this](uint32_t) { return link_.down_count; });
     carrier_lost_ = reported() && !link_.carrier;
