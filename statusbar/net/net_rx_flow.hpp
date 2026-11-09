@@ -48,12 +48,14 @@ struct RxFlowRange
     }
 };
 
-/// What RxFlowSteering installs: rules within `locations`, and RSS kept off `rss_excluded`.
+/// What RxFlowSteering installs: rules within `locations`, and RSS kept off `rss_excluded`; `ntuple`
+/// turns the ntuple flag on first (igb needs it for VLAN priority rules; igc honours rules without it).
 struct RxFlowPlan
 {
     RxFlowRange locations;
     std::vector<RxFlowRule> rules;
     std::vector<uint32_t> rss_excluded;
+    bool ntuple{true};
 };
 
 /// Whether the interface's ntuple filters are on (ETHTOOL_GFLAGS, ETH_FLAG_NTUPLE). No privilege.
@@ -80,7 +82,8 @@ struct RxFlowPlan
 
 namespace detail {
 
-/// `invalid_argument` unless every rule lies in the plan's range and every queue is below `rx_queues`.
+/// `invalid_argument` unless every rule lies in the plan's range, matches on an EtherType or a VLAN
+/// priority (igc reads a rule on neither as its default-queue wildcard) and every queue is below `rx_queues`.
 [[nodiscard]] auto check_rx_flow_plan(RxFlowPlan const& plan, uint32_t rx_queues) -> Status;
 
 #if defined(__linux__)
@@ -148,10 +151,9 @@ class RxFlowEthtool final : public RxFlowControl
 [[nodiscard]] auto clear_rx_flow_rules(RxFlowControl& control, std::string_view interface_name, RxFlowRange range)
     -> StatusValue<size_t>;
 
-/// Holds a plan's rules and RSS table installed on an interface, and removes them again.
-///
-/// steer() first clears the plan's range (a previous owner's leftovers; their RSS table goes back to
-/// the driver's default), turns ntuple on if it is off, inserts the rules, then writes the RSS table.
+/// Holds a plan's rules and RSS table on an interface: steer() clears the plan's range of a previous
+/// owner's leftovers, turns ntuple on if the plan asks, inserts the rules and writes the RSS table.
+/// ntuple is never turned off again: igb and igc reset the adapter (and igb its PHC) for it.
 class RxFlowSteering
 {
   public:
@@ -160,6 +162,8 @@ class RxFlowSteering
     ~RxFlowSteering();
 
     RxFlowSteering(RxFlowSteering&& other) noexcept;
+    /// Assigning a guard for the same interface and range over a live one hands the old one's RSS
+    /// table to the new one (its sweep removed the old rules); otherwise the old one restores first.
     auto operator=(RxFlowSteering&& other) noexcept -> RxFlowSteering&;
     RxFlowSteering(RxFlowSteering const&) = delete;
     auto operator=(RxFlowSteering const&) -> RxFlowSteering& = delete;
@@ -169,7 +173,8 @@ class RxFlowSteering
     [[nodiscard]] static auto steer(RxFlowControl& flows, RssControl& rss, std::string_view interface_name, RxFlowPlan plan)
         -> StatusValue<RxFlowSteering>;
 
-    /// The RSS table back, the rules removed, ntuple off again if steer() turned it on. Tried once:
+    /// The RSS table back (the driver's default after a previous owner's leftovers) and the rules
+    /// removed; ntuple stays as it is. Tried once:
     /// the first failure is returned and nothing more is owed.
     [[nodiscard]] auto restore() -> Status;
 
@@ -180,7 +185,7 @@ class RxFlowSteering
     [[nodiscard]] auto holds() const noexcept -> bool { return flows_ != nullptr; }
     /// How many rules a previous owner had left in the range.
     [[nodiscard]] auto leftovers() const noexcept -> size_t { return leftovers_; }
-    /// Whether steer() turned ntuple on.
+    /// Whether steer() turned ntuple on (it stays on).
     [[nodiscard]] auto enabled_ntuple() const noexcept -> bool { return enabled_ntuple_; }
     /// Whether steer() wrote an RSS table.
     [[nodiscard]] auto wrote_rss() const noexcept -> bool { return !previous_.empty(); }
@@ -197,6 +202,8 @@ class RxFlowSteering
     [[nodiscard]] auto write_rss(RssIndirection const& wanted, RssIndirection current) -> Status;
     [[nodiscard]] auto install() -> Status;
     [[nodiscard]] auto restore_rss() -> Status;
+    auto adopt_debt(RxFlowSteering& successor) noexcept -> void;
+    auto move_from(RxFlowSteering& other) noexcept -> void;
     [[nodiscard]] auto remove_rules() -> Status;
 
     RxFlowControl* flows_{nullptr};
@@ -208,6 +215,7 @@ class RxFlowSteering
     size_t leftovers_{0};
     uint32_t rx_queues_{0};
     bool enabled_ntuple_{false};
+    bool default_rss_on_restore_{false};
 };
 
 }  // namespace statusbar::net

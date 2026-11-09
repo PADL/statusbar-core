@@ -118,6 +118,13 @@ TEST(net_rx_flow, a_plan_outside_its_range_or_queues_is_refused)
     EXPECT_TRUE(detail::check_rx_flow_plan(plan(), 4).has_value());
 }
 
+TEST(net_rx_flow, a_rule_matching_nothing_is_refused)
+{
+    auto wildcard = plan();
+    wildcard.rules.push_back(RxFlowRule{.location = 15, .queue = 1});
+    EXPECT_FALSE(detail::check_rx_flow_plan(wildcard, 4).has_value());
+}
+
 // RxFlowSteering
 
 TEST(net_rx_flow_steering, steering_installs_the_rules_ntuple_and_the_spread)
@@ -146,9 +153,25 @@ TEST(net_rx_flow_steering, a_restore_leaves_the_nic_as_it_was)
         EXPECT_FALSE(steered->holds());
     }
     EXPECT_TRUE(flows.rules().empty());
-    EXPECT_FALSE(flows.ntuple_flag());
+    EXPECT_TRUE(flows.ntuple_flag());
+    EXPECT_EQ(flows.ntuple_writes(), size_t{1});
     EXPECT_EQ(rss.table(), spread_table());
     EXPECT_EQ(rss.writes().size(), size_t{2});
+}
+
+TEST(net_rx_flow_steering, a_plan_without_ntuple_leaves_the_flag_alone)
+{
+    RxFlowRecorder flows;
+    RssRecorder rss;
+    rss.set_table(spread_table());
+    auto unflagged = plan();
+    unflagged.ntuple = false;
+    {
+        auto steered = RxFlowSteering::steer(flows, rss, "eth0", unflagged);
+        EXPECT_EQ(flows.rules().size(), size_t{3});
+    }
+    EXPECT_FALSE(flows.ntuple_flag());
+    EXPECT_EQ(flows.ntuple_writes(), size_t{0});
 }
 
 TEST(net_rx_flow_steering, ntuple_already_on_is_left_on)
@@ -166,7 +189,7 @@ TEST(net_rx_flow_steering, ntuple_already_on_is_left_on)
     EXPECT_TRUE(flows.rules().empty());
 }
 
-TEST(net_rx_flow_steering, leftovers_in_the_range_are_removed_and_the_table_reset)
+TEST(net_rx_flow_steering, leftovers_are_removed_and_their_table_reset_at_restore)
 {
     RxFlowRecorder flows;
     flows.place(RxFlowRule{.location = 15, .queue = 1, .ethertype = 0x22ea});
@@ -174,10 +197,62 @@ TEST(net_rx_flow_steering, leftovers_in_the_range_are_removed_and_the_table_rese
     RssRecorder rss;
     rss.set_table(RssIndirection{1, 2, 1, 2});
     auto steered = RxFlowSteering::steer(flows, rss, "eth0", plan());
-    EXPECT_TRUE(steered.has_value());
     EXPECT_EQ(steered->leftovers(), size_t{1});
-    EXPECT_TRUE(rss.writes()[0].table.empty());
+    EXPECT_TRUE(rss.writes().empty());
     EXPECT_EQ(flows.rules().size(), size_t{4});
+    EXPECT_TRUE(steered->restore().has_value());
+    EXPECT_TRUE(rss.writes().back().table.empty());
+}
+
+TEST(net_rx_flow_steering, an_administrators_table_survives_leftovers_and_a_refusal)
+{
+    RxFlowRecorder flows;
+    flows.place(RxFlowRule{.location = 15, .queue = 1, .ethertype = 0x22ea});
+    flows.fail_insert_after(1, std::make_error_code(std::errc::invalid_argument));
+    RssRecorder rss;
+    rss.set_table(RssIndirection{3, 3, 2, 2});
+    EXPECT_FALSE(RxFlowSteering::steer(flows, rss, "eth0", plan()).has_value());
+    EXPECT_TRUE(rss.writes().empty());
+    EXPECT_EQ(rss.table(), (RssIndirection{3, 3, 2, 2}));
+}
+
+TEST(net_rx_flow_steering, an_administrators_table_comes_back_after_leftovers)
+{
+    RxFlowRecorder flows;
+    flows.place(RxFlowRule{.location = 15, .queue = 1, .ethertype = 0x22ea});
+    RssRecorder rss;
+    rss.set_table(RssIndirection{3, 3, 2, 2});
+    {
+        auto steered = RxFlowSteering::steer(flows, rss, "eth0", plan());
+        EXPECT_EQ(rss.table(), (RssIndirection{1, 2, 1, 2}));
+    }
+    EXPECT_EQ(rss.table(), (RssIndirection{3, 3, 2, 2}));
+}
+
+TEST(net_rx_flow_steering, a_resized_table_is_refused_at_restore_and_the_rules_still_go)
+{
+    RxFlowRecorder flows;
+    RssRecorder rss;
+    rss.set_table(spread_table());
+    auto steered = RxFlowSteering::steer(flows, rss, "eth0", plan());
+    rss.set_table(RssIndirection{1, 2, 1, 2});
+    EXPECT_EQ(steered->restore().error(), std::make_error_code(std::errc::state_not_recoverable));
+    EXPECT_TRUE(flows.rules().empty());
+    EXPECT_EQ(rss.table(), (RssIndirection{1, 2, 1, 2}));
+}
+
+TEST(net_rx_flow_steering, a_guard_assigned_over_one_for_the_same_range_keeps_its_rules)
+{
+    RxFlowRecorder flows;
+    RssRecorder rss;
+    rss.set_table(spread_table());
+    auto first = RxFlowSteering::steer(flows, rss, "eth0", plan());
+    auto second = RxFlowSteering::steer(flows, rss, "eth0", plan());
+    *first = std::move(*second);
+    EXPECT_EQ(flows.rules().size(), size_t{3});
+    EXPECT_TRUE(first->restore().has_value());
+    EXPECT_TRUE(flows.rules().empty());
+    EXPECT_EQ(rss.table(), spread_table());
 }
 
 TEST(net_rx_flow_steering, a_refused_rule_undoes_the_ones_before_it)
@@ -189,7 +264,7 @@ TEST(net_rx_flow_steering, a_refused_rule_undoes_the_ones_before_it)
     auto steered = RxFlowSteering::steer(flows, rss, "eth0", plan());
     EXPECT_EQ(steered.error(), std::make_error_code(std::errc::invalid_argument));
     EXPECT_TRUE(flows.rules().empty());
-    EXPECT_FALSE(flows.ntuple_flag());
+    EXPECT_TRUE(flows.ntuple_flag());
     EXPECT_EQ(rss.table(), spread_table());
 }
 

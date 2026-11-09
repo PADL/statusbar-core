@@ -38,7 +38,8 @@ namespace detail {
 auto check_rx_flow_plan(RxFlowPlan const& plan, uint32_t const rx_queues) -> Status
 {
     bool const rules_fit = std::ranges::all_of(plan.rules, [&plan, rx_queues](RxFlowRule const& rule) {
-        return plan.locations.contains(rule.location) && rule.queue < rx_queues;
+        bool const matches = rule.ethertype.has_value() || rule.vlan_pcp.has_value();
+        return matches && plan.locations.contains(rule.location) && rule.queue < rx_queues;
     });
     bool const excluded_fit =
         std::ranges::all_of(plan.rss_excluded, [rx_queues](uint32_t const queue) { return queue < rx_queues; });
@@ -272,26 +273,48 @@ RxFlowSteering::RxFlowSteering(RxFlowSteering&& other) noexcept
     , leftovers_{other.leftovers_}
     , rx_queues_{other.rx_queues_}
     , enabled_ntuple_{other.enabled_ntuple_}
+    , default_rss_on_restore_{other.default_rss_on_restore_}
 {
     other.release();
 }
 
 auto RxFlowSteering::operator=(RxFlowSteering&& other) noexcept -> RxFlowSteering&
 {
-    if (this != &other) {  // NOLINT(statusbar-block-statements): a member-wise move
-        (void)restore();
-        flows_ = other.flows_;
-        rss_ = other.rss_;
-        interface_ = std::move(other.interface_);
-        plan_ = std::move(other.plan_);
-        previous_ = std::move(other.previous_);
-        inserted_ = other.inserted_;
-        leftovers_ = other.leftovers_;
-        rx_queues_ = other.rx_queues_;
-        enabled_ntuple_ = other.enabled_ntuple_;
-        other.release();
+    if (this == &other) {
+        return *this;
     }
+    bool const same_owner = holds() && other.holds() && interface_ == other.interface_ &&
+        plan_.locations.first == other.plan_.locations.first && plan_.locations.count == other.plan_.locations.count;
+    if (same_owner) {
+        adopt_debt(other);  // the successor's sweep removed our rules: only our RSS debt is left
+    }
+    (void)restore();
+    move_from(other);
     return *this;
+}
+
+auto RxFlowSteering::adopt_debt(RxFlowSteering& successor) noexcept -> void
+{
+    if (!previous_.empty() || default_rss_on_restore_) {
+        successor.previous_ = std::move(previous_);
+        successor.default_rss_on_restore_ = default_rss_on_restore_;
+    }
+    release();
+}
+
+auto RxFlowSteering::move_from(RxFlowSteering& other) noexcept -> void
+{  // NOLINT(statusbar-block-statements): a member-wise move
+    flows_ = other.flows_;
+    rss_ = other.rss_;
+    interface_ = std::move(other.interface_);
+    plan_ = std::move(other.plan_);
+    previous_ = std::move(other.previous_);
+    inserted_ = other.inserted_;
+    leftovers_ = other.leftovers_;
+    rx_queues_ = other.rx_queues_;
+    enabled_ntuple_ = other.enabled_ntuple_;
+    default_rss_on_restore_ = other.default_rss_on_restore_;
+    other.release();
 }
 
 RxFlowSteering::~RxFlowSteering()
@@ -309,6 +332,7 @@ auto RxFlowSteering::release() noexcept -> void
     previous_.clear();
     inserted_ = 0;
     enabled_ntuple_ = false;
+    default_rss_on_restore_ = false;
 }
 
 auto RxFlowSteering::clear_leftovers() -> Status
@@ -318,20 +342,17 @@ auto RxFlowSteering::clear_leftovers() -> Status
         return failure(removed.error());
     }
     leftovers_ = *removed;
-    if (leftovers_ != 0) {
-        (void)rss_->set_indirection(interface_, {});  // their table was the owner's too: the driver's default
-    }
     return success();
 }
 
 auto RxFlowSteering::enable_ntuple() -> Status
 {
-    auto const enabled = flows_->ntuple(interface_);
-    if (!enabled) {
-        return failure(enabled.error());
-    }
-    if (*enabled) {
+    if (!plan_.ntuple) {
         return success();
+    }
+    auto const enabled = flows_->ntuple(interface_);
+    if (!enabled || *enabled) {
+        return enabled.transform([](bool) {});
     }
     if (auto const status = flows_->set_ntuple(interface_, true); !status) {
         return status;
@@ -360,6 +381,7 @@ auto RxFlowSteering::steer_rss() -> Status
     }
     auto const wanted = rss_indirection_excluding(current->size(), rx_queues_, plan_.rss_excluded);
     if (wanted.empty() || wanted == *current) {
+        default_rss_on_restore_ = leftovers_ != 0;  // already spread so by the owner that left them
         return success();
     }
     return write_rss(wanted, std::move(*current));
@@ -409,7 +431,7 @@ auto RxFlowSteering::steer(RxFlowControl& flows, RssControl& rss, std::string_vi
 auto RxFlowSteering::restore_rss() -> Status
 {
     if (previous_.empty()) {
-        return success();
+        return default_rss_on_restore_ ? rss_->set_indirection(interface_, {}) : success();
     }
     auto const current = rss_->indirection(interface_);
     if (current && current->size() != previous_.size()) {
@@ -437,10 +459,6 @@ auto RxFlowSteering::restore() -> Status
     Status result = restore_rss();
     if (auto const status = remove_rules(); !status && result) {
         result = status;
-    }
-    if (enabled_ntuple_) {
-        auto const status = flows_->set_ntuple(interface_, false);
-        result = result ? status : result;
     }
     release();
     return result;
