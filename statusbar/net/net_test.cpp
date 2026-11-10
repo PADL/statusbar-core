@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -24,6 +25,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #include <netinet/in.h>
@@ -1678,6 +1680,35 @@ TEST(net_reactor, clock_injection_consistent)
     // Both ports should see the same timestamp
     EXPECT_EQ(pa->last_now_ns(), int64_t{42});
     EXPECT_EQ(pb->last_now_ns(), int64_t{42});
+}
+
+TEST(net_reactor, handlers_see_the_time_after_poll_returns)
+{
+    // The clock advances while poll() waits: dispatch and tick both see the later time, read once.
+    itc::StopToken stop{};
+    std::atomic<int64_t> fake_time{100};
+    int clock_reads = 0;
+    auto clock = [&]() -> int64_t {
+        ++clock_reads;
+        return fake_time.load();
+    };
+
+    auto mock = std::make_unique<MockPollable>();
+    auto* ptr = mock.get();
+    MessageReactor reactor{stop, clock, 0};
+    reactor.add(std::move(mock));
+
+    std::thread writer{[&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        fake_time = 200;
+        ptr->make_readable();
+    }};
+    EXPECT_TRUE(reactor.poll_once(5000));
+    writer.join();
+    EXPECT_EQ(ptr->on_ready_count(), 1);
+    EXPECT_EQ(ptr->tick_count(), 1);
+    EXPECT_EQ(ptr->last_now_ns(), int64_t{200});
+    EXPECT_EQ(clock_reads, 1);
 }
 
 TEST(net_reactor, finished_port_removed)

@@ -12,7 +12,7 @@ calls `poll()` once per cycle, and dispatches `on_ready` /
 `on_writable` / `tick` callbacks with a nanosecond timestamp from
 an injected clock: the control-plane clock (`monotonic_ns` is
 `std::chrono::steady_clock`, the same clock as `sm::Clock`), read once
-per cycle and told to every port. Buffers and queue capacities are
+per cycle after `poll()` returns and told to every port. Buffers and queue capacities are
 fixed at construction — nothing on the hot path allocates.
 
 The socket layer adds RAII (`FileDescriptor`), an IPv4/IPv6 address
