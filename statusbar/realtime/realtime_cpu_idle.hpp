@@ -44,8 +44,12 @@ class CpuSysfs
     [[nodiscard]] auto idle_states(int cpu) const -> StatusValue<std::vector<CpuIdleState>>;
 
     /// Lets `cpu` enter only idle states whose exit latency is at most `limit_us` (`power/pm_qos_resume_latency_us`);
-    /// 0 is written as "n/a", since a written 0 lifts the limit. The write's error when it fails.
+    /// 0 is written as "n/a", since a written 0 lifts the limit. It outlives the process. The write's error.
     [[nodiscard]] auto set_resume_latency_limit(int cpu, uint32_t limit_us) const -> Status;
+
+    /// Lifts `cpu`'s resume-latency limit (writes "0"), as a caller of set_resume_latency_limit() does at stop.
+    /// The write's error when it fails.
+    [[nodiscard]] auto clear_resume_latency_limit(int cpu) const -> Status;
 
   private:
     [[nodiscard]] auto cpu_path(int cpu, std::string_view file) const -> std::string;
