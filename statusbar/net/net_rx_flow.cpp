@@ -308,10 +308,14 @@ auto RxFlowSteering::move_from(RxFlowSteering& other) noexcept -> void
 
 RxFlowSteering::~RxFlowSteering()
 {
+#if __cpp_exceptions
     try {
+#endif
         (void)restore();
+#if __cpp_exceptions
     } catch (...) {  // NOLINT(bugprone-empty-catch) a destructor has nobody to report to
     }
+#endif
 }
 
 auto RxFlowSteering::release() noexcept -> void
