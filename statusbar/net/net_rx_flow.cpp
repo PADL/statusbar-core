@@ -11,8 +11,6 @@
 #    include "statusbar/net/net_posix_util.hpp"
 
 #    include <arpa/inet.h>
-#    include <linux/sockios.h>
-#    include <net/if.h>
 #endif
 
 namespace statusbar::net {
@@ -132,15 +130,6 @@ auto rule_of(ethtool_rx_flow_spec const& spec) noexcept -> RxFlowRule
 
 namespace {
 
-/// Hand `payload` to SIOCETHTOOL as the ifr_data payload.
-template <typename Payload>
-[[nodiscard]] auto ethtool_ioctl(std::string_view const interface_name, Payload& payload) -> Status
-{
-    ifreq request{};
-    set_ifr_data(request, &payload);
-    return ifreq_ioctl(interface_name, SIOCETHTOOL, request);
-}
-
 /// A classifier request: `cmd` at `location`.
 [[nodiscard]] auto rule_request(uint32_t const cmd, uint32_t const location) noexcept -> ethtool_rxnfc
 {
@@ -154,7 +143,7 @@ template <typename Payload>
 [[nodiscard]] auto ethtool_flags(std::string_view const interface_name) -> StatusValue<uint32_t>
 {
     ethtool_value value{.cmd = ETHTOOL_GFLAGS, .data = 0};
-    if (auto const status = ethtool_ioctl(interface_name, value); !status) {
+    if (auto const status = ethtool_ioctl(interface_name, &value); !status) {
         return failure(status.error());
     }
     return value.data;
@@ -175,13 +164,13 @@ auto set_ntuple(std::string_view const interface_name, bool const enabled) -> St
     }
     uint32_t const others = *flags & ~uint32_t{ETH_FLAG_NTUPLE};
     ethtool_value value{.cmd = ETHTOOL_SFLAGS, .data = enabled ? (others | ETH_FLAG_NTUPLE) : others};
-    return ethtool_ioctl(interface_name, value);
+    return ethtool_ioctl(interface_name, &value);
 }
 
 auto rx_flow_rule(std::string_view const interface_name, uint32_t const location) -> StatusValue<std::optional<RxFlowRule>>
 {
     auto nfc = rule_request(ETHTOOL_GRXCLSRULE, location);
-    auto const status = ethtool_ioctl(interface_name, nfc);
+    auto const status = ethtool_ioctl(interface_name, &nfc);
     if (!status && (status.error() == std::errc::invalid_argument || status.error() == std::errc::no_such_file_or_directory)) {
         return std::optional<RxFlowRule>{};  // igb and igc answer EINVAL for an empty slot, others ENOENT
     }
@@ -195,13 +184,13 @@ auto insert_rx_flow_rule(std::string_view const interface_name, RxFlowRule const
 {
     auto nfc = rule_request(ETHTOOL_SRXCLSRLINS, rule.location);
     nfc.fs = detail::flow_spec_of(rule);
-    return ethtool_ioctl(interface_name, nfc);
+    return ethtool_ioctl(interface_name, &nfc);
 }
 
 auto delete_rx_flow_rule(std::string_view const interface_name, uint32_t const location) -> Status
 {
     auto nfc = rule_request(ETHTOOL_SRXCLSRLDEL, location);
-    return ethtool_ioctl(interface_name, nfc);
+    return ethtool_ioctl(interface_name, &nfc);
 }
 
 #else  // !__linux__

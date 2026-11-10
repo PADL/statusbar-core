@@ -14,8 +14,6 @@
 #    include "statusbar/net/net_posix_util.hpp"
 
 #    include <linux/ethtool.h>
-#    include <linux/sockios.h>
-#    include <net/if.h>
 #endif
 
 namespace statusbar::net {
@@ -132,14 +130,6 @@ struct StatsHeader
 static_assert(sizeof(StringsHeader) == sizeof(struct ::ethtool_gstrings));
 static_assert(sizeof(StatsHeader) == sizeof(struct ::ethtool_stats));
 
-/// Hand `buffer` to SIOCETHTOOL as the ifr_data payload (operator new's alignment suits its u64 data).
-auto ethtool_buffer(std::string_view const interface_name, std::vector<uint8_t>& buffer) -> Status
-{
-    ifreq request{};
-    set_ifr_data(request, buffer.data());
-    return ifreq_ioctl(interface_name, SIOCETHTOOL, request);
-}
-
 /// SIOCETHTOOL of `header` and `payload` zeroed bytes after it: the buffer as the driver left it, `header` read
 /// back from it.
 template <typename Header>
@@ -148,7 +138,7 @@ auto ethtool_request(std::string_view const interface_name, Header& header, size
 {
     std::vector<uint8_t> buffer(sizeof(Header) + payload, 0);
     span_copy(make_span(buffer).first(sizeof(Header)), make_const_span(header));
-    if (auto const status = ethtool_buffer(interface_name, buffer); !status) {
+    if (auto const status = ethtool_ioctl(interface_name, buffer.data()); !status) {
         return failure(status.error());
     }
     span_copy(make_span(header), make_const_span(buffer).first(sizeof(Header)));
