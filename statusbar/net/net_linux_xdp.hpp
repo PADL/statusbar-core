@@ -1591,6 +1591,22 @@ class BpfState
 /// @param fd An open AF_XDP socket descriptor
 [[nodiscard]] auto read_xdp_kernel_stats(int fd) -> StatusValue<XdpKernelStats>;
 
+/// The AF_PACKET socket an XdpContext takes its multicast memberships on.
+/// Protocol 0, so it receives nothing; it exists for PACKET_ADD_MEMBERSHIP
+/// and PACKET_DROP_MEMBERSHIP, which the kernel counts per socket and per
+/// group and lets go of when the socket closes -- the same ownership the
+/// rawnet and mmap backends have through their own sockets. Needs
+/// CAP_NET_RAW, which AF_XDP needs anyway.
+[[nodiscard]] auto open_membership_socket() -> StatusValue<FileDescriptor>;
+
+/// Add (@p optname PACKET_ADD_MEMBERSHIP) or drop (PACKET_DROP_MEMBERSHIP)
+/// one membership of @p addr on interface @p if_index through @p fd. A
+/// repeated add raises the socket's count for the group without touching
+/// the NIC again, a drop lowers it and the NIC entry goes when the count
+/// does. Dropping a group the socket does not hold is a no-op the kernel
+/// answers with success.
+[[nodiscard]] auto change_membership(int fd, unsigned int if_index, ieee::Eui48 const& addr, int optname) -> Status;
+
 }  // namespace detail
 
 class XdpContext
@@ -1784,10 +1800,22 @@ class XdpContext
     /// @param rules New filter rules to replace existing entries
     [[nodiscard]] auto set_rules(std::span<CompiledRule<32> const> rules) -> Status { return bpf_.set_rules(rules); }
 
+    /// Join a multicast group to receive frames sent to the given address.
+    /// The membership belongs to this context: it is counted per group (two
+    /// joins need two leaves), it is dropped by close(), and it dies with
+    /// the process. Earlier versions set the NIC's filter directly
+    /// (SIOCADDMULTI), one uncounted bit with no owner, which outlived a
+    /// killed process and which one leave cleared for every user. Two
+    /// consequences of the counting: a repeated join raises the count and
+    /// no longer rewrites the NIC's table, so a lost table entry is repaired
+    /// by leaving and joining again, not by joining again; and leaving a
+    /// group this context does not hold succeeds silently (the kernel's
+    /// answer; SIOCDELMULTI used to fail).
     /// @param addr Multicast MAC address to join
     [[nodiscard]] auto join_multicast(ieee::Eui48 const& addr) -> Status;
 
-    /// Drop a NIC multicast filter entry added with join_multicast().
+    /// Drop one membership taken with join_multicast(); see there for what
+    /// leaving a group not held does.
     [[nodiscard]] auto leave_multicast(ieee::Eui48 const& addr) -> Status;
 
     /// The socket's counters, as of now. See XdpSocketStats on what a reader
@@ -1866,6 +1894,7 @@ class XdpContext
         std::swap(program_, other.program_);
         std::swap(bind_retries_, other.bind_retries_);
         std::swap(tx_frame_reserve_, other.tx_frame_reserve_);
+        std::swap(membership_fd_, other.membership_fd_);
         bool const mine = tx_pending_.load(std::memory_order_relaxed);
         tx_pending_.store(other.tx_pending_.load(std::memory_order_relaxed), std::memory_order_relaxed);
         other.tx_pending_.store(mine, std::memory_order_relaxed);
@@ -1890,6 +1919,10 @@ class XdpContext
     /// detail::effective_tx_reserve() of the configured reserve, settled at
     /// open() so fill_replenish() does not recompute it per cycle.
     size_t tx_frame_reserve_{0};
+    /// The socket the multicast memberships are held on; opened by the
+    /// first join_multicast(), closed with the context. See
+    /// detail::open_membership_socket().
+    FileDescriptor membership_fd_{};
     /// Frames are in the TX ring that the kernel has not been kicked for.
     /// Set by tx_commit(), cleared only by a kick the kernel accepted.
     /// Frames submitted since the last kick that got through. Atomic so a

@@ -8,6 +8,7 @@
 
 #if defined(__linux__) && defined(HAVE_XDP)
 #    include <linux/genetlink.h>
+#    include <linux/if_packet.h>
 #    include <linux/magic.h>
 #    include <linux/netlink.h>
 #    include <sys/stat.h>
@@ -1353,6 +1354,7 @@ void XdpContext::close() noexcept
 
     bpf_.close();
     umem_.close();
+    membership_fd_.close();  // and with it every membership this context held
 
     zero_copy_ = false;
     tx_pending_.store(false, std::memory_order_relaxed);
@@ -1719,41 +1721,47 @@ auto XdpContext::fill_replenish() -> Status
     return success();
 }
 
-namespace {
+namespace detail {
 
-// SIOCADDMULTI and SIOCDELMULTI take the same ifreq: the interface name
-// and the group as a hardware address. One routine for both, with the
-// request selecting the direction.
-auto change_multicast_membership(unsigned int const if_index, ieee::Eui48 const& addr, unsigned long const request) -> Status
+auto open_membership_socket() -> StatusValue<FileDescriptor>
 {
-    struct ifreq ifr{};
-    if (::if_indextoname(if_index, ifr.ifr_name) == nullptr) {
-        return failure(XdpError::interface_not_found);
-    }
-    span_copy(hwaddr_bytes(ifr), make_const_span(addr.value));
-    ifr.ifr_hwaddr.sa_family = AF_UNSPEC;
-
-    int sock_fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock_fd < 0) {
+    // Protocol 0: bound to no EtherType, so the kernel never queues a frame
+    // to it. It is a handle for memberships and nothing else.
+    int const fd = ::socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
         return failure(XdpError::socket_creation_failed);
     }
-    auto close_sock = detail::scopeguard([&]() noexcept { ::close(sock_fd); });
+    return FileDescriptor{fd};
+}
 
-    if (::ioctl(sock_fd, request, &ifr) < 0) {
+auto change_membership(int fd, unsigned int if_index, ieee::Eui48 const& addr, int optname) -> Status
+{
+    struct packet_mreq mreq{};
+    mreq.mr_ifindex = static_cast<int>(if_index);
+    mreq.mr_type = PACKET_MR_MULTICAST;
+    mreq.mr_alen = 6;
+    span_copy(std::span{mreq.mr_address}.first(6), make_const_span(addr.value));
+    if (::setsockopt(fd, SOL_PACKET, optname, &mreq, sizeof(mreq)) < 0) {
         return failure(XdpError::join_multicast_failed);
     }
-
     return success();
 }
 
-}  // namespace
+}  // namespace detail
 
 auto XdpContext::join_multicast(ieee::Eui48 const& addr) -> Status
 {
     if (xsk_ == nullptr) {
         return failure(XdpError::not_open);
     }
-    return change_multicast_membership(interface_.index, addr, SIOCADDMULTI);
+    if (!membership_fd_.valid()) {
+        auto sock = detail::open_membership_socket();
+        if (!sock) {
+            return failure(sock.error());
+        }
+        membership_fd_ = std::move(*sock);
+    }
+    return detail::change_membership(membership_fd_.get(), interface_.index, addr, PACKET_ADD_MEMBERSHIP);
 }
 
 auto XdpContext::leave_multicast(ieee::Eui48 const& addr) -> Status
@@ -1761,7 +1769,10 @@ auto XdpContext::leave_multicast(ieee::Eui48 const& addr) -> Status
     if (xsk_ == nullptr) {
         return failure(XdpError::not_open);
     }
-    return change_multicast_membership(interface_.index, addr, SIOCDELMULTI);
+    if (!membership_fd_.valid()) {
+        return success();  // nothing was ever joined: nothing to drop, as the kernel would say
+    }
+    return detail::change_membership(membership_fd_.get(), interface_.index, addr, PACKET_DROP_MEMBERSHIP);
 }
 
 #endif  // __linux__ && HAVE_XDP

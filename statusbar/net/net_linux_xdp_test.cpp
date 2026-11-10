@@ -21,17 +21,23 @@ static auto stats_through_an_incomplete_type(statusbar::net::XdpSocketStats cons
 #    include "statusbar/net/net.hpp"
 #    include "statusbar/status/status.hpp"
 
+#    include <unistd.h>
+
 #    include <array>
 #    include <cerrno>
 #    include <cstddef>
 #    include <cstdint>
 #    include <expected>
+#    include <fstream>
 #    include <limits>
 #    include <optional>
 #    include <span>
 #    include <string>
 #    include <system_error>
 #    include <vector>
+
+#    include <linux/if_packet.h>
+#    include <net/if.h>
 
 using namespace statusbar;
 using namespace statusbar::net;
@@ -3169,6 +3175,83 @@ TEST(xdp_kernel_stats, an_out_of_range_tx_descriptor_is_counted_though_the_kick_
     EXPECT_TRUE(report.after_read);
     EXPECT_EQ(report.fresh_tx_invalid, 0u);
     EXPECT_EQ(report.after_tx_invalid, 1u);
+}
+
+//
+// Multicast memberships
+//
+
+/// Whether the kernel lists @p group on the loopback interface: a line of
+/// /proc/net/dev_mcast reading "<ifindex> lo <users> <global> <hex address>".
+auto lo_lists_group(std::string const& hex_address) -> bool
+{
+    std::ifstream table{"/proc/net/dev_mcast"};
+    std::string line;
+    while (std::getline(table, line)) {
+        if (line.find(" lo ") != std::string::npos && line.find(hex_address) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+TEST(xdp_membership, memberships_are_counted_per_socket_and_per_group)
+{
+    // Root-only: AF_PACKET needs CAP_NET_RAW. The loopback interface takes
+    // memberships like any other, so the counting can be checked without a
+    // NIC: two joins keep the group on the interface through one leave and
+    // drop it at the second. A leave past that, or of a group never joined,
+    // is a no-op the kernel answers with success.
+    int const probe = ::socket(AF_PACKET, SOCK_RAW, 0);
+    if (probe < 0) {
+        SKIP("needs CAP_NET_RAW (AF_PACKET open refused)");
+    }
+    ::close(probe);
+    unsigned int const lo = ::if_nametoindex("lo");
+    if (lo == 0) {
+        SKIP("no loopback interface");
+    }
+
+    auto sock = detail::open_membership_socket();
+    EXPECT_TRUE(sock.has_value());
+    ieee::Eui48 const group{0x01, 0x00, 0x5E, 0x00, 0x00, 0xFB};
+    std::string const group_hex{"01005e0000fb"};
+    auto change = [&](ieee::Eui48 const& addr, int optname) { return detail::change_membership(sock->get(), lo, addr, optname); };
+    EXPECT_FALSE(lo_lists_group(group_hex));
+
+    EXPECT_TRUE(change(group, PACKET_ADD_MEMBERSHIP).has_value());
+    EXPECT_TRUE(change(group, PACKET_ADD_MEMBERSHIP).has_value());
+    EXPECT_TRUE(lo_lists_group(group_hex));
+    EXPECT_TRUE(change(group, PACKET_DROP_MEMBERSHIP).has_value());
+    EXPECT_TRUE(lo_lists_group(group_hex));  // one of the two joins still stands
+    EXPECT_TRUE(change(group, PACKET_DROP_MEMBERSHIP).has_value());
+    EXPECT_FALSE(lo_lists_group(group_hex));
+    EXPECT_TRUE(change(group, PACKET_DROP_MEMBERSHIP).has_value());  // nothing held: a no-op
+}
+
+TEST(xdp_membership, a_membership_ends_with_its_socket)
+{
+    int const probe = ::socket(AF_PACKET, SOCK_RAW, 0);
+    if (probe < 0) {
+        SKIP("needs CAP_NET_RAW (AF_PACKET open refused)");
+    }
+    ::close(probe);
+    unsigned int const lo = ::if_nametoindex("lo");
+    if (lo == 0) {
+        SKIP("no loopback interface");
+    }
+
+    ieee::Eui48 const group{0x01, 0x00, 0x5E, 0x00, 0x00, 0xFC};
+    std::string const group_hex{"01005e0000fc"};
+    {
+        auto sock = detail::open_membership_socket();
+        EXPECT_TRUE(sock.has_value());
+        EXPECT_TRUE(detail::change_membership(sock->get(), lo, group, PACKET_ADD_MEMBERSHIP).has_value());
+        EXPECT_TRUE(lo_lists_group(group_hex));
+    }
+    // The socket is closed: what a killed process would leave behind under
+    // SIOCADDMULTI is gone here.
+    EXPECT_FALSE(lo_lists_group(group_hex));
 }
 
 #    endif  // __linux__ && HAVE_XDP
