@@ -250,12 +250,12 @@ auto create_local_listener(SocketAddress const& addr, TcpServerOptions const& op
         // An unnamed or abstract address has no file to own or protect.
         return failure(NetError::invalid_address);
     }
+    if (options.unix_mode > 0777) {
+        return failure(NetError::invalid_argument);  // permission bits only, refused before anything is touched
+    }
     int const sock_type = options.unix_seqpacket ? SOCK_SEQPACKET : SOCK_STREAM;
     if (auto const cleared = clear_socket_path(path, sock_type); !cleared) {
         return failure(cleared.error());
-    }
-    if (options.unix_mode > 0777) {
-        return failure(NetError::invalid_argument);  // permission bits only
     }
     return bind_local(addr, sock_type, options.unix_mode)
         .and_then([&](FileDescriptor&& sock) { return claim_bound(path, std::move(sock), options.unix_mode); })
