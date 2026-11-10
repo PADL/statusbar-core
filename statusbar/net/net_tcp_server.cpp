@@ -307,14 +307,18 @@ auto record_socket_file(LocalListener listener, std::string const& path) -> Stat
     return listener;
 }
 
-/// A fresh socket bound at @p path.
-auto bind_socket_file(SocketAddress const& addr, std::string const& path, int sock_type) -> StatusValue<LocalListener>
+/// A fresh socket bound at @p path. With a @p mode, fchmod() first: Linux makes the file with the
+/// socket's mode, less the umask (elsewhere serve_socket_file() sets the mode).
+auto bind_socket_file(SocketAddress const& addr, std::string const& path, int sock_type, int mode) -> StatusValue<LocalListener>
 {
     int const fd = ::socket(AF_UNIX, sock_type, 0);
     if (fd < 0) {
         return failure(NetError::socket_creation_failed);
     }
     LocalListener listener{.fd = FileDescriptor{fd}, .file = {}};
+    if (mode >= 0) {
+        (void)::fchmod(fd, static_cast<mode_t>(mode));
+    }
     // No SO_REUSEADDR: on AF_UNIX it does nothing, and the stale path has
     // already been dealt with.
     if (::bind(fd, addr.sockaddr(), addr.length()) < 0) {
@@ -323,14 +327,24 @@ auto bind_socket_file(SocketAddress const& addr, std::string const& path, int so
     return record_socket_file(std::move(listener), path);
 }
 
-/// chmod, then listen -- in that order, so the socket never answers at its
-/// final path with umask permissions. (A path swapped between bind and chmod
-/// would take the mode with it; binding in a private directory and renaming
-/// into place closes that window and is the next step if we ever need it.)
+/// Whether the socket file has @p mode, put back where the umask narrowed what fchmod() gave the
+/// socket, without following a symlink swapped in at the path.
+auto restore_socket_mode(LocalSocketFile const& file, int mode) -> bool
+{
+    struct stat bound{};
+    if (::lstat(file.path.c_str(), &bound) < 0) {
+        return false;
+    }
+    bool const narrowed = (bound.st_mode & 07777U) != static_cast<mode_t>(mode);
+    return !narrowed || ::fchmodat(AT_FDCWD, file.path.c_str(), static_cast<mode_t>(mode), AT_SYMLINK_NOFOLLOW) == 0;
+}
+
+/// The mode, then listen -- in that order, so the socket never answers at its
+/// final path with umask permissions, and the mode never follows a symlink.
 auto serve_socket_file(LocalListener listener, TcpServerOptions const& options) -> StatusValue<LocalListener>
 {
     auto const& file = listener.file;
-    if (options.unix_mode >= 0 && ::chmod(file.path.c_str(), static_cast<mode_t>(options.unix_mode)) < 0) {
+    if (options.unix_mode >= 0 && !restore_socket_mode(file, options.unix_mode)) {
         unlink_if_ours(file.path, file.dev, file.ino);
         return failure(NetError::socket_option_failed);
     }
@@ -350,7 +364,7 @@ auto bind_local_listener(SocketAddress const& addr, std::string const& path, Tcp
     if (auto cleared = clear_socket_path(path, sock_type); !cleared) {
         return failure(cleared.error());
     }
-    auto bound = bind_socket_file(addr, path, sock_type);
+    auto bound = bind_socket_file(addr, path, sock_type, options.unix_mode);
     if (!bound) {
         return failure(bound.error());
     }
