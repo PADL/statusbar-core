@@ -3258,18 +3258,24 @@ TEST(xdp_kernel_stats, an_out_of_range_tx_descriptor_is_counted_though_the_kick_
 // Multicast memberships
 //
 
-/// Whether the kernel lists @p group on the loopback interface: a line of
-/// /proc/net/dev_mcast reading "<ifindex> lo <users> <global> <hex address>".
-auto lo_lists_group(std::string const& hex_address) -> bool
+/// Whether the kernel lists @p hex_address on interface @p device: a line of
+/// /proc/net/dev_mcast reading "<ifindex> <device> <users> <global> <hex address>".
+auto lists_group(std::string const& device, std::string const& hex_address) -> bool
 {
     std::ifstream table{"/proc/net/dev_mcast"};
     std::string line;
     while (std::getline(table, line)) {
-        if (line.find(" lo ") != std::string::npos && line.find(hex_address) != std::string::npos) {
+        if (line.find(" " + device + " ") != std::string::npos && line.find(hex_address) != std::string::npos) {
             return true;
         }
     }
     return false;
+}
+
+/// Whether the kernel lists @p hex_address on the loopback interface.
+auto lo_lists_group(std::string const& hex_address) -> bool
+{
+    return lists_group("lo", hex_address);
 }
 
 TEST(xdp_membership, memberships_are_counted_per_socket_and_per_group)
@@ -3329,6 +3335,58 @@ TEST(xdp_membership, a_membership_ends_with_its_socket)
     // The socket is closed: what a killed process would leave behind under
     // SIOCADDMULTI is gone here.
     EXPECT_FALSE(lo_lists_group(group_hex));
+}
+
+/// An XdpContext open on a fresh veth "xdptest0", or nullopt with the reason to skip.
+auto open_membership_context(XdpContext& ctx) -> std::optional<char const*>
+{
+    if (getuid() != 0) {
+        return "needs root";
+    }
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        return "could not create a veth pair";
+    }
+    auto const rules = ClassifierRuleBuilder<32>{}.ethertype(0x22F0).vlan_tagged_any().result(flag::process).build();
+    EXPECT_TRUE(ctx.open({.interface_name = "xdptest0", .filter_rules = rules, .umem_frame_count = 64}).has_value());
+    return std::nullopt;
+}
+
+// XdpContext's own join_multicast()/leave_multicast(): each join needs its own leave, and a
+// leave of a group the context does not hold succeeds and changes nothing.
+TEST(xdp_integration, a_contexts_joins_are_counted_and_an_unheld_leave_changes_nothing)
+{
+    XdpContext ctx;
+    if (auto const skip = open_membership_context(ctx)) {
+        SKIP(*skip);
+    }
+    auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
+    ieee::Eui48 const group{0x91, 0xE0, 0xF0, 0x00, 0xFE, 0x01};
+    ieee::Eui48 const other{0x91, 0xE0, 0xF0, 0x00, 0xFE, 0x02};
+    EXPECT_TRUE(ctx.join_multicast(group).has_value());
+    EXPECT_TRUE(ctx.join_multicast(group).has_value());
+    EXPECT_TRUE(ctx.leave_multicast(group).has_value());
+    EXPECT_TRUE(lists_group("xdptest0", "91e0f000fe01"));  // one of the two joins still stands
+    EXPECT_TRUE(ctx.leave_multicast(other).has_value());
+    EXPECT_TRUE(lists_group("xdptest0", "91e0f000fe01"));
+    EXPECT_TRUE(ctx.leave_multicast(group).has_value());
+    EXPECT_FALSE(lists_group("xdptest0", "91e0f000fe01"));
+}
+
+// XdpContext::close() drops the groups the context still holds.
+TEST(xdp_integration, a_contexts_close_drops_its_groups)
+{
+    XdpContext ctx;
+    if (auto const skip = open_membership_context(ctx)) {
+        SKIP(*skip);
+    }
+    auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
+    ieee::Eui48 const group{0x91, 0xE0, 0xF0, 0x00, 0xFE, 0x03};
+    EXPECT_TRUE(ctx.join_multicast(group).has_value());
+    EXPECT_TRUE(ctx.join_multicast(group).has_value());
+    EXPECT_TRUE(lists_group("xdptest0", "91e0f000fe03"));
+    ctx.close();
+    EXPECT_FALSE(lists_group("xdptest0", "91e0f000fe03"));
 }
 
 #    endif  // __linux__ && HAVE_XDP
