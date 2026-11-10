@@ -289,9 +289,9 @@ section for the full walkthrough).
 libFuzzer support via Clang's built-in `-fsanitize=fuzzer`. Pulled in
 by the toolchain file.
 
-| Option           | Default | Effect                                                           |
-|------------------|---------|------------------------------------------------------------------|
-| `ENABLE_FUZZING` | `OFF`   | Defines `HAS_LIBFUZZER=1` and exports the cache variables below. |
+| Option           | Default                                    | Effect                                                           |
+|------------------|--------------------------------------------|------------------------------------------------------------------|
+| `ENABLE_FUZZING` | `ON` for Clang (automatic), `OFF` on Apple | Defines `HAS_LIBFUZZER=1` and exports the cache variables below. |
 
 When enabled, the script sets the following internal cache variables
 for fuzzer-target CMake code to read:
