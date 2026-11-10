@@ -214,7 +214,7 @@ TEST(net_link_readiness, no_carrier_loss_within_the_settle_time_is_no_reset)
     }
     bool applied = false;
     auto const link = readiness_after(applied, link_report(true, 7), NEWADDR, NEWQDISC);
-    ResetWaitPolicy const policy{.settle_ns = 2000 * MS, .timeout_ns = 30'000 * MS, .ipv4 = true};
+    ResetWaitPolicy const policy{.ipv4 = true};
     EXPECT_TRUE(applied && reset_wait_state(link, policy, 0) == ResetWaitState::waiting);
     EXPECT_EQ(reset_wait_state(link, policy, 1999 * MS), ResetWaitState::waiting);
     EXPECT_EQ(reset_wait_state(link, policy, 2000 * MS), ResetWaitState::no_reset);
@@ -226,7 +226,7 @@ TEST(net_link_readiness, after_a_loss_the_wait_ends_with_carrier_and_address)
         SKIP("the messages are little-endian bytes");
     }
     bool applied = false;
-    ResetWaitPolicy const policy{.settle_ns = 2000 * MS, .timeout_ns = 30'000 * MS, .ipv4 = true};
+    ResetWaitPolicy const policy{.ipv4 = true};
     auto const down = readiness_after(applied, link_report(true, 7), NEWADDR, NEWQDISC, link_report(false, 8), removed_address());
     EXPECT_EQ(reset_wait_state(down, policy, 5000 * MS), ResetWaitState::waiting);  // past the settle time: lost
     auto const up = readiness_after(
@@ -244,7 +244,7 @@ TEST(net_link_readiness, a_link_not_back_in_time_times_out)
         SKIP("the messages are little-endian bytes");
     }
     bool applied = false;
-    ResetWaitPolicy const policy{.settle_ns = 2000 * MS, .timeout_ns = 30'000 * MS, .ipv4 = true};
+    ResetWaitPolicy const policy{.ipv4 = true};
     auto const down = readiness_after(applied, link_report(true, 7), NEWADDR, NEWQDISC, link_report(false, 8));
     EXPECT_TRUE(applied && reset_wait_state(down, policy, 29'999 * MS) == ResetWaitState::waiting);
     EXPECT_EQ(reset_wait_state(down, policy, 30'000 * MS), ResetWaitState::timed_out);
@@ -258,7 +258,7 @@ TEST(net_link_readiness, a_loss_before_the_last_change_does_not_count)
     bool applied = false;
     auto const link =
         readiness_after(applied, link_report(true, 7), NEWADDR, NEWQDISC, link_report(false, 8), link_report(true, 8), NEWQDISC);
-    ResetWaitPolicy const policy{.settle_ns = 2000 * MS, .timeout_ns = 30'000 * MS, .ipv4 = true};
+    ResetWaitPolicy const policy{.ipv4 = true};
     EXPECT_TRUE(applied && !link.carrier_lost());
     EXPECT_EQ(reset_wait_state(link, policy, 1000 * MS), ResetWaitState::waiting);
     EXPECT_EQ(reset_wait_state(link, policy, 2000 * MS), ResetWaitState::no_reset);
@@ -270,7 +270,7 @@ TEST(net_link_readiness, no_carrier_at_a_change_is_a_reset_under_way)
         SKIP("the messages are little-endian bytes");
     }
     bool applied = false;
-    ResetWaitPolicy const policy{.settle_ns = 2000 * MS, .timeout_ns = 30'000 * MS, .ipv4 = true};
+    ResetWaitPolicy const policy{.ipv4 = true};
     auto const down = readiness_after(applied, link_report(true, 7), link_report(false, 8), NEWQDISC);
     EXPECT_TRUE(applied && down.carrier_lost());
     EXPECT_EQ(reset_wait_state(down, policy, 5000 * MS), ResetWaitState::waiting);
@@ -285,7 +285,7 @@ TEST(net_link_readiness, the_settle_time_runs_from_the_change_as_read)
         SKIP("the messages are little-endian bytes");
     }
     LinkReadiness link{3};
-    ResetWaitPolicy const policy{.settle_ns = 2000 * MS, .timeout_ns = 30'000 * MS, .ipv4 = true};
+    ResetWaitPolicy const policy{.ipv4 = true};
     EXPECT_TRUE(link.apply(link_report(true, 7), 0).has_value() && link.apply(NEWQDISC, 5000 * MS).has_value());
     EXPECT_EQ(reset_wait_state(link, policy, 6999 * MS), ResetWaitState::waiting);
     EXPECT_EQ(reset_wait_state(link, policy, 7000 * MS), ResetWaitState::no_reset);
@@ -298,7 +298,7 @@ TEST(net_link_readiness, lost_notifications_assume_a_change_and_keep_a_loss)
     if (!LITTLE) {
         SKIP("the messages are little-endian bytes");
     }
-    ResetWaitPolicy const policy{.settle_ns = 2000 * MS, .timeout_ns = 30'000 * MS, .ipv4 = true};
+    ResetWaitPolicy const policy{.ipv4 = true};
     LinkReadiness quiet{3};
     EXPECT_TRUE(quiet.apply(link_report(true, 7), 0).has_value());
     quiet.notifications_lost(8000 * MS);  // an overrun may have hidden a change
