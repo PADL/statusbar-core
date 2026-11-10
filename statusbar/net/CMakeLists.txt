@@ -118,7 +118,7 @@ set_property(
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # The netdev uapi constants net_netdev_features.cpp and net_netdev_napi.cpp
   # assert against, where the headers have them (xsk-features 6.8, queue and
-  # NAPI commands 6.9, tx-launch-time-fifo 6.15, busy-poll 7.1).
+  # NAPI commands 6.9, tx-launch-time-fifo 6.15, busy-poll 6.19).
   include(CheckCXXSourceCompiles)
   include(CMakePushCheckState)
   cmake_push_check_state(RESET)
