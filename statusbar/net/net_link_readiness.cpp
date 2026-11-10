@@ -336,19 +336,19 @@ auto reset_wait_state(LinkReadiness const& link, ResetWaitPolicy const& policy, 
     if (link.carrier_lost() && link.carrier() && (!policy.ipv4 || link.has_ipv4())) {
         return ResetWaitState::ready;
     }
-    if (!link.carrier_lost() && now_ns - *changed_ns >= policy.settle_ns) {
+    if (!link.carrier_lost() && now_ns - *changed_ns >= RESET_SETTLE_NS) {
         return ResetWaitState::no_reset;
     }
-    return now_ns - *changed_ns >= policy.timeout_ns ? ResetWaitState::timed_out : ResetWaitState::waiting;
+    return now_ns - *changed_ns >= RESET_TIMEOUT_NS ? ResetWaitState::timed_out : ResetWaitState::waiting;
 }
 
 namespace {
 
 /// How long until reset_wait_state() may change without a message: the settle time, else the timeout.
-[[nodiscard]] auto poll_timeout_ms(LinkReadiness const& link, ResetWaitPolicy const& policy, int64_t const now_ns) noexcept -> int
+[[nodiscard]] auto poll_timeout_ms(LinkReadiness const& link, int64_t const now_ns) noexcept -> int
 {
     int64_t const elapsed_ns = now_ns - link.last_qdisc_change_ns().value_or(now_ns);
-    int64_t const bound_ns = !link.carrier_lost() && elapsed_ns < policy.settle_ns ? policy.settle_ns : policy.timeout_ns;
+    int64_t const bound_ns = !link.carrier_lost() && elapsed_ns < RESET_SETTLE_NS ? RESET_SETTLE_NS : RESET_TIMEOUT_NS;
     int64_t const left_ms = (bound_ns - elapsed_ns + 999'999) / 1'000'000;
     return static_cast<int>(std::clamp<int64_t>(left_ms, 0, INT_MAX));
 }
@@ -366,7 +366,7 @@ auto await_reset(LinkWatch& watch, ResetWaitPolicy const& policy) -> StatusValue
             return state;
         }
         pollfd ready{.fd = watch.fd(), .events = POLLIN, .revents = 0};
-        if (::poll(&ready, 1, poll_timeout_ms(watch.readiness(), policy, now_ns)) < 0) {
+        if (::poll(&ready, 1, poll_timeout_ms(watch.readiness(), now_ns)) < 0) {
             return failure(errno_code());
         }
     }
