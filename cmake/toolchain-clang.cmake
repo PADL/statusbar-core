@@ -84,6 +84,88 @@ set(_STATUSBAR_CXX_FLAGS
     -Wno-c23-extensions)
 set(_STATUSBAR_LINKER_FLAGS "") # appended to EXE / SHARED / MODULE link kinds
 
+# libc++ 20 to 22: std::format_to into a back_insert_iterator overflows its
+# stack buffer (llvm-project issue 154670). Puts a patched copy of
+# __format/buffer.h first on the include path; the system headers are never
+# touched.
+function(_statusbar_libcxx_format_overlay)
+  if(CMAKE_IN_TRY_COMPILE)
+    return() # the parent's flags already name the overlay
+  endif()
+  set(_overlay "${CMAKE_BINARY_DIR}/libcxx-overlay")
+  # Through any symlink to this file (the umbrella's cmake/), to core's cmake/.
+  get_filename_component(_here "${CMAKE_CURRENT_FUNCTION_LIST_FILE}" REALPATH)
+  get_filename_component(_here "${_here}" DIRECTORY)
+  set(_patch "${_here}/patches/libcxx-20-format-buffer.patch")
+  # The header the compiler resolves: LLVM_PATH's, or the sysroot's when cross.
+  set(_probe "${CMAKE_BINARY_DIR}/CMakeFiles/libcxx-overlay-probe.cpp")
+  file(WRITE "${_probe}" "#include <__format/buffer.h>\n")
+  set(_probe_flags -stdlib=libc++ -std=c++23)
+  if(CMAKE_CXX_COMPILER_TARGET)
+    list(APPEND _probe_flags --target=${CMAKE_CXX_COMPILER_TARGET})
+  endif()
+  if(CMAKE_SYSROOT)
+    list(APPEND _probe_flags --sysroot=${CMAKE_SYSROOT})
+  endif()
+  execute_process(
+    COMMAND "${CMAKE_CXX_COMPILER}" ${_probe_flags} -M "${_probe}"
+    OUTPUT_VARIABLE _deps
+    ERROR_QUIET)
+  string(REGEX MATCH "[^ \t\r\n]*/__format/buffer\\.h" _header "${_deps}")
+  if(NOT _header)
+    message(STATUS "libc++ format_to overlay: no libc++ __format/buffer.h")
+    return()
+  endif()
+  get_filename_component(_header "${_header}" REALPATH)
+  get_filename_component(_v1 "${_header}" DIRECTORY)
+  get_filename_component(_v1 "${_v1}" DIRECTORY)
+  file(STRINGS "${_v1}/__config" _version
+       REGEX "^#[ \t]*define[ \t]+_LIBCPP_VERSION[ \t]+[0-9]+")
+  string(REGEX MATCH "[0-9]+$" _version "${_version}")
+  if(NOT _version
+     OR _version LESS 200000
+     OR _version GREATER_EQUAL 230000)
+    return() # before 20.x or past 22.x: not affected
+  endif()
+  set_property(
+    DIRECTORY
+    APPEND
+    PROPERTY CMAKE_CONFIGURE_DEPENDS "${_patch}" "${_header}")
+  find_program(STATUSBAR_PATCH_EXECUTABLE patch)
+  if(NOT EXISTS "${_patch}" OR NOT STATUSBAR_PATCH_EXECUTABLE)
+    message(FATAL_ERROR "libc++ ${_version} needs ${_patch} and patch(1)")
+  endif()
+  # -f: never prompt, and never read the patch as reversed. Applies in reverse:
+  # this libc++ has the fix already.
+  execute_process(
+    COMMAND "${STATUSBAR_PATCH_EXECUTABLE}" -R -f -s --dry-run -p1 -d "${_v1}"
+            -i "${_patch}"
+    RESULT_VARIABLE _fixed
+    OUTPUT_QUIET ERROR_QUIET)
+  if(_fixed EQUAL 0)
+    return()
+  endif()
+  # Patched to a scratch file and copied only when it differs, so a reconfigure
+  # does not touch the overlay's timestamp and rebuild every TU.
+  file(MAKE_DIRECTORY "${_overlay}/include/__format")
+  execute_process(
+    COMMAND "${STATUSBAR_PATCH_EXECUTABLE}" -f -s -p1 -d "${_v1}" -i "${_patch}"
+            -o "${_overlay}/buffer.h.patched" -r -
+    RESULT_VARIABLE _patched
+    OUTPUT_QUIET ERROR_QUIET)
+  if(NOT _patched EQUAL 0)
+    message(FATAL_ERROR "${_patch} does not apply to ${_header}")
+  endif()
+  file(COPY_FILE "${_overlay}/buffer.h.patched"
+       "${_overlay}/include/__format/buffer.h" ONLY_IF_DIFFERENT)
+  message(STATUS "libc++ format_to overlay: ${_overlay}/include (${_header})")
+  list(APPEND _STATUSBAR_CXX_FLAGS -isystem "${_overlay}/include")
+  set(_STATUSBAR_CXX_FLAGS
+      "${_STATUSBAR_CXX_FLAGS}"
+      PARENT_SCOPE)
+endfunction()
+_statusbar_libcxx_format_overlay()
+
 # Record stdlib for statusbarConfig.cmake consumer ABI check. The `if(NOT ...)`
 # guard treats an explicitly-empty cache value as "use the default" too (a bare
 # `set(... CACHE STRING ...)` would skip the assignment only when the cache key
