@@ -157,10 +157,9 @@ class TcpConnectionPool : public Pollable
     /// for one longer than @p out.
     [[nodiscard]] auto read_message(Slot& s, std::span<uint8_t> out) -> StatusValue<size_t>;
 
-    /// The constructor's two halves, one per address family: bind, then
-    /// hand the listener to register_listener(). Each leaves the pool
-    /// invalid on failure with nothing of its own left behind - for the
-    /// local one, that includes the socket file bind() created.
+    /// The constructor's two halves, one per address family: bind, then hand the listener to
+    /// register_listener(). On failure each leaves the pool invalid; the local one removes the socket
+    /// file bind() created, and only its `<path>.lock` stays behind.
     void open_local_listener(SocketAddress const& bind_addr);
     void open_tcp_listener(SocketAddress const& bind_addr);
     /// Take a bound, listening descriptor and put it on the multiplexer.
