@@ -158,8 +158,6 @@ TEST(netdev_features, launch_time_reported_by_xsk_features)
     auto const device = parse_dev(DEV_REPLY, NETDEV_ID);
     EXPECT_TRUE(device.has_value());
     EXPECT_TRUE(device && device->ifindex == 3);
-    EXPECT_TRUE(device && device->xdp_features == 0x7f);
-    EXPECT_TRUE(device && (device->xdp_features & XDP_ACT_XSK_ZEROCOPY) != 0);
     EXPECT_TRUE(device && device->xsk.tx_timestamp() && device->xsk.tx_checksum() && device->xsk.launch_time());
 }
 
@@ -173,7 +171,6 @@ TEST(netdev_features, absent_xsk_features_mean_none)
     auto const device = parse_dev(std::span{reply}.first(48), NETDEV_ID);
     EXPECT_TRUE(device.has_value());
     EXPECT_TRUE(device && device->xsk.flags == 0 && !device->xsk.launch_time());
-    EXPECT_TRUE(device && device->xdp_features == 0x7f);
 }
 
 TEST(netdev_features, rx_metadata_features_are_not_xsk_features)

@@ -28,7 +28,7 @@ extern "C" int LLVMFuzzerTestOneInput(uint8_t const* data, size_t size)
         g_sink = g_sink + *id;
     }
     if (auto const device = parse_dev(message, family_id)) {
-        g_sink = g_sink ^ device->xdp_features ^ device->xsk.flags ^ static_cast<uint64_t>(device->ifindex);
+        g_sink = g_sink ^ device->xsk.flags ^ static_cast<uint64_t>(device->ifindex);
     }
     return 0;
 }
