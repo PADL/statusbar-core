@@ -212,7 +212,7 @@ auto stat_values_in(std::span<uint8_t const> const payload, uint32_t const count
 {
     std::vector<EthtoolStat> stats;
     stats.reserve(names.size());
-    for (size_t i = 0; i < names.size() && i < values.size(); ++i) {
+    for (size_t i = 0; i < names.size(); ++i) {
         stats.push_back({.name = std::move(names[i]), .value = values[i]});
     }
     return stats;
