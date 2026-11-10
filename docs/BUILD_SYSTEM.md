@@ -313,6 +313,15 @@ through the linker.
 compatible with `-stdlib=libc++`, so no separate libFuzzer detection
 is needed.
 
+On Linux every target but a MODULE library (the clang-tidy plugin) is
+compiled with `-fsanitize=fuzzer-no-link`, and every executable links
+it, so a fuzzer's coverage feedback reaches into the libraries it
+calls rather than stopping at the harness. Every package that includes
+`module.cmake` gets this; the fuzzer targets alone link
+`-fsanitize=fuzzer`. The instrumentation slows every binary of such a
+build: measure in a build with `-DENABLE_FUZZING=OFF`, as the package
+builds are.
+
 ## `statusbar-coreConfig.cmake.in`
 
 This package's `find_package` template.

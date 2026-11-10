@@ -60,6 +60,20 @@ if(ENABLE_FUZZING)
         ""
         CACHE INTERNAL "Extra link options for fuzzer targets")
   endif()
+
+  # Coverage of the libraries a harness calls, not of the harness alone: every
+  # target is compiled with libFuzzer's instrumentation, and every executable
+  # links its callbacks (fuzzer-no-link: no main()); the fuzzers link
+  # -fsanitize=fuzzer. Not a MODULE library: a clang-tidy plugin is loaded into
+  # an uninstrumented clang-tidy.
+  if(NOT APPLE)
+    add_compile_options(
+      "$<$<NOT:$<STREQUAL:$<TARGET_PROPERTY:TYPE>,MODULE_LIBRARY>>:-fsanitize=fuzzer-no-link>"
+    )
+    add_link_options(
+      "$<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>:-fsanitize=fuzzer-no-link>"
+    )
+  endif()
 endif()
 
 # Register the fuzz-smoke and fuzz-all custom make targets. Both auto-discover
