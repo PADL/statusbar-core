@@ -152,14 +152,18 @@ class LinkWatch
     std::array<uint8_t, 32768> buffer_{};  ///< an RTM_NEWLINK with its statistics is a few KiB
 };
 
-/// The bounds of a wait for an adapter reset, and what it waits for, each from the last qdisc change.
+/// No carrier loss this long after the last qdisc change: no reset came. Above linkwatch's one-second batching of
+/// the carrier-loss notification.
+inline constexpr int64_t RESET_SETTLE_NS = 2'000'000'000;
+/// The whole wait for an adapter reset, from the last qdisc change.
+inline constexpr int64_t RESET_TIMEOUT_NS = 30'000'000'000;
+
+/// What a wait for an adapter reset waits for.
 struct ResetWaitPolicy
 {
-    /// No carrier loss this long: no reset came. Above linkwatch's one-second batching of the carrier-loss
-    /// notification.
-    int64_t settle_ns{2'000'000'000};
-    int64_t timeout_ns{30'000'000'000};  ///< the whole wait
-    bool ipv4{true};                     ///< the link is back only with an IPv4 address too
+    /// The link is back only with an IPv4 address too: for an interface that has one, where a network manager
+    /// may withdraw it with the carrier.
+    bool ipv4{false};
 };
 
 /// Where a wait for an adapter reset stands.
