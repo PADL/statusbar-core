@@ -163,6 +163,14 @@ TEST(realtime_cpu_sysfs, a_zero_limit_is_written_as_n_a)
     EXPECT_EQ(fake.read("cpu3/power/pm_qos_resume_latency_us"), std::string{"n/a"});
 }
 
+TEST(realtime_cpu_sysfs, clearing_the_limit_writes_0)
+{
+    FakeSysfs const fake;
+    fake.write("cpu3/power/pm_qos_resume_latency_us", "2\n");
+    EXPECT_TRUE(fake.sysfs().clear_resume_latency_limit(3).has_value());
+    EXPECT_EQ(fake.read("cpu3/power/pm_qos_resume_latency_us"), std::string{"0\n"});
+}
+
 TEST(realtime_cpu_sysfs, a_missing_pm_qos_file_is_an_error)
 {
     FakeSysfs const fake;
