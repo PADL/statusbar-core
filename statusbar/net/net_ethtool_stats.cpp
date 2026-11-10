@@ -130,8 +130,9 @@ struct StatsHeader
 static_assert(sizeof(StringsHeader) == sizeof(struct ::ethtool_gstrings));
 static_assert(sizeof(StatsHeader) == sizeof(struct ::ethtool_stats));
 
-/// The entries a GSTRINGS or GSTATS reply has room for, the driver having reported `count` (GDRVINFO): the
-/// kernel copies out the driver's count at the time, whatever room the caller made.
+/// Room for a GSTRINGS or GSTATS reply after GDRVINFO reported `count`, which is sent exactly: a kernel with the
+/// CVE-2025-68795 fix copies nothing on a mismatch, one without it copies the driver's own count. The extra room
+/// covers that growth only up to 2n+64.
 [[nodiscard]] constexpr auto stat_capacity(uint32_t const count) noexcept -> size_t
 {
     return (size_t{count} * 2) + 64;
@@ -152,7 +153,7 @@ template <typename Header>
     return buffer;
 }
 
-/// How many statistics the driver keeps (ETHTOOL_GDRVINFO's n_stats).
+/// How many statistics the driver keeps (ETHTOOL_GDRVINFO's n_stats); never 0.
 [[nodiscard]] auto stat_count(EthtoolRequest const& request) -> StatusValue<uint32_t>
 {
     ethtool_drvinfo info{};
@@ -166,22 +167,22 @@ template <typename Header>
     return info.n_stats;
 }
 
-/// `resource_unavailable_try_again` when the driver reported more entries than the `capacity` made room for.
-[[nodiscard]] auto within(uint32_t const reported, size_t const capacity) -> Status
+/// `resource_unavailable_try_again` unless the reply's count is the one sent (0: a fixed kernel refused it).
+[[nodiscard]] auto as_sent(uint32_t const reported, uint32_t const sent) -> Status
 {
-    return reported <= capacity ? success() : Status{failure(std::make_error_code(std::errc::resource_unavailable_try_again))};
+    return reported == sent ? success() : Status{failure(std::make_error_code(std::errc::resource_unavailable_try_again))};
 }
 
-/// The driver's statistic names (ETHTOOL_GSTRINGS of ETH_SS_STATS), with room for `capacity`.
-[[nodiscard]] auto stat_names(EthtoolRequest const& request, size_t const capacity) -> StatusValue<std::vector<std::string>>
+/// The driver's `count` statistic names (ETHTOOL_GSTRINGS of ETH_SS_STATS).
+[[nodiscard]] auto stat_names(EthtoolRequest const& request, uint32_t const count) -> StatusValue<std::vector<std::string>>
 {
-    StringsHeader header{.cmd = ETHTOOL_GSTRINGS, .string_set = ETH_SS_STATS, .len = static_cast<uint32_t>(capacity)};
-    auto const buffer = ethtool_request(request, header, capacity * ETHTOOL_STAT_NAME_SIZE);
-    auto const fits = buffer.and_then([&](auto const&) { return within(header.len, capacity); });
-    if (!fits) {
-        return failure(fits.error());
+    StringsHeader header{.cmd = ETHTOOL_GSTRINGS, .string_set = ETH_SS_STATS, .len = count};
+    auto const buffer = ethtool_request(request, header, stat_capacity(count) * ETHTOOL_STAT_NAME_SIZE);
+    auto const same = buffer.and_then([&](auto const&) { return as_sent(header.len, count); });
+    if (!same) {
+        return failure(same.error());
     }
-    return parse_stat_names(make_const_span(*buffer).subspan(sizeof(header)), header.len);
+    return parse_stat_names(make_const_span(*buffer).subspan(sizeof(header)), count);
 }
 
 /// The `count` u64 values in an ETHTOOL_GSTATS payload.
@@ -194,39 +195,35 @@ auto stat_values_in(std::span<uint8_t const> const payload, uint32_t const count
     return values;
 }
 
-/// The driver's statistic values (ETHTOOL_GSTATS), with room for `capacity`.
-[[nodiscard]] auto stat_values(EthtoolRequest const& request, size_t const capacity) -> StatusValue<std::vector<uint64_t>>
+/// The driver's `count` statistic values (ETHTOOL_GSTATS).
+[[nodiscard]] auto stat_values(EthtoolRequest const& request, uint32_t const count) -> StatusValue<std::vector<uint64_t>>
 {
-    StatsHeader header{.cmd = ETHTOOL_GSTATS, .n_stats = static_cast<uint32_t>(capacity)};
-    auto const buffer = ethtool_request(request, header, capacity * sizeof(uint64_t));
-    auto const fits = buffer.and_then([&](auto const&) { return within(header.n_stats, capacity); });
-    if (!fits) {
-        return failure(fits.error());
+    StatsHeader header{.cmd = ETHTOOL_GSTATS, .n_stats = count};
+    auto const buffer = ethtool_request(request, header, stat_capacity(count) * sizeof(uint64_t));
+    auto const same = buffer.and_then([&](auto const&) { return as_sent(header.n_stats, count); });
+    if (!same) {
+        return failure(same.error());
     }
-    return stat_values_in(make_const_span(*buffer).subspan(sizeof(header)), header.n_stats);
+    return stat_values_in(make_const_span(*buffer).subspan(sizeof(header)), count);
 }
 
-/// Each name with its value, in the driver's order; `resource_unavailable_try_again` unless both are as many.
-[[nodiscard]] auto paired(std::vector<std::string> names, std::vector<uint64_t> const& values)
-    -> StatusValue<std::vector<EthtoolStat>>
+/// Each name with its value, in the driver's order (both as many).
+[[nodiscard]] auto paired(std::vector<std::string> names, std::vector<uint64_t> const& values) -> std::vector<EthtoolStat>
 {
-    if (names.size() != values.size()) {
-        return failure(std::make_error_code(std::errc::resource_unavailable_try_again));
-    }
     std::vector<EthtoolStat> stats;
     stats.reserve(names.size());
-    for (size_t i = 0; i < names.size(); ++i) {
+    for (size_t i = 0; i < names.size() && i < values.size(); ++i) {
         stats.push_back({.name = std::move(names[i]), .value = values[i]});
     }
     return stats;
 }
 
-/// One reading: the count, then the names and the values, each with room past the count.
+/// One reading: the count, then as many names and values, each reply with room past the count.
 [[nodiscard]] auto read_stats(EthtoolRequest const& request) -> StatusValue<std::vector<EthtoolStat>>
 {
-    auto const capacity = stat_count(request).transform(stat_capacity);
-    auto names = capacity.and_then([&](size_t const room) { return stat_names(request, room); });
-    auto const values = names.and_then([&](auto const&) { return stat_values(request, *capacity); });
+    auto const count = stat_count(request);
+    auto names = count.and_then([&](uint32_t const n) { return stat_names(request, n); });
+    auto const values = names.and_then([&](auto const&) { return stat_values(request, *count); });
     if (!values) {
         return failure(values.error());
     }
