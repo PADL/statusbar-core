@@ -49,7 +49,9 @@ class Pollable
     /// Called when the fd is writable (POLLOUT). Only fires if poll_events() includes POLLOUT.
     virtual void on_writable(int64_t now_ns) { (void)now_ns; }
 
-    /// Called every poll cycle (after processing ready events).
+    /// Called every poll cycle (after processing ready events). @p now_ns
+    /// is the reactor's clock read once per cycle, after poll() returned,
+    /// and is the same value the cycle's on_ready() calls were told.
     virtual void tick(int64_t now_ns) = 0;
 
     /// Return true when this port should be removed from the reactor.
@@ -94,7 +96,9 @@ class MessageReactor
     /// Run the event loop until stop is set or all ports are finished.
     void run();
 
-    /// Execute one poll cycle. Returns false when the reactor should stop.
+    /// Execute one poll cycle: wait up to @p timeout_ms for a ready fd,
+    /// read the clock once, then dispatch the ready ports and tick every
+    /// port with that reading. Returns false when the reactor should stop.
     auto poll_once(int timeout_ms) -> bool;
 
     /// Number of active (non-finished) ports.
@@ -103,6 +107,11 @@ class MessageReactor
   private:
     [[nodiscard]] auto should_run() const noexcept -> bool;
     void fill_pollfds();
+    /// Wait up to @p timeout_ms for a ready fd (or just sleep when there is
+    /// none to wait on). Returns poll()'s count, 0 when nothing is ready.
+    [[nodiscard]] auto wait_for_ready(int timeout_ms) -> int;
+    /// The rest of a cycle: read the clock, serve the ready ports, tick all.
+    void serve_cycle(int ready_count);
     void dispatch_ready(int64_t now_ns);
     void tick_all(int64_t now_ns);
     void remove_finished();

@@ -23,31 +23,38 @@ auto MessageReactor::poll_once(int timeout_ms) -> bool
     if (!should_run()) {
         return false;
     }
-
-    int64_t const now_ns = clock_();
-
     fill_pollfds();
+    serve_cycle(wait_for_ready(timeout_ms));
+    return should_run();
+}
 
-    int n = 0;
+auto MessageReactor::wait_for_ready(int timeout_ms) -> int
+{
     if (pollfds_.empty()) {
         if (timeout_ms > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
         }
-    } else {
-        n = ::poll(pollfds_.data(), pollfds_.size(), timeout_ms);
-        if (n < 0 && errno != EINTR) {
-            std::println(stderr, "MessageReactor: poll() error: {}", std::strerror(errno));
-        }
+        return 0;
     }
+    int const n = ::poll(pollfds_.data(), pollfds_.size(), timeout_ms);
+    if (n < 0 && errno != EINTR) {
+        std::println(stderr, "MessageReactor: poll() error: {}", std::strerror(errno));
+    }
+    return n;
+}
 
-    if (n > 0) {
+void MessageReactor::serve_cycle(int ready_count)
+{
+    // One clock reading per cycle, taken after the wait: the handlers are
+    // told the time their frames arrived and their deadlines are judged
+    // against, not a time up to one timeout old. A handler that re-arms
+    // a timer from this value measures from the cycle that served it.
+    int64_t const now_ns = clock_();
+    if (ready_count > 0) {
         dispatch_ready(now_ns);
     }
-
     tick_all(now_ns);
     remove_finished();
-
-    return should_run();
 }
 
 auto MessageReactor::active_count() const noexcept -> size_t

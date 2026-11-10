@@ -1532,6 +1532,31 @@ TEST(net_reactor, single_port_gets_ticked)
     EXPECT_EQ(ptr->last_now_ns(), int64_t{2'000'000});
 }
 
+TEST(net_reactor, the_time_told_is_read_after_the_wait)
+{
+    // Nothing is readable, so the cycle waits out its timeout. The time the
+    // port is told has to come from after that wait: a reading taken before
+    // poll() would be up to one timeout old by the time a handler judged a
+    // deadline against it.
+    itc::StopToken stop{};
+    int clock_reads = 0;
+    auto clock = [&]() -> int64_t {
+        ++clock_reads;
+        return monotonic_ns();
+    };
+
+    auto mock = std::make_unique<MockPollable>();
+    auto* ptr = mock.get();
+    MessageReactor reactor{stop, clock, 0};
+    reactor.add(std::move(mock));
+
+    constexpr int WAIT_MS = 20;
+    int64_t const before = monotonic_ns();
+    EXPECT_TRUE(reactor.poll_once(WAIT_MS));
+    EXPECT_EQ(clock_reads, 1);
+    EXPECT_TRUE(ptr->last_now_ns() >= before + int64_t{WAIT_MS} * 1'000'000 / 2);
+}
+
 TEST(net_reactor, on_ready_called_when_readable)
 {
     itc::StopToken stop{};
