@@ -254,6 +254,9 @@ auto create_local_listener(SocketAddress const& addr, TcpServerOptions const& op
     if (auto const cleared = clear_socket_path(path, sock_type); !cleared) {
         return failure(cleared.error());
     }
+    if (options.unix_mode > 0777) {
+        return failure(NetError::invalid_argument);  // permission bits only
+    }
     return bind_local(addr, sock_type, options.unix_mode)
         .and_then([&](FileDescriptor&& sock) { return claim_bound(path, std::move(sock), options.unix_mode); })
         .and_then([&](LocalListener&& local) { return listen_local(std::move(local), path, options.backlog); });
