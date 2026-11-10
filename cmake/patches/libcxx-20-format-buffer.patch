@@ -1,8 +1,12 @@
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+See https://llvm.org/LICENSE.txt for license information.
+
 libc++ 20 (and 21, 22): std::format_to into a back_insert_iterator overflows its
 256-code-unit stack buffer when an argument or fill of a multiple of 256 code units
 is followed by more output (llvm-project issue 154670). Upstream fix, llvm-project
-PR 226791 (Apache-2.0 WITH LLVM-exception), against <llvm>/include/c++/v1:
-  sudo patch -p1 -d /usr/lib/llvm-20/include/c++/v1 < cmake/patches/libcxx-20-format-buffer.patch
+PR 226791, against <llvm>/include/c++/v1. toolchain-clang.cmake applies it to a copy
+of the header in the build tree; the system headers are never modified.
 
 diff --git a/__format/buffer.h b/__format/buffer.h
 index bf2bebf9b2a859..f53f4d60b7d4c4 100644
