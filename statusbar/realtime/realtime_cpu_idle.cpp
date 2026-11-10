@@ -146,6 +146,11 @@ auto CpuSysfs::set_resume_latency_limit(int const cpu, uint32_t const limit_us) 
     return write_attribute(cpu_path(cpu, "power/pm_qos_resume_latency_us"), text);
 }
 
+auto CpuSysfs::clear_resume_latency_limit(int const cpu) const -> Status
+{
+    return write_attribute(cpu_path(cpu, "power/pm_qos_resume_latency_us"), "0");
+}
+
 auto CpuSysfs::cpu_path(int const cpu, std::string_view const file) const -> std::string
 {
     return std::format("{}/cpu{}/{}", root_, cpu, file);
