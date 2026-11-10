@@ -216,7 +216,7 @@ TEST(net_rx_flow_steering, an_administrators_table_survives_leftovers_and_a_refu
     EXPECT_EQ(rss.table(), (RssIndirection{3, 3, 2, 2}));
 }
 
-TEST(net_rx_flow_steering, an_administrators_table_comes_back_after_leftovers)
+TEST(net_rx_flow_steering, after_leftovers_of_another_plan_the_drivers_default_comes_back)
 {
     RxFlowRecorder flows;
     flows.place(RxFlowRule{.location = 15, .queue = 1, .ethertype = 0x22ea});
@@ -226,7 +226,7 @@ TEST(net_rx_flow_steering, an_administrators_table_comes_back_after_leftovers)
         auto steered = RxFlowSteering::steer(flows, rss, "eth0", plan());
         EXPECT_EQ(rss.table(), (RssIndirection{1, 2, 1, 2}));
     }
-    EXPECT_EQ(rss.table(), (RssIndirection{3, 3, 2, 2}));
+    EXPECT_TRUE(rss.writes().back().table.empty());
 }
 
 TEST(net_rx_flow_steering, a_resized_table_is_refused_at_restore_and_the_rules_still_go)
