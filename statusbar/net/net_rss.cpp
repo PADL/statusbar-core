@@ -205,10 +205,14 @@ auto RssSteering::operator=(RssSteering&& other) noexcept -> RssSteering&
 
 RssSteering::~RssSteering()
 {
+#if __cpp_exceptions
     try {
+#endif
         (void)restore();
+#if __cpp_exceptions
     } catch (...) {  // NOLINT(bugprone-empty-catch) a destructor has nobody to report to
     }
+#endif
 }
 
 auto RssSteering::release() noexcept -> void
