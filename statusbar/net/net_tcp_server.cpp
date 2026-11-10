@@ -327,16 +327,16 @@ auto bind_socket_file(SocketAddress const& addr, std::string const& path, int so
     return record_socket_file(std::move(listener), path);
 }
 
-/// Whether the socket file has @p mode, put back where the umask narrowed what fchmod() gave the
-/// socket, without following a symlink swapped in at the path.
+/// Whether the socket file has @p mode, set where the file's differs (the umask narrowed what
+/// fchmod() gave the socket), without following a symlink swapped in at the path.
 auto restore_socket_mode(LocalSocketFile const& file, int mode) -> bool
 {
     struct stat bound{};
     if (::lstat(file.path.c_str(), &bound) < 0) {
         return false;
     }
-    bool const narrowed = (bound.st_mode & 07777U) != static_cast<mode_t>(mode);
-    return !narrowed || ::fchmodat(AT_FDCWD, file.path.c_str(), static_cast<mode_t>(mode), AT_SYMLINK_NOFOLLOW) == 0;
+    bool const differs = (bound.st_mode & 07777U) != static_cast<mode_t>(mode);
+    return !differs || ::fchmodat(AT_FDCWD, file.path.c_str(), static_cast<mode_t>(mode), AT_SYMLINK_NOFOLLOW) == 0;
 }
 
 /// The mode, then listen -- in that order, so the socket never answers at its

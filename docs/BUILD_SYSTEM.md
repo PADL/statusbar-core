@@ -109,8 +109,10 @@ when an argument or fill whose length is a multiple of 256 is followed by more o
 asks the compiler which `__format/buffer.h` it uses (LLVM_PATH's, or the sysroot's when cross),
 and for a libc++ 20.x to 22.x without the fix copies it to `<build>/libcxx-overlay/include`,
 applies `cmake/patches/libcxx-20-format-buffer.patch` there and puts that directory first with
-`-isystem`. The system headers are never modified; a patch that does not apply stops the
-configure; a libc++ that already has the fix (the patch applies in reverse) gets no overlay.
+`-isystem`. The system headers are never modified; a header the patch neither applies to nor
+reverses gets a warning and no overlay (`fmt_format_to_test` then fails under ASan if that
+libc++ still overflows); a libc++ that already has the fix (the patch applies in reverse) gets
+no overlay.
 The patch and the header are configure dependencies, so a libc++ upgrade reconfigures.
 `fmt_format_to_test` fails under ASan without the overlay.
 
