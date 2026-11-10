@@ -143,7 +143,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_compile_definitions(statusbar-net
                                PUBLIC HAVE_NETDEV_XSK_LAUNCH_TIME=1)
   endif()
-  # The queue and NAPI commands (Linux 6.9) and threaded busy poll (7.1), the
+  # The queue and NAPI commands (Linux 6.9) and threaded busy poll (6.19), the
   # enumerators net_netdev_napi.cpp asserts its mirrors against.
   check_cxx_source_compiles(
     "
