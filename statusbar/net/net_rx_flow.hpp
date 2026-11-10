@@ -162,8 +162,8 @@ class RxFlowSteering
     ~RxFlowSteering();
 
     RxFlowSteering(RxFlowSteering&& other) noexcept;
-    /// Assigning a guard for the same interface and range over a live one hands the old one's RSS
-    /// table to the new one (its sweep removed the old rules); otherwise the old one restores first.
+    /// The guard assigned over restores first: steer() a plan for a held range only after its
+    /// restore(), which would otherwise remove the new rules.
     auto operator=(RxFlowSteering&& other) noexcept -> RxFlowSteering&;
     RxFlowSteering(RxFlowSteering const&) = delete;
     auto operator=(RxFlowSteering const&) -> RxFlowSteering& = delete;
@@ -202,7 +202,6 @@ class RxFlowSteering
     [[nodiscard]] auto write_rss(RssIndirection const& wanted, RssIndirection current) -> Status;
     [[nodiscard]] auto install() -> Status;
     [[nodiscard]] auto restore_rss() -> Status;
-    auto adopt_debt(RxFlowSteering& successor) noexcept -> void;
     auto move_from(RxFlowSteering& other) noexcept -> void;
     [[nodiscard]] auto remove_rules() -> Status;
 
