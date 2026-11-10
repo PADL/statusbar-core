@@ -3368,8 +3368,8 @@ TEST(xdp_membership, a_membership_ends_with_its_socket)
     EXPECT_FALSE(lo_lists_group(group_hex));
 }
 
-/// An XdpContext open on a fresh veth "xdptest0", or nullopt with the reason to skip.
-auto open_membership_context(XdpContext& ctx) -> std::optional<char const*>
+/// A fresh veth pair "xdptest0"/"xdptest1", or the reason to skip.
+auto make_membership_veth() -> std::optional<char const*>
 {
     if (getuid() != 0) {
         return "needs root";
@@ -3378,20 +3378,26 @@ auto open_membership_context(XdpContext& ctx) -> std::optional<char const*>
     if (!create_veth_pair("xdptest0", "xdptest1")) {
         return "could not create a veth pair";
     }
-    auto const rules = ClassifierRuleBuilder<32>{}.ethertype(0x22F0).vlan_tagged_any().result(flag::process).build();
-    EXPECT_TRUE(ctx.open({.interface_name = "xdptest0", .filter_rules = rules, .umem_frame_count = 64}).has_value());
     return std::nullopt;
+}
+
+/// Open @p ctx on "xdptest0".
+auto open_on_membership_veth(XdpContext& ctx) -> bool
+{
+    auto const rules = ClassifierRuleBuilder<32>{}.ethertype(0x22F0).vlan_tagged_any().result(flag::process).build();
+    return ctx.open({.interface_name = "xdptest0", .filter_rules = rules, .umem_frame_count = 64}).has_value();
 }
 
 // XdpContext's own join_multicast()/leave_multicast(): each join needs its own leave, and a
 // leave of a group the context does not hold succeeds and changes nothing.
 TEST(xdp_integration, a_contexts_joins_are_counted_and_an_unheld_leave_changes_nothing)
 {
-    XdpContext ctx;
-    if (auto const skip = open_membership_context(ctx)) {
+    if (auto const skip = make_membership_veth()) {
         SKIP(*skip);
     }
     auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
+    XdpContext ctx;
+    EXPECT_TRUE(open_on_membership_veth(ctx));
     ieee::Eui48 const group{0x91, 0xE0, 0xF0, 0x00, 0xFE, 0x01};
     ieee::Eui48 const other{0x91, 0xE0, 0xF0, 0x00, 0xFE, 0x02};
     EXPECT_TRUE(ctx.join_multicast(group).has_value());
@@ -3407,11 +3413,12 @@ TEST(xdp_integration, a_contexts_joins_are_counted_and_an_unheld_leave_changes_n
 // XdpContext::close() drops the groups the context still holds.
 TEST(xdp_integration, a_contexts_close_drops_its_groups)
 {
-    XdpContext ctx;
-    if (auto const skip = open_membership_context(ctx)) {
+    if (auto const skip = make_membership_veth()) {
         SKIP(*skip);
     }
     auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
+    XdpContext ctx;
+    EXPECT_TRUE(open_on_membership_veth(ctx));
     ieee::Eui48 const group{0x91, 0xE0, 0xF0, 0x00, 0xFE, 0x03};
     EXPECT_TRUE(ctx.join_multicast(group).has_value());
     EXPECT_TRUE(ctx.join_multicast(group).has_value());
