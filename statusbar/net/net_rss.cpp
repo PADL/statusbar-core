@@ -13,8 +13,6 @@
 #    include "statusbar/net/net_posix_util.hpp"
 
 #    include <linux/ethtool.h>
-#    include <linux/sockios.h>
-#    include <net/if.h>
 #endif
 
 namespace statusbar::net {
@@ -61,14 +59,6 @@ namespace {
 static_assert(sizeof(ethtool_rxfh_indir) == 2 * sizeof(uint32_t));
 constexpr size_t IndirHeaderWords = 2;
 
-/// Hand `words` to SIOCETHTOOL as the ifr_data payload.
-[[nodiscard]] auto ethtool_words(std::string_view const interface_name, std::vector<uint32_t>& words) -> Status
-{
-    ifreq request{};
-    set_ifr_data(request, words.data());
-    return ifreq_ioctl(interface_name, SIOCETHTOOL, request);
-}
-
 /// An indirection-table request: the command, the bucket count, and room for
 /// that many ring indices. The layout lives here once rather than in each of
 /// the three places that builds one.
@@ -85,7 +75,7 @@ constexpr size_t IndirHeaderWords = 2;
 [[nodiscard]] auto read_indirection_size(std::string_view const interface_name) -> StatusValue<uint32_t>
 {
     auto words = indir_request(ETHTOOL_GRXFHINDIR, 0);
-    if (auto const status = ethtool_words(interface_name, words); !status) {
+    if (auto const status = ethtool_ioctl(interface_name, words.data()); !status) {
         return failure(status.error());
     }
     if (words[1] == 0) {
@@ -103,7 +93,7 @@ auto rss_indirection(std::string_view const interface_name) -> StatusValue<RssIn
         return failure(entries.error());
     }
     auto words = indir_request(ETHTOOL_GRXFHINDIR, *entries);
-    if (auto const status = ethtool_words(interface_name, words); !status) {
+    if (auto const status = ethtool_ioctl(interface_name, words.data()); !status) {
         return failure(status.error());
     }
     return RssIndirection(words.begin() + IndirHeaderWords, words.end());
@@ -113,9 +103,7 @@ auto rx_queue_count(std::string_view const interface_name) -> StatusValue<uint32
 {
     ethtool_rxnfc rings{};
     rings.cmd = ETHTOOL_GRXRINGS;
-    ifreq request{};
-    set_ifr_data(request, &rings);
-    if (auto const status = ifreq_ioctl(interface_name, SIOCETHTOOL, request); !status) {
+    if (auto const status = ethtool_ioctl(interface_name, &rings); !status) {
         return failure(status.error());
     }
     // data is a __u64; a queue count that does not fit in 32 bits is not a thing
@@ -126,7 +114,7 @@ auto set_rss_indirection(std::string_view const interface_name, std::span<uint32
 {
     auto words = indir_request(ETHTOOL_SRXFHINDIR, static_cast<uint32_t>(table.size()));
     std::ranges::copy(table, words.begin() + IndirHeaderWords);
-    return ethtool_words(interface_name, words);
+    return ethtool_ioctl(interface_name, words.data());
 }
 
 auto set_rss_indirection_all(std::string_view const interface_name, uint32_t const queue_id) -> StatusValue<RssIndirection>
