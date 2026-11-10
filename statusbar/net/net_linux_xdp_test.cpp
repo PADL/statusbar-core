@@ -21,7 +21,6 @@ static auto stats_through_an_incomplete_type(statusbar::net::XdpSocketStats cons
 #    include "statusbar/net/net.hpp"
 #    include "statusbar/status/status.hpp"
 
-#    include <poll.h>
 #    include <unistd.h>
 
 #    include <array>
@@ -204,6 +203,20 @@ TEST(xdp_umem_geometry, the_default_geometry_is_valid_on_every_page_size)
     XdpConfig const config{.interface_name = "eth0"};
     EXPECT_TRUE(detail::umem_geometry_is_valid(config.umem_frame_size, config.umem_headroom, 4096));
     EXPECT_TRUE(detail::umem_geometry_is_valid(config.umem_frame_size, config.umem_headroom, 16384));
+}
+
+// A geometry the kernel would refuse is reported as what it is, so a caller
+// that tuned the frame size learns which knob is wrong.
+TEST(xdp_umem_geometry, opening_with_an_impossible_frame_size_says_so)
+{
+    XdpContext context;
+    XdpConfig config{.interface_name = "lo"};
+    config.umem_frame_size = 3000;
+    auto const opened = context.open(config);
+    EXPECT_FALSE(opened.has_value());
+    if (!opened) {
+        EXPECT_EQ(opened.error(), make_error_code(XdpError::invalid_umem_geometry));
+    }
 }
 
 TEST(xdp_config, default_values)
@@ -1254,6 +1267,61 @@ TEST(xdp_bind_retry, a_fresh_context_has_waited_for_nothing)
 
 #        include <net/if.h>
 
+TEST(xdp_query, nothing_is_attached_to_loopback)
+{
+    auto const index = ::if_nametoindex("lo");
+    EXPECT_TRUE(index != 0);
+    auto const attached = XdpProgram::query(index);
+    EXPECT_TRUE(attached.has_value());
+    if (attached) {
+        // An answer, and the answer is "nothing" - told apart from the query
+        // having failed, which is the distinction a caller deciding whether
+        // to adopt depends on.
+        EXPECT_FALSE(attached->has_value());
+    }
+}
+
+TEST(xdp_query, an_unknown_interface_is_reported_as_one)
+{
+    constexpr unsigned int NoSuchInterface = 0x7FFFFFFF;
+    auto const attached = XdpProgram::query(NoSuchInterface);
+    EXPECT_FALSE(attached.has_value());
+    if (!attached) {
+        EXPECT_TRUE(attached.error() == std::errc::no_such_device);
+    }
+}
+
+TEST(xdp_detach, succeeds_when_there_is_nothing_to_detach)
+{
+    // An empty pin path means "detach only", so this reaches nothing but the
+    // interface - and loopback has no program on it. Nothing attached is not
+    // an error: detach() is idempotent, so a daemon can call it on the way in
+    // without first working out what the last run left behind.
+    auto const index = ::if_nametoindex("lo");
+    EXPECT_TRUE(index != 0);
+    EXPECT_TRUE(XdpProgram::detach(index, "").has_value());
+    EXPECT_TRUE(XdpProgram::detach(index, "").has_value());
+}
+
+TEST(xdp_detach, an_unreadable_pin_directory_is_reported_rather_than_assumed_empty)
+{
+    // /sys/fs/bpf is mode 700, so without privilege we cannot tell "the pin
+    // is not there" from "we cannot look". Reporting the permission error is
+    // the honest answer; silently treating it as "nothing to remove" would
+    // tell a daemon it had cleaned up when it had not.
+    auto const index = ::if_nametoindex("lo");
+    auto const absent = XdpProgram::pin_path_for("statusbar-no-if");
+    auto const status = XdpProgram::detach(index, absent);
+    if (getuid() == 0) {
+        EXPECT_TRUE(status.has_value());  // root can look, and there is nothing there
+    } else {
+        EXPECT_FALSE(status.has_value());
+        if (!status) {
+            EXPECT_TRUE(status.error() == std::errc::permission_denied);
+        }
+    }
+}
+
 //
 // pinnable(): the three ways pinning can be unavailable, told apart
 //
@@ -1307,6 +1375,31 @@ TEST(xdp_pinnable, a_path_in_a_mounted_bpffs_is_accepted_without_privilege)
     }
     // Nothing was created on the way through.
     EXPECT_TRUE(::access(path.c_str(), F_OK) != 0 || getuid() == 0);
+}
+
+TEST(xdp_detach, a_pin_path_it_could_not_have_made_is_refused)
+{
+    // detach() unlinks inside the directory and then removes it, so a path
+    // that is not somewhere a pin could be must not be followed. Nothing
+    // outside bpffs is touched, and the interface is left alone too.
+    auto const index = ::if_nametoindex("lo");
+    for (auto const* const path : {"/tmp/statusbar-elsewhere/lo", "/sys/fs/bpf", "/etc"}) {
+        auto const status = XdpProgram::detach(index, path);
+        EXPECT_FALSE(status.has_value());
+        if (!status) {
+            EXPECT_TRUE(status.error() == XdpError::invalid_pin_path);
+        }
+    }
+}
+
+TEST(xdp_detach, an_unknown_interface_is_reported_as_one)
+{
+    constexpr unsigned int NoSuchInterface = 0x7FFFFFFF;
+    auto const status = XdpProgram::detach(NoSuchInterface, "");
+    EXPECT_FALSE(status.has_value());
+    if (!status) {
+        EXPECT_TRUE(status.error() == std::errc::no_such_device);
+    }
 }
 
 TEST(xdp_owner, a_path_that_could_not_hold_a_pin_is_refused)
@@ -1394,6 +1487,25 @@ TEST(xdp_open, a_pin_path_outside_bpffs_is_refused_before_any_syscall)
     }
 }
 
+TEST(xdp_open, an_empty_pin_path_changes_nothing)
+{
+    // The opt-in has to be exactly that: with no pin path, open() takes the
+    // path it took before pinning existed. Here that means it gets as far as
+    // the UMEM and fails there for want of privilege - never on anything to
+    // do with pinning.
+    XdpContext ctx;
+    XdpConfig const config{.interface_name = "lo", .umem_frame_count = 16};
+    EXPECT_TRUE(config.pin_path.empty());
+    auto const status = ctx.open(config);
+    if (!status) {
+        EXPECT_TRUE(status.error() != XdpError::invalid_pin_path);
+        EXPECT_TRUE(status.error() != XdpError::bpffs_not_mounted);
+        EXPECT_TRUE(status.error() != XdpError::pin_failed);
+    }
+    EXPECT_FALSE(ctx.pinned());
+    EXPECT_FALSE(ctx.adopted());
+}
+
 //
 // kernel_stats_from - the mapping, with no socket at all
 //
@@ -1431,6 +1543,16 @@ TEST(xdp_kernel_stats, the_reported_length_decides_how_many_counters_are_claimed
     // claiming counters we could not have copied.
     EXPECT_EQ(detail::kernel_stats_from(raw, 9 * sizeof(uint64_t)).counters_reported, 6u);
     EXPECT_EQ(detail::kernel_stats_from(raw, 0).counters_reported, 0u);
+}
+
+TEST(xdp_kernel_stats, reading_a_socket_that_is_not_an_af_xdp_socket_fails)
+{
+    int const udp = ::socket(AF_INET, SOCK_DGRAM, 0);
+    EXPECT_TRUE(udp >= 0);
+    auto const stats = detail::read_xdp_kernel_stats(udp);
+    ::close(udp);
+    EXPECT_FALSE(stats.has_value());
+    EXPECT_TRUE(stats.error() == std::error_code(XdpError::stats_read_failed));
 }
 
 TEST(xdp_kernel_stats, reading_a_closed_descriptor_fails)
@@ -3042,6 +3164,256 @@ TEST(xdp_integration, a_queue_rebound_the_instant_it_is_closed_still_opens)
 
 #        include <sys/wait.h>
 
+namespace {
+
+constexpr size_t PROBE_FRAME_SIZE = 2048;
+constexpr size_t PROBE_FRAME_COUNT = 64;
+constexpr size_t PROBE_RING_SIZE = 64;
+constexpr size_t PROBE_FRAME_LENGTH = 60;
+
+// Write a uid/gid map for the new user namespace, so the child is root in it.
+auto write_own_map(char const* path, char const* line) -> bool
+{
+    FILE* f = ::fopen(path, "we");
+    if (f == nullptr) {
+        return false;
+    }
+    bool const wrote = ::fputs(line, f) >= 0;
+    return ::fclose(f) == 0 && wrote;
+}
+
+auto enter_private_namespaces() -> bool
+{
+    // The maps name the caller's own id, not a literal: without CAP_SETUID
+    // outside the namespace that is the only mapping the kernel will accept,
+    // and hardcoding one makes the test skip for every other uid - including
+    // root, which is how this was caught.
+    std::array<char, 32> uid_line{};
+    std::array<char, 32> gid_line{};
+    (void)std::snprintf(uid_line.data(), uid_line.size(), "0 %u 1", static_cast<unsigned>(::getuid()));
+    (void)std::snprintf(gid_line.data(), gid_line.size(), "0 %u 1", static_cast<unsigned>(::getgid()));
+
+    if (::unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) {
+        return false;
+    }
+    // setgroups must be denied before the gid map may be written.
+    (void)write_own_map("/proc/self/setgroups", "deny");
+    return write_own_map("/proc/self/uid_map", uid_line.data()) && write_own_map("/proc/self/gid_map", gid_line.data());
+}
+
+// Bring a device up with no help from a shell.
+auto bring_up(char const* device) -> bool
+{
+    int const control = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (control < 0) {
+        return false;
+    }
+    auto const closer = detail::scopeguard([control] { ::close(control); });
+    ifreq request{};
+    (void)std::snprintf(request.ifr_name, sizeof(request.ifr_name), "%s", device);
+    if (::ioctl(control, SIOCGIFFLAGS, &request) < 0) {
+        return false;
+    }
+    request.ifr_flags = static_cast<short>(request.ifr_flags | IFF_UP);
+    return ::ioctl(control, SIOCSIFFLAGS, &request) == 0;
+}
+
+// Everything a child reports back. POD so it crosses the pipe as bytes.
+struct ProbeReport
+{
+    bool entered{false};
+    bool link_up{false};
+    bool umem_created{false};
+    bool socket_bound{false};
+    bool fresh_read{false};
+    bool bad_desc_submitted{false};
+    bool kick_succeeded{false};
+    bool after_read{false};
+    uint64_t counters_reported{0};
+    uint64_t fresh_tx_invalid{0};
+    uint64_t fresh_sum{0};
+    uint64_t after_tx_invalid{0};
+};
+
+// Build a transmit-only AF_XDP socket on the namespace's loopback, submit one
+// descriptor addressed past the end of the UMEM, kick it, and report the
+// counters either side. Runs as the child of fork(), inside its own
+// namespaces.
+void probe_tx_invalid(ProbeReport& out)
+{
+    out.entered = enter_private_namespaces();
+    if (!out.entered) {
+        return;
+    }
+    if (!bring_up("lo")) {
+        return;
+    }
+    out.link_up = true;
+
+    // The kernel refuses a UMEM whose area is not page-aligned, so this cannot
+    // be a plain vector. aligned_alloc wants the size to be a multiple of the
+    // alignment, which a whole number of frames is on any page size that
+    // divides the region.
+    size_t const area_size = PROBE_FRAME_SIZE * PROBE_FRAME_COUNT;
+    auto const page_size = static_cast<size_t>(::getpagesize());
+    std::unique_ptr<void, decltype(&std::free)> const area{std::aligned_alloc(page_size, area_size), &std::free};
+    if (!area) {
+        return;
+    }
+    std::memset(area.get(), 0, area_size);
+
+    xsk_umem* umem = nullptr;
+    xsk_ring_prod fill{};
+    xsk_ring_cons comp{};
+    xsk_umem_config const umem_config{
+        .fill_size = PROBE_RING_SIZE,
+        .comp_size = PROBE_RING_SIZE,
+        .frame_size = PROBE_FRAME_SIZE,
+        .frame_headroom = 0,
+        .flags = 0,
+    };
+    if (xsk_umem__create(&umem, area.get(), area_size, &fill, &comp, &umem_config) != 0) {
+        return;
+    }
+    out.umem_created = true;
+
+    xsk_socket* xsk = nullptr;
+    xsk_ring_prod tx{};
+    xsk_socket_config const socket_config{
+        .rx_size = PROBE_RING_SIZE,
+        .tx_size = PROBE_RING_SIZE,
+        .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
+        .xdp_flags = 0,
+        .bind_flags = XDP_COPY,
+    };
+    if (xsk_socket__create(&xsk, "lo", 0, umem, nullptr, &tx, &socket_config) != 0) {
+        xsk_umem__delete(umem);
+        return;
+    }
+    out.socket_bound = true;
+    int const fd = xsk_socket__fd(xsk);
+
+    if (auto const fresh = detail::read_xdp_kernel_stats(fd); fresh.has_value()) {
+        out.fresh_read = true;
+        out.counters_reported = fresh->counters_reported;
+        out.fresh_tx_invalid = fresh->tx_invalid_descs;
+        out.fresh_sum = fresh->rx_dropped + fresh->rx_invalid_descs + fresh->tx_invalid_descs + fresh->rx_ring_full +
+            fresh->rx_fill_ring_empty_descs + fresh->tx_ring_empty_descs;
+    }
+
+    uint32_t index = 0;
+    if (xsk_ring_prod__reserve(&tx, 1, &index) == 1) {
+        xdp_desc* desc = xsk_ring_prod__tx_desc(&tx, index);
+        desc->addr = area_size + PROBE_FRAME_SIZE;  // past the end of the UMEM
+        desc->len = PROBE_FRAME_LENGTH;
+        desc->options = 0;
+        xsk_ring_prod__submit(&tx, 1);
+        out.bad_desc_submitted = true;
+        out.kick_succeeded = ::sendto(fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0) == 0;
+    }
+
+    if (auto const after = detail::read_xdp_kernel_stats(fd); after.has_value()) {
+        out.after_read = true;
+        out.after_tx_invalid = after->tx_invalid_descs;
+    }
+
+    xsk_socket__delete(xsk);
+    xsk_umem__delete(umem);
+}
+
+// What a probe came back with, or why there is nothing to assert. The reason
+// is a string rather than a silent nullopt so the test body can hand it to
+// SKIP(): a test that stops running has to say so.
+struct ProbeOutcome
+{
+    std::optional<ProbeReport> report;
+    char const* skipped{nullptr};
+};
+
+// Run fill() in a forked child inside private namespaces and bring its report
+// back.
+auto run_probe(void (*fill)(ProbeReport&)) -> ProbeOutcome
+{
+    std::array<int, 2> pipe_fds{-1, -1};
+    if (::pipe(pipe_fds.data()) != 0) {
+        return ProbeOutcome{.skipped = "pipe() failed"};
+    }
+    pid_t const child = ::fork();
+    if (child < 0) {
+        ::close(pipe_fds[0]);
+        ::close(pipe_fds[1]);
+        return ProbeOutcome{.skipped = "fork() failed"};
+    }
+    if (child == 0) {
+        ::close(pipe_fds[0]);
+        ProbeReport report;
+        fill(report);
+        auto const* bytes = reinterpret_cast<uint8_t const*>(&report);
+        ssize_t const written = ::write(pipe_fds[1], bytes, sizeof(report));
+        ::close(pipe_fds[1]);
+        ::_exit(written == static_cast<ssize_t>(sizeof(report)) ? 0 : 1);
+    }
+    ::close(pipe_fds[1]);
+    ProbeReport report;
+    ssize_t const read_bytes = ::read(pipe_fds[0], &report, sizeof(report));
+    ::close(pipe_fds[0]);
+    int status = 0;
+    (void)::waitpid(child, &status, 0);
+    if (read_bytes != static_cast<ssize_t>(sizeof(report))) {
+        return ProbeOutcome{.skipped = "the child reported nothing"};
+    }
+    if (!report.entered) {
+        return ProbeOutcome{.skipped = "no user+network namespace available to this uid"};
+    }
+    if (!report.link_up) {
+        return ProbeOutcome{.skipped = "could not bring the namespace's loopback up"};
+    }
+    if (!report.umem_created) {
+        return ProbeOutcome{.skipped = "could not register a UMEM (RLIMIT_MEMLOCK?)"};
+    }
+    if (!report.socket_bound) {
+        return ProbeOutcome{.skipped = "could not bind a transmit-only AF_XDP socket to loopback"};
+    }
+    return ProbeOutcome{.report = report};
+}
+
+}  // namespace
+
+TEST(xdp_kernel_stats, a_fresh_socket_reads_zero_on_every_counter)
+{
+    auto const outcome = run_probe(probe_tx_invalid);
+    if (outcome.skipped != nullptr) {
+        SKIP(outcome.skipped);
+    }
+    auto const& report = *outcome.report;
+
+    EXPECT_TRUE(report.fresh_read);
+    EXPECT_EQ(report.fresh_sum, 0u);
+    // Six, which is what pins that the read asks for the whole struct: a
+    // request truncated to the old three would still succeed and still read
+    // zero, and only this number would notice. A kernel older than 5.9
+    // answers 3 and fails here, which is the right way to find that out.
+    EXPECT_EQ(report.counters_reported, 6u);
+}
+
+// The point of the whole feature: the kernel refuses the descriptor, drops the
+// frame, counts it - and sendto still returns success, so without this counter
+// a dropped frame is indistinguishable from a sent one.
+TEST(xdp_kernel_stats, an_out_of_range_tx_descriptor_is_counted_though_the_kick_succeeds)
+{
+    auto const outcome = run_probe(probe_tx_invalid);
+    if (outcome.skipped != nullptr) {
+        SKIP(outcome.skipped);
+    }
+    auto const& report = *outcome.report;
+
+    EXPECT_TRUE(report.bad_desc_submitted);
+    EXPECT_TRUE(report.kick_succeeded);
+    EXPECT_TRUE(report.after_read);
+    EXPECT_EQ(report.fresh_tx_invalid, 0u);
+    EXPECT_EQ(report.after_tx_invalid, 1u);
+}
+
 //
 // Multicast memberships
 //
@@ -3125,8 +3497,8 @@ TEST(xdp_membership, a_membership_ends_with_its_socket)
     EXPECT_FALSE(lo_lists_group(group_hex));
 }
 
-/// An XdpContext open on a fresh veth "xdptest0", or nullopt with the reason to skip.
-auto open_membership_context(XdpContext& ctx) -> std::optional<char const*>
+/// A fresh veth pair "xdptest0"/"xdptest1", or the reason to skip.
+auto make_membership_veth() -> std::optional<char const*>
 {
     if (getuid() != 0) {
         return "needs root";
@@ -3135,20 +3507,26 @@ auto open_membership_context(XdpContext& ctx) -> std::optional<char const*>
     if (!create_veth_pair("xdptest0", "xdptest1")) {
         return "could not create a veth pair";
     }
-    auto const rules = ClassifierRuleBuilder<32>{}.ethertype(0x22F0).vlan_tagged_any().result(flag::process).build();
-    EXPECT_TRUE(ctx.open({.interface_name = "xdptest0", .filter_rules = rules, .umem_frame_count = 64}).has_value());
     return std::nullopt;
+}
+
+/// Open @p ctx on "xdptest0".
+auto open_on_membership_veth(XdpContext& ctx) -> bool
+{
+    auto const rules = ClassifierRuleBuilder<32>{}.ethertype(0x22F0).vlan_tagged_any().result(flag::process).build();
+    return ctx.open({.interface_name = "xdptest0", .filter_rules = rules, .umem_frame_count = 64}).has_value();
 }
 
 // XdpContext's own join_multicast()/leave_multicast(): each join needs its own leave, and a
 // leave of a group the context does not hold succeeds and changes nothing.
 TEST(xdp_integration, a_contexts_joins_are_counted_and_an_unheld_leave_changes_nothing)
 {
-    XdpContext ctx;
-    if (auto const skip = open_membership_context(ctx)) {
+    if (auto const skip = make_membership_veth()) {
         SKIP(*skip);
     }
     auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
+    XdpContext ctx;
+    EXPECT_TRUE(open_on_membership_veth(ctx));
     ieee::Eui48 const group{0x91, 0xE0, 0xF0, 0x00, 0xFE, 0x01};
     ieee::Eui48 const other{0x91, 0xE0, 0xF0, 0x00, 0xFE, 0x02};
     EXPECT_TRUE(ctx.join_multicast(group).has_value());
@@ -3164,11 +3542,12 @@ TEST(xdp_integration, a_contexts_joins_are_counted_and_an_unheld_leave_changes_n
 // XdpContext::close() drops the groups the context still holds.
 TEST(xdp_integration, a_contexts_close_drops_its_groups)
 {
-    XdpContext ctx;
-    if (auto const skip = open_membership_context(ctx)) {
+    if (auto const skip = make_membership_veth()) {
         SKIP(*skip);
     }
     auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
+    XdpContext ctx;
+    EXPECT_TRUE(open_on_membership_veth(ctx));
     ieee::Eui48 const group{0x91, 0xE0, 0xF0, 0x00, 0xFE, 0x03};
     EXPECT_TRUE(ctx.join_multicast(group).has_value());
     EXPECT_TRUE(ctx.join_multicast(group).has_value());
