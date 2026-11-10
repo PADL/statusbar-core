@@ -24,30 +24,35 @@ auto MessageReactor::poll_once(int timeout_ms) -> bool
         return false;
     }
 
-    int64_t const now_ns = clock_();
+    bool const ready = wait_ready(timeout_ms);
+    serve(ready);
+    return should_run();
+}
 
+auto MessageReactor::wait_ready(int timeout_ms) -> bool
+{
     fill_pollfds();
-
-    int n = 0;
     if (pollfds_.empty()) {
         if (timeout_ms > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
         }
-    } else {
-        n = ::poll(pollfds_.data(), pollfds_.size(), timeout_ms);
-        if (n < 0 && errno != EINTR) {
-            std::println(stderr, "MessageReactor: poll() error: {}", std::strerror(errno));
-        }
+        return false;
     }
+    int const n = ::poll(pollfds_.data(), pollfds_.size(), timeout_ms);
+    if (n < 0 && errno != EINTR) {
+        std::println(stderr, "MessageReactor: poll() error: {}", std::strerror(errno));
+    }
+    return n > 0;
+}
 
-    if (n > 0) {
+void MessageReactor::serve(bool ready)
+{
+    int64_t const now_ns = clock_();  // after the wait: handlers see the time they run at
+    if (ready) {
         dispatch_ready(now_ns);
     }
-
     tick_all(now_ns);
     remove_finished();
-
-    return should_run();
 }
 
 auto MessageReactor::active_count() const noexcept -> size_t

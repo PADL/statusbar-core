@@ -36,7 +36,9 @@
 /// "only this user may drive the daemon" becomes expressible — see
 /// TcpServerOptions::unix_mode and ::unix_seqpacket. The pool owns the
 /// socket file: it replaces one left behind by a previous run, refuses to
-/// touch a live one, and removes its own on destruction.
+/// touch a live one, and removes its own on destruction. It holds an flock()
+/// on `<path>.lock` beside the socket while it lives, so a second pool at the
+/// path is refused even before the first listens; the lock file stays behind.
 
 #include "statusbar/net/net_address.hpp"
 #include "statusbar/net/net_fd_multiplexer.hpp"
@@ -155,10 +157,9 @@ class TcpConnectionPool : public Pollable
     /// for one longer than @p out.
     [[nodiscard]] auto read_message(Slot& s, std::span<uint8_t> out) -> StatusValue<size_t>;
 
-    /// The constructor's two halves, one per address family: bind, then
-    /// hand the listener to register_listener(). Each leaves the pool
-    /// invalid on failure with nothing of its own left behind - for the
-    /// local one, that includes the socket file bind() created.
+    /// The constructor's two halves, one per address family: bind, then hand the listener to
+    /// register_listener(). On failure each leaves the pool invalid; the local one removes the socket
+    /// file bind() created, and only its `<path>.lock` stays behind.
     void open_local_listener(SocketAddress const& bind_addr);
     void open_tcp_listener(SocketAddress const& bind_addr);
     /// Take a bound, listening descriptor and put it on the multiplexer.
@@ -174,6 +175,7 @@ class TcpConnectionPool : public Pollable
     std::string unix_path_{};
     uint64_t unix_dev_{0};
     uint64_t unix_ino_{0};
+    FileDescriptor unix_lock_{};  ///< the flock() on `<unix_path_>.lock`, released after the file is removed
     FileDescriptor listener_{};
     FdMultiplexer mux_;
     std::vector<Slot> slots_;     ///< sized at construction

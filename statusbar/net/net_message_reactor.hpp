@@ -6,8 +6,8 @@
 /// Message-oriented Reactor with injected clock.
 ///
 /// Manages multiple Pollable ports in a single poll() loop. The clock
-/// function is injected at construction — called once per cycle, the
-/// timestamp is passed to all callbacks.
+/// function is injected at construction — called once per cycle, after
+/// poll() returns, and the timestamp is passed to all callbacks.
 
 #include "statusbar/itc/itc_stop_token.hpp"
 #include "statusbar/sg14/inplace_function.h"
@@ -102,6 +102,11 @@ class MessageReactor
 
   private:
     [[nodiscard]] auto should_run() const noexcept -> bool;
+    /// Polls the ports' fds (sleeps when there are none) for up to @p timeout_ms; true when any is ready.
+    [[nodiscard]] auto wait_ready(int timeout_ms) -> bool;
+    /// Reads the clock once, dispatches the ready ports (when @p ready) and ticks all at that time, then
+    /// removes the finished ones.
+    void serve(bool ready);
     void fill_pollfds();
     void dispatch_ready(int64_t now_ns);
     void tick_all(int64_t now_ns);
