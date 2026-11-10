@@ -319,14 +319,15 @@ through the linker.
 compatible with `-stdlib=libc++`, so no separate libFuzzer detection
 is needed.
 
-On Linux every target but a MODULE library (the clang-tidy plugin) is
-compiled with `-fsanitize=fuzzer-no-link`, and every executable links
-it, so a fuzzer's coverage feedback reaches into the libraries it
-calls rather than stopping at the harness. Every package that includes
+In an ASan build (`-DENABLE_ASAN=ON`) on Linux, every target but a
+MODULE library (the clang-tidy plugin) is also compiled with
+`-fsanitize=fuzzer-no-link`, and every executable links it, so a
+fuzzer's coverage feedback reaches into the libraries it calls rather
+than stopping at the harness. Every package that includes
 `module.cmake` gets this; the fuzzer targets alone link
-`-fsanitize=fuzzer`. The instrumentation slows every binary of such a
-build: measure in a build with `-DENABLE_FUZZING=OFF`, as the package
-builds are.
+`-fsanitize=fuzzer`. Other builds keep the libraries uninstrumented, so
+a fuzz campaign uses the ASan build:
+`BUILD_DIR=build-asan ./local-build.sh -DENABLE_ASAN=ON`.
 
 ## `statusbar-coreConfig.cmake.in`
 
