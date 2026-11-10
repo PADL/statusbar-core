@@ -94,9 +94,13 @@ class LaunchOrder
     ///        stepped. Told, not asked (see "told the time"): a nanosecond
     ///        count like @p wanted_ns, because the clock is whichever one
     ///        the NIC keeps - CLOCK_TAI, or a PHC - and no one clock tag
-    ///        names both.
+    ///        names both. 0 is a failed read (`tai_now_ns` and a PHC read
+    ///        both answer 0 then), not a time: see unclocked().
     [[nodiscard]] auto next(std::uint64_t const wanted_ns, std::uint64_t const now_ns) noexcept -> std::uint64_t
     {
+        if (now_ns == 0) {
+            return unclocked(wanted_ns);
+        }
         std::uint64_t const asked = wanted_ns == 0 ? now_ns : wanted_ns;
         std::uint64_t const given = ordered(asked, now_ns);
         last_ns_ = given;
@@ -131,6 +135,25 @@ class LaunchOrder
     }
 
   private:
+    /// The commit whose clock read failed. Without a `now` nothing can tell
+    /// a stale frame from a clock that stepped, so nothing is counted and no
+    /// time is invented: an untimed frame stays untimed (0, which the NIC
+    /// sends at once) and leaves the ordering alone; a timed frame is held at
+    /// the last time handed out, so it cannot launch ahead of the frames
+    /// already queued. (Before this a 0 `now` read as the clock having
+    /// stepped back a whole epoch: any earlier time went through as asked,
+    /// the ordering followed it down, and steps() counted a step that never
+    /// happened.)
+    [[nodiscard]] auto unclocked(std::uint64_t const wanted_ns) noexcept -> std::uint64_t
+    {
+        if (wanted_ns == 0) {
+            return 0;
+        }
+        std::uint64_t const given = wanted_ns < last_ns_ ? last_ns_ : wanted_ns;
+        last_ns_ = given;
+        return given;
+    }
+
     /// @p asked, held at the last time handed out where it must be, with the
     /// counters moved on.
     [[nodiscard]] auto ordered(std::uint64_t const asked, std::uint64_t const now_ns) noexcept -> std::uint64_t

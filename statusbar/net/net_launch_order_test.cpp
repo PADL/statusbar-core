@@ -135,6 +135,41 @@ TEST(launch_order, an_untimed_frame_whose_now_went_backwards_is_held)
 
 // Counters are a soak-test readout, so they must be clearable without
 // building a new ordering around a live socket.
+TEST(launch_order, a_failed_clock_read_leaves_an_untimed_frame_untimed)
+{
+    // tai_now_ns() and a PHC read answer 0 when the read fails. An untimed
+    // frame then stays untimed - the NIC sends it at once - and the ordering
+    // and the counters are untouched: nothing was learned about the clock.
+    LaunchOrder order;
+    EXPECT_EQ(order.next(T, T), T);
+    EXPECT_EQ(order.next(0, 0), 0ULL);
+    EXPECT_EQ(order.steps(), 0ULL);
+    EXPECT_EQ(order.clamped(), 0ULL);
+    // The last time handed out is still T: a later frame behind it is held.
+    EXPECT_EQ(order.next(T - 10 * LaunchOrder::PACKET_NS, T + LaunchOrder::PACKET_NS), T);
+    EXPECT_EQ(order.clamped(), 1ULL);
+}
+
+TEST(launch_order, a_failed_clock_read_holds_a_timed_frame_at_the_last_time)
+{
+    // Two timed frames queued, then a commit whose clock read fails: the
+    // frame must not launch ahead of them, and no step is counted (before,
+    // a 0 now read as the clock stepping back an epoch and the stale time
+    // went through as asked, stalling the FIFO).
+    LaunchOrder order;
+    EXPECT_EQ(order.next(T, T), T);
+    EXPECT_EQ(order.next(T + LaunchOrder::PACKET_NS, T), T + LaunchOrder::PACKET_NS);
+    EXPECT_EQ(order.next(T - 2 * LaunchOrder::STEP_NS, 0), T + LaunchOrder::PACKET_NS);
+    EXPECT_EQ(order.steps(), 0ULL);
+    EXPECT_EQ(order.clamped(), 0ULL);
+    // A timed frame ahead of the last one passes through and becomes the last.
+    EXPECT_EQ(order.next(T + 3 * LaunchOrder::PACKET_NS, 0), T + 3 * LaunchOrder::PACKET_NS);
+    EXPECT_EQ(order.next(T + 2 * LaunchOrder::PACKET_NS, T + 4 * LaunchOrder::PACKET_NS), T + 3 * LaunchOrder::PACKET_NS);
+    EXPECT_EQ(order.steps(), 0ULL);
+    // The callable form takes the same path when its clock answers 0.
+    EXPECT_EQ(order.next(T + 2 * LaunchOrder::PACKET_NS, [] { return std::uint64_t{0}; }), T + 3 * LaunchOrder::PACKET_NS);
+}
+
 TEST(launch_order, reset_clears_the_counters_but_not_the_ordering)
 {
     LaunchOrder order;
