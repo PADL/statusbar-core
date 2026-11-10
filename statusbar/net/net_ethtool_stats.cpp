@@ -130,15 +130,22 @@ struct StatsHeader
 static_assert(sizeof(StringsHeader) == sizeof(struct ::ethtool_gstrings));
 static_assert(sizeof(StatsHeader) == sizeof(struct ::ethtool_stats));
 
-/// SIOCETHTOOL of `header` and `payload` zeroed bytes after it: the buffer as the driver left it, `header` read
-/// back from it.
+/// The entries a GSTRINGS or GSTATS reply has room for, the driver having reported `count` (GDRVINFO): the
+/// kernel copies out the driver's count at the time, whatever room the caller made.
+[[nodiscard]] constexpr auto stat_capacity(uint32_t const count) noexcept -> size_t
+{
+    return (size_t{count} * 2) + 64;
+}
+
+/// `header` and `payload` zeroed bytes after it through `request`: the buffer as the driver left it, `header`
+/// read back from it.
 template <typename Header>
-auto ethtool_request(std::string_view const interface_name, Header& header, size_t const payload)
+[[nodiscard]] auto ethtool_request(EthtoolRequest const& request, Header& header, size_t const payload)
     -> StatusValue<std::vector<uint8_t>>
 {
-    std::vector<uint8_t> buffer(sizeof(Header) + payload, 0);
+    std::vector<uint8_t> buffer(sizeof(Header) + payload, 0);  // operator new's alignment suits the u64 data
     span_copy(make_span(buffer).first(sizeof(Header)), make_const_span(header));
-    if (auto const status = ethtool_ioctl(interface_name, buffer.data()); !status) {
+    if (auto const status = request(make_span(buffer)); !status) {
         return failure(status.error());
     }
     span_copy(make_span(header), make_const_span(buffer).first(sizeof(Header)));
@@ -146,11 +153,11 @@ auto ethtool_request(std::string_view const interface_name, Header& header, size
 }
 
 /// How many statistics the driver keeps (ETHTOOL_GDRVINFO's n_stats).
-auto stat_count(std::string_view const interface_name) -> StatusValue<uint32_t>
+[[nodiscard]] auto stat_count(EthtoolRequest const& request) -> StatusValue<uint32_t>
 {
     ethtool_drvinfo info{};
     info.cmd = ETHTOOL_GDRVINFO;
-    if (auto const sent = ethtool_request(interface_name, info, 0); !sent) {
+    if (auto const sent = ethtool_request(request, info, 0); !sent) {
         return failure(sent.error());
     }
     if (info.n_stats == 0) {
@@ -159,18 +166,22 @@ auto stat_count(std::string_view const interface_name) -> StatusValue<uint32_t>
     return info.n_stats;
 }
 
-/// The driver's `count` statistic names (ETHTOOL_GSTRINGS of ETH_SS_STATS).
-auto stat_names(std::string_view const interface_name, uint32_t const count) -> StatusValue<std::vector<std::string>>
+/// `resource_unavailable_try_again` when the driver reported more entries than the `capacity` made room for.
+[[nodiscard]] auto within(uint32_t const reported, size_t const capacity) -> Status
 {
-    StringsHeader header{.cmd = ETHTOOL_GSTRINGS, .string_set = ETH_SS_STATS, .len = count};
-    auto const buffer = ethtool_request(interface_name, header, size_t{count} * ETHTOOL_STAT_NAME_SIZE);
-    if (!buffer) {
-        return failure(buffer.error());
+    return reported <= capacity ? success() : Status{failure(std::make_error_code(std::errc::resource_unavailable_try_again))};
+}
+
+/// The driver's statistic names (ETHTOOL_GSTRINGS of ETH_SS_STATS), with room for `capacity`.
+[[nodiscard]] auto stat_names(EthtoolRequest const& request, size_t const capacity) -> StatusValue<std::vector<std::string>>
+{
+    StringsHeader header{.cmd = ETHTOOL_GSTRINGS, .string_set = ETH_SS_STATS, .len = static_cast<uint32_t>(capacity)};
+    auto const buffer = ethtool_request(request, header, capacity * ETHTOOL_STAT_NAME_SIZE);
+    auto const fits = buffer.and_then([&](auto const&) { return within(header.len, capacity); });
+    if (!fits) {
+        return failure(fits.error());
     }
-    if (header.len != count) {
-        return failure(std::make_error_code(std::errc::resource_unavailable_try_again));
-    }
-    return parse_stat_names(make_const_span(*buffer).subspan(sizeof(header)), count);
+    return parse_stat_names(make_const_span(*buffer).subspan(sizeof(header)), header.len);
 }
 
 /// The `count` u64 values in an ETHTOOL_GSTATS payload.
@@ -183,46 +194,70 @@ auto stat_values_in(std::span<uint8_t const> const payload, uint32_t const count
     return values;
 }
 
-/// The driver's `count` statistic values (ETHTOOL_GSTATS).
-auto stat_values(std::string_view const interface_name, uint32_t const count) -> StatusValue<std::vector<uint64_t>>
+/// The driver's statistic values (ETHTOOL_GSTATS), with room for `capacity`.
+[[nodiscard]] auto stat_values(EthtoolRequest const& request, size_t const capacity) -> StatusValue<std::vector<uint64_t>>
 {
-    StatsHeader header{.cmd = ETHTOOL_GSTATS, .n_stats = count};
-    auto const buffer = ethtool_request(interface_name, header, size_t{count} * sizeof(uint64_t));
-    if (!buffer) {
-        return failure(buffer.error());
+    StatsHeader header{.cmd = ETHTOOL_GSTATS, .n_stats = static_cast<uint32_t>(capacity)};
+    auto const buffer = ethtool_request(request, header, capacity * sizeof(uint64_t));
+    auto const fits = buffer.and_then([&](auto const&) { return within(header.n_stats, capacity); });
+    if (!fits) {
+        return failure(fits.error());
     }
-    if (header.n_stats != count) {
-        return failure(std::make_error_code(std::errc::resource_unavailable_try_again));
-    }
-    return stat_values_in(make_const_span(*buffer).subspan(sizeof(header)), count);
+    return stat_values_in(make_const_span(*buffer).subspan(sizeof(header)), header.n_stats);
 }
 
-/// Each name with its value, in the driver's order (both as many).
-auto paired(std::vector<std::string> names, std::vector<uint64_t> const& values) -> std::vector<EthtoolStat>
+/// Each name with its value, in the driver's order; `resource_unavailable_try_again` unless both are as many.
+[[nodiscard]] auto paired(std::vector<std::string> names, std::vector<uint64_t> const& values)
+    -> StatusValue<std::vector<EthtoolStat>>
 {
+    if (names.size() != values.size()) {
+        return failure(std::make_error_code(std::errc::resource_unavailable_try_again));
+    }
     std::vector<EthtoolStat> stats;
-    for (size_t i = 0; i < names.size() && i < values.size(); ++i) {
+    stats.reserve(names.size());
+    for (size_t i = 0; i < names.size(); ++i) {
         stats.push_back({.name = std::move(names[i]), .value = values[i]});
     }
     return stats;
 }
 
-}  // namespace
-
-auto ethtool_stats(std::string_view const interface_name) -> StatusValue<std::vector<EthtoolStat>>
+/// One reading: the count, then the names and the values, each with room past the count.
+[[nodiscard]] auto read_stats(EthtoolRequest const& request) -> StatusValue<std::vector<EthtoolStat>>
 {
-    auto const count = stat_count(interface_name);
-    auto names = count.and_then([&](uint32_t const n) { return stat_names(interface_name, n); });
-    auto const values = names.and_then([&](auto const&) { return stat_values(interface_name, *count); });
+    auto const capacity = stat_count(request).transform(stat_capacity);
+    auto names = capacity.and_then([&](size_t const room) { return stat_names(request, room); });
+    auto const values = names.and_then([&](auto const&) { return stat_values(request, *capacity); });
     if (!values) {
         return failure(values.error());
     }
     return paired(std::move(*names), *values);
 }
 
+}  // namespace
+
+auto ethtool_stats(EthtoolRequest const& request) -> StatusValue<std::vector<EthtoolStat>>
+{
+    auto stats = read_stats(request);
+    if (stats || stats.error() != std::errc::resource_unavailable_try_again) {
+        return stats;
+    }
+    return read_stats(request);  // the count changed while it was read: once more
+}
+
+auto ethtool_stats(std::string_view const interface_name) -> StatusValue<std::vector<EthtoolStat>>
+{
+    return ethtool_stats(
+        [interface_name](std::span<uint8_t> const payload) { return ethtool_ioctl(interface_name, payload.data()); });
+}
+
 #else
 
 auto ethtool_stats(std::string_view const /*interface_name*/) -> StatusValue<std::vector<EthtoolStat>>
+{
+    return failure(std::make_error_code(std::errc::operation_not_supported));
+}
+
+auto ethtool_stats(EthtoolRequest const& /*request*/) -> StatusValue<std::vector<EthtoolStat>>
 {
     return failure(std::make_error_code(std::errc::operation_not_supported));
 }
