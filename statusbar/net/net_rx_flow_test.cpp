@@ -241,18 +241,18 @@ TEST(net_rx_flow_steering, a_resized_table_is_refused_at_restore_and_the_rules_s
     EXPECT_EQ(rss.table(), (RssIndirection{1, 2, 1, 2}));
 }
 
-TEST(net_rx_flow_steering, a_guard_assigned_over_one_for_the_same_range_keeps_its_rules)
+TEST(net_rx_flow_steering, a_guard_assigned_over_a_live_one_restores_it_first)
 {
     RxFlowRecorder flows;
     RssRecorder rss;
     rss.set_table(spread_table());
     auto first = RxFlowSteering::steer(flows, rss, "eth0", plan());
-    auto second = RxFlowSteering::steer(flows, rss, "eth0", plan());
+    auto second = RxFlowSteering::steer(
+        flows, rss, "eth0", RxFlowPlan{.locations = {.first = 20, .count = 1}, .rules = {}, .rss_excluded = {0, 3}});
     *first = std::move(*second);
-    EXPECT_EQ(flows.rules().size(), size_t{3});
-    EXPECT_TRUE(first->restore().has_value());
     EXPECT_TRUE(flows.rules().empty());
     EXPECT_EQ(rss.table(), spread_table());
+    EXPECT_TRUE(first->holds() && first->plan().locations.first == 20);
 }
 
 TEST(net_rx_flow_steering, a_refused_rule_undoes_the_ones_before_it)
