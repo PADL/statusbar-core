@@ -161,6 +161,18 @@ fi
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+# The copies under test live in $TREE, linted with the repository's own
+# .clang-tidy plus the gate's bound; --config would drop the repository's, and
+# with it the header filter, so a header would never be reported.
+TREE="$TMP/tree"
+mkdir -p "$TREE"
+inherit=""
+if [ -f "$REPO/.clang-tidy" ]; then
+    cp "$REPO/.clang-tidy" "$TMP/.clang-tidy"
+    inherit="InheritParentConfig: true\n"
+fi
+printf "${inherit}CheckOptions:\n  statusbar-block-statements.MaxStatements: %s\n" "$MAX" > "$TREE/.clang-tidy"
+
 # The compile command for a source file, from compile_commands.json: prints the
 # directory to run in, then the flags shell-quoted on one line -- without the
 # compiler, the source, the output and the dependency-file flags. For a
@@ -268,7 +280,7 @@ for f in $files; do
 
     # The content under test lives in a copy of the tree, so a staged .cpp
     # that includes a staged header sees the staged header.
-    copy="$TMP/$f"
+    copy="$TREE/$f"
     mkdir -p "$(dirname "$copy")"
     content_of "$f" > "$copy"
 
@@ -311,14 +323,14 @@ for f in $files; do
     report="$TMP/report.txt"
     (cd "$run_dir" && "$CLANG_TIDY" -load="$PLUGIN" \
         --checks='-*,statusbar-block-statements' \
-        --config="{CheckOptions: {statusbar-block-statements.MaxStatements: $MAX}}" \
-        --quiet "$tu" -- -I"$TMP" -iquote "$REPO/$(dirname "$f")" "$@") > "$report" 2>&1 || true
+        --warnings-as-errors='-*' --header-filter='.*' \
+        --quiet "$tu" -- -I"$TREE" -iquote "$REPO/$(dirname "$f")" "$@") > "$report" 2>&1 || true
 
     # A file clang-tidy could not parse was not checked; say so rather than
     # read an empty report as a clean one.
     errors=$(grep -E '(^|[[:space:]])error: |^Error |^Error while processing' "$report" || true)
     if [ -n "$errors" ]; then
-        skipped "$f did not parse: $(printf '%s\n' "$errors" | head -n 3 | sed "s|$TMP/||g" | tr '\n' ' ')"
+        skipped "$f did not parse: $(printf '%s\n' "$errors" | head -n 3 | sed "s|$TREE/||g" | tr '\n' ' ')"
         continue
     fi
 
