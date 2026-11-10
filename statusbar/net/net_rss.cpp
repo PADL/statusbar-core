@@ -3,6 +3,8 @@
 
 #include "statusbar/net/net_rss.hpp"
 
+#include "statusbar/status/catch_or_status.hpp"
+
 #include <algorithm>
 #include <system_error>
 #include <utility>
@@ -208,10 +210,11 @@ auto RssSteering::operator=(RssSteering&& other) noexcept -> RssSteering&
 
 RssSteering::~RssSteering()
 {
-    try {
-        (void)restore();
-    } catch (...) {  // NOLINT(bugprone-empty-catch) a destructor has nobody to report to
-    }
+    // A destructor has nobody to report to, and a bare try/catch does not
+    // build under -fno-exceptions (ENABLE_NO_EXCEPTIONS). catch_or_status is
+    // the library's one catch boundary: it swallows an escaping exception
+    // where exceptions exist and calls restore() straight where they do not.
+    (void)catch_or_status([this] { return restore(); }, std::errc::operation_canceled);
 }
 
 auto RssSteering::release() noexcept -> void
