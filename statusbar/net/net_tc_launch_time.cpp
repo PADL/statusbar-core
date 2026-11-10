@@ -210,7 +210,7 @@ struct Root
 }
 
 /// Lay @p root unless it is already ours: a stale root of ours, or a foreign mqprio or taprio, is
-/// deleted first (NET_MODULE.md, "Notes & caveats": mqprio takes no change or in-place replace).
+/// deleted first (NET_MODULE.md, "Notes & caveats": mqprio accepts no change or in-place replace).
 [[nodiscard]] auto ensure_root(TcControl& tc, int const ifindex, MqprioQdisc const& root, Root const& seen) -> Status
 {
     if (seen.state == RootState::ours) {
