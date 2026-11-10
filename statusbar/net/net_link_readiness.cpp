@@ -117,14 +117,6 @@ constexpr uint32_t ADDRESSES_SEQ = 2;
     return ours && error < 0 ? -error : 0;
 }
 
-/// Whether `bytes` start with an RTM_NEWLINK of @p ifindex (as parse_link_carrier() reads one), whole or cut.
-[[nodiscard]] auto starts_with_link_report(std::span<uint8_t const> const bytes, int const ifindex) noexcept -> bool
-{
-    return bytes.size() >= netlink::MESSAGE_HEADER + sizeof(ifinfomsg) && message_type(bytes) == RTM_NEWLINK &&
-        bytes[netlink::MESSAGE_HEADER + offsetof(ifinfomsg, ifi_family)] == AF_UNSPEC &&
-        load<int32_t>(bytes, netlink::MESSAGE_HEADER + offsetof(ifinfomsg, ifi_index)) == ifindex;
-}
-
 }  // namespace
 
 auto parse_ipv4_address(std::span<uint8_t const> const message, int const ifindex) -> StatusValue<std::optional<Ipv4AddressChange>>
@@ -263,7 +255,7 @@ void LinkWatch::lose_notifications(int64_t const now_ns) noexcept
 
 auto LinkWatch::receive() -> StatusValue<Received>
 {
-    // MSG_TRUNC: the datagram's whole length, so one longer than the buffer is known to be cut.
+    // MSG_TRUNC: the datagram's whole length, so one cut short is known, and lost as on an overrun.
     auto const received = ::recv(fd_.get(), buffer_.data(), buffer_.size(), MSG_DONTWAIT | MSG_TRUNC);
     if (received < 0) {
         int const error = errno;
@@ -273,19 +265,7 @@ auto LinkWatch::receive() -> StatusValue<Received>
                                                        : failure(errno_code(error));
     }
     length_ = static_cast<size_t>(received);
-    return length_ > buffer_.size() ? cut() : StatusValue<Received>{Received::delivered};
-}
-
-auto LinkWatch::cut() noexcept -> StatusValue<Received>
-{
-    // Cut short (a link with many VFs): lost, as on an overrun. Only our link's report cut again after asking
-    // is refused: another interface's is cut whatever the buffer, and holds nothing of ours.
-    if (!starts_with_link_report(std::span<uint8_t const>{buffer_}, readiness_.ifindex())) {
-        return Received::lost;
-    }
-    return std::exchange(cut_, true) && asked_after_cut_
-        ? StatusValue<Received>{failure(std::make_error_code(std::errc::message_size))}
-        : StatusValue<Received>{Received::lost};
+    return length_ > buffer_.size() ? Received::lost : Received::delivered;
 }
 
 auto LinkWatch::deliver(std::span<uint8_t const> const datagram, int64_t const now_ns) -> Status
@@ -308,16 +288,7 @@ auto LinkWatch::deliver_one(std::span<uint8_t const> const message, int64_t cons
         lose_notifications(now_ns);  // asked again once drained
         return success();
     }
-    return apply(message, now_ns);
-}
-
-auto LinkWatch::apply(std::span<uint8_t const> const message, int64_t const now_ns) -> Status
-{
-    auto const applied = readiness_.apply(message, now_ns);
-    if (applied && *applied) {
-        cut_ = asked_after_cut_ = false;
-    }
-    return applied ? success() : Status{failure(applied.error())};
+    return readiness_.apply(message, now_ns).transform([](bool) {});
 }
 
 void LinkWatch::track_dump(std::span<uint8_t const> const message) noexcept
@@ -329,7 +300,6 @@ void LinkWatch::track_dump(std::span<uint8_t const> const message) noexcept
 auto LinkWatch::request() -> Status
 {
     std::array<uint8_t, netlink::MESSAGE_HEADER + sizeof(ifinfomsg)> link{};
-    asked_after_cut_ = cut_;
     dump_wanted_ = true;
     return build_get_link(link, readiness_.ifindex(), LINK_SEQ)
         .and_then([&](size_t const length) { return send(std::span{link}.first(length)); })
