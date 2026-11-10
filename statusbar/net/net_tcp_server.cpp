@@ -197,7 +197,7 @@ struct LocalListener
 }
 
 /// The listener @p sock bound at @p path, with that file's device and inode (fstat() on the socket reports the
-/// socket's own inode), and @p mode where the umask narrowed it, set without following a symlink.
+/// socket's own inode), and @p mode where the file's differs, set without following a symlink.
 [[nodiscard]] auto claim_bound(std::string const& path, FileDescriptor sock, int const mode) -> StatusValue<LocalListener>
 {
     struct stat bound{};
@@ -206,8 +206,8 @@ struct LocalListener
     }
     LocalListener local{
         .fd = std::move(sock), .dev = static_cast<uint64_t>(bound.st_dev), .ino = static_cast<uint64_t>(bound.st_ino)};
-    bool const narrowed = mode >= 0 && (bound.st_mode & 07777U) != static_cast<mode_t>(mode);
-    if (narrowed && ::fchmodat(AT_FDCWD, path.c_str(), static_cast<mode_t>(mode), AT_SYMLINK_NOFOLLOW) < 0) {
+    bool const differs = mode >= 0 && (bound.st_mode & 07777U) != static_cast<mode_t>(mode);
+    if (differs && ::fchmodat(AT_FDCWD, path.c_str(), static_cast<mode_t>(mode), AT_SYMLINK_NOFOLLOW) < 0) {
         unlink_if_ours(path, local.dev, local.ino);
         return failure(NetError::socket_option_failed);
     }
