@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 // The netdev queue and NAPI builders against bytes checked by hand from linux/netlink.h,
-// linux/genetlink.h and Linux 7.1's linux/netdev.h, and the parsers against replies framed as
+// linux/genetlink.h and Linux 6.19's linux/netdev.h, and the parsers against replies framed as
 // netdev_nl_queue_fill_one and netdev_nl_napi_fill_one write them. The expected bytes are little-endian.
 
 #include "statusbar/test/test.hpp"
