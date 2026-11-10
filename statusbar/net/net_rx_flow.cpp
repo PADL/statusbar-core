@@ -357,9 +357,9 @@ auto RxFlowSteering::steer_rss() -> Status
         // no RSS: the rules alone steer
         return current.error() == std::errc::operation_not_supported ? Status{} : Status{failure(current.error())};
     }
+    default_rss_on_restore_ = leftovers_ != 0;  // the table is the crashed owner's, whatever its plan
     auto const wanted = rss_indirection_excluding(current->size(), rx_queues_, plan_.rss_excluded);
     if (wanted.empty() || wanted == *current) {
-        default_rss_on_restore_ = leftovers_ != 0;  // already spread so by the owner that left them
         return success();
     }
     return write_rss(wanted, std::move(*current));
@@ -408,8 +408,11 @@ auto RxFlowSteering::steer(RxFlowControl& flows, RssControl& rss, std::string_vi
 
 auto RxFlowSteering::restore_rss() -> Status
 {
+    if (default_rss_on_restore_) {
+        return rss_->set_indirection(interface_, {});
+    }
     if (previous_.empty()) {
-        return default_rss_on_restore_ ? rss_->set_indirection(interface_, {}) : success();
+        return success();
     }
     auto const current = rss_->indirection(interface_);
     if (current && current->size() != previous_.size()) {
