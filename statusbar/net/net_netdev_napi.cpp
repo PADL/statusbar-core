@@ -34,7 +34,7 @@ static_assert(QUEUE_NAPI_ID == NETDEV_A_QUEUE_NAPI_ID && NAPI_IFINDEX == NETDEV_
 static_assert(NAPI_IRQ == NETDEV_A_NAPI_IRQ && NAPI_PID == NETDEV_A_NAPI_PID);
 static_assert(QueueType::rx == QueueType{NETDEV_QUEUE_TYPE_RX} && QueueType::tx == QueueType{NETDEV_QUEUE_TYPE_TX});
 #    endif
-#    if defined(HAVE_NETDEV_NAPI_BUSY_POLL)  // 7.1+, detected by CMake
+#    if defined(HAVE_NETDEV_NAPI_BUSY_POLL)  // 6.19+, detected by CMake
 static_assert(CMD_NAPI_SET == NETDEV_CMD_NAPI_SET && NAPI_THREADED == NETDEV_A_NAPI_THREADED);
 static_assert(NapiThreaded::busy_poll == NapiThreaded{NETDEV_NAPI_THREADED_BUSY_POLL});
 #    endif
