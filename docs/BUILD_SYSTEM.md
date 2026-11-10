@@ -221,9 +221,15 @@ section for the full walkthrough).
 libFuzzer support via Clang's built-in `-fsanitize=fuzzer`. Pulled in
 by the toolchain file.
 
-| Option           | Default | Effect                                                           |
-|------------------|---------|------------------------------------------------------------------|
-| `ENABLE_FUZZING` | `OFF`   | Defines `HAS_LIBFUZZER=1` and exports the cache variables below. |
+| Option           | Default                                        | Effect                                                           |
+|------------------|------------------------------------------------|------------------------------------------------------------------|
+| `ENABLE_FUZZING` | `ON` with Clang on Linux; `OFF` on Apple or GCC | Defines `HAS_LIBFUZZER=1` and exports the cache variables below. |
+
+The default follows the compiler: a Linux Clang build (the CI host, the
+containers) builds every `*_fuzzer` target unless `-DENABLE_FUZZING=OFF`
+is passed; Apple builds stay off because the macOS branch of
+`add_*_fuzzer()` has no libFuzzer driver, and GCC has no
+`-fsanitize=fuzzer`.
 
 When enabled, the script sets the following internal cache variables
 for fuzzer-target CMake code to read:
