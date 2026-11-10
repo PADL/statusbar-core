@@ -80,6 +80,33 @@ auto operator new[](size_t size, std::align_val_t alignment) -> void*
     return ::operator new(size, alignment);
 }
 
+// The nothrow forms too (std::stable_sort's buffer uses one): every new pairs with a delete below.
+auto operator new(size_t size, std::nothrow_t const&) noexcept -> void*
+{
+    count_allocation();
+    return std::malloc(size == 0 ? 1 : size);
+}
+
+auto operator new[](size_t size, std::nothrow_t const& tag) noexcept -> void*
+{
+    return ::operator new(size, tag);
+}
+
+auto operator new(size_t size, std::align_val_t alignment, std::nothrow_t const&) noexcept -> void*
+{
+    count_allocation();
+    void* p = nullptr;
+    if (::posix_memalign(&p, size_t(alignment) < sizeof(void*) ? sizeof(void*) : size_t(alignment), size == 0 ? 1 : size) != 0) {
+        return nullptr;
+    }
+    return p;
+}
+
+auto operator new[](size_t size, std::align_val_t alignment, std::nothrow_t const& tag) noexcept -> void*
+{
+    return ::operator new(size, alignment, tag);
+}
+
 void operator delete(void* p) noexcept
 {
     std::free(p);
@@ -109,6 +136,22 @@ void operator delete(void* p, size_t, std::align_val_t) noexcept
     std::free(p);
 }
 void operator delete[](void* p, size_t, std::align_val_t) noexcept
+{
+    std::free(p);
+}
+void operator delete(void* p, std::nothrow_t const&) noexcept
+{
+    std::free(p);
+}
+void operator delete[](void* p, std::nothrow_t const&) noexcept
+{
+    std::free(p);
+}
+void operator delete(void* p, std::align_val_t, std::nothrow_t const&) noexcept
+{
+    std::free(p);
+}
+void operator delete[](void* p, std::align_val_t, std::nothrow_t const&) noexcept
 {
     std::free(p);
 }
