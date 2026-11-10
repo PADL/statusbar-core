@@ -323,7 +323,7 @@ using FileDescriptor = ::statusbar::FileDescriptor;
     return group.octet(0) == 232;
 }
 
-/// `address` as the sockaddr_storage the protocol-independent multicast options take (RFC 3678 Section 5).
+/// `address` as the sockaddr_storage the protocol-independent multicast options expect (RFC 3678 Section 5).
 [[nodiscard]] inline auto ipv4_sockaddr_storage(ip::IPv4Address const& address) noexcept -> sockaddr_storage
 {
     sockaddr_in in{};
@@ -339,7 +339,7 @@ using FileDescriptor = ::statusbar::FileDescriptor;
 
 /// Join IPv4 multicast `group` for datagrams from `source` alone, an IGMPv3 INCLUDE join (RFC 4607 Section 4.1), on
 /// the interface with index `interface_index` (0: the routing table's choice): the source-specific join_group().
-/// MCAST_JOIN_SOURCE_GROUP (RFC 3678 Section 5.2) takes the index on Linux, Darwin and the BSDs alike.
+/// MCAST_JOIN_SOURCE_GROUP (RFC 3678 Section 5.2) accepts the index on Linux, Darwin and the BSDs alike.
 [[nodiscard]] inline auto join_source_group(
     int fd, ip::IPv4Address const& group, ip::IPv4Address const& source, unsigned int interface_index) noexcept -> Status
 {
@@ -398,7 +398,7 @@ using FileDescriptor = ::statusbar::FileDescriptor;
 }
 
 /// The interface unicast leaves by on an IPv4 or IPv6 (`family`) socket: `interface_index`, or 0 for the route
-/// again. Linux: IP_UNICAST_IF / IPV6_UNICAST_IF (both take the index in network order), refused (EINVAL) on a
+/// again. Linux: IP_UNICAST_IF / IPV6_UNICAST_IF (both read the index in network order), refused (EINVAL) on a
 /// socket bound to a device with SO_BINDTODEVICE; macOS and BSD: IP_BOUND_IF / IPV6_BOUND_IF.
 [[nodiscard]] inline auto set_unicast_interface(int fd, int family, unsigned int interface_index) noexcept -> Status
 {
@@ -433,10 +433,9 @@ using FileDescriptor = ::statusbar::FileDescriptor;
     return set ? success() : failure(errno_code());
 }
 
-/// Send unicast from an IPv4 or IPv6 (`family`) socket out of interface `interface_index`, whatever the route
-/// prefers (0: the route; set_unicast_interface(), so not on a socket bound to a device), with hop limit `ttl` (0:
-/// the host's default; set_unicast_hops()). Both are set either way, so a reconfigured socket keeps nothing from
-/// before. The unicast counterpart of set_multicast_send().
+/// Unicast from an IPv4 or IPv6 (`family`) socket out of `interface_index` (0: the route) with hop limit `ttl`
+/// (0: the default): set_unicast_interface() and set_unicast_hops(), both set either way, so a reconfigured
+/// socket keeps nothing from before. The unicast counterpart of set_multicast_send().
 [[nodiscard]] inline auto set_unicast_send(int fd, int family, unsigned int interface_index, uint8_t ttl) noexcept -> Status
 {
     if (auto pinned = set_unicast_interface(fd, family, interface_index); !pinned) {

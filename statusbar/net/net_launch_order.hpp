@@ -66,7 +66,7 @@ namespace statusbar::net {
     return (static_cast<std::uint64_t>(now.tv_sec) * 1'000'000'000ULL) + static_cast<std::uint64_t>(now.tv_nsec);
 }
 
-/// @p phc (a nullable callable such as ClockFn) read: the sending NIC's PHC, for a NIC taking launch
+/// @p phc (a nullable callable such as ClockFn) read: the sending NIC's PHC, for a NIC reading launch
 /// times in its PHC's time (AF_XDP, xsk-tx-metadata.rst). 0 without a clock or on a failed read, as
 /// tai_now_ns gives on a failed read; the caller then sends untimed.
 template <typename Clock>
