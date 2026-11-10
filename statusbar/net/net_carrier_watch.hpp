@@ -64,7 +64,7 @@ class CarrierWatch final : public Pollable
     /// The netlink socket, -1 before open().
     [[nodiscard]] auto fd() const noexcept -> int override { return fd_.get(); }
     /// Reads every notification queued, asking again after an overrun or a cut datagram. A lasting error
-    /// reply, a second cut, the link's removal (reported as no carrier) or a socket error finish the watch.
+    /// reply, the link's removal (reported as no carrier) or a socket error finish the watch.
     void on_ready(int64_t now_ns) override;
     /// Nothing is timed: the watch is event-driven.
     void tick(int64_t /*now_ns*/) override {}
@@ -87,8 +87,7 @@ class CarrierWatch final : public Pollable
     int ifindex_{0};
     OnChange on_change_;
     bool failed_{false};
-    bool resync_{false};                   ///< an overrun since the last request_link()
-    bool truncated_{false};                ///< a datagram cut short since the last whole RTM_NEWLINK
+    bool resync_{false};                   ///< an overrun or a cut datagram since the last request_link()
     std::array<uint8_t, 32768> buffer_{};  ///< an RTM_NEWLINK with its statistics is a few KiB
 };
 
