@@ -84,10 +84,9 @@ set(_STATUSBAR_CXX_FLAGS
     -Wno-c23-extensions)
 set(_STATUSBAR_LINKER_FLAGS "") # appended to EXE / SHARED / MODULE link kinds
 
-# libc++ 20 to 22: std::format_to into a back_insert_iterator overflows its
-# stack buffer (llvm-project issue 154670). Puts a patched copy of
-# __format/buffer.h first on the include path; the system headers are never
-# touched.
+# libc++ 20 to 22: format_to into a back_insert_iterator overflows a stack
+# buffer (llvm-project issue 154670); a patched copy of __format/buffer.h goes
+# first on the include path. The system headers are never touched.
 function(_statusbar_libcxx_format_overlay)
   if(CMAKE_IN_TRY_COMPILE)
     return() # the parent's flags already name the overlay
@@ -154,7 +153,8 @@ function(_statusbar_libcxx_format_overlay)
     RESULT_VARIABLE _patched
     OUTPUT_QUIET ERROR_QUIET)
   if(NOT _patched EQUAL 0)
-    message(FATAL_ERROR "${_patch} does not apply to ${_header}")
+    message(WARNING "${_patch} does not apply to ${_header}: no overlay")
+    return() # fmt_format_to_test catches a libc++ that still overflows
   endif()
   file(COPY_FILE "${_overlay}/buffer.h.patched"
        "${_overlay}/include/__format/buffer.h" ONLY_IF_DIFFERENT)
