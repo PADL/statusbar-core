@@ -61,11 +61,9 @@ if(ENABLE_FUZZING)
         CACHE INTERNAL "Extra link options for fuzzer targets")
   endif()
 
-  # In an ASan build, coverage of the libraries a harness calls, not of the
-  # harness alone: every target is compiled with libFuzzer's instrumentation and
-  # every executable links its callbacks (fuzzer-no-link: no main()); the
-  # fuzzers link -fsanitize=fuzzer. Other builds stay uninstrumented. Not a
-  # MODULE library: a clang-tidy plugin is loaded into a plain clang-tidy.
+  # ASan builds only: the libraries a harness calls get libFuzzer's coverage
+  # too, every executable linking its callbacks (fuzzer-no-link). Not a MODULE
+  # library: the clang-tidy plugin is loaded into a plain clang-tidy.
   if(NOT APPLE AND ENABLE_ASAN)
     add_compile_options(
       "$<$<NOT:$<STREQUAL:$<TARGET_PROPERTY:TYPE>,MODULE_LIBRARY>>:-fsanitize=fuzzer-no-link>"
