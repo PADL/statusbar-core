@@ -14,8 +14,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -733,39 +731,27 @@ TEST(net_tcp_server_local, the_requested_mode_is_on_the_socket_file)
     EXPECT_EQ(path.mode_bits(), 0600U);
 }
 
-TEST(net_tcp_server_local, the_socket_is_staged_privately_and_linked_into_place)
+TEST(net_tcp_server_local, a_mode_the_umask_would_narrow_is_set_whole)
 {
-    std::string dir = "/tmp/sb_pool_stage_XXXXXX";
-    EXPECT_TRUE(::mkdtemp(dir.data()) != nullptr);
-    std::string const path = dir + "/s.sock";
-    auto const addr = SocketAddress::local(path);
-    EXPECT_TRUE(addr.has_value());
-    {
-        TcpConnectionPool* pool_ptr = nullptr;
-        EchoHandler handler{pool_ptr};
-        TcpServerOptions options;
-        options.unix_mode = 0600;
-        TcpConnectionPool pool{*addr, 2, handler, options};
-        pool_ptr = &pool;
-        EXPECT_TRUE(pool.valid());
-        // Only the socket is left beside it: the private directory is gone.
-        size_t entries = 0;
-        for (auto const& entry : std::filesystem::directory_iterator{dir}) {
-            EXPECT_EQ(entry.path().string(), path);
-            ++entries;
-        }
-        EXPECT_EQ(entries, size_t{1});
-        auto const bound = pool.local_addr();
-        EXPECT_TRUE(bound.has_value());
-        Client c{*bound};
-        EXPECT_TRUE(c.fd >= 0);
-    }
-    (void)::rmdir(dir.c_str());
+    LocalPath const path{"narrowed"};
+    mode_t const umask_was = ::umask(0077);
+    TcpConnectionPool* pool_ptr = nullptr;
+    EchoHandler handler{pool_ptr};
+    TcpServerOptions options;
+    options.unix_mode = 0660;
+    TcpConnectionPool pool{path.addr(), 2, handler, options};
+    pool_ptr = &pool;
+    (void)::umask(umask_was);
+    EXPECT_TRUE(pool.valid());
+    EXPECT_EQ(path.mode_bits(), 0660U);
+    auto const bound = pool.local_addr();
+    EXPECT_TRUE(bound.has_value() && bound->path() == path.str());
+    Client const c{path.addr()};
+    EXPECT_TRUE(c.fd >= 0);
 }
 
-// A path that fits sun_path when its staged name would not (near the limit) is refused, not bound in
-// place where it would answer before its mode was set.
-TEST(net_tcp_server_local, a_path_too_long_to_stage_is_refused)
+// A path of 100 octets is bound in place with its mode, as any other.
+TEST(net_tcp_server_local, a_long_path_is_bound_with_its_mode)
 {
     std::string top = "/tmp/sb_pool_long_XXXXXX";
     EXPECT_TRUE(::mkdtemp(top.data()) != nullptr);
@@ -781,40 +767,12 @@ TEST(net_tcp_server_local, a_path_too_long_to_stage_is_refused)
         options.unix_mode = 0600;
         TcpConnectionPool pool{*addr, 2, handler, options};
         pool_ptr = &pool;
-        EXPECT_FALSE(pool.valid());
+        EXPECT_TRUE(pool.valid());
         struct stat st{};
-        EXPECT_TRUE(::lstat(path.c_str(), &st) < 0 && errno == ENOENT);
+        EXPECT_TRUE(::lstat(path.c_str(), &st) == 0 && S_ISSOCK(st.st_mode) && (st.st_mode & 07777U) == 0600U);
     }
     (void)::rmdir(dir.c_str());
     (void)::rmdir(top.c_str());
-}
-
-// The staging directory a run that crashed between the bind and the link left behind, with its
-// socket in it, is swept before the next run stages there.
-TEST(net_tcp_server_local, a_staging_directory_left_by_a_crash_is_swept)
-{
-    std::string dir = "/tmp/sb_pool_sweep_XXXXXX";
-    EXPECT_TRUE(::mkdtemp(dir.data()) != nullptr);
-    std::string const path = dir + "/s.sock";
-    std::string const staging = path + ".staging";
-    EXPECT_EQ(::mkdir(staging.c_str(), 0700), 0);
-    {
-        std::ofstream left{staging + "/s"};
-        left << "a stale socket";
-    }
-    auto const addr = SocketAddress::local(path);
-    EXPECT_TRUE(addr.has_value());
-    {
-        TcpConnectionPool* pool_ptr = nullptr;
-        EchoHandler handler{pool_ptr};
-        TcpConnectionPool pool{*addr, 2, handler, TcpServerOptions{}};
-        pool_ptr = &pool;
-        EXPECT_TRUE(pool.valid());
-        struct stat st{};
-        EXPECT_TRUE(::lstat(staging.c_str(), &st) < 0 && errno == ENOENT);
-        EXPECT_TRUE(::lstat(path.c_str(), &st) == 0 && S_ISSOCK(st.st_mode));
-    }
-    (void)::rmdir(dir.c_str());
 }
 
 TEST(net_tcp_server_local, without_a_mode_the_umask_result_stands)
