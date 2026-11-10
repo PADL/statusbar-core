@@ -110,11 +110,9 @@ asks the compiler which `__format/buffer.h` it uses (LLVM_PATH's, or the sysroot
 and for a libc++ 20.x to 22.x without the fix copies it to `<build>/libcxx-overlay/include`,
 applies `cmake/patches/libcxx-20-format-buffer.patch` there and puts that directory first with
 `-isystem`. The system headers are never modified; a header the patch neither applies to nor
-reverses gets a warning and no overlay (`fmt_format_to_test` then fails under ASan if that
-libc++ still overflows); a libc++ that already has the fix (the patch applies in reverse) gets
-no overlay.
-The patch and the header are configure dependencies, so a libc++ upgrade reconfigures.
-`fmt_format_to_test` fails under ASan without the overlay.
+reverses gets a warning and no overlay; a libc++ that already has the fix (the patch applies in
+reverse) gets no overlay. The patch and the header are configure dependencies, so a libc++
+upgrade reconfigures. `fmt_format_to_test` fails under ASan without the overlay.
 
 ## `toolchain-clang-aarch64.cmake` — cross builds
 
