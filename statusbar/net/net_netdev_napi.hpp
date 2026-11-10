@@ -23,7 +23,7 @@
 namespace statusbar::net::netdev {
 
 //
-// Wire constants - linux/netdev.h (Linux 7.1); defined here as the build host's headers may predate them
+// Wire constants - linux/netdev.h (Linux 6.19); defined here as the build host's headers may predate them
 //
 
 /// NETDEV_CMD_QUEUE_GET (6.9), NETDEV_CMD_NAPI_GET (6.9) and NETDEV_CMD_NAPI_SET (6.13).
@@ -50,7 +50,7 @@ enum class QueueType : uint32_t
 };
 
 /// enum netdev_napi_threaded: softirq polling, a kthread woken by the IRQ, or a kthread that busy polls
-/// with the IRQ left masked (busy_poll, Linux 7.1).
+/// with the IRQ left masked (busy_poll, Linux 6.19).
 enum class NapiThreaded : uint32_t
 {
     disabled = 0,
@@ -133,7 +133,7 @@ class NapiClient
     /// NETDEV_CMD_NAPI_GET. Errors: ENOENT for no such NAPI or one whose device is down, else the request's.
     [[nodiscard]] auto napi(uint32_t napi_id) -> StatusValue<NapiInfo>;
     /// NETDEV_CMD_NAPI_SET of the threaded mode (CAP_NET_ADMIN). Errors: EINVAL where the kernel lacks
-    /// `mode` (busy_poll before 7.1, any before 6.17), EOPNOTSUPP before 6.13, the driver's refusal.
+    /// `mode` (busy_poll before 6.19, any before 6.17), EOPNOTSUPP before 6.13, the driver's refusal.
     [[nodiscard]] auto set_threaded(uint32_t napi_id, NapiThreaded mode) -> Status;
     /// The NAPIs of `ifindex`'s RX and TX queue `queue_id` (RX's alone without that TX queue), pids unset.
     /// Errors: the RX queue()'s, and operation_not_supported when the driver links no NAPI to either.
@@ -146,9 +146,9 @@ class NapiClient
     NetdevClient netdev_{};  ///< the netdev family's socket, shared with the device queries
 };
 
-/// `client`'s queue_napis() of `ifindex`'s queue `queue_id` set to `mode`; a threaded mode is reached through
-/// enabled, each kthread pinned SCHED_OTHER to `cpu` (pin_napi_thread()) first, and a failure leaves them
-/// disabled, as does disabled (whatever mode they had before). Errors: the client's, or the pinning's errno.
+/// `client`'s queue_napis() of `ifindex`'s queue `queue_id` set to `mode`: a threaded mode through enabled, each
+/// kthread pinned SCHED_OTHER to `cpu` first, a failure putting each back in its previous mode; disabled stops at the
+/// first refusal. The mode outlives the process: set disabled at stop. Errors: the client's, or the pinning's errno.
 [[nodiscard]] auto set_queue_threaded(NapiClient& client, int ifindex, uint32_t queue_id, NapiThreaded mode, int cpu)
     -> StatusValue<QueueNapis>;
 
