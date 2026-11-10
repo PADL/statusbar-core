@@ -14,6 +14,7 @@
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -177,6 +178,7 @@ struct LocalListener
     FileDescriptor fd{};
     uint64_t dev{0};
     uint64_t ino{0};
+    FileDescriptor lock{};  ///< claim_socket_path()'s, held while the listener lives
 };
 
 /// A socket of @p sock_type bound at @p addr. With a @p mode, fchmod() first: Linux makes the file with the
@@ -241,6 +243,19 @@ struct LocalListener
     return failure(NetError::bind_failed);
 }
 
+/// The claim on @p path for a listener's lifetime: an exclusive flock() on `<path>.lock` beside it, then the
+/// path cleared. A second listener is refused while the lock is held, even before the first listens; the lock
+/// file stays behind afterwards, which is harmless.
+[[nodiscard]] auto claim_socket_path(std::string const& path, int const sock_type) -> StatusValue<FileDescriptor>
+{
+    std::string const lock_path = path + ".lock";
+    FileDescriptor lock{::open(lock_path.c_str(), O_RDONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600)};
+    if (!lock.valid() || ::flock(lock.get(), LOCK_EX | LOCK_NB) < 0) {
+        return failure(NetError::bind_failed);
+    }
+    return clear_socket_path(path, sock_type).transform([&] { return std::move(lock); });
+}
+
 /// Bind with the mode, then listen: nobody can connect before the mode is final, and the mode is never set
 /// through a symlink swapped in at the path.
 auto create_local_listener(SocketAddress const& addr, TcpServerOptions const& options) -> StatusValue<LocalListener>
@@ -254,12 +269,15 @@ auto create_local_listener(SocketAddress const& addr, TcpServerOptions const& op
         return failure(NetError::invalid_argument);  // permission bits only, refused before anything is touched
     }
     int const sock_type = options.unix_seqpacket ? SOCK_SEQPACKET : SOCK_STREAM;
-    if (auto const cleared = clear_socket_path(path, sock_type); !cleared) {
-        return failure(cleared.error());
-    }
-    return bind_local(addr, sock_type, options.unix_mode)
-        .and_then([&](FileDescriptor&& sock) { return claim_bound(path, std::move(sock), options.unix_mode); })
-        .and_then([&](LocalListener&& local) { return listen_local(std::move(local), path, options.backlog); });
+    return claim_socket_path(path, sock_type).and_then([&](FileDescriptor&& lock) {
+        return bind_local(addr, sock_type, options.unix_mode)
+            .and_then([&](FileDescriptor&& sock) { return claim_bound(path, std::move(sock), options.unix_mode); })
+            .and_then([&](LocalListener&& local) { return listen_local(std::move(local), path, options.backlog); })
+            .transform([&](LocalListener&& local) {
+                local.lock = std::move(lock);
+                return std::move(local);
+            });
+    });
 }
 
 }  // namespace
@@ -284,7 +302,7 @@ TcpConnectionPool::TcpConnectionPool(
 }
 
 void TcpConnectionPool::open_local_listener(SocketAddress const& bind_addr)
-{
+{  // NOLINT(statusbar-block-statements): the owned socket file's path, identity and lock, set together
     auto local = create_local_listener(bind_addr, options_);
     if (!local) {
         return;
@@ -299,6 +317,7 @@ void TcpConnectionPool::open_local_listener(SocketAddress const& bind_addr)
     unix_path_ = std::string{bind_addr.path()};
     unix_dev_ = local->dev;
     unix_ino_ = local->ino;
+    unix_lock_ = std::move(local->lock);
 }
 
 void TcpConnectionPool::open_tcp_listener(SocketAddress const& bind_addr)

@@ -14,10 +14,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 
@@ -127,14 +129,20 @@ class LocalPath
         : path_{std::string{"/tmp/sb_pool_"} + std::string{tag} + "_" + std::to_string(::getpid()) + ".sock"}
     {
         (void)::unlink(path_.c_str());
+        (void)::unlink(lock_path().c_str());
     }
-    ~LocalPath() { (void)::unlink(path_.c_str()); }
+    ~LocalPath()
+    {
+        (void)::unlink(path_.c_str());
+        (void)::unlink(lock_path().c_str());
+    }
     LocalPath(LocalPath const&) = delete;
     LocalPath(LocalPath&&) = delete;
     auto operator=(LocalPath const&) -> LocalPath& = delete;
     auto operator=(LocalPath&&) -> LocalPath& = delete;
 
     [[nodiscard]] auto str() const -> std::string const& { return path_; }
+    [[nodiscard]] auto lock_path() const -> std::string { return path_ + ".lock"; }
     [[nodiscard]] auto addr() const -> SocketAddress
     {
         auto a = SocketAddress::local(path_);
@@ -599,6 +607,70 @@ TEST(net_tcp_server_local, a_socket_left_by_a_previous_run_is_replaced)
     EXPECT_EQ(handler.accepts.size(), 1U);
 }
 
+TEST(net_tcp_server_local, a_stale_socket_with_a_lock_file_nobody_holds_is_replaced)
+{
+    LocalPath const path{"stalelock"};
+    leave_stale_socket(path.addr());
+    int const lock = ::open(path.lock_path().c_str(), O_RDONLY | O_CREAT | O_CLOEXEC, 0600);
+    EXPECT_TRUE(lock >= 0);
+    ::close(lock);  // the lock file a previous run left behind, unheld
+
+    TcpConnectionPool* pool_ptr = nullptr;  // no events pumped: the handler is never called
+    EchoHandler handler{pool_ptr};
+    TcpConnectionPool const pool{path.addr(), 2, handler};
+    EXPECT_TRUE(pool.valid());
+    Client const c{path.addr()};
+    EXPECT_TRUE(c.fd >= 0);
+}
+
+TEST(net_tcp_server_local, a_second_pool_is_refused_until_the_first_closes)
+{
+    LocalPath const path{"twice"};
+    TcpConnectionPool* pool_ptr = nullptr;  // no events pumped: the handler is never called
+    EchoHandler handler{pool_ptr};
+    auto first = std::make_unique<TcpConnectionPool>(path.addr(), 2, handler);
+    EXPECT_TRUE(first->valid());
+    {
+        TcpConnectionPool const second{path.addr(), 2, handler};
+        EXPECT_FALSE(second.valid());
+    }
+    EXPECT_TRUE(path.is_socket());  // the refused pool left the first one's file alone
+
+    first.reset();
+    TcpConnectionPool const third{path.addr(), 2, handler};
+    EXPECT_TRUE(third.valid());
+    Client const c{path.addr()};
+    EXPECT_TRUE(c.fd >= 0);
+}
+
+TEST(net_tcp_server_local, a_socket_bound_but_not_yet_listening_is_not_replaced)
+{
+    // Another instance mid-start: it holds the lock and has bound, but not listened. A connect() probe
+    // reads that as stale (ECONNREFUSED); the lock is what refuses the second pool.
+    LocalPath const path{"starting"};
+    int const lock = ::open(path.lock_path().c_str(), O_RDONLY | O_CREAT | O_CLOEXEC, 0600);
+    EXPECT_TRUE(lock >= 0);
+    EXPECT_EQ(::flock(lock, LOCK_EX | LOCK_NB), 0);
+    SocketAddress const at = path.addr();
+    int const bound = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    EXPECT_TRUE(bound >= 0);
+    EXPECT_EQ(::bind(bound, at.sockaddr(), at.length()), 0);
+    struct stat before{};
+    EXPECT_EQ(::lstat(path.str().c_str(), &before), 0);
+
+    TcpConnectionPool* pool_ptr = nullptr;  // no events pumped: the handler is never called
+    EchoHandler handler{pool_ptr};
+    {
+        TcpConnectionPool const pool{path.addr(), 2, handler};
+        EXPECT_FALSE(pool.valid());
+    }
+    struct stat after{};
+    EXPECT_EQ(::lstat(path.str().c_str(), &after), 0);
+    EXPECT_EQ(after.st_ino, before.st_ino);  // the starting instance's socket file is still there
+    ::close(bound);
+    ::close(lock);
+}
+
 TEST(net_tcp_server_local, a_live_listener_is_not_hijacked)
 {
     // The failure this guards: a second instance unlinks the path, binds its
@@ -796,6 +868,7 @@ TEST(net_tcp_server_local, a_long_path_is_bound_with_its_mode)
         struct stat st{};
         EXPECT_TRUE(::lstat(path.c_str(), &st) == 0 && S_ISSOCK(st.st_mode) && (st.st_mode & 07777U) == 0600U);
     }
+    (void)::unlink((path + ".lock").c_str());
     (void)::rmdir(dir.c_str());
     (void)::rmdir(top.c_str());
 }
