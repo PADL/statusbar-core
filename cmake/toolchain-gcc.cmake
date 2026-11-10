@@ -233,9 +233,9 @@ if(_STATUSBAR_TARGET_PROC MATCHES "aarch64|arm64|ARM64"
 endif()
 
 # libFuzzer is a clang feature; GCC has no -fsanitize=fuzzer. fuzzing.cmake
-# already defaults ENABLE_FUZZING off, but pin it in the cache so an explicit
-# -DENABLE_FUZZING=ON fails at configure time with this message rather than at
-# link time with an unresolved main().
+# already defaults ENABLE_FUZZING off for a non-clang CMAKE_CXX_COMPILER, but
+# pin it in the cache so an explicit -DENABLE_FUZZING=ON fails at configure time
+# with this message rather than at link time with an unresolved main().
 if(ENABLE_FUZZING)
   message(
     FATAL_ERROR
