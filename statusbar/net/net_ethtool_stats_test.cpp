@@ -1,14 +1,16 @@
 // Copyright 2026 Jeff Koftinoff <jeff.koftinoff@statusbar.com>
 // SPDX-License-Identifier: MIT
 
-// The statistic names' parser and the per-queue counter names, on crafted payloads; the ioctl
-// itself only by its refusals, as no host here has a NIC with per-queue counters.
+// The statistic names' parser and the per-queue counter names, on crafted payloads; the reading against
+// a pretend driver whose count changes; the ioctl itself only by its refusals.
 
 #include "statusbar/net/net_ethtool_stats.hpp"
 
+#include "statusbar/buffer/span_utils.hpp"
 #include "statusbar/test/test.hpp"
 
 #include <cstdint>
+#include <format>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -96,5 +98,114 @@ TEST(net_ethtool_stats, an_unknown_interface_fails)
     auto const stats = ethtool_stats("nosuchif0");
     EXPECT_FALSE(stats.has_value());
 }
+
+#if defined(__linux__)
+
+#    include <linux/ethtool.h>
+
+namespace {
+
+/// What a pretend driver reports in one reading: the GDRVINFO count, then the GSTRINGS and GSTATS counts.
+struct Reading
+{
+    uint32_t drvinfo{0};
+    uint32_t strings{0};
+    uint32_t stats{0};
+};
+
+/// A driver answering GDRVINFO, GSTRINGS and GSTATS with its counts at the time, as the kernel does: it writes
+/// its count in the header whatever room the request made, and as many entries as fit.
+class StatsRecorder
+{
+  public:
+    explicit StatsRecorder(std::vector<Reading> readings)
+        : readings_{std::move(readings)}
+    {}
+
+    auto answer(std::span<uint8_t> const payload) -> Status
+    {
+        uint32_t cmd = 0;
+        span_load(cmd, payload);
+        if (cmd == ETHTOOL_GDRVINFO) {
+            reading_ = readings_.at(drvinfo_calls_++);
+            return put_u32(payload, offsetof(ethtool_drvinfo, n_stats), reading_.drvinfo);
+        }
+        return cmd == ETHTOOL_GSTRINGS ? strings(payload) : stats(payload);
+    }
+
+    [[nodiscard]] auto drvinfo_calls() const noexcept -> size_t { return drvinfo_calls_; }
+
+  private:
+    static auto put_u32(std::span<uint8_t> const payload, size_t const offset, uint32_t const value) -> Status
+    {
+        span_store(payload.subspan(offset, sizeof(value)), value);
+        return success();
+    }
+
+    auto strings(std::span<uint8_t> const payload) -> Status
+    {
+        auto const data = payload.subspan(sizeof(ethtool_gstrings));
+        for (size_t i = 0; i < reading_.strings && (i + 1) * ETHTOOL_STAT_NAME_SIZE <= data.size(); ++i) {
+            auto const name = std::format("rx_queue_{}_packets", i);
+            span_copy(data.subspan(i * ETHTOOL_STAT_NAME_SIZE, name.size()), make_const_span(std::string_view{name}));
+        }
+        return put_u32(payload, offsetof(ethtool_gstrings, len), reading_.strings);
+    }
+
+    auto stats(std::span<uint8_t> const payload) -> Status
+    {
+        auto const data = payload.subspan(sizeof(struct ::ethtool_stats));
+        for (size_t i = 0; i < reading_.stats && (i + 1) * sizeof(uint64_t) <= data.size(); ++i) {
+            span_store(data.subspan(i * sizeof(uint64_t), sizeof(uint64_t)), uint64_t{100 + i});
+        }
+        return put_u32(payload, offsetof(struct ::ethtool_stats, n_stats), reading_.stats);
+    }
+
+    std::vector<Reading> readings_;
+    Reading reading_{};
+    size_t drvinfo_calls_{0};
+};
+
+auto read_from(StatsRecorder& driver) -> StatusValue<std::vector<EthtoolStat>>
+{
+    return net::ethtool_stats([&driver](std::span<uint8_t> const payload) { return driver.answer(payload); });
+}
+
+}  // namespace
+
+TEST(net_ethtool_stats, a_count_grown_since_drvinfo_is_read_whole)
+{
+    StatsRecorder driver{{{.drvinfo = 2, .strings = 5, .stats = 5}}};
+    auto const stats = read_from(driver);
+    EXPECT_TRUE(stats && stats->size() == 5);
+    EXPECT_TRUE(stats && stats->back().name == "rx_queue_4_packets" && stats->back().value == 104);
+    EXPECT_EQ(driver.drvinfo_calls(), size_t{1});
+}
+
+TEST(net_ethtool_stats, a_count_past_the_room_made_is_read_again)
+{
+    StatsRecorder driver{{{.drvinfo = 2, .strings = 100, .stats = 100}, {.drvinfo = 100, .strings = 100, .stats = 100}}};
+    auto const stats = read_from(driver);
+    EXPECT_TRUE(stats && stats->size() == 100);
+    EXPECT_EQ(driver.drvinfo_calls(), size_t{2});
+}
+
+TEST(net_ethtool_stats, names_and_values_of_different_counts_are_read_again)
+{
+    StatsRecorder driver{{{.drvinfo = 4, .strings = 4, .stats = 5}, {.drvinfo = 5, .strings = 5, .stats = 5}}};
+    auto const stats = read_from(driver);
+    EXPECT_TRUE(stats && stats->size() == 5);
+    EXPECT_EQ(driver.drvinfo_calls(), size_t{2});
+}
+
+TEST(net_ethtool_stats, a_count_changing_twice_running_is_resource_unavailable)
+{
+    StatsRecorder driver{{{.drvinfo = 2, .strings = 100, .stats = 100}, {.drvinfo = 2, .strings = 100, .stats = 100}}};
+    auto const stats = read_from(driver);
+    EXPECT_TRUE(!stats && stats.error() == std::errc::resource_unavailable_try_again);
+    EXPECT_EQ(driver.drvinfo_calls(), size_t{2});
+}
+
+#endif
 
 TEST_MAIN(statusbar_net, net_ethtool_stats_test)

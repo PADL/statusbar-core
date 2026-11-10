@@ -6,6 +6,7 @@
 /// A NIC driver's statistics (`ethtool -S <if>`: ETHTOOL_GSTRINGS and ETHTOOL_GSTATS), and the per-queue
 /// packet counters among them, under the names the common drivers give them.
 
+#include "statusbar/sg14/inplace_function.h"
 #include "statusbar/status/status.hpp"
 
 #include <cstddef>
@@ -28,8 +29,15 @@ struct EthtoolStat
 };
 
 /// The driver's statistics of `interface_name`, in the driver's order. No privilege. Errors: the ioctl's errno
-/// (`operation_not_supported` for a driver with none), `resource_unavailable_try_again` when the count changed.
+/// (`operation_not_supported` for a driver with none), `resource_unavailable_try_again` when the count changed
+/// while it was read, twice running.
 [[nodiscard]] auto ethtool_stats(std::string_view interface_name) -> StatusValue<std::vector<EthtoolStat>>;
+
+/// One SIOCETHTOOL request: an ethtool command and its data in `payload`, rewritten in place by the driver.
+using EthtoolRequest = sg14::inplace_function<Status(std::span<uint8_t> payload), 32>;
+
+/// ethtool_stats() made through `request`, for a test to stand in for the driver. Linux only.
+[[nodiscard]] auto ethtool_stats(EthtoolRequest const& request) -> StatusValue<std::vector<EthtoolStat>>;
 
 /// The bytes of one ETH_SS_STATS name (ETH_GSTRING_LEN).
 inline constexpr size_t ETHTOOL_STAT_NAME_SIZE = 32;
