@@ -1,11 +1,31 @@
 # Copyright 2026 Jeff Koftinoff <jeff.koftinoff@statusbar.com>
 # SPDX-License-Identifier: MIT
 #
-# libFuzzer detection and configuration. Defaults OFF; enable with
-# -DENABLE_FUZZING=ON (Clang on Linux). On Apple each package's add_*_fuzzer()
-# builds the fuzzer source as a plain executable, which does not link yet.
+# libFuzzer detection and configuration. Defaults ON when the compiler is Clang
+# (the toolchain-required compiler); disable with -DENABLE_FUZZING=OFF.
+
+# Toolchain files run before project() so CMAKE_CXX_COMPILER_ID may not be
+# populated yet. CMAKE_CXX_COMPILER (the path or program name) is set by the
+# toolchain file itself, so probe that for "clang" / "clang++" instead.
+#
+# Default OFF on Apple: the macOS branch of each package's add_*_fuzzer() builds
+# the fuzzer source as a plain executable (no -fsanitize=fuzzer, no standalone
+# driver supplying main()), so the link step fails. Opt in explicitly with
+# -DENABLE_FUZZING=ON once that path is wired up.
+if(APPLE)
+  set(STATUSBAR_FUZZING_DEFAULT OFF)
+elseif(
+  CMAKE_CXX_COMPILER_ID STREQUAL "Clang"
+  OR CMAKE_CXX_COMPILER MATCHES "clang(\\+\\+)?$"
+  OR CMAKE_CXX_COMPILER MATCHES "clang(\\+\\+)?-[0-9]+$")
+  set(STATUSBAR_FUZZING_DEFAULT ON)
+else()
+  set(STATUSBAR_FUZZING_DEFAULT OFF)
+endif()
+
 option(ENABLE_FUZZING
-       "Enable fuzzing toolchain defaults (try to locate libFuzzer)" OFF)
+       "Enable fuzzing toolchain defaults (try to locate libFuzzer)"
+       ${STATUSBAR_FUZZING_DEFAULT})
 
 if(ENABLE_FUZZING)
   message(STATUS "Fuzzing toolchain enabled")
