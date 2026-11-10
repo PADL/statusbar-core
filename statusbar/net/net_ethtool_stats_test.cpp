@@ -226,10 +226,12 @@ TEST(net_ethtool_stats, an_unfixed_kernels_own_count_is_read_again)
 
 TEST(net_ethtool_stats, names_and_values_of_different_counts_are_read_again)
 {
-    StatsRecorder driver{Kernel::fixed, {{.drvinfo = 4, .strings = 4, .stats = 5}, {.drvinfo = 5, .strings = 5, .stats = 5}}};
-    auto const stats = read_from(driver);
-    EXPECT_TRUE(stats && stats->size() == 5);
-    EXPECT_EQ(driver.drvinfo_calls(), size_t{2});
+    for (auto const kernel : {Kernel::fixed, Kernel::unfixed}) {
+        StatsRecorder driver{kernel, {{.drvinfo = 4, .strings = 4, .stats = 5}, {.drvinfo = 5, .strings = 5, .stats = 5}}};
+        auto const stats = read_from(driver);
+        EXPECT_TRUE(stats && stats->size() == 5);
+        EXPECT_EQ(driver.drvinfo_calls(), size_t{2});
+    }
 }
 
 TEST(net_ethtool_stats, a_count_changing_twice_running_is_resource_unavailable)
