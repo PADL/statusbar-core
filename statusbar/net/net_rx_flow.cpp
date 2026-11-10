@@ -269,26 +269,11 @@ RxFlowSteering::RxFlowSteering(RxFlowSteering&& other) noexcept
 
 auto RxFlowSteering::operator=(RxFlowSteering&& other) noexcept -> RxFlowSteering&
 {
-    if (this == &other) {
-        return *this;
+    if (this != &other) {
+        (void)restore();
+        move_from(other);
     }
-    bool const same_owner = holds() && other.holds() && interface_ == other.interface_ &&
-        plan_.locations.first == other.plan_.locations.first && plan_.locations.count == other.plan_.locations.count;
-    if (same_owner) {
-        adopt_debt(other);  // the successor's sweep removed our rules: only our RSS debt is left
-    }
-    (void)restore();
-    move_from(other);
     return *this;
-}
-
-auto RxFlowSteering::adopt_debt(RxFlowSteering& successor) noexcept -> void
-{
-    if (!previous_.empty() || default_rss_on_restore_) {
-        successor.previous_ = std::move(previous_);
-        successor.default_rss_on_restore_ = default_rss_on_restore_;
-    }
-    release();
 }
 
 auto RxFlowSteering::move_from(RxFlowSteering& other) noexcept -> void
