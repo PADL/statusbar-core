@@ -163,6 +163,7 @@ TEST(launch_order, a_failed_clock_read_holds_a_timed_frame_at_the_last_time)
     EXPECT_EQ(order.next(T - 2 * LaunchOrder::STEP_NS, 0), T + LaunchOrder::PACKET_NS);
     EXPECT_EQ(order.steps(), 0ULL);
     EXPECT_EQ(order.clamped(), 0ULL);
+    EXPECT_EQ(order.launched_late(), 0ULL);  // with no reading, no frame is known to be late
     // A timed frame ahead of the last one passes through and becomes the last.
     EXPECT_EQ(order.next(T + 3 * LaunchOrder::PACKET_NS, 0), T + 3 * LaunchOrder::PACKET_NS);
     EXPECT_EQ(order.next(T + 2 * LaunchOrder::PACKET_NS, T + 4 * LaunchOrder::PACKET_NS), T + 3 * LaunchOrder::PACKET_NS);
