@@ -111,6 +111,16 @@ constexpr std::string_view SYSFS_NET = "/sys/class/net/";
     return success();
 }
 
+/// Run an SIOCETHTOOL command whose payload is `data`.
+template <typename Command>
+[[nodiscard]] auto ethtool_ioctl(std::string_view name, Command& data) noexcept -> Status
+{
+    ifreq ifr{};
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    ifr.ifr_data = reinterpret_cast<char*>(&data);
+    return interface_ioctl(name, SIOCETHTOOL, ifr);
+}
+
 /// Build "/sys/class/net/<name>/<suffix>" into a fixed buffer. Returns the
 /// length written, or 0 if it would not fit.
 [[nodiscard]] auto sysfs_path(std::span<char> out, std::string_view name, std::string_view suffix) noexcept -> std::size_t
@@ -244,13 +254,10 @@ auto interface_mtu(std::string_view const interface_name) -> StatusValue<uint32_
 
 auto driver_name(std::string_view const interface_name) -> StatusValue<std::string>
 {
-    if (auto status = validate_name(interface_name); !status) {
-        return forward_failure(status);
-    }
     ethtool_drvinfo info{};
     info.cmd = ETHTOOL_GDRVINFO;
-    if (auto status = ethtool_ioctl(interface_name, &info); !status) {
-        return failure(errno_error(status.error().value()));  // errno, in this module's generic category
+    if (auto status = ethtool_ioctl(interface_name, info); !status) {
+        return forward_failure(status);
     }
     // The kernel does not promise a terminator in a full field.
     return success(std::string{info.driver, ::strnlen(info.driver, sizeof(info.driver))});
