@@ -102,21 +102,17 @@ includes `sanitizers.cmake`, `coverage.cmake`, `fuzzing.cmake`, and
 `clang_tidy.cmake`. Their options become available without any extra
 `include()` from the project.
 
-**libc++ 20 needs a patch.** From LLVM 20 (21 and 22 too), `std::format_to` into a
-`back_insert_iterator` of a string, vector or deque overflows a 256-code-unit stack buffer
+**libc++ 20 to 22 are patched in the build tree.** From LLVM 20 (21 and 22 too), `std::format_to`
+into a `back_insert_iterator` of a string, vector or deque overflows a 256-code-unit stack buffer
 when an argument or fill whose length is a multiple of 256 is followed by more output
-(llvm-project issue 154670; fixed upstream by PR 226791, not in 20.x). The tree formats that
-way in many places, so patch the headers of every libc++ it builds against, the host's and
-any cross sysroot's (`cmake/patches/libcxx-20-format-buffer.patch` is the upstream change):
-
-```sh
-sudo patch -p1 -d /usr/lib/llvm-20/include/c++/v1 < cmake/patches/libcxx-20-format-buffer.patch
-patch -p1 -d <sysroot>/usr/lib/llvm-20/include/c++/v1 < cmake/patches/libcxx-20-format-buffer.patch
-grep -c 'push_back needs a free code unit' /usr/lib/llvm-20/include/c++/v1/__format/buffer.h  # 3
-```
-
-The fix is in headers only, so rebuild everything after applying it; a libc++ package
-upgrade restores the old header, so apply it again then.
+(llvm-project issue 154670; fixed upstream by PR 226791, not in 20.x). `toolchain-clang.cmake`
+asks the compiler which `__format/buffer.h` it uses (LLVM_PATH's, or the sysroot's when cross),
+and for a libc++ 20.x to 22.x without the fix copies it to `<build>/libcxx-overlay/include`,
+applies `cmake/patches/libcxx-20-format-buffer.patch` there and puts that directory first with
+`-isystem`. The system headers are never modified; a patch that does not apply stops the
+configure; a libc++ that already has the fix (the patch applies in reverse) gets no overlay.
+The patch and the header are configure dependencies, so a libc++ upgrade reconfigures.
+`fmt_format_to_test` fails under ASan without the overlay.
 
 ## `toolchain-clang-aarch64.cmake` — cross builds
 
