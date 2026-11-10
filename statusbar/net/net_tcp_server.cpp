@@ -3,12 +3,12 @@
 
 #include "statusbar/net/net_tcp_server.hpp"
 
+#include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
 
 #include <cassert>
 #include <cerrno>
-#include <cstdlib>
 #include <string>
 #include <utility>
 
@@ -18,7 +18,6 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
-#include <sys/un.h>
 
 namespace statusbar::net {
 
@@ -180,91 +179,47 @@ struct LocalListener
     uint64_t ino{0};
 };
 
-/// The staged name "<path>.staging/s" is this much longer than @p path.
-constexpr size_t STAGED_SUFFIX = sizeof(".staging/s") - 1;
-
-/// Whether the staged name of @p path fits sun_path: not for a path near the limit.
-[[nodiscard]] auto staged_name_fits(std::string const& path) noexcept -> bool
+/// A socket of @p sock_type bound at @p addr. With a @p mode, fchmod() first: Linux makes the file with the
+/// socket's mode, less the umask (elsewhere claim_bound() sets the mode).
+[[nodiscard]] auto bind_local(SocketAddress const& addr, int const sock_type, int const mode) -> StatusValue<FileDescriptor>
 {
-    return path.size() + STAGED_SUFFIX < sizeof(sockaddr_un::sun_path);
-}
-
-/// Remove the staged name and its directory, whatever became of them.
-void remove_staged(std::string const& staged, std::string const& dir) noexcept
-{
-    (void)::unlink(staged.c_str());
-    (void)::rmdir(dir.c_str());
-}
-
-/// A fresh private (0700) directory "<path>.staging" to stage the socket in, one a run that crashed
-/// left swept first; bind_failed when it cannot be made (a directory of that name holding more).
-[[nodiscard]] auto make_private_dir(std::string const& path) -> StatusValue<std::string>
-{
-    std::string dir = path + ".staging";
-    remove_staged(dir + "/s", dir);
-    if (::mkdir(dir.c_str(), 0700) < 0) {
-        return failure(NetError::bind_failed);
-    }
-    return dir;
-}
-
-/// A socket of @p sock_type bound at @p staged.
-[[nodiscard]] auto bind_staged(std::string const& staged, int const sock_type) -> StatusValue<FileDescriptor>
-{
-    auto const addr = SocketAddress::local(staged);
     FileDescriptor sock{::socket(AF_UNIX, sock_type, 0)};
-    if (!addr || !sock.valid()) {
-        return failure(addr ? NetError::socket_creation_failed : NetError::invalid_address);
+    if (!sock.valid()) {
+        return failure(NetError::socket_creation_failed);
     }
-    if (::bind(sock.get(), addr->sockaddr(), addr->length()) < 0) {
+    if (mode >= 0) {
+        (void)::fchmod(sock.get(), static_cast<mode_t>(mode));
+    }
+    if (::bind(sock.get(), addr.sockaddr(), addr.length()) < 0) {
         return failure(NetError::bind_failed);
     }
     return sock;
 }
 
-/// The listener @p sock bound at @p staged, with that file's device and inode
-/// (fstat() on the socket reports the socket's own inode). Read inside the
-/// private directory, before the link puts the same inode at the path.
-[[nodiscard]] auto claim_staged(std::string const& staged, FileDescriptor sock) -> StatusValue<LocalListener>
+/// The listener @p sock bound at @p path, with that file's device and inode (fstat() on the socket reports the
+/// socket's own inode), and @p mode where the umask narrowed it, set without following a symlink.
+[[nodiscard]] auto claim_bound(std::string const& path, FileDescriptor sock, int const mode) -> StatusValue<LocalListener>
 {
     struct stat bound{};
-    if (::lstat(staged.c_str(), &bound) < 0 || S_ISSOCK(bound.st_mode) == 0) {
+    if (::lstat(path.c_str(), &bound) < 0 || S_ISSOCK(bound.st_mode) == 0) {
         return failure(NetError::bind_failed);
     }
-    return LocalListener{
+    LocalListener local{
         .fd = std::move(sock), .dev = static_cast<uint64_t>(bound.st_dev), .ino = static_cast<uint64_t>(bound.st_ino)};
-}
-
-/// A socket of @p sock_type bound at @p staged, given its mode and listening.
-[[nodiscard]] auto listen_staged(std::string const& staged, int const sock_type, TcpServerOptions const& options)
-    -> StatusValue<LocalListener>
-{
-    auto sock = bind_staged(staged, sock_type);
-    if (!sock) {
-        return failure(sock.error());
-    }
-    if (options.unix_mode >= 0 && ::chmod(staged.c_str(), static_cast<mode_t>(options.unix_mode)) < 0) {
+    bool const narrowed = mode >= 0 && (bound.st_mode & 07777U) != static_cast<mode_t>(mode);
+    if (narrowed && ::fchmodat(AT_FDCWD, path.c_str(), static_cast<mode_t>(mode), AT_SYMLINK_NOFOLLOW) < 0) {
+        unlink_if_ours(path, local.dev, local.ino);
         return failure(NetError::socket_option_failed);
     }
-    if (::listen(sock->get(), options.backlog) < 0) {
-        return failure(NetError::listen_failed);
-    }
-    return claim_staged(staged, std::move(*sock));
+    return local;
 }
 
-/// The listener staged in @p dir, hard-linked to @p path. link(), like
-/// bind(), neither follows nor replaces what is at the path. The staged name
-/// and its directory are removed either way.
-[[nodiscard]] auto link_staged(
-    std::string const& dir, std::string const& path, int const sock_type, TcpServerOptions const& options)
-    -> StatusValue<LocalListener>
+/// @p local listening, its file removed if it cannot.
+[[nodiscard]] auto listen_local(LocalListener local, std::string const& path, int const backlog) -> StatusValue<LocalListener>
 {
-    std::string const staged = dir + "/s";
-    auto local = listen_staged(staged, sock_type, options);
-    bool const linked = local.has_value() && ::link(staged.c_str(), path.c_str()) == 0;
-    remove_staged(staged, dir);
-    if (local && !linked) {
-        return failure(NetError::bind_failed);
+    if (::listen(local.fd.get(), backlog) < 0) {
+        unlink_if_ours(path, local.dev, local.ino);
+        return failure(NetError::listen_failed);
     }
     return local;
 }
@@ -286,9 +241,8 @@ void remove_staged(std::string const& staged, std::string const& dir) noexcept
     return failure(NetError::bind_failed);
 }
 
-/// Bind, chmod and listen in a private directory, then link into place: the socket never answers
-/// at its path before its mode is final, and a symlink swapped in at the path is never followed by
-/// chmod(). A path too long for its staged name is refused (invalid_address), not bound in place.
+/// Bind with the mode, then listen: nobody can connect before the mode is final, and the mode is never set
+/// through a symlink swapped in at the path.
 auto create_local_listener(SocketAddress const& addr, TcpServerOptions const& options) -> StatusValue<LocalListener>
 {
     std::string const path{addr.path()};
@@ -300,10 +254,9 @@ auto create_local_listener(SocketAddress const& addr, TcpServerOptions const& op
     if (auto const cleared = clear_socket_path(path, sock_type); !cleared) {
         return failure(cleared.error());
     }
-    if (!staged_name_fits(path)) {
-        return failure(NetError::invalid_address);
-    }
-    return make_private_dir(path).and_then([&](std::string const& dir) { return link_staged(dir, path, sock_type, options); });
+    return bind_local(addr, sock_type, options.unix_mode)
+        .and_then([&](FileDescriptor&& sock) { return claim_bound(path, std::move(sock), options.unix_mode); })
+        .and_then([&](LocalListener&& local) { return listen_local(std::move(local), path, options.backlog); });
 }
 
 }  // namespace
@@ -379,10 +332,6 @@ auto TcpConnectionPool::local_addr() const -> StatusValue<SocketAddress>
 {
     if (!listener_.valid()) {
         return failure(NetError::not_connected);
-    }
-    if (!unix_path_.empty()) {
-        // Not getsockname(): the socket was bound under a staged name.
-        return SocketAddress::local(unix_path_);
     }
     SocketAddress addr;
     addr.reset_length();
