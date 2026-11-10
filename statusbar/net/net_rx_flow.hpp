@@ -82,8 +82,9 @@ struct RxFlowPlan
 
 namespace detail {
 
-/// `invalid_argument` unless every rule lies in the plan's range, matches on an EtherType or a VLAN
-/// priority (igc reads a rule on neither as its default-queue wildcard) and every queue is below `rx_queues`.
+/// `invalid_argument` unless every rule lies in the plan's range at a location of its own, matches on an
+/// EtherType or a VLAN priority (igc reads a rule on neither as its default-queue wildcard) and every queue
+/// is below `rx_queues`.
 [[nodiscard]] auto check_rx_flow_plan(RxFlowPlan const& plan, uint32_t rx_queues) -> Status;
 
 #if defined(__linux__)

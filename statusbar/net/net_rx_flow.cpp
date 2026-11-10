@@ -33,6 +33,17 @@ auto rss_indirection_excluding(size_t const entries, uint32_t const rx_queues, s
 
 namespace detail {
 
+/// Whether two of `rules` share a location.
+[[nodiscard]] auto shares_a_location(std::span<RxFlowRule const> const rules) noexcept -> bool
+{
+    for (size_t i = 0; i < rules.size(); ++i) {
+        if (std::ranges::contains(rules.subspan(i + 1), rules[i].location, &RxFlowRule::location)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 auto check_rx_flow_plan(RxFlowPlan const& plan, uint32_t const rx_queues) -> Status
 {
     bool const rules_fit = std::ranges::all_of(plan.rules, [&plan, rx_queues](RxFlowRule const& rule) {
@@ -41,7 +52,7 @@ auto check_rx_flow_plan(RxFlowPlan const& plan, uint32_t const rx_queues) -> Sta
     });
     bool const excluded_fit =
         std::ranges::all_of(plan.rss_excluded, [rx_queues](uint32_t const queue) { return queue < rx_queues; });
-    if (!rules_fit || !excluded_fit) {
+    if (!rules_fit || !excluded_fit || shares_a_location(plan.rules)) {
         return failure(std::make_error_code(std::errc::invalid_argument));
     }
     return success();
