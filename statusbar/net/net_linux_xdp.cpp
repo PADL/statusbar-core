@@ -8,6 +8,7 @@
 #include "statusbar/net/net_socket.hpp"
 
 #if defined(__linux__) && defined(HAVE_XDP)
+#    include <linux/if_packet.h>
 #    include <linux/magic.h>
 #    include <sys/stat.h>
 #    include <sys/vfs.h>
@@ -1313,6 +1314,14 @@ auto XdpContext::open(XdpConfig const& config) -> Status
     bind_retries_ = pauses;
     zero_copy_ = detail::socket_has_zero_copy(xsk_socket__fd(xsk_));
 
+    // Step 4b: The socket that owns join_multicast()'s memberships, so they end with it.
+    auto membership_socket = detail::open_membership_socket();
+    if (!membership_socket) {
+        close();
+        return failure(membership_socket.error());
+    }
+    memberships_ = std::move(*membership_socket);
+
     // Step 5: Attach BPF + register socket. An adopted program is already
     // attached and stays as it is; only the xsk_map entry is ours to replace,
     // since the socket the last process put there died with it.
@@ -1375,6 +1384,7 @@ void XdpContext::close() noexcept
 
     bpf_.close();
     umem_.close();
+    memberships_.close();
 
     zero_copy_ = false;
     tx_pending_.store(false, std::memory_order_relaxed);
@@ -1564,41 +1574,36 @@ auto XdpContext::fill_replenish() -> Status
     return success();
 }
 
-namespace {
-
-// SIOCADDMULTI and SIOCDELMULTI take the same ifreq: the interface name
-// and the group as a hardware address. One routine for both, with the
-// request selecting the direction.
-auto change_multicast_membership(unsigned int const if_index, ieee::Eui48 const& addr, unsigned long const request) -> Status
+auto detail::open_membership_socket() noexcept -> StatusValue<FileDescriptor>
 {
-    struct ifreq ifr{};
-    if (::if_indextoname(if_index, ifr.ifr_name) == nullptr) {
-        return failure(XdpError::interface_not_found);
-    }
-    span_copy(hwaddr_bytes(ifr), make_const_span(addr.value));
-    ifr.ifr_hwaddr.sa_family = AF_UNSPEC;
-
-    int sock_fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock_fd < 0) {
+    FileDescriptor sock{::socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC, 0)};
+    if (!sock.valid()) {
         return failure(XdpError::socket_creation_failed);
     }
-    auto close_sock = detail::scopeguard([&]() noexcept { ::close(sock_fd); });
-
-    if (::ioctl(sock_fd, request, &ifr) < 0) {
-        return failure(XdpError::join_multicast_failed);
-    }
-
-    return success();
+    return sock;
 }
 
-}  // namespace
+auto detail::change_multicast_membership(
+    int const fd, unsigned int const if_index, ieee::Eui48 const& addr, int const option) noexcept -> Status
+{
+    struct packet_mreq mreq{
+        .mr_ifindex = static_cast<int>(if_index),
+        .mr_type = PACKET_MR_MULTICAST,
+        .mr_alen = static_cast<unsigned short>(addr.value.size()),
+    };
+    span_copy(std::span{mreq.mr_address}.first(addr.value.size()), make_const_span(addr.value));
+    if (::setsockopt(fd, SOL_PACKET, option, &mreq, sizeof(mreq)) < 0) {
+        return failure(XdpError::join_multicast_failed);
+    }
+    return success();
+}
 
 auto XdpContext::join_multicast(ieee::Eui48 const& addr) -> Status
 {
     if (xsk_ == nullptr) {
         return failure(XdpError::not_open);
     }
-    return change_multicast_membership(interface_.index, addr, SIOCADDMULTI);
+    return detail::change_multicast_membership(memberships_.get(), interface_.index, addr, PACKET_ADD_MEMBERSHIP);
 }
 
 auto XdpContext::leave_multicast(ieee::Eui48 const& addr) -> Status
@@ -1606,7 +1611,7 @@ auto XdpContext::leave_multicast(ieee::Eui48 const& addr) -> Status
     if (xsk_ == nullptr) {
         return failure(XdpError::not_open);
     }
-    return change_multicast_membership(interface_.index, addr, SIOCDELMULTI);
+    return detail::change_multicast_membership(memberships_.get(), interface_.index, addr, PACKET_DROP_MEMBERSHIP);
 }
 
 #endif  // __linux__ && HAVE_XDP
