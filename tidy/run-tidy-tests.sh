@@ -66,6 +66,34 @@ findings_max3() {
 }
 expect "MaxStatements is honoured" "3" "$(findings_max3)"
 
+# The gate, in a scratch repository: of two five-statement blocks in a header,
+# only the one the change touches is reported, and only over a bound below 5.
+SCRATCH=$(mktemp -d)
+trap 'rm -rf "${SCRATCH:?}"' EXIT
+gate_findings() {
+    (cd "$SCRATCH" && STATUSBAR_BUILD_DIR="$SCRATCH/build" STATUSBAR_TIDY_PLUGIN="$PLUGIN" \
+        CLANG_TIDY_EXE="$CLANG_TIDY" STATUSBAR_BLOCK_STATEMENTS_MAX="$1" STATUSBAR_BLOCK_STATEMENTS_STRICT=1 \
+        sh "$DIR/../check-block-statements.sh" --since HEAD 2>&1 || true) |
+        grep "statusbar-block-statements\]" | sed 's|^gate.hpp:\([0-9]*\):.*|\1|' | tr '\n' ' ' | sed 's/ $//'
+}
+gate_repo() {
+    mkdir -p "$SCRATCH/build"
+    cp "$DIR/../.clang-tidy" "$SCRATCH/.clang-tidy"
+    printf 'int unit() { return 0; }\n' > "$SCRATCH/unit.cpp"
+    printf '[{"directory": "%s", "file": "unit.cpp", "arguments": ["c++", "-std=c++23", "-c", "unit.cpp"]}]\n' \
+        "$SCRATCH" > "$SCRATCH/build/compile_commands.json"
+    sed -n '/^int five()$/,/^}$/p' "$FIXTURE" | sed 's/^int /inline int /' > "$SCRATCH/gate.hpp"
+    sed -n '/^int five()$/,/^}$/p' "$FIXTURE" | sed 's/^int five/inline int other/' >> "$SCRATCH/gate.hpp"
+    git -C "$SCRATCH" init -q
+    git -C "$SCRATCH" add .clang-tidy unit.cpp gate.hpp
+    git -C "$SCRATCH" -c user.name=gate -c user.email=gate@example.invalid -c commit.gpgsign=false \
+        -c core.hooksPath=/dev/null commit -q -m fixture
+}
+gate_repo
+sed -i.orig '11s/1;/7;/' "$SCRATCH/gate.hpp"
+expect "the gate reports a touched header block, and only that one" "10" "$(gate_findings 4)"
+expect "the gate reads its bound" "" "$(gate_findings 5)"
+
 if [ "$fail" -ne 0 ]; then
     echo "" >&2
     echo "run-tidy-tests: FAILED" >&2
