@@ -364,6 +364,9 @@ auto bind_local_listener(SocketAddress const& addr, std::string const& path, Tcp
     if (auto cleared = clear_socket_path(path, sock_type); !cleared) {
         return failure(cleared.error());
     }
+    if (options.unix_mode > 0777) {
+        return failure(NetError::invalid_argument);  // permission bits only
+    }
     auto bound = bind_socket_file(addr, path, sock_type, options.unix_mode);
     if (!bound) {
         return failure(bound.error());

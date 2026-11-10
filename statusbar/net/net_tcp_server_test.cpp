@@ -763,6 +763,18 @@ TEST(net_tcp_server_local, a_mode_the_umask_would_narrow_is_set_whole)
     EXPECT_TRUE(c.fd >= 0);
 }
 
+TEST(net_tcp_server_local, a_mode_past_the_permission_bits_is_refused)
+{
+    LocalPath const path{"badmode"};
+    TcpConnectionPool* pool_ptr = nullptr;
+    EchoHandler handler{pool_ptr};
+    TcpServerOptions options;
+    options.unix_mode = 04660;
+    TcpConnectionPool const pool{path.addr(), 2, handler, options};
+    EXPECT_FALSE(pool.valid());
+    EXPECT_FALSE(path.is_socket());
+}
+
 // A path of 100 octets is bound in place with its mode, as any other.
 TEST(net_tcp_server_local, a_long_path_is_bound_with_its_mode)
 {
