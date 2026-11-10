@@ -148,7 +148,7 @@ set_property(
 # Optional: libbpf/libxdp for AF_XDP support (Linux only)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # The netdev uapi enumerators net_netdev_napi.cpp asserts against, where the
-  # headers have them (queue and NAPI commands 6.9, busy-poll 7.1).
+  # headers have them (queue and NAPI commands 6.9, busy-poll 6.19).
   include(CheckCXXSourceCompiles)
   include(CMakePushCheckState)
   cmake_push_check_state(RESET)
