@@ -16,6 +16,7 @@
 #include <string_view>
 #include <vector>
 
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 
@@ -125,14 +126,26 @@ class LocalPath
         : path_{std::string{"/tmp/sb_pool_"} + std::string{tag} + "_" + std::to_string(::getpid()) + ".sock"}
     {
         (void)::unlink(path_.c_str());
+        (void)::unlink(lock_str().c_str());
     }
-    ~LocalPath() { (void)::unlink(path_.c_str()); }
+    ~LocalPath()
+    {
+        (void)::unlink(path_.c_str());
+        (void)::unlink(lock_str().c_str());
+    }
     LocalPath(LocalPath const&) = delete;
     LocalPath(LocalPath&&) = delete;
     auto operator=(LocalPath const&) -> LocalPath& = delete;
     auto operator=(LocalPath&&) -> LocalPath& = delete;
 
     [[nodiscard]] auto str() const -> std::string const& { return path_; }
+    /// The pool's claim on the path lives in this file beside it.
+    [[nodiscard]] auto lock_str() const -> std::string { return path_ + ".lock"; }
+    [[nodiscard]] auto lock_exists() const -> bool
+    {
+        struct stat st{};
+        return ::lstat(lock_str().c_str(), &st) == 0;
+    }
     [[nodiscard]] auto addr() const -> SocketAddress
     {
         auto a = SocketAddress::local(path_);
@@ -615,6 +628,88 @@ TEST(net_tcp_server_local, without_a_mode_the_umask_result_stands)
     // Nothing asserted about which bits those are -- only that the socket
     // exists and we did not chmod it to something of our own invention.
     EXPECT_TRUE(path.is_socket());
+}
+
+/// Hold a pool's lock file the way a second instance of ours that has
+/// claimed the path but not yet listened does.
+class PathClaimHolder
+{
+  public:
+    explicit PathClaimHolder(std::string const& lock_path)
+        : fd_{::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600)}
+    {
+        if (fd_ >= 0 && ::flock(fd_, LOCK_EX | LOCK_NB) < 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+    }
+    ~PathClaimHolder()
+    {
+        if (fd_ >= 0) {
+            ::close(fd_);
+        }
+    }
+    PathClaimHolder(PathClaimHolder const&) = delete;
+    PathClaimHolder(PathClaimHolder&&) = delete;
+    auto operator=(PathClaimHolder const&) -> PathClaimHolder& = delete;
+    auto operator=(PathClaimHolder&&) -> PathClaimHolder& = delete;
+
+    [[nodiscard]] auto holding() const -> bool { return fd_ >= 0; }
+
+  private:
+    int fd_{-1};
+};
+
+TEST(net_tcp_server_local, a_claimed_path_is_refused_before_it_is_touched)
+{
+    // The race the probe cannot see: another instance has bound but not yet
+    // called listen(), so its socket answers ECONNREFUSED exactly like a
+    // dead process's. It holds the lock, though, and that is what decides.
+    LocalPath const path{"claimed"};
+    leave_stale_socket(path.addr());  // what its bind() left at the path
+    PathClaimHolder const other{path.lock_str()};
+    EXPECT_TRUE(other.holding());
+
+    TcpConnectionPool* pool_ptr = nullptr;
+    EchoHandler handler{pool_ptr};
+    TcpConnectionPool pool{path.addr(), 2, handler};
+    pool_ptr = &pool;
+    EXPECT_FALSE(pool.valid());
+    // Nothing of theirs was cleared or replaced.
+    EXPECT_TRUE(path.is_socket());
+    EXPECT_TRUE(path.lock_exists());
+}
+
+TEST(net_tcp_server_local, a_lock_file_left_by_a_dead_process_holds_nothing)
+{
+    LocalPath const path{"deadlock"};
+    leave_stale_socket(path.addr());
+    {
+        PathClaimHolder const died{path.lock_str()};  // closed on exit: lock gone, file stays
+        EXPECT_TRUE(died.holding());
+    }
+    EXPECT_TRUE(path.lock_exists());
+
+    TcpConnectionPool* pool_ptr = nullptr;
+    EchoHandler handler{pool_ptr};
+    TcpConnectionPool pool{path.addr(), 2, handler};
+    pool_ptr = &pool;
+    EXPECT_TRUE(pool.valid());
+}
+
+TEST(net_tcp_server_local, the_lock_file_goes_away_with_the_pool)
+{
+    LocalPath const path{"lockcleanup"};
+    {
+        TcpConnectionPool* pool_ptr = nullptr;
+        EchoHandler handler{pool_ptr};
+        TcpConnectionPool pool{path.addr(), 2, handler};
+        pool_ptr = &pool;
+        EXPECT_TRUE(pool.valid());
+        EXPECT_TRUE(path.lock_exists());
+    }
+    EXPECT_FALSE(path.lock_exists());
+    EXPECT_FALSE(path.exists());
 }
 
 TEST(net_tcp_server_local, the_socket_file_goes_away_with_the_pool)

@@ -37,6 +37,14 @@
 /// TcpServerOptions::unix_mode and ::unix_seqpacket. The pool owns the
 /// socket file: it replaces one left behind by a previous run, refuses to
 /// touch a live one, and removes its own on destruction.
+///
+/// The path is claimed before it is touched: an exclusive flock() on the
+/// lock file beside it (`<path>.lock`, mode 0600), held until the pool is
+/// destroyed and removed with it. A second instance at the same path fails
+/// construction on the lock instead of racing the first between its bind()
+/// and its listen(), a window the stale-socket probe cannot see (both a
+/// dead process's socket and a not-yet-listening one answer ECONNREFUSED).
+/// A lock file left by a crashed process holds nothing and does not block.
 
 #include "statusbar/net/net_address.hpp"
 #include "statusbar/net/net_fd_multiplexer.hpp"
@@ -87,6 +95,19 @@ struct TcpServerOptions
     /// framing problem. The stale-socket probe uses this same type, since a
     /// live socket of the other type must not read as stale.
     bool unix_seqpacket = false;
+};
+
+/// The socket file a local TcpConnectionPool owns and its claim on the
+/// path. The device and inode are what bind() created, so the destructor
+/// can tell our socket apart from anything that replaced it at the name;
+/// the lock is the flock() on `<path>.lock` held from before the path was
+/// touched until after the file is removed.
+struct LocalSocketFile
+{
+    std::string path{};
+    uint64_t dev{0};
+    uint64_t ino{0};
+    FileDescriptor lock{};
 };
 
 class TcpConnectionPool : public Pollable
@@ -162,12 +183,9 @@ class TcpConnectionPool : public Pollable
 
     TcpConnectionHandler& handler_;
     TcpServerOptions options_;
-    /// Non-empty when we created an AF_UNIX socket file we are responsible
-    /// for. The device and inode are what we created, so the destructor can
-    /// tell our socket apart from anything that replaced it.
-    std::string unix_path_{};
-    uint64_t unix_dev_{0};
-    uint64_t unix_ino_{0};
+    /// The AF_UNIX socket file this pool created, when it did; empty for a
+    /// TCP listener or a failed local one.
+    LocalSocketFile unix_{};
     FileDescriptor listener_{};
     FdMultiplexer mux_;
     std::vector<Slot> slots_;     ///< sized at construction

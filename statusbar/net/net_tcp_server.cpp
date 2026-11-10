@@ -3,6 +3,7 @@
 
 #include "statusbar/net/net_tcp_server.hpp"
 
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <cassert>
@@ -12,6 +13,7 @@
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 
@@ -63,6 +65,102 @@ void unlink_if_ours(std::string const& path, uint64_t dev, uint64_t ino)
         return;  // not ours any more
     }
     (void)::unlink(path.c_str());
+}
+
+/// The lock file that stands for a socket path: the path with ".lock"
+/// appended, beside the socket.
+auto lock_path_for(std::string const& socket_path) -> std::string
+{
+    return socket_path + ".lock";
+}
+
+/// Whether @p fd is still the file at @p path. A holder that released
+/// between our open() and our flock() unlinked the file we hold, so the
+/// lock we won guards a name nobody can find any more.
+auto fd_is_the_file_at(int fd, std::string const& path) -> bool
+{
+    struct stat held{};
+    struct stat at_path{};
+    if (::fstat(fd, &held) < 0 || ::lstat(path.c_str(), &at_path) < 0) {
+        return false;
+    }
+    return held.st_dev == at_path.st_dev && held.st_ino == at_path.st_ino;
+}
+
+/// How one attempt at the lock ended.
+enum class ClaimOutcome
+{
+    claimed,  ///< ours: the descriptor holds the lock
+    held,     ///< somebody else has it: a second instance at this path
+    swapped,  ///< the holder released and unlinked under us: try again
+};
+
+struct ClaimAttempt
+{
+    ClaimOutcome outcome{ClaimOutcome::held};
+    FileDescriptor lock{};
+};
+
+/// One attempt at the lock. An error means the file cannot be ours at all
+/// (a symlink, somebody else's regular file, a directory we cannot write),
+/// which the caller reports as bind_failed.
+auto try_claim(std::string const& lock_path) -> StatusValue<ClaimAttempt>
+{
+    // O_NOFOLLOW: a symlink planted at the lock name is refused, not
+    // followed to a file of the planter's choosing. 0600: the lock is a
+    // token, nobody else needs to read it.
+    int const fd = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) {
+        return failure(NetError::bind_failed);
+    }
+    ClaimAttempt attempt{.outcome = ClaimOutcome::claimed, .lock = FileDescriptor{fd}};
+    if (::flock(attempt.lock.get(), LOCK_EX | LOCK_NB) < 0) {
+        if (errno != EWOULDBLOCK) {
+            return failure(NetError::bind_failed);
+        }
+        attempt.outcome = ClaimOutcome::held;
+    } else if (!fd_is_the_file_at(attempt.lock.get(), lock_path)) {
+        attempt.outcome = ClaimOutcome::swapped;
+    }
+    return attempt;
+}
+
+/// Claim the socket path for this listener's lifetime: an exclusive
+/// flock() on its lock file. Two instances starting at one path then
+/// contend on the lock, not on the stale-socket probe below, which cannot
+/// tell "bound, about to listen" from "left behind by a dead process" --
+/// both answer ECONNREFUSED. The probe stays for a listener that predates
+/// the lock; the lock is what closes the race between two of ours.
+auto claim_socket_path(std::string const& lock_path) -> StatusValue<FileDescriptor>
+{
+    constexpr int ATTEMPTS = 3;
+    for (int attempt = 0; attempt < ATTEMPTS; ++attempt) {
+        auto tried = try_claim(lock_path);
+        if (!tried) {
+            return failure(tried.error());
+        }
+        if (tried->outcome == ClaimOutcome::claimed) {
+            return std::move(tried->lock);
+        }
+        if (tried->outcome == ClaimOutcome::held) {
+            return failure(NetError::bind_failed);
+        }
+    }
+    return failure(NetError::bind_failed);  // swapped three times running
+}
+
+/// Let the path go: remove the lock file while still holding the lock (so
+/// nobody can open it between the unlink and the close and believe they
+/// hold a live name), then close. A file that replaced ours is left alone.
+void release_socket_path(FileDescriptor& lock, std::string const& lock_path)
+{
+    if (!lock.valid()) {
+        return;
+    }
+    if (fd_is_the_file_at(lock.get(), lock_path)) {
+        (void)::unlink(lock_path.c_str());
+    }
+    lock.close();
 }
 
 /// What is sitting at a socket path we have been asked to bind.
@@ -122,14 +220,107 @@ auto inspect_socket_path(std::string const& path, int sock_type) -> PathVerdict
 struct LocalListener
 {
     FileDescriptor fd{};
-    uint64_t dev{0};
-    uint64_t ino{0};
+    LocalSocketFile file{};
 };
 
-/// Bind, chmod, listen -- in that order, so the socket never answers at its
+/// Clear what is at @p path when it is ours to clear; refuse otherwise.
+auto clear_socket_path(std::string const& path, int sock_type) -> Status
+{
+    switch (inspect_socket_path(path, sock_type)) {
+        case PathVerdict::absent:
+            return success();
+        case PathVerdict::stale:
+            return (::unlink(path.c_str()) < 0) ? failure(NetError::bind_failed) : success();
+        case PathVerdict::occupied:
+        case PathVerdict::unusable:
+            return failure(NetError::bind_failed);
+    }
+    return failure(NetError::bind_failed);
+}
+
+/// Record the socket file bind() just made. Ownership is its device and
+/// inode read back from the filesystem -- fstat() on the socket reports the
+/// socket's own inode, which is a different number. From here every failure
+/// has to remove the file.
+auto record_socket_file(LocalListener listener, std::string const& path) -> StatusValue<LocalListener>
+{
+    struct stat bound{};
+    if (::lstat(path.c_str(), &bound) < 0 || S_ISSOCK(bound.st_mode) == 0) {
+        (void)::unlink(path.c_str());
+        return failure(NetError::bind_failed);
+    }
+    listener.file.path = path;
+    listener.file.dev = static_cast<uint64_t>(bound.st_dev);
+    listener.file.ino = static_cast<uint64_t>(bound.st_ino);
+    return listener;
+}
+
+/// A fresh socket bound at @p path.
+auto bind_socket_file(SocketAddress const& addr, std::string const& path, int sock_type) -> StatusValue<LocalListener>
+{
+    int const fd = ::socket(AF_UNIX, sock_type, 0);
+    if (fd < 0) {
+        return failure(NetError::socket_creation_failed);
+    }
+    LocalListener listener{.fd = FileDescriptor{fd}, .file = {}};
+    // No SO_REUSEADDR: on AF_UNIX it does nothing, and the stale path has
+    // already been dealt with.
+    if (::bind(fd, addr.sockaddr(), addr.length()) < 0) {
+        return failure(NetError::bind_failed);
+    }
+    return record_socket_file(std::move(listener), path);
+}
+
+/// chmod, then listen -- in that order, so the socket never answers at its
 /// final path with umask permissions. (A path swapped between bind and chmod
 /// would take the mode with it; binding in a private directory and renaming
 /// into place closes that window and is the next step if we ever need it.)
+auto serve_socket_file(LocalListener listener, TcpServerOptions const& options) -> StatusValue<LocalListener>
+{
+    auto const& file = listener.file;
+    if (options.unix_mode >= 0 && ::chmod(file.path.c_str(), static_cast<mode_t>(options.unix_mode)) < 0) {
+        unlink_if_ours(file.path, file.dev, file.ino);
+        return failure(NetError::socket_option_failed);
+    }
+    if (::listen(listener.fd.get(), options.backlog) < 0) {
+        unlink_if_ours(file.path, file.dev, file.ino);
+        return failure(NetError::listen_failed);
+    }
+    return listener;
+}
+
+/// Clear a stale socket, then bind, chmod and listen at @p path. The path
+/// is already claimed; a failure leaves nothing of ours behind.
+auto bind_local_listener(SocketAddress const& addr, std::string const& path, TcpServerOptions const& options)
+    -> StatusValue<LocalListener>
+{
+    int const sock_type = options.unix_seqpacket ? SOCK_SEQPACKET : SOCK_STREAM;
+    if (auto cleared = clear_socket_path(path, sock_type); !cleared) {
+        return failure(cleared.error());
+    }
+    auto bound = bind_socket_file(addr, path, sock_type);
+    if (!bound) {
+        return failure(bound.error());
+    }
+    return serve_socket_file(std::move(*bound), options);
+}
+
+/// Bind under a claim already taken: the claim travels with the listener on
+/// success and is let go on failure.
+auto bind_under_claim(FileDescriptor lock, SocketAddress const& addr, std::string const& path, TcpServerOptions const& options)
+    -> StatusValue<LocalListener>
+{
+    auto bound = bind_local_listener(addr, path, options);
+    if (!bound) {
+        release_socket_path(lock, lock_path_for(path));
+        return failure(bound.error());
+    }
+    bound->file.lock = std::move(lock);
+    return std::move(*bound);
+}
+
+/// Claim the path, then bind, chmod, listen. From the claim to the pool's
+/// destructor this process is the one allowed to clear, bind and remove it.
 auto create_local_listener(SocketAddress const& addr, TcpServerOptions const& options) -> StatusValue<LocalListener>
 {
     std::string const path{addr.path()};
@@ -137,56 +328,20 @@ auto create_local_listener(SocketAddress const& addr, TcpServerOptions const& op
         // An unnamed or abstract address has no file to own or protect.
         return failure(NetError::invalid_address);
     }
-    int const sock_type = options.unix_seqpacket ? SOCK_SEQPACKET : SOCK_STREAM;
+    auto lock = claim_socket_path(lock_path_for(path));
+    if (!lock) {
+        return failure(lock.error());
+    }
+    return bind_under_claim(std::move(*lock), addr, path, options);
+}
 
-    switch (inspect_socket_path(path, sock_type)) {
-        case PathVerdict::absent:
-            break;
-        case PathVerdict::stale:
-            if (::unlink(path.c_str()) < 0) {
-                return failure(NetError::bind_failed);
-            }
-            break;
-        case PathVerdict::occupied:
-        case PathVerdict::unusable:
-            return failure(NetError::bind_failed);
-    }
-
-    int const fd = ::socket(AF_UNIX, sock_type, 0);
-    if (fd < 0) {
-        return failure(NetError::socket_creation_failed);
-    }
-    FileDescriptor sock{fd};
-    // No SO_REUSEADDR: on AF_UNIX it does nothing, and the stale path has
-    // already been dealt with above.
-    if (::bind(fd, addr.sockaddr(), addr.length()) < 0) {
-        return failure(NetError::bind_failed);
-    }
-
-    // The file exists now, so from here every failure has to remove it.
-    // Ownership is the device and inode bind just created, read back from
-    // the filesystem -- fstat() on the socket reports the socket's own
-    // inode, which is a different number.
-    struct stat bound{};
-    if (::lstat(path.c_str(), &bound) < 0 || S_ISSOCK(bound.st_mode) == 0) {
-        (void)::unlink(path.c_str());
-        return failure(NetError::bind_failed);
-    }
-    LocalListener out;
-    out.dev = static_cast<uint64_t>(bound.st_dev);
-    out.ino = static_cast<uint64_t>(bound.st_ino);
-
-    if (options.unix_mode >= 0 && ::chmod(path.c_str(), static_cast<mode_t>(options.unix_mode)) < 0) {
-        unlink_if_ours(path, out.dev, out.ino);
-        return failure(NetError::socket_option_failed);
-    }
-    if (::listen(fd, options.backlog) < 0) {
-        unlink_if_ours(path, out.dev, out.ino);
-        return failure(NetError::listen_failed);
-    }
-
-    out.fd = std::move(sock);
-    return out;
+/// A listener that was bound but will never serve: remove its file and let
+/// the path go, since nobody else will.
+void abandon_local_listener(LocalListener& listener)
+{
+    auto& file = listener.file;
+    unlink_if_ours(file.path, file.dev, file.ino);
+    release_socket_path(file.lock, lock_path_for(file.path));
 }
 
 }  // namespace
@@ -217,15 +372,10 @@ void TcpConnectionPool::open_local_listener(SocketAddress const& bind_addr)
         return;
     }
     if (!mux_.valid() || !register_listener(local->fd.release())) {
-        // Bound but never serving: the socket file bind() just made is
-        // ours to remove, and nobody else will. The destructor goes by
-        // the path recorded below, which this path never reaches.
-        unlink_if_ours(std::string{bind_addr.path()}, local->dev, local->ino);
+        abandon_local_listener(*local);
         return;
     }
-    unix_path_ = std::string{bind_addr.path()};
-    unix_dev_ = local->dev;
-    unix_ino_ = local->ino;
+    unix_ = std::move(local->file);
 }
 
 void TcpConnectionPool::open_tcp_listener(SocketAddress const& bind_addr)
@@ -250,7 +400,10 @@ auto TcpConnectionPool::register_listener(int fd) -> bool
 
 TcpConnectionPool::~TcpConnectionPool()
 {
-    unlink_if_ours(unix_path_, unix_dev_, unix_ino_);
+    // The socket file first, the claim on the path last: a successor
+    // waiting on the lock finds the path clear when it wins.
+    unlink_if_ours(unix_.path, unix_.dev, unix_.ino);
+    release_socket_path(unix_.lock, lock_path_for(unix_.path));
 }
 
 auto TcpConnectionPool::valid() const noexcept -> bool
