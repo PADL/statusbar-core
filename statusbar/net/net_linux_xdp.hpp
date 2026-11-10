@@ -1868,6 +1868,7 @@ class XdpContext
     [[nodiscard]] auto join_multicast(ieee::Eui48 const& addr) -> Status;
 
     /// Drop one join_multicast() of @p addr; the group stays while another join holds it.
+    /// Leaving a group this context does not hold succeeds and changes nothing.
     [[nodiscard]] auto leave_multicast(ieee::Eui48 const& addr) -> Status;
 
     /// The socket's counters, as of now. See XdpSocketStats on what a reader
