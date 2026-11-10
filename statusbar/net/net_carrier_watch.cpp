@@ -159,9 +159,7 @@ void CarrierWatch::on_ready(int64_t /*now_ns*/)
 void CarrierWatch::on_received(size_t const length)
 {
     if (length > buffer_.size()) {
-        // Cut short (a link with many VFs): lost, as on an overrun. A resync cut short too finishes the watch.
-        failed_ = truncated_;
-        resync_ = truncated_ = true;
+        resync_ = true;  // cut short: lost, as on an overrun
         return;
     }
     deliver(std::span<uint8_t const>{buffer_.data(), length});
@@ -197,7 +195,6 @@ void CarrierWatch::deliver(std::span<uint8_t const> const datagram)
 void CarrierWatch::report(std::span<uint8_t const> const message)
 {
     if (auto const link = parse_link_carrier(message, ifindex_); link && *link) {
-        truncated_ = false;
         on_change_(**link);
         return;
     }
