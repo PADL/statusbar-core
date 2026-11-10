@@ -3,8 +3,9 @@
 
 /// The M5 allocation gate (docs/HTTP_PLAN.md §7): the module's central
 /// promise — no dynamic allocation after startup — enforced, not
-/// asserted. This translation unit replaces the global operator new
-/// family with a counting forwarder; the test builds a server, runs one
+/// asserted. This translation unit replaces the whole replaceable global
+/// operator new family (plain, aligned, nothrow and aligned-nothrow, with
+/// their deletes) with a counting forwarder; the test builds a server, runs one
 /// warm-up pass of every request shape, ARMS the counter, drives a
 /// steady-state mixed workload (static GET from both sources, 304, HEAD,
 /// buffered POST echo, streamed PUT, pipelined pairs, WebSocket echo and
@@ -14,6 +15,13 @@
 /// request bytes are prebuilt, responses land in fixed buffers, and
 /// verification is memcmp-shaped. EXPECT failures may allocate — that
 /// only happens when the gate has already failed.
+///
+/// Every replaceable form has to be here, not just the throwing ones. The
+/// aggregate test binary links every package's tests, and anything in it
+/// that allocates through the nothrow forms (libc++'s std::stable_sort
+/// temporary buffer, for one) would otherwise get its memory from the
+/// runtime's operator new and hand it to our malloc-based operator delete:
+/// an alloc-dealloc mismatch under ASan.
 
 #include "statusbar/http/http_server.hpp"
 #include "statusbar/http/http_static.hpp"
@@ -47,13 +55,31 @@ void count_allocation() noexcept
         g_alloc_count.fetch_add(1, std::memory_order_relaxed);
     }
 }
+
+/// The nothrow forms' allocators: counted, nullptr on failure. The throwing
+/// forms are these plus a std::bad_alloc.
+auto counted_malloc(size_t size) noexcept -> void*
+{
+    count_allocation();
+    return std::malloc(size == 0 ? 1 : size);
+}
+
+auto counted_aligned_malloc(size_t size, std::align_val_t alignment) noexcept -> void*
+{
+    count_allocation();
+    void* p = nullptr;
+    size_t const align = size_t(alignment) < sizeof(void*) ? sizeof(void*) : size_t(alignment);
+    if (::posix_memalign(&p, align, size == 0 ? 1 : size) != 0) {
+        return nullptr;
+    }
+    return p;
+}
 }  // namespace
 
 // NOLINTBEGIN(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory,readability-inconsistent-declaration-parameter-name)
 auto operator new(size_t size) -> void*
 {
-    count_allocation();
-    void* p = std::malloc(size == 0 ? 1 : size);
+    void* p = counted_malloc(size);
     if (p == nullptr) {
         throw std::bad_alloc{};
     }
@@ -67,9 +93,8 @@ auto operator new[](size_t size) -> void*
 
 auto operator new(size_t size, std::align_val_t alignment) -> void*
 {
-    count_allocation();
-    void* p = nullptr;
-    if (::posix_memalign(&p, size_t(alignment) < sizeof(void*) ? sizeof(void*) : size_t(alignment), size == 0 ? 1 : size) != 0) {
+    void* p = counted_aligned_malloc(size, alignment);
+    if (p == nullptr) {
         throw std::bad_alloc{};
     }
     return p;
@@ -78,6 +103,23 @@ auto operator new(size_t size, std::align_val_t alignment) -> void*
 auto operator new[](size_t size, std::align_val_t alignment) -> void*
 {
     return ::operator new(size, alignment);
+}
+
+auto operator new(size_t size, std::nothrow_t const&) noexcept -> void*
+{
+    return counted_malloc(size);
+}
+auto operator new[](size_t size, std::nothrow_t const&) noexcept -> void*
+{
+    return counted_malloc(size);
+}
+auto operator new(size_t size, std::align_val_t alignment, std::nothrow_t const&) noexcept -> void*
+{
+    return counted_aligned_malloc(size, alignment);
+}
+auto operator new[](size_t size, std::align_val_t alignment, std::nothrow_t const&) noexcept -> void*
+{
+    return counted_aligned_malloc(size, alignment);
 }
 
 void operator delete(void* p) noexcept
@@ -109,6 +151,22 @@ void operator delete(void* p, size_t, std::align_val_t) noexcept
     std::free(p);
 }
 void operator delete[](void* p, size_t, std::align_val_t) noexcept
+{
+    std::free(p);
+}
+void operator delete(void* p, std::nothrow_t const&) noexcept
+{
+    std::free(p);
+}
+void operator delete[](void* p, std::nothrow_t const&) noexcept
+{
+    std::free(p);
+}
+void operator delete(void* p, std::align_val_t, std::nothrow_t const&) noexcept
+{
+    std::free(p);
+}
+void operator delete[](void* p, std::align_val_t, std::nothrow_t const&) noexcept
 {
     std::free(p);
 }
