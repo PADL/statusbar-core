@@ -762,6 +762,19 @@ TEST(net_tcp_server_local, a_mode_past_the_permission_bits_is_refused)
     EXPECT_FALSE(path.is_socket());
 }
 
+TEST(net_tcp_server_local, a_stale_socket_survives_a_refused_mode)
+{
+    LocalPath const path{"badmodestale"};
+    leave_stale_socket(path.addr());
+    TcpConnectionPool* pool_ptr = nullptr;
+    EchoHandler handler{pool_ptr};
+    TcpServerOptions options;
+    options.unix_mode = 01777;
+    TcpConnectionPool const pool{path.addr(), 2, handler, options};
+    EXPECT_FALSE(pool.valid());
+    EXPECT_TRUE(path.is_socket());
+}
+
 // A path of 100 octets is bound in place with its mode, as any other.
 TEST(net_tcp_server_local, a_long_path_is_bound_with_its_mode)
 {
