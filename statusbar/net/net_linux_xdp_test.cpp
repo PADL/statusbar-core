@@ -2993,9 +2993,12 @@ TEST(xdp_integration, a_queue_rebound_the_instant_it_is_closed_still_opens)
 
 #        include <sched.h>
 
+#        include <cstdio>
 #        include <cstring>
 #        include <memory>
+#        include <type_traits>
 
+#        include <linux/if_packet.h>
 #        include <sys/wait.h>
 
 namespace {
@@ -3158,29 +3161,34 @@ void probe_tx_invalid(ProbeReport& out)
 // What a probe came back with, or why there is nothing to assert. The reason
 // is a string rather than a silent nullopt so the test body can hand it to
 // SKIP(): a test that stops running has to say so.
-struct ProbeOutcome
+template <typename Report>
+struct ChildOutcome
 {
-    std::optional<ProbeReport> report;
+    std::optional<Report> report;
     char const* skipped{nullptr};
 };
 
-// Run fill() in a forked child inside private namespaces and bring its report
-// back.
-auto run_probe(void (*fill)(ProbeReport&)) -> ProbeOutcome
+using ProbeOutcome = ChildOutcome<ProbeReport>;
+
+// Run fill() in a forked child and bring its report back. The report is POD,
+// so it crosses the pipe as bytes.
+template <typename Report>
+auto run_in_child(void (*fill)(Report&)) -> ChildOutcome<Report>
 {
+    static_assert(std::is_trivially_copyable_v<Report>);
     std::array<int, 2> pipe_fds{-1, -1};
     if (::pipe(pipe_fds.data()) != 0) {
-        return ProbeOutcome{.skipped = "pipe() failed"};
+        return ChildOutcome<Report>{.skipped = "pipe() failed"};
     }
     pid_t const child = ::fork();
     if (child < 0) {
         ::close(pipe_fds[0]);
         ::close(pipe_fds[1]);
-        return ProbeOutcome{.skipped = "fork() failed"};
+        return ChildOutcome<Report>{.skipped = "fork() failed"};
     }
     if (child == 0) {
         ::close(pipe_fds[0]);
-        ProbeReport report;
+        Report report;
         fill(report);
         auto const* bytes = reinterpret_cast<uint8_t const*>(&report);
         ssize_t const written = ::write(pipe_fds[1], bytes, sizeof(report));
@@ -3188,14 +3196,26 @@ auto run_probe(void (*fill)(ProbeReport&)) -> ProbeOutcome
         ::_exit(written == static_cast<ssize_t>(sizeof(report)) ? 0 : 1);
     }
     ::close(pipe_fds[1]);
-    ProbeReport report;
+    Report report;
     ssize_t const read_bytes = ::read(pipe_fds[0], &report, sizeof(report));
     ::close(pipe_fds[0]);
     int status = 0;
     (void)::waitpid(child, &status, 0);
     if (read_bytes != static_cast<ssize_t>(sizeof(report))) {
-        return ProbeOutcome{.skipped = "the child reported nothing"};
+        return ChildOutcome<Report>{.skipped = "the child reported nothing"};
     }
+    return ChildOutcome<Report>{.report = report};
+}
+
+// Run fill() in a forked child inside private namespaces and bring its report
+// back.
+auto run_probe(void (*fill)(ProbeReport&)) -> ProbeOutcome
+{
+    auto const outcome = run_in_child(fill);
+    if (!outcome.report) {
+        return outcome;
+    }
+    auto const& report = *outcome.report;
     if (!report.entered) {
         return ProbeOutcome{.skipped = "no user+network namespace available to this uid"};
     }
@@ -3246,6 +3266,168 @@ TEST(xdp_kernel_stats, an_out_of_range_tx_descriptor_is_counted_though_the_kick_
     EXPECT_TRUE(report.after_read);
     EXPECT_EQ(report.fresh_tx_invalid, 0u);
     EXPECT_EQ(report.after_tx_invalid, 1u);
+}
+
+//
+// Multicast memberships through an AF_PACKET socket, with no privilege
+//
+// A user namespace grants CAP_NET_RAW over its own network namespace, which is
+// all PACKET_ADD_MEMBERSHIP needs; /proc/net/dev_mcast then shows the count.
+//
+
+namespace {
+
+constexpr ieee::Eui48 PROBE_GROUP{0x91, 0xE0, 0xF0, 0x00, 0xFE, 0x01};
+constexpr char const* PROBE_GROUP_HEX = "91e0f000fe01";
+
+// The users /proc/net/dev_mcast counts for PROBE_GROUP on `device`: 0 when it is
+// absent, -1 for a global (SIOCADDMULTI) entry, -2 when the file cannot be read.
+auto probe_group_users(char const* device) -> int
+{
+    FILE* const f = ::fopen("/proc/net/dev_mcast", "re");
+    if (f == nullptr) {
+        return -2;
+    }
+    auto const closer = detail::scopeguard([f] { (void)::fclose(f); });
+    std::array<char, 16> name{};
+    std::array<char, 64> address{};
+    int index = 0;
+    int users = 0;
+    int global = 0;
+    while (std::fscanf(f, "%d %15s %d %d %63s", &index, name.data(), &users, &global, address.data()) == 5) {
+        if (std::strcmp(name.data(), device) == 0 && std::strcmp(address.data(), PROBE_GROUP_HEX) == 0) {
+            return global != 0 ? -1 : users;
+        }
+    }
+    return 0;
+}
+
+struct MembershipReport
+{
+    bool entered{false};
+    bool opened{false};
+    int users_after_two_sockets_join{-2};
+    int users_after_one_leaves{-2};
+    int users_after_an_unheld_leave{-2};
+    int users_after_a_second_join_and_one_leave{-2};
+    int users_after_close{-2};
+};
+
+// Two membership sockets on the namespace's loopback join, leave and close
+// PROBE_GROUP, with the count read back after each step.
+void probe_memberships(MembershipReport& out)
+{
+    out.entered = enter_private_namespaces();
+    unsigned int const lo = ::if_nametoindex("lo");
+    auto first = detail::open_membership_socket();
+    auto second = detail::open_membership_socket();
+    out.opened = out.entered && lo != 0 && first.has_value() && second.has_value();
+    if (!out.opened) {
+        return;
+    }
+    auto const change = [lo](FileDescriptor const& fd, int const option) {
+        return detail::change_multicast_membership(fd.get(), lo, PROBE_GROUP, option).has_value();
+    };
+    (void)change(*first, PACKET_ADD_MEMBERSHIP);
+    (void)change(*second, PACKET_ADD_MEMBERSHIP);
+    out.users_after_two_sockets_join = probe_group_users("lo");
+    (void)change(*first, PACKET_DROP_MEMBERSHIP);
+    out.users_after_one_leaves = probe_group_users("lo");
+    (void)change(*first, PACKET_DROP_MEMBERSHIP);
+    out.users_after_an_unheld_leave = probe_group_users("lo");
+    (void)change(*second, PACKET_ADD_MEMBERSHIP);
+    (void)change(*second, PACKET_DROP_MEMBERSHIP);
+    out.users_after_a_second_join_and_one_leave = probe_group_users("lo");
+    second->close();
+    out.users_after_close = probe_group_users("lo");
+}
+
+auto run_membership_probe() -> ChildOutcome<MembershipReport>
+{
+    auto const outcome = run_in_child(probe_memberships);
+    if (outcome.report && !outcome.report->entered) {
+        return {.skipped = "no user+network namespace available to this uid"};
+    }
+    if (outcome.report && !outcome.report->opened) {
+        return {.skipped = "could not open an AF_PACKET socket in the namespace"};
+    }
+    return outcome;
+}
+
+// One probe serves every xdp_membership test: each reads its own step of the report.
+auto membership_outcome() -> ChildOutcome<MembershipReport> const&
+{
+    static auto const outcome = run_membership_probe();
+    return outcome;
+}
+
+}  // namespace
+
+TEST(xdp_membership, a_joined_group_is_counted_per_socket_not_global)
+{
+    auto const& outcome = membership_outcome();
+    if (!outcome.report) {
+        SKIP(outcome.skipped);
+    }
+    EXPECT_EQ(outcome.report->users_after_two_sockets_join, 2);
+}
+
+TEST(xdp_membership, one_leave_does_not_drop_a_group_another_socket_holds)
+{
+    auto const& outcome = membership_outcome();
+    if (!outcome.report) {
+        SKIP(outcome.skipped);
+    }
+    EXPECT_EQ(outcome.report->users_after_one_leaves, 1);
+}
+
+TEST(xdp_membership, a_leave_from_a_socket_that_does_not_hold_the_group_changes_nothing)
+{
+    auto const& outcome = membership_outcome();
+    if (!outcome.report) {
+        SKIP(outcome.skipped);
+    }
+    EXPECT_EQ(outcome.report->users_after_an_unheld_leave, 1);
+}
+
+TEST(xdp_membership, each_join_on_one_socket_needs_its_own_leave)
+{
+    auto const& outcome = membership_outcome();
+    if (!outcome.report) {
+        SKIP(outcome.skipped);
+    }
+    EXPECT_EQ(outcome.report->users_after_a_second_join_and_one_leave, 1);
+}
+
+TEST(xdp_membership, closing_the_socket_drops_its_groups)
+{
+    auto const& outcome = membership_outcome();
+    if (!outcome.report) {
+        SKIP(outcome.skipped);
+    }
+    EXPECT_EQ(outcome.report->users_after_close, 0);
+}
+
+// The same through XdpContext on a veth, which needs root to load the filter.
+TEST(xdp_integration, a_contexts_groups_are_counted_and_dropped_by_close)
+{
+    if (getuid() != 0) {
+        SKIP("needs root");
+    }
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        SKIP("could not create a veth pair");
+    }
+    auto cleanup = detail::scopeguard([&] { destroy_veth_pair("xdptest0"); });
+    auto const rules = ClassifierRuleBuilder<32>{}.ethertype(0x22F0).vlan_tagged_any().result(flag::process).build();
+    XdpContext ctx;
+    EXPECT_TRUE(ctx.open({.interface_name = "xdptest0", .filter_rules = rules, .umem_frame_count = 64}).has_value());
+    EXPECT_TRUE(ctx.join_multicast(PROBE_GROUP).has_value());
+    EXPECT_TRUE(ctx.join_multicast(PROBE_GROUP).has_value());
+    EXPECT_TRUE(ctx.leave_multicast(PROBE_GROUP).has_value());
+    EXPECT_EQ(probe_group_users("xdptest0"), 1);
+    ctx.close();
+    EXPECT_EQ(probe_group_users("xdptest0"), 0);
 }
 
 #    endif  // __linux__ && HAVE_XDP

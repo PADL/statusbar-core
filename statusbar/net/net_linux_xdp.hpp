@@ -37,6 +37,7 @@ extern unsigned int const xdp_filter_bpf_o_len;
 #endif  // __linux__ && HAVE_XDP
 
 #include "statusbar/buffer/buffer.hpp"
+#include "statusbar/buffer/file_descriptor.hpp"
 #include "statusbar/ieee/ieee.hpp"
 #include "statusbar/net/net_compiled_rule.hpp"
 #include "statusbar/net/net_ethernet_port.hpp"
@@ -1677,6 +1678,15 @@ class BpfState
 /// @param fd An open AF_XDP socket descriptor
 [[nodiscard]] auto read_xdp_kernel_stats(int fd) -> StatusValue<XdpKernelStats>;
 
+/// An AF_PACKET socket bound to no protocol, so it receives nothing: the owner of the
+/// multicast memberships made through it, which the kernel drops when it closes (packet(7)).
+[[nodiscard]] auto open_membership_socket() noexcept -> StatusValue<FileDescriptor>;
+
+/// PACKET_ADD_MEMBERSHIP or PACKET_DROP_MEMBERSHIP (@p option) of group @p addr on interface
+/// @p if_index through @p fd, counted per socket. Fails with join_multicast_failed.
+[[nodiscard]] auto change_multicast_membership(int fd, unsigned int if_index, ieee::Eui48 const& addr, int option) noexcept
+    -> Status;
+
 }  // namespace detail
 
 class XdpContext
@@ -1853,10 +1863,11 @@ class XdpContext
     /// @param rules New filter rules to replace existing entries
     [[nodiscard]] auto set_rules(std::span<CompiledRule<32> const> rules) -> Status { return bpf_.set_rules(rules); }
 
+    /// Join group @p addr; counted per context and dropped by close() (packet(7)).
     /// @param addr Multicast MAC address to join
     [[nodiscard]] auto join_multicast(ieee::Eui48 const& addr) -> Status;
 
-    /// Drop a NIC multicast filter entry added with join_multicast().
+    /// Drop one join_multicast() of @p addr; the group stays while another join holds it.
     [[nodiscard]] auto leave_multicast(ieee::Eui48 const& addr) -> Status;
 
     /// The socket's counters, as of now. See XdpSocketStats on what a reader
@@ -1971,6 +1982,7 @@ class XdpContext
         std::swap(zero_copy_, other.zero_copy_);
         napi_busy_poll_.swap(other.napi_busy_poll_);
         std::swap(tx_progress_, other.tx_progress_);
+        std::swap(memberships_, other.memberships_);
     }
 
     struct xsk_socket* xsk_{nullptr};
@@ -1999,6 +2011,8 @@ class XdpContext
     bool zero_copy_{false};
     detail::NapiBusyPoll napi_busy_poll_;
     detail::TxProgress tx_progress_;
+    /// Holds this context's multicast memberships; see detail::open_membership_socket().
+    FileDescriptor memberships_;
 };
 
 /// Whether this build and this kernel can put a launch time on an AF_XDP
