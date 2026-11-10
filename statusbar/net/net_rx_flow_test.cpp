@@ -118,6 +118,14 @@ TEST(net_rx_flow, a_plan_outside_its_range_or_queues_is_refused)
     EXPECT_TRUE(detail::check_rx_flow_plan(plan(), 4).has_value());
 }
 
+TEST(net_rx_flow, two_rules_at_one_location_are_refused)
+{
+    auto doubled = plan();
+    doubled.rules.push_back(RxFlowRule{.location = 13, .queue = 1, .ethertype = 0x88f7});
+    EXPECT_EQ(detail::check_rx_flow_plan(doubled, 4).error(), std::make_error_code(std::errc::invalid_argument));
+    EXPECT_TRUE(detail::check_rx_flow_plan(plan(), 4).has_value());
+}
+
 TEST(net_rx_flow, a_rule_matching_nothing_is_refused)
 {
     auto wildcard = plan();
