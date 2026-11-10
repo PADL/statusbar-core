@@ -45,8 +45,6 @@ inline constexpr uint16_t DEV_XSK_FEATURES = 6;
 inline constexpr uint64_t XSK_TX_TIMESTAMP = 1;
 inline constexpr uint64_t XSK_TX_CHECKSUM = 2;
 inline constexpr uint64_t XSK_TX_LAUNCH_TIME_FIFO = 4;
-/// NETDEV_XDP_ACT_XSK_ZEROCOPY: the driver runs AF_XDP zero-copy.
-inline constexpr uint64_t XDP_ACT_XSK_ZEROCOPY = 8;
 
 /// A device's netdev xsk-features: the AF_XDP TX metadata requests its driver honours.
 struct XskFeatures
@@ -65,7 +63,6 @@ struct XskFeatures
 struct DeviceFeatures
 {
     int ifindex{0};
-    uint64_t xdp_features{0};  ///< NETDEV_XDP_ACT_* (XDP_ACT_XSK_ZEROCOPY among them)
     XskFeatures xsk{};
 
     auto operator==(DeviceFeatures const&) const noexcept -> bool = default;
