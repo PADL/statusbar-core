@@ -35,12 +35,13 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 
-#if defined(__linux__)
-#    include <linux/sockios.h>
-#else
+#if !defined(__linux__)
 #    include <ifaddrs.h>
 
 #    include <net/if_dl.h>
+#endif
+#if defined(__linux__)
+#    include <linux/sockios.h>
 #endif
 
 namespace statusbar::net {
