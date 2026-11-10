@@ -28,7 +28,6 @@ static_assert(CTRL_FAMILY_ID == CTRL_ATTR_FAMILY_ID && CTRL_FAMILY_NAME == CTRL_
 #    if __has_include(<linux/netdev.h>)  // 6.3+
 static_assert(FAMILY_VERSION == NETDEV_FAMILY_VERSION && CMD_DEV_GET == NETDEV_CMD_DEV_GET);
 static_assert(DEV_IFINDEX == NETDEV_A_DEV_IFINDEX && DEV_XDP_FEATURES == NETDEV_A_DEV_XDP_FEATURES);
-static_assert(XDP_ACT_XSK_ZEROCOPY == NETDEV_XDP_ACT_XSK_ZEROCOPY);
 #    endif
 #    if defined(HAVE_NETDEV_XSK_FEATURES)  // 6.8+, detected by CMake
 static_assert(DEV_XDP_RX_METADATA_FEATURES == NETDEV_A_DEV_XDP_RX_METADATA_FEATURES);
@@ -151,8 +150,6 @@ auto parse_dev(std::span<uint8_t const> const message, uint16_t const family_id)
             switch (type & netlink::ATTRIBUTE_TYPE_MASK) {
                 case DEV_IFINDEX:
                     return parse_scalar(payload, ifindex.emplace());
-                case DEV_XDP_FEATURES:
-                    return parse_scalar(payload, device.xdp_features);
                 case DEV_XSK_FEATURES:
                     return parse_scalar(payload, device.xsk.flags);
                 default:

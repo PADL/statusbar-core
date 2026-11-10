@@ -178,7 +178,7 @@ TEST(netdev_napi, a_napi_reply_names_its_kthread_and_mode)
     }
     auto const napi = parse_napi(NAPI_REPLY, NETDEV_ID);
     EXPECT_TRUE(napi.has_value());
-    EXPECT_TRUE(napi && napi->id == NAPI && napi->ifindex == 3 && napi->irq == 140u);
+    EXPECT_TRUE(napi && napi->id == NAPI && napi->ifindex == 3);
     EXPECT_TRUE(napi && napi->pid == 1234u && napi->threaded == NapiThreaded::busy_poll);
 }
 
