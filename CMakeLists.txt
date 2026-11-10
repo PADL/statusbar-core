@@ -82,8 +82,15 @@ if(NOT STATUSBAR_AGGREGATE_BUILD)
     PROGRAMS ${_statusbar_cmake_scripts}
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/statusbar-core
     COMPONENT devel)
+  # The libc++ format_to patch toolchain-clang.cmake applies, beside it.
+  install(
+    FILES cmake/patches/libcxx-20-format-buffer.patch
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/statusbar-core/patches
+    COMPONENT devel)
   file(COPY ${_statusbar_cmake_modules} ${_statusbar_cmake_scripts}
        DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+  file(COPY cmake/patches/libcxx-20-format-buffer.patch
+       DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/patches)
 endif()
 
 # ---- packaging (CPack: TGZ + ZIP, plus DEB/RPM on Linux) ----
