@@ -114,7 +114,7 @@ class LinkWatch
     [[nodiscard]] auto fd() const noexcept -> int { return fd_.get(); }
     /// Apply everything queued at @p now_ns, without blocking; after an overrun or a cut datagram, ask again. Read
     /// right after a change, so the change is timed. Errors: recv() or sendto()'s errno, a refused request
-    /// (no_such_device for an unknown link), apply()'s, message_size for a link report cut twice running.
+    /// (no_such_device for an unknown link), apply()'s.
     [[nodiscard]] auto read(int64_t now_ns) -> Status;
     /// The interface as read so far.
     [[nodiscard]] auto readiness() const noexcept -> LinkReadiness const& { return readiness_; }
@@ -131,12 +131,8 @@ class LinkWatch
 
     /// One recv() into buffer_ (length_ octets when delivered).
     [[nodiscard]] auto receive() -> StatusValue<Received>;
-    /// A datagram cut short: lost; the interface's own link report cut again after asking: message_size.
-    [[nodiscard]] auto cut() noexcept -> StatusValue<Received>;
     [[nodiscard]] auto deliver(std::span<uint8_t const> datagram, int64_t now_ns) -> Status;
     [[nodiscard]] auto deliver_one(std::span<uint8_t const> message, int64_t now_ns) -> Status;
-    /// readiness_.apply(): a whole link report answers the ask after a cut.
-    [[nodiscard]] auto apply(std::span<uint8_t const> message, int64_t now_ns) -> Status;
     /// A message ending the address dump, done or refused.
     void track_dump(std::span<uint8_t const> message) noexcept;
     /// Notifications were lost: a change is assumed, and the link and the addresses are asked for again.
@@ -150,8 +146,6 @@ class LinkWatch
     FileDescriptor fd_{};
     LinkReadiness readiness_;
     bool lost_{false};                     ///< notifications lost since the last request
-    bool cut_{false};                      ///< the link's report cut short since the last whole one
-    bool asked_after_cut_{false};          ///< the link asked for again since that cut
     bool dump_running_{false};             ///< an RTM_GETADDR dump not yet done
     bool dump_wanted_{false};              ///< an RTM_GETADDR dump to start once none runs
     size_t length_{0};                     ///< the datagram in buffer_, as received
