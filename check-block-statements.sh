@@ -162,12 +162,16 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 # The copies under test live in $TREE, linted with the repository's own
-# .clang-tidy plus the gate's bound; the header filter always admits the copy,
-# so a header is reported like a source (--config would drop the repo's).
+# .clang-tidy plus the gate's bound; --config would drop the repository's, and
+# with it the header filter, so a header would never be reported.
 TREE="$TMP/tree"
 mkdir -p "$TREE"
-[ ! -f "$REPO/.clang-tidy" ] || cp "$REPO/.clang-tidy" "$TMP/.clang-tidy"
-printf 'InheritParentConfig: true\nCheckOptions:\n  statusbar-block-statements.MaxStatements: %s\n' "$MAX" > "$TREE/.clang-tidy"
+inherit=""
+if [ -f "$REPO/.clang-tidy" ]; then
+    cp "$REPO/.clang-tidy" "$TMP/.clang-tidy"
+    inherit="InheritParentConfig: true\n"
+fi
+printf "${inherit}CheckOptions:\n  statusbar-block-statements.MaxStatements: %s\n" "$MAX" > "$TREE/.clang-tidy"
 
 # The compile command for a source file, from compile_commands.json: prints the
 # directory to run in, then the flags shell-quoted on one line -- without the
@@ -319,7 +323,7 @@ for f in $files; do
     report="$TMP/report.txt"
     (cd "$run_dir" && "$CLANG_TIDY" -load="$PLUGIN" \
         --checks='-*,statusbar-block-statements' \
-        --warnings-as-errors='-*' --header-filter="^$TREE/" \
+        --warnings-as-errors='-*' --header-filter='.*' \
         --quiet "$tu" -- -I"$TREE" -iquote "$REPO/$(dirname "$f")" "$@") > "$report" 2>&1 || true
 
     # A file clang-tidy could not parse was not checked; say so rather than
