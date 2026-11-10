@@ -113,13 +113,22 @@ struct Reading
     uint32_t stats{0};
 };
 
-/// A driver answering GDRVINFO, GSTRINGS and GSTATS with its counts at the time, as the kernel does: it writes
-/// its count in the header whatever room the request made, and as many entries as fit.
+/// The two kernels: with the CVE-2025-68795 fix a count other than the driver's copies nothing and reads
+/// back 0; without it the driver's own count is written back, with as many entries as fit (and, in a real
+/// kernel, more).
+enum class Kernel : uint8_t
+{
+    fixed,
+    unfixed,
+};
+
+/// A driver answering GDRVINFO, GSTRINGS and GSTATS with its counts at the time, as `kernel` passes them on.
 class StatsRecorder
 {
   public:
-    explicit StatsRecorder(std::vector<Reading> readings)
-        : readings_{std::move(readings)}
+    StatsRecorder(Kernel const kernel, std::vector<Reading> readings)
+        : kernel_{kernel}
+        , readings_{std::move(readings)}
     {}
 
     auto answer(std::span<uint8_t> const payload) -> Status
@@ -134,6 +143,8 @@ class StatsRecorder
     }
 
     [[nodiscard]] auto drvinfo_calls() const noexcept -> size_t { return drvinfo_calls_; }
+    /// Every count a GSTRINGS or GSTATS request carried.
+    [[nodiscard]] auto counts_sent() const noexcept -> std::vector<uint32_t> const& { return sent_; }
 
   private:
     static auto put_u32(std::span<uint8_t> const payload, size_t const offset, uint32_t const value) -> Status
@@ -142,27 +153,40 @@ class StatsRecorder
         return success();
     }
 
+    /// The count the kernel copies out for a request of `sent` when the driver has `count`.
+    auto copied(std::span<uint8_t> const payload, size_t const offset, uint32_t const count) -> uint32_t
+    {
+        uint32_t sent = 0;
+        span_load(sent, payload.subspan(offset, sizeof(sent)));
+        sent_.push_back(sent);
+        return kernel_ == Kernel::fixed && sent != count ? 0 : count;
+    }
+
     auto strings(std::span<uint8_t> const payload) -> Status
     {
         auto const data = payload.subspan(sizeof(ethtool_gstrings));
-        for (size_t i = 0; i < reading_.strings && (i + 1) * ETHTOOL_STAT_NAME_SIZE <= data.size(); ++i) {
+        auto const count = copied(payload, offsetof(ethtool_gstrings, len), reading_.strings);
+        for (size_t i = 0; i < count && (i + 1) * ETHTOOL_STAT_NAME_SIZE <= data.size(); ++i) {
             auto const name = std::format("rx_queue_{}_packets", i);
             span_copy(data.subspan(i * ETHTOOL_STAT_NAME_SIZE, name.size()), make_const_span(std::string_view{name}));
         }
-        return put_u32(payload, offsetof(ethtool_gstrings, len), reading_.strings);
+        return put_u32(payload, offsetof(ethtool_gstrings, len), count);
     }
 
     auto stats(std::span<uint8_t> const payload) -> Status
     {
         auto const data = payload.subspan(sizeof(struct ::ethtool_stats));
-        for (size_t i = 0; i < reading_.stats && (i + 1) * sizeof(uint64_t) <= data.size(); ++i) {
+        auto const count = copied(payload, offsetof(struct ::ethtool_stats, n_stats), reading_.stats);
+        for (size_t i = 0; i < count && (i + 1) * sizeof(uint64_t) <= data.size(); ++i) {
             span_store(data.subspan(i * sizeof(uint64_t), sizeof(uint64_t)), uint64_t{100 + i});
         }
-        return put_u32(payload, offsetof(struct ::ethtool_stats, n_stats), reading_.stats);
+        return put_u32(payload, offsetof(struct ::ethtool_stats, n_stats), count);
     }
 
+    Kernel kernel_;
     std::vector<Reading> readings_;
     Reading reading_{};
+    std::vector<uint32_t> sent_;
     size_t drvinfo_calls_{0};
 };
 
@@ -173,26 +197,36 @@ auto read_from(StatsRecorder& driver) -> StatusValue<std::vector<EthtoolStat>>
 
 }  // namespace
 
-TEST(net_ethtool_stats, a_count_grown_since_drvinfo_is_read_whole)
+TEST(net_ethtool_stats, the_drvinfo_count_is_sent_and_read_whole)
 {
-    StatsRecorder driver{{{.drvinfo = 2, .strings = 5, .stats = 5}}};
-    auto const stats = read_from(driver);
-    EXPECT_TRUE(stats && stats->size() == 5);
-    EXPECT_TRUE(stats && stats->back().name == "rx_queue_4_packets" && stats->back().value == 104);
-    EXPECT_EQ(driver.drvinfo_calls(), size_t{1});
+    for (auto const kernel : {Kernel::fixed, Kernel::unfixed}) {
+        StatsRecorder driver{kernel, {{.drvinfo = 5, .strings = 5, .stats = 5}}};
+        auto const stats = read_from(driver);
+        EXPECT_TRUE(stats && stats->size() == 5);
+        EXPECT_TRUE(stats && stats->back().name == "rx_queue_4_packets" && stats->back().value == 104);
+        EXPECT_TRUE(driver.counts_sent() == (std::vector<uint32_t>{5, 5}));
+    }
 }
 
-TEST(net_ethtool_stats, a_count_past_the_room_made_is_read_again)
+TEST(net_ethtool_stats, a_fixed_kernels_empty_reply_to_a_changed_count_is_read_again)
 {
-    StatsRecorder driver{{{.drvinfo = 2, .strings = 100, .stats = 100}, {.drvinfo = 100, .strings = 100, .stats = 100}}};
+    StatsRecorder driver{Kernel::fixed, {{.drvinfo = 2, .strings = 5, .stats = 5}, {.drvinfo = 5, .strings = 5, .stats = 5}}};
     auto const stats = read_from(driver);
-    EXPECT_TRUE(stats && stats->size() == 100);
+    EXPECT_TRUE(stats && stats->size() == 5);
+    EXPECT_TRUE(driver.counts_sent() == (std::vector<uint32_t>{2, 5, 5}));
+}
+
+TEST(net_ethtool_stats, an_unfixed_kernels_own_count_is_read_again)
+{
+    StatsRecorder driver{Kernel::unfixed, {{.drvinfo = 2, .strings = 5, .stats = 5}, {.drvinfo = 5, .strings = 5, .stats = 5}}};
+    auto const stats = read_from(driver);
+    EXPECT_TRUE(stats && stats->size() == 5);
     EXPECT_EQ(driver.drvinfo_calls(), size_t{2});
 }
 
 TEST(net_ethtool_stats, names_and_values_of_different_counts_are_read_again)
 {
-    StatsRecorder driver{{{.drvinfo = 4, .strings = 4, .stats = 5}, {.drvinfo = 5, .strings = 5, .stats = 5}}};
+    StatsRecorder driver{Kernel::fixed, {{.drvinfo = 4, .strings = 4, .stats = 5}, {.drvinfo = 5, .strings = 5, .stats = 5}}};
     auto const stats = read_from(driver);
     EXPECT_TRUE(stats && stats->size() == 5);
     EXPECT_EQ(driver.drvinfo_calls(), size_t{2});
@@ -200,10 +234,12 @@ TEST(net_ethtool_stats, names_and_values_of_different_counts_are_read_again)
 
 TEST(net_ethtool_stats, a_count_changing_twice_running_is_resource_unavailable)
 {
-    StatsRecorder driver{{{.drvinfo = 2, .strings = 100, .stats = 100}, {.drvinfo = 2, .strings = 100, .stats = 100}}};
-    auto const stats = read_from(driver);
-    EXPECT_TRUE(!stats && stats.error() == std::errc::resource_unavailable_try_again);
-    EXPECT_EQ(driver.drvinfo_calls(), size_t{2});
+    for (auto const kernel : {Kernel::fixed, Kernel::unfixed}) {
+        StatsRecorder driver{kernel, {{.drvinfo = 2, .strings = 3, .stats = 3}, {.drvinfo = 3, .strings = 4, .stats = 4}}};
+        auto const stats = read_from(driver);
+        EXPECT_TRUE(!stats && stats.error() == std::errc::resource_unavailable_try_again);
+        EXPECT_EQ(driver.drvinfo_calls(), size_t{2});
+    }
 }
 
 #endif
