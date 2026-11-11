@@ -304,11 +304,12 @@ endfunction()
 # The standalone install + export block every package carried verbatim: targets
 # (runtime/devel components), the export set (installed AND exported into the
 # build tree so a sibling package can use -Dstatusbar-<name>_DIR=<build-dir>
-# without an install step), headers, the find_package() config + version files,
-# and docs when present. Skipped under an outer aggregate build, which builds
-# but does not install — the outer project owns the install set.
+# without an install step), headers (INCLUDE_DIR, statusbar/ by default), the
+# find_package() config + version files, and docs when present. Skipped under an
+# outer aggregate build, which builds but does not install — the outer project
+# owns the install set.
 function(statusbar_package_install_export)
-  cmake_parse_arguments(ARG "" "NAME" "" ${ARGN})
+  cmake_parse_arguments(ARG "" "NAME;INCLUDE_DIR" "" ${ARGN})
   if(NOT ARG_NAME)
     message(FATAL_ERROR "statusbar_package_install_export: NAME is required")
   endif()
@@ -333,9 +334,13 @@ function(statusbar_package_install_export)
     EXPORT ${_pkg}Targets
     FILE ${_pkg}Targets.cmake
     NAMESPACE statusbar::)
+  # The package's header root: statusbar/ unless INCLUDE_DIR names another.
+  if(NOT ARG_INCLUDE_DIR)
+    set(ARG_INCLUDE_DIR statusbar)
+  endif()
   install(
-    DIRECTORY statusbar/
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/statusbar
+    DIRECTORY ${ARG_INCLUDE_DIR}/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/${ARG_INCLUDE_DIR}
     COMPONENT devel
     FILES_MATCHING
     PATTERN "*.hpp"
