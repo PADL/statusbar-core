@@ -297,21 +297,6 @@ struct XdpConfig
     unsigned int tap_ifindex{0};
     size_t rx_drain_max{32};
     size_t completion_drain_max{64};
-    /// Register the UMEM with room for AF_XDP TX metadata, so each frame can
-    /// carry a launch time (XdpContext::tx_set_launch_time). The NIC must be
-    /// in launch-time mode for the time to mean anything - an offloaded `etf`
-    /// on this queue, which net_tc_launch_time.hpp lays - and the driver must
-    /// honour it. open() asks the kernel, through probe_tx_launch_time(),
-    /// whether this NIC does, and fails with
-    /// XdpError::launch_time_not_supported when it does not - a kernel before
-    /// 6.15 takes the metadata and discards the time - or with
-    /// XdpError::tx_metadata_not_supported when this build or kernel cannot
-    /// carry the metadata at all, rather than opening a socket whose times
-    /// would be ignored.
-    ///
-    /// Costs sizeof(xsk_tx_metadata) bytes of every frame's headroom: the
-    /// headroom is raised to that where a caller asked for less.
-    bool tx_launch_time{false};
     XdpBindMode bind_mode{XdpBindMode::auto_};
     XdpAttachMode attach_mode{XdpAttachMode::native};
     /// Where to pin the program and its maps, from XdpProgram::pin_path_for().
@@ -338,6 +323,25 @@ struct XdpConfig
     /// Zero gives the old behaviour: receive may take everything, and a
     /// receive-only context loses nothing by it.
     size_t tx_frame_reserve{xdp_default_tx_frame_reserve};
+    /// The other thing transmit sets aside, beside the frames above: room in
+    /// every frame's headroom for AF_XDP TX metadata, so each frame can carry
+    /// a launch time (XdpContext::tx_set_launch_time). The NIC must be in
+    /// launch-time mode for the time to mean anything - an offloaded `etf` on
+    /// this queue, which net_tc_launch_time.hpp lays - and the driver must
+    /// honour it. open() asks the kernel, through probe_tx_launch_time(),
+    /// whether this NIC does, and fails with
+    /// XdpError::launch_time_not_supported when it does not - a kernel before
+    /// 6.15 takes the metadata and discards the time - or with
+    /// XdpError::tx_metadata_not_supported when this build or kernel cannot
+    /// carry the metadata at all, rather than opening a socket whose times
+    /// would be ignored.
+    ///
+    /// Costs sizeof(xsk_tx_metadata) bytes of every frame's headroom: the
+    /// headroom is raised to that where a caller asked for less. Declared
+    /// last so that a designated initializer may name it after the bind,
+    /// attach and pin settings, which is where a caller setting up transmit
+    /// reaches it.
+    bool tx_launch_time{false};
 };
 
 // ──────────────────────────────────────────────
@@ -1692,8 +1696,8 @@ class XdpContext
     /// @param launch_time_ns CLOCK_TAI nanoseconds to send the frame at, or 0
     ///        for as soon as possible. Needs XdpConfig::tx_launch_time;
     ///        without it a non-zero time is ignored, as it always was.
-    ///        tx_set_launch_time() is the same thing after the fact, and says
-    ///        so when it cannot.
+    ///        tx_set_launch_time() is the same thing after the fact, and
+    ///        try_tx_set_launch_time() the same thing with its answer kept.
     [[nodiscard]] auto tx_start(int64_t launch_time_ns = 0) -> StatusValue<EthernetTxSlot>
     {
         auto addr = umem_.alloc_frame();
@@ -1859,12 +1863,34 @@ class XdpContext
     /// driver's to refuse. net::LaunchOrder is what keeps the times in the
     /// order the queue needs.
     ///
+    /// Reports nothing, which is the shape a commit path wants: a real-time
+    /// thread writing a frame's time has nobody to report a failed write to.
+    /// The two things it could report - a closed socket, and a UMEM registered
+    /// without room for metadata - are both settled before the first frame of
+    /// a batch rather than per frame, and are what open() and
+    /// tx_launch_time() answer. On either of them the frame simply carries no
+    /// time: the write goes nowhere rather than into a UMEM that is not there.
+    /// try_tx_set_launch_time() is this same call with that answer kept, for
+    /// a caller that can act on it.
+    ///
     /// @param handle UMEM frame address from tx_start()
     /// @param launch_time_ns CLOCK_TAI nanoseconds; 0 means "as soon as
     ///        possible", and clears any time already set on the frame
+    void tx_set_launch_time(uint64_t const handle, int64_t const launch_time_ns) noexcept
+    {
+        static_cast<void>(try_tx_set_launch_time(handle, launch_time_ns));
+    }
+
+    /// tx_set_launch_time() with its answer kept rather than dropped: the same
+    /// write, reporting whether the frame will carry the time. The failures
+    /// are the two the silent form swallows, and both are a property of the
+    /// socket rather than of this frame, so a caller that cannot tolerate an
+    /// untimed frame wants this form, or wants tx_launch_time() checked once
+    /// at startup.
+    ///
     /// @return `not_open` on a closed socket, `tx_metadata_not_supported`
     ///         when the UMEM carries no metadata.
-    [[nodiscard]] auto tx_set_launch_time(uint64_t handle, int64_t launch_time_ns) noexcept -> Status
+    [[nodiscard]] auto try_tx_set_launch_time(uint64_t const handle, int64_t const launch_time_ns) noexcept -> Status
     {
         if (!valid()) {
             return failure(XdpError::not_open);
@@ -2094,7 +2120,9 @@ class XdpContext
 
     [[nodiscard]] auto tx_launch_time() const noexcept -> bool { return false; }
 
-    [[nodiscard]] auto tx_set_launch_time(uint64_t, int64_t) noexcept -> Status
+    void tx_set_launch_time(uint64_t, int64_t) noexcept {}
+
+    [[nodiscard]] auto try_tx_set_launch_time(uint64_t, int64_t) noexcept -> Status
     {
         return failure(XdpError::not_supported_on_platform);
     }

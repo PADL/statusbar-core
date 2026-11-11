@@ -42,13 +42,13 @@ TEST(xdp_launch_time, the_error_for_a_kernel_without_tx_metadata_is_its_own)
     EXPECT_TRUE(error.message() != std::string{"Unknown XDP error"});
 }
 
-// A closed context has no socket to time frames on, and must say so rather
-// than write into a UMEM that is not there.
+// A closed context has no socket to time frames on, and the checked form
+// must say so rather than write into a UMEM that is not there.
 TEST(xdp_launch_time, a_closed_context_refuses_to_set_a_launch_time)
 {
     XdpContext context;
     EXPECT_FALSE(context.tx_launch_time());
-    auto const set = context.tx_set_launch_time(0, 1'000);
+    auto const set = context.try_tx_set_launch_time(0, 1'000);
     EXPECT_FALSE(set.has_value());
     if (!set) {
 #if defined(__linux__) && defined(HAVE_XDP)
@@ -58,6 +58,16 @@ TEST(xdp_launch_time, a_closed_context_refuses_to_set_a_launch_time)
         EXPECT_EQ(set.error(), make_error_code(XdpError::not_supported_on_platform));
 #endif
     }
+}
+
+// The silent form is a statement on a commit path: it takes the same refusal
+// without an answer to drop, and the context is as closed afterwards as before.
+TEST(xdp_launch_time, the_silent_form_swallows_the_refusal_of_a_closed_context)
+{
+    XdpContext context;
+    context.tx_set_launch_time(0, 1'000);
+    EXPECT_FALSE(context.valid());
+    EXPECT_FALSE(context.tx_launch_time());
 }
 
 // The probe is what open() consults, so it must give a definite answer on
