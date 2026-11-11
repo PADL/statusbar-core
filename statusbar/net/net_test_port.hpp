@@ -208,7 +208,7 @@ class TestPortContext
 
   private:
     /// Log a join or leave of @p group when record_memberships() named a log.
-    void note_membership(ieee::Eui48 const& group, bool joined);
+    void notify_membership(ieee::Eui48 const& group, bool joined);
 
     struct RxEntry
     {
