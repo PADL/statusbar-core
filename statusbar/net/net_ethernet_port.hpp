@@ -149,19 +149,6 @@ using RxTimePoint = RxClock::time_point;
     return now.time_since_epoch().count();
 }
 
-/// Transitional, for the "told the time" migration: @p clock_id's time in
-/// nanoseconds, what a caller read once for a batch of frames it then
-/// handed to AnyEthernetPort::rx_start(int64_t). New code reads
-/// rx_clock_now() and tells the RxTimePoint, which cannot be a time on
-/// another clock. This keeps the bare-count pattern compiling until the
-/// migration is complete, then goes.
-[[nodiscard]] inline auto software_rx_timestamp_ns(int const clock_id) noexcept -> int64_t
-{
-    struct timespec ts{};
-    (void)::clock_gettime(static_cast<clockid_t>(clock_id), &ts);
-    return (static_cast<int64_t>(ts.tv_sec) * 1'000'000'000LL) + ts.tv_nsec;
-}
-
 /// Concept for zero-copy Ethernet frame TX/RX backends.
 ///
 /// All implementations are single-threaded. The caller must not access a port

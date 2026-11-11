@@ -55,19 +55,6 @@ TEST(any_ethernet_port, a_name_that_is_not_a_backend_is_refused)
     EXPECT_FALSE(parse_ethernet_backend("rawnet ").has_value());
 }
 
-// The RX clock is CLOCK_MONOTONIC_RAW and not a choice; the transitional
-// field compiles an old config and refuses a value that would have chosen.
-TEST(any_ethernet_port, an_rx_clock_other_than_monotonic_raw_is_refused_before_any_socket)
-{
-    AnyEthernetPort port;
-    auto const status =
-        port.open(EthernetBackend::rawnet, {.interface_name = "lo", .ethertype = 0x22F0, .rx_clock_id = CLOCK_MONOTONIC});
-    EXPECT_FALSE(status.has_value());
-    EXPECT_EQ(status.error(), make_error_code(NetError::invalid_argument));
-    EXPECT_FALSE(port.valid());
-    EXPECT_TRUE(software_rx_timestamp_ns(CLOCK_MONOTONIC_RAW) > 0);
-}
-
 TEST(any_ethernet_port, a_closed_port_is_closed_in_every_answer)
 {
     AnyEthernetPort port;
@@ -84,9 +71,9 @@ TEST(any_ethernet_port, a_closed_port_is_closed_in_every_answer)
     EXPECT_EQ(tx.error(), make_error_code(NetError::not_connected));
     auto const rx = port.rx_start();
     EXPECT_FALSE(rx.has_value());
-    auto const rx_told_a_count = port.rx_start(int64_t{5});  // the transitional bare-count form
-    EXPECT_FALSE(rx_told_a_count.has_value());
-    EXPECT_EQ(rx_told_a_count.error(), make_error_code(NetError::not_connected));
+    auto const rx_told = port.rx_start(RxTimePoint{RxClock::duration{5}});
+    EXPECT_FALSE(rx_told.has_value());
+    EXPECT_EQ(rx_told.error(), make_error_code(NetError::not_connected));
     EXPECT_FALSE(port.tx_flush().has_value());
     EXPECT_FALSE(port.end_cycle().has_value());
     port.begin_cycle();  // nothing to do, and nothing to crash on

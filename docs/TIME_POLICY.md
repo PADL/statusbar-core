@@ -111,11 +111,6 @@ The surface a told function presents:
   `CLOCK_MONOTONIC_RAW`). The capture tools that use it compare stamps only
   with each other. It predates the policy and is the one RAW exception left
   in core.
-- Transitional net shims, kept on purpose while an external tree written
-  against the earlier API catches up: `AnyEthernetPort::rx_start(int64_t
-  now_ns)`, `net::software_rx_timestamp_ns(clock_id)` and the
-  `AnyEthernetPortConfig::rx_clock_id` field (refused unless RAW). Each
-  says "Transitional" in its comment and goes when that tree has rebased.
 
 ## Checklist for new code
 
