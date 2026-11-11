@@ -56,9 +56,9 @@ auto xdp_config_from(AnyEthernetPortConfig const& config) -> XdpConfig
         .tx_ring_size = config.ring_size,
         .fill_ring_size = config.ring_size * 2,
         .completion_ring_size = config.ring_size * 2,
+        .tx_launch_time = config.xdp_tx_launch_time,
         .bind_mode = config.xdp_bind_mode,
         .attach_mode = config.xdp_attach_mode,
-        .tx_launch_time = config.xdp_tx_launch_time,
     };
 }
 

@@ -297,6 +297,25 @@ struct XdpConfig
     unsigned int tap_ifindex{0};
     size_t rx_drain_max{32};
     size_t completion_drain_max{64};
+    /// Register the UMEM with room for AF_XDP TX metadata, so each frame can
+    /// carry a launch time (XdpContext::tx_set_launch_time). The NIC must be
+    /// in launch-time mode for the time to mean anything - an offloaded `etf`
+    /// on this queue, which net_tc_launch_time.hpp lays - and the driver must
+    /// honour it. open() asks the kernel, through probe_tx_launch_time(),
+    /// whether this NIC does, and fails with
+    /// XdpError::launch_time_not_supported when it does not - a kernel before
+    /// 6.15 takes the metadata and discards the time - or with
+    /// XdpError::tx_metadata_not_supported when this build or kernel cannot
+    /// carry the metadata at all, rather than opening a socket whose times
+    /// would be ignored.
+    ///
+    /// Costs sizeof(xsk_tx_metadata) bytes of every frame's headroom: the
+    /// headroom is raised to that where a caller asked for less.
+    ///
+    /// Declared here, before the bind, attach and pin settings: designated
+    /// initializers outside this tree name it in this position, and a field
+    /// order is API.
+    bool tx_launch_time{false};
     XdpBindMode bind_mode{XdpBindMode::auto_};
     XdpAttachMode attach_mode{XdpAttachMode::native};
     /// Where to pin the program and its maps, from XdpProgram::pin_path_for().
@@ -323,25 +342,6 @@ struct XdpConfig
     /// Zero gives the old behaviour: receive may take everything, and a
     /// receive-only context loses nothing by it.
     size_t tx_frame_reserve{xdp_default_tx_frame_reserve};
-    /// The other thing transmit sets aside, beside the frames above: room in
-    /// every frame's headroom for AF_XDP TX metadata, so each frame can carry
-    /// a launch time (XdpContext::tx_set_launch_time). The NIC must be in
-    /// launch-time mode for the time to mean anything - an offloaded `etf` on
-    /// this queue, which net_tc_launch_time.hpp lays - and the driver must
-    /// honour it. open() asks the kernel, through probe_tx_launch_time(),
-    /// whether this NIC does, and fails with
-    /// XdpError::launch_time_not_supported when it does not - a kernel before
-    /// 6.15 takes the metadata and discards the time - or with
-    /// XdpError::tx_metadata_not_supported when this build or kernel cannot
-    /// carry the metadata at all, rather than opening a socket whose times
-    /// would be ignored.
-    ///
-    /// Costs sizeof(xsk_tx_metadata) bytes of every frame's headroom: the
-    /// headroom is raised to that where a caller asked for less. Declared
-    /// last so that a designated initializer may name it after the bind,
-    /// attach and pin settings, which is where a caller setting up transmit
-    /// reaches it.
-    bool tx_launch_time{false};
 };
 
 // ──────────────────────────────────────────────
