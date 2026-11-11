@@ -1734,13 +1734,20 @@ auto open_membership_socket() -> StatusValue<FileDescriptor>
     return FileDescriptor{fd};
 }
 
-auto change_membership(int fd, unsigned int if_index, ieee::Eui48 const& addr, int optname) -> Status
+/// The PACKET_ADD/DROP_MEMBERSHIP request for multicast @p addr on @p if_index.
+auto multicast_request(unsigned int if_index, ieee::Eui48 const& addr) noexcept -> packet_mreq
 {
-    struct packet_mreq mreq{};
+    packet_mreq mreq{};
     mreq.mr_ifindex = static_cast<int>(if_index);
     mreq.mr_type = PACKET_MR_MULTICAST;
     mreq.mr_alen = 6;
     span_copy(std::span{mreq.mr_address}.first(6), make_const_span(addr.value));
+    return mreq;
+}
+
+auto change_membership(int fd, unsigned int if_index, ieee::Eui48 const& addr, int optname) -> Status
+{
+    auto const mreq = multicast_request(if_index, addr);
     if (::setsockopt(fd, SOL_PACKET, optname, &mreq, sizeof(mreq)) < 0) {
         return failure(XdpError::join_multicast_failed);
     }
