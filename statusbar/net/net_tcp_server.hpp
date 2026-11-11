@@ -45,6 +45,12 @@
 /// and its listen(), a window the stale-socket probe cannot see (both a
 /// dead process's socket and a not-yet-listening one answer ECONNREFUSED).
 /// A lock file left by a crashed process holds nothing and does not block.
+///
+/// The socket file itself is made in a private 0700 directory beside the
+/// path, given its mode there, and hard-linked to the path only then: it is
+/// never reachable with the wrong mode, nothing at the path is ever
+/// replaced (the link fails instead), and no chmod() can be led through a
+/// symlink. The private directory is gone before listen().
 
 #include "statusbar/net/net_address.hpp"
 #include "statusbar/net/net_fd_multiplexer.hpp"
@@ -82,9 +88,16 @@ struct TcpServerOptions
     bool nodelay = true;          ///< TCP_NODELAY on accepted sockets
     int64_t idle_timeout_ns = 0;  ///< close slots idle this long; 0 = never
 
-    /// AF_UNIX only: the socket file's mode, applied after bind and before
-    /// listen so the socket never answers at its final path with whatever
-    /// the umask happened to allow. -1 leaves the umask result alone.
+    /// AF_UNIX only: the socket file's mode. The file is made in a private
+    /// 0700 directory beside the path, given the mode there, and only then
+    /// linked to the path, so it never exists at a reachable name with
+    /// whatever the umask happened to allow and no chmod() ever follows a
+    /// symlink planted at the path. -1 leaves the umask result alone; a
+    /// value that is not a mode (above 07777) is refused before the path is
+    /// claimed. The staged name is the path's directory plus about twenty
+    /// characters, so a path whose directory is within that of sun_path's
+    /// limit (108 bytes on Linux, 104 on macOS) is refused as
+    /// invalid_address however short its own name.
     int unix_mode = -1;
 
     /// AF_UNIX only: listen on SOCK_SEQPACKET rather than SOCK_STREAM.
@@ -130,7 +143,8 @@ class TcpConnectionPool : public Pollable
     /// False when the listener or multiplexer failed to come up.
     [[nodiscard]] auto valid() const noexcept -> bool;
 
-    /// The listener's bound address (resolves port 0).
+    /// The listener's bound address (resolves port 0); for an AF_UNIX
+    /// listener, the path clients connect to.
     [[nodiscard]] auto local_addr() const -> StatusValue<SocketAddress>;
 
     /// Reads into @p out. 0 => orderly EOF; NetError::would_block => no

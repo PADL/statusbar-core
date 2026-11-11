@@ -8,6 +8,7 @@
 
 #include <cassert>
 #include <cerrno>
+#include <cstdlib>
 #include <string>
 #include <utility>
 
@@ -255,15 +256,53 @@ auto record_socket_file(LocalListener listener, std::string const& path) -> Stat
     return listener;
 }
 
+/// Where the socket is made before it has its public name: a fresh 0700
+/// directory beside the final path, so nothing but this process can reach
+/// the file while it is bound, given its mode and linked into place.
+struct StagedSocket
+{
+    std::string dir{};   ///< the private directory, ours alone
+    std::string path{};  ///< "<dir>/s": where bind() makes the file
+};
+
+/// The mkdtemp() template for a socket at @p socket_path: in its directory,
+/// hidden, and named for this process so a test can see what one left.
+auto staging_template_for(std::string const& socket_path) -> std::string
+{
+    auto const slash = socket_path.rfind('/');
+    std::string const dir = (slash == 0) ? std::string{} : socket_path.substr(0, slash);
+    return dir + "/.sb" + std::to_string(::getpid()) + ".XXXXXX";
+}
+
+/// A private directory for the socket to be made in. mkdtemp() makes it
+/// 0700 whatever the umask.
+auto make_staging(std::string const& socket_path) -> StatusValue<StagedSocket>
+{
+    std::string dir = staging_template_for(socket_path);
+    if (::mkdtemp(dir.data()) == nullptr) {
+        return failure(NetError::bind_failed);
+    }
+    return StagedSocket{.dir = dir, .path = dir + "/s"};
+}
+
+/// Remove the private directory and whatever is still in it: the staged
+/// name once the socket has its public one, or the whole attempt when it
+/// failed.
+void remove_staging(StagedSocket const& staged)
+{
+    (void)::unlink(staged.path.c_str());
+    (void)::rmdir(staged.dir.c_str());
+}
+
 /// A fresh socket bound at @p path.
-auto bind_socket_file(SocketAddress const& addr, std::string const& path, int sock_type) -> StatusValue<LocalListener>
+auto bind_at(SocketAddress const& addr, std::string const& path, int sock_type) -> StatusValue<LocalListener>
 {
     int const fd = ::socket(AF_UNIX, sock_type, 0);
     if (fd < 0) {
         return failure(NetError::socket_creation_failed);
     }
     LocalListener listener{.fd = FileDescriptor{fd}, .file = {}};
-    // No SO_REUSEADDR: on AF_UNIX it does nothing, and the stale path has
+    // No SO_REUSEADDR: on AF_UNIX it does nothing, and the public path has
     // already been dealt with.
     if (::bind(fd, addr.sockaddr(), addr.length()) < 0) {
         return failure(NetError::bind_failed);
@@ -271,17 +310,82 @@ auto bind_socket_file(SocketAddress const& addr, std::string const& path, int so
     return record_socket_file(std::move(listener), path);
 }
 
-/// chmod, then listen -- in that order, so the socket never answers at its
-/// final path with umask permissions. (A path swapped between bind and chmod
-/// would take the mode with it; binding in a private directory and renaming
-/// into place closes that window and is the next step if we ever need it.)
+/// The socket, bound at its staged name. A socket path within the staged
+/// name's extra length of sun_path's limit cannot be staged and is refused
+/// as invalid_address, the same answer as a path that does not fit at all.
+auto bind_socket_file(StagedSocket const& staged, int sock_type) -> StatusValue<LocalListener>
+{
+    auto const addr = SocketAddress::local(staged.path);
+    if (!addr) {
+        return failure(NetError::invalid_address);
+    }
+    return bind_at(*addr, staged.path, sock_type);
+}
+
+/// The requested mode, put on the file while it is still inside the private
+/// directory, where nobody can swap a symlink in under the chmod.
+auto apply_mode(LocalListener listener, TcpServerOptions const& options) -> StatusValue<LocalListener>
+{
+    if (options.unix_mode >= 0 && ::chmod(listener.file.path.c_str(), static_cast<mode_t>(options.unix_mode)) < 0) {
+        return failure(NetError::socket_option_failed);
+    }
+    return listener;
+}
+
+/// The socket's public name: link() the staged file to @p path. A link
+/// fails with EEXIST rather than replace whatever appeared at the name
+/// since it was cleared, and the name is then checked to be our file by
+/// device and inode before anything trusts it.
+auto move_into_place(LocalListener listener, std::string const& path) -> StatusValue<LocalListener>
+{
+    if (::link(listener.file.path.c_str(), path.c_str()) < 0) {
+        return failure(NetError::bind_failed);
+    }
+    struct stat at_path{};
+    if (::lstat(path.c_str(), &at_path) < 0 || static_cast<uint64_t>(at_path.st_dev) != listener.file.dev ||
+        static_cast<uint64_t>(at_path.st_ino) != listener.file.ino) {
+        unlink_if_ours(path, listener.file.dev, listener.file.ino);
+        return failure(NetError::bind_failed);
+    }
+    listener.file.path = path;
+    return listener;
+}
+
+/// Bind in the private directory, give the file its mode there, and link
+/// it to @p path.
+auto make_socket_file(StagedSocket const& staged, std::string const& path, TcpServerOptions const& options)
+    -> StatusValue<LocalListener>
+{
+    int const sock_type = options.unix_seqpacket ? SOCK_SEQPACKET : SOCK_STREAM;
+    auto bound = bind_socket_file(staged, sock_type);
+    if (!bound) {
+        return failure(bound.error());
+    }
+    auto moded = apply_mode(std::move(*bound), options);
+    if (!moded) {
+        return failure(moded.error());
+    }
+    return move_into_place(std::move(*moded), path);
+}
+
+/// The whole staged pass: the private directory comes and goes within it,
+/// whether the socket reached its public name or not.
+auto stage_socket_file(std::string const& path, TcpServerOptions const& options) -> StatusValue<LocalListener>
+{
+    auto staged = make_staging(path);
+    if (!staged) {
+        return failure(staged.error());
+    }
+    auto made = make_socket_file(*staged, path, options);
+    remove_staging(*staged);
+    return made;
+}
+
+/// listen(): from here the socket answers at its name, already with its
+/// mode. A refusal removes the file, which is ours by device and inode.
 auto serve_socket_file(LocalListener listener, TcpServerOptions const& options) -> StatusValue<LocalListener>
 {
     auto const& file = listener.file;
-    if (options.unix_mode >= 0 && ::chmod(file.path.c_str(), static_cast<mode_t>(options.unix_mode)) < 0) {
-        unlink_if_ours(file.path, file.dev, file.ino);
-        return failure(NetError::socket_option_failed);
-    }
     if (::listen(listener.fd.get(), options.backlog) < 0) {
         unlink_if_ours(file.path, file.dev, file.ino);
         return failure(NetError::listen_failed);
@@ -289,28 +393,27 @@ auto serve_socket_file(LocalListener listener, TcpServerOptions const& options) 
     return listener;
 }
 
-/// Clear a stale socket, then bind, chmod and listen at @p path. The path
-/// is already claimed; a failure leaves nothing of ours behind.
-auto bind_local_listener(SocketAddress const& addr, std::string const& path, TcpServerOptions const& options)
-    -> StatusValue<LocalListener>
+/// Clear a stale socket at @p path, make the new one beside it in a private
+/// directory and link it into place, then listen. The path is already
+/// claimed; a failure leaves nothing of ours behind.
+auto bind_local_listener(std::string const& path, TcpServerOptions const& options) -> StatusValue<LocalListener>
 {
     int const sock_type = options.unix_seqpacket ? SOCK_SEQPACKET : SOCK_STREAM;
     if (auto cleared = clear_socket_path(path, sock_type); !cleared) {
         return failure(cleared.error());
     }
-    auto bound = bind_socket_file(addr, path, sock_type);
-    if (!bound) {
-        return failure(bound.error());
+    auto made = stage_socket_file(path, options);
+    if (!made) {
+        return failure(made.error());
     }
-    return serve_socket_file(std::move(*bound), options);
+    return serve_socket_file(std::move(*made), options);
 }
 
 /// Bind under a claim already taken: the claim travels with the listener on
 /// success and is let go on failure.
-auto bind_under_claim(FileDescriptor lock, SocketAddress const& addr, std::string const& path, TcpServerOptions const& options)
-    -> StatusValue<LocalListener>
+auto bind_under_claim(FileDescriptor lock, std::string const& path, TcpServerOptions const& options) -> StatusValue<LocalListener>
 {
-    auto bound = bind_local_listener(addr, path, options);
+    auto bound = bind_local_listener(path, options);
     if (!bound) {
         release_socket_path(lock, lock_path_for(path));
         return failure(bound.error());
@@ -319,20 +422,29 @@ auto bind_under_claim(FileDescriptor lock, SocketAddress const& addr, std::strin
     return std::move(*bound);
 }
 
-/// Claim the path, then bind, chmod, listen. From the claim to the pool's
-/// destructor this process is the one allowed to clear, bind and remove it.
+/// Whether @p mode is a file mode at all. Anything else is refused before
+/// the path is touched rather than discovered by chmod() after bind().
+auto usable_mode(int mode) -> bool
+{
+    return mode <= 07777;
+}
+
+/// Claim the path, then make the socket, give it the path and listen. From
+/// the claim to the pool's destructor this process is the one allowed to
+/// clear, bind and remove it.
 auto create_local_listener(SocketAddress const& addr, TcpServerOptions const& options) -> StatusValue<LocalListener>
 {
     std::string const path{addr.path()};
-    if (path.empty()) {
-        // An unnamed or abstract address has no file to own or protect.
-        return failure(NetError::invalid_address);
+    if (path.empty() || !usable_mode(options.unix_mode)) {
+        // An unnamed or abstract address has no file to own or protect; a
+        // value that is not a mode has nothing to be applied to.
+        return failure(path.empty() ? NetError::invalid_address : NetError::invalid_argument);
     }
     auto lock = claim_socket_path(lock_path_for(path));
     if (!lock) {
         return failure(lock.error());
     }
-    return bind_under_claim(std::move(*lock), addr, path, options);
+    return bind_under_claim(std::move(*lock), path, options);
 }
 
 /// A listener that was bound but will never serve: remove its file and let
@@ -415,6 +527,11 @@ auto TcpConnectionPool::local_addr() const -> StatusValue<SocketAddress>
 {
     if (!listener_.valid()) {
         return failure(NetError::not_connected);
+    }
+    if (!unix_.path.empty()) {
+        // The public name. getsockname() would answer the staged one the
+        // socket was bound at, which no longer exists.
+        return SocketAddress::local(unix_.path);
     }
     SocketAddress addr;
     addr.reset_length();

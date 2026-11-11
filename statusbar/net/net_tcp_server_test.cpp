@@ -6,6 +6,7 @@
 #include "statusbar/itc/itc_stop_token.hpp"
 #include "statusbar/test/test.hpp"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -19,6 +20,7 @@
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 
 using namespace statusbar;
 using namespace statusbar::net;
@@ -168,6 +170,27 @@ class LocalPath
             return 0;
         }
         return static_cast<unsigned>(st.st_mode) & 0777U;
+    }
+    /// Private directories this process's pools staged a socket in and did
+    /// not remove: entries beside the path named ".sb<pid>.".
+    [[nodiscard]] auto staging_leftovers() const -> int { return count_staging_leftovers(path_); }
+
+    static auto count_staging_leftovers(std::string const& socket_path) -> int
+    {
+        std::string const dir = socket_path.substr(0, socket_path.rfind('/'));
+        std::string const prefix = ".sb" + std::to_string(::getpid()) + ".";
+        DIR* d = ::opendir(dir.c_str());
+        if (d == nullptr) {
+            return -1;
+        }
+        int count = 0;
+        for (struct dirent* e = ::readdir(d); e != nullptr; e = ::readdir(d)) {
+            if (std::string_view{e->d_name}.starts_with(prefix)) {
+                ++count;
+            }
+        }
+        ::closedir(d);
+        return count;
     }
 
   private:
@@ -628,6 +651,67 @@ TEST(net_tcp_server_local, without_a_mode_the_umask_result_stands)
     // Nothing asserted about which bits those are -- only that the socket
     // exists and we did not chmod it to something of our own invention.
     EXPECT_TRUE(path.is_socket());
+}
+
+TEST(net_tcp_server_local, a_value_that_is_not_a_mode_is_refused_before_the_path_is_claimed)
+{
+    LocalPath const path{"badmode"};
+    TcpConnectionPool* pool_ptr = nullptr;
+    EchoHandler handler{pool_ptr};
+    TcpServerOptions options;
+    options.unix_mode = 010000;  // one bit above the mode bits
+    TcpConnectionPool pool{path.addr(), 2, handler, options};
+    pool_ptr = &pool;
+    EXPECT_FALSE(pool.valid());
+    // Refused before anything was made: no socket, no lock, no staging.
+    EXPECT_FALSE(path.exists());
+    EXPECT_FALSE(path.lock_exists());
+    EXPECT_EQ(path.staging_leftovers(), 0);
+}
+
+TEST(net_tcp_server_local, the_private_directory_is_gone_once_the_socket_has_its_name)
+{
+    LocalPath const path{"staged"};
+    TcpConnectionPool* pool_ptr = nullptr;
+    EchoHandler handler{pool_ptr};
+    TcpServerOptions options;
+    options.unix_mode = 0600;
+    TcpConnectionPool pool{path.addr(), 2, handler, options};
+    pool_ptr = &pool;
+    EXPECT_TRUE(pool.valid());
+    // The socket is at its name with its mode, and the directory it was made
+    // in is already gone: the file was never reachable any other way.
+    EXPECT_TRUE(path.is_socket());
+    EXPECT_EQ(path.mode_bits(), 0600U);
+    EXPECT_EQ(path.staging_leftovers(), 0);
+}
+
+TEST(net_tcp_server_local, a_path_whose_directory_is_too_long_to_stage_in_is_refused_and_nothing_is_left)
+{
+    // A directory name that leaves the socket path two bytes inside
+    // sun_path's limit: the path fits, the staged name beside it
+    // ("<dir>/.sb<pid>.XXXXXX/s") cannot. The directory itself is made for
+    // the test and removed after it.
+    std::string const name{"/s.sock"};
+    std::string dir{"/tmp/sb_pool_longdir_" + std::to_string(::getpid()) + "_"};
+    dir.append(sizeof(sockaddr_un{}.sun_path) - 2 - name.size() - dir.size(), 'x');
+    EXPECT_EQ(::mkdir(dir.c_str(), 0700), 0);
+    std::string const path = dir + name;
+    auto const addr = SocketAddress::local(path);
+    EXPECT_TRUE(addr.has_value());
+
+    {
+        TcpConnectionPool* pool_ptr = nullptr;
+        EchoHandler handler{pool_ptr};
+        TcpConnectionPool pool{*addr, 2, handler};
+        pool_ptr = &pool;
+        EXPECT_FALSE(pool.valid());
+        struct stat st{};
+        EXPECT_TRUE(::lstat(path.c_str(), &st) != 0);
+        EXPECT_EQ(LocalPath::count_staging_leftovers(path), 0);
+    }
+    // The lock went with the pool; the directory is empty again.
+    EXPECT_EQ(::rmdir(dir.c_str()), 0);
 }
 
 /// Hold a pool's lock file the way a second instance of ours that has
