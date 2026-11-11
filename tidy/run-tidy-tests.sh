@@ -17,11 +17,18 @@ CLANG_TIDY="${2:-clang-tidy}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 FIXTURE="$DIR/tests/block_statements_fixture.cpp"
 FIXTURE_TEST="$DIR/tests/block_statements_fixture_test.cpp"
+FIXTURE_HEADER="$DIR/tests/block_statements_header_fixture.hpp"
+GATE="$DIR/../check-block-statements.sh"
 
 if [ ! -f "$PLUGIN" ]; then
     echo "run-tidy-tests: no plugin at $PLUGIN" >&2
     exit 1
 fi
+# Absolute, because the gate case below runs from another directory.
+case "$PLUGIN" in
+    /*) ;;
+    *) PLUGIN="$(pwd)/$PLUGIN" ;;
+esac
 
 # Report only the line numbers the check fires on, in order.
 findings() {
@@ -65,6 +72,29 @@ findings_max3() {
         grep -c "statusbar-block-statements" || true
 }
 expect "MaxStatements is honoured" "3" "$(findings_max3)"
+
+# The gate itself, in files mode, over a compile database of one entry: the
+# header fixture reaches clang-tidy through the gate's one-line translation
+# unit, and its block at line 15 must come back -- which it only does
+# because the gate names the header filter rather than trusting clang-tidy's
+# default (empty before 22, everything from 22 on). The .cpp fixture through
+# the same path pins that the main file is still reported the same way.
+# MAX=4 matches the plugin's own default so the expectations line up.
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+cat > "$TMP/compile_commands.json" <<EOF
+[{"directory": "$DIR/tests", "file": "$DIR/tests/block_statements_fixture.cpp",
+  "arguments": ["clang++", "-std=c++23", "-c", "block_statements_fixture.cpp"]}]
+EOF
+gate_findings() {
+    (cd "$DIR/.." && STATUSBAR_BUILD_DIR="$TMP" STATUSBAR_TIDY_PLUGIN="$PLUGIN" CLANG_TIDY_EXE="$CLANG_TIDY" \
+        STATUSBAR_BLOCK_STATEMENTS_MAX=4 STATUSBAR_BLOCK_STATEMENTS_STRICT=1 "$GATE" "$1" 2>&1 || true) |
+        grep "statusbar-block-statements\]" |
+        sed 's|^.*fixture[^:]*:\([0-9]*\):.*|\1|' |
+        tr '\n' ' ' | sed 's/ $//'
+}
+expect "the gate reports a block in a header" "15" "$(gate_findings "$FIXTURE_HEADER")"
+expect "the gate reports the main file as before" "17" "$(gate_findings "$FIXTURE")"
 
 if [ "$fail" -ne 0 ]; then
     echo "" >&2

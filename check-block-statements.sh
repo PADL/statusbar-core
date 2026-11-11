@@ -33,7 +33,9 @@
 # records for it, or for a header or a file the build has not configured yet,
 # those of a neighbouring .cpp. A header is linted through a one-line
 # translation unit that includes it, so a header-only change is checked like
-# any other.
+# any other; the header filter is passed explicitly, since what clang-tidy
+# reports in headers by default has differed between its releases (nothing
+# before 22, everything from 22 on) and this gate must not.
 #
 # Exits 0 without checking anything when the tools are not available (no
 # plugin, no compile_commands.json, a clang-tidy that cannot load the plugin,
@@ -307,6 +309,7 @@ for f in $files; do
     (cd "$run_dir" && "$CLANG_TIDY" -load="$PLUGIN" \
         --checks='-*,statusbar-block-statements' \
         --config="{CheckOptions: {statusbar-block-statements.MaxStatements: $MAX}}" \
+        --header-filter='.*' \
         --quiet "$tu" -- -I"$TMP" -iquote "$REPO/$(dirname "$f")" "$@") > "$report" 2>&1 || true
 
     # A file clang-tidy could not parse was not checked; say so rather than
@@ -321,9 +324,10 @@ for f in $files; do
     # finding sits on the opening brace and the check follows it with a note
     # on the closing brace; the change touches the block if any touched
     # range meets that extent, so editing a body without its braces counts.
-    # clang-tidy lints a whole translation unit, so a block in any header it
-    # includes is reported too; the file under test is always reported at its
-    # path in the copy, which is what the name is matched on.
+    # clang-tidy lints a whole translation unit and, told --header-filter='.*'
+    # above, reports a block in any header it includes too (a header under
+    # test only ever appears that way); the file under test is always reported
+    # at its path in the copy, which is what the name is matched on.
     kept=$(grep -E ':[0-9]+:[0-9]+: (warning|note): ' "$report" | awk -v ranges="$ranges" -v want="$copy" -v name="$f" '
         BEGIN { n = split(ranges, r, ";"); start = 0 }
         function touched(lo, hi,    i, b) {

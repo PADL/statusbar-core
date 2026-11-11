@@ -1884,21 +1884,38 @@ class XdpContext
   private:
     void swap(XdpContext& other) noexcept
     {
+        swap_socket(other);
+        swap_settings(other);
+        swap_tx_pending(other);
+    }
+    /// The kernel-side half: socket, memory, program, rings, the interface
+    /// they sit on and the socket that holds the multicast memberships.
+    void swap_socket(XdpContext& other) noexcept
+    {
         std::swap(xsk_, other.xsk_);
         std::swap(umem_, other.umem_);
         std::swap(bpf_, other.bpf_);
         std::swap(rings_, other.rings_);
         std::swap(interface_, other.interface_);
+        std::swap(membership_fd_, other.membership_fd_);
+    }
+    /// What open() decided and what has happened since.
+    void swap_settings(XdpContext& other) noexcept
+    {
         std::swap(budget_, other.budget_);
         std::swap(stats_, other.stats_);
         std::swap(program_, other.program_);
         std::swap(bind_retries_, other.bind_retries_);
         std::swap(tx_frame_reserve_, other.tx_frame_reserve_);
-        std::swap(membership_fd_, other.membership_fd_);
+        std::swap(zero_copy_, other.zero_copy_);
+    }
+    /// The one atomic, swapped by value: nothing else touches either
+    /// context while it is being moved.
+    void swap_tx_pending(XdpContext& other) noexcept
+    {
         bool const mine = tx_pending_.load(std::memory_order_relaxed);
         tx_pending_.store(other.tx_pending_.load(std::memory_order_relaxed), std::memory_order_relaxed);
         other.tx_pending_.store(mine, std::memory_order_relaxed);
-        std::swap(zero_copy_, other.zero_copy_);
     }
 
     struct xsk_socket* xsk_{nullptr};
