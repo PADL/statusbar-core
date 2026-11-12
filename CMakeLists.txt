@@ -114,3 +114,10 @@ statusbar_register_fuzz_targets()
 
 # clang-tidy aggregate target (no-op unless clang-tidy is on PATH).
 statusbar_register_clang_tidy_target()
+
+# The package boilerplate's header root (statusbar_package_install_export
+# INCLUDE_DIR), pinned by configuring and installing a fixture package.
+add_test(
+  NAME cmake_install_export
+  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tests/run-install-export-tests.sh
+          ${CMAKE_COMMAND} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/module.cmake)

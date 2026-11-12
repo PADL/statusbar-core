@@ -307,10 +307,25 @@ endfunction()
 # without an install step), headers, the find_package() config + version files,
 # and docs when present. Skipped under an outer aggregate build, which builds
 # but does not install — the outer project owns the install set.
+#
+# INCLUDE_DIR names the header root, the directory the package's public headers
+# live under and the directory they are installed under in <prefix>/include, so
+# a consumer's #include <root/...> is the same against the source tree and the
+# install. It defaults to statusbar; a package that keeps its headers under
+# another root passes that root and nothing else changes.
 function(statusbar_package_install_export)
-  cmake_parse_arguments(ARG "" "NAME" "" ${ARGN})
+  cmake_parse_arguments(ARG "" "NAME;INCLUDE_DIR" "" ${ARGN})
   if(NOT ARG_NAME)
     message(FATAL_ERROR "statusbar_package_install_export: NAME is required")
+  endif()
+  if(ARG_UNPARSED_ARGUMENTS)
+    message(
+      FATAL_ERROR
+        "statusbar_package_install_export(${ARG_NAME}): unknown keyword(s): "
+        "${ARG_UNPARSED_ARGUMENTS}. Valid keywords are NAME, INCLUDE_DIR.")
+  endif()
+  if(NOT ARG_INCLUDE_DIR)
+    set(ARG_INCLUDE_DIR statusbar)
   endif()
   if(STATUSBAR_AGGREGATE_BUILD)
     return()
@@ -334,8 +349,8 @@ function(statusbar_package_install_export)
     FILE ${_pkg}Targets.cmake
     NAMESPACE statusbar::)
   install(
-    DIRECTORY statusbar/
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/statusbar
+    DIRECTORY ${ARG_INCLUDE_DIR}/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/${ARG_INCLUDE_DIR}
     COMPONENT devel
     FILES_MATCHING
     PATTERN "*.hpp"

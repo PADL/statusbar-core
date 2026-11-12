@@ -1,0 +1,7 @@
+# Copyright 2026 Jeff Koftinoff <jeff.koftinoff@statusbar.com>
+# SPDX-License-Identifier: MIT
+#
+# Package config template for the install-export test fixture.
+@PACKAGE_INIT@
+include("${CMAKE_CURRENT_LIST_DIR}/statusbar-fixtureTargets.cmake")
+check_required_components(statusbar-fixture)

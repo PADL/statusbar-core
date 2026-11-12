@@ -1,0 +1,12 @@
+-- Clang toolchain prefix: /opt/homebrew/Cellar/llvm/23.1.4
+-- Build type: Debug
+-- CXX flags:  -stdlib=libc++ -fstack-protector-strong -Wno-c23-extensions -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -Werror
+-- The CXX compiler identification is Clang 23.1.4
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /opt/homebrew/Cellar/llvm/23.1.4/bin/clang++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done (0.8s)
+-- Generating done (0.1s)
+-- Build files have been written to: /Volumes/Sources/src/staging/statusbar/tmp/core-incdir/build
