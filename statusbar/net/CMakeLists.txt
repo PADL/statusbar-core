@@ -45,6 +45,7 @@ statusbar_add_module(
   net_group_membership_test.cpp
   net_link_monitor_test.cpp
   net_linux_xdp_test.cpp
+  net_linux_mmap_test.cpp
   net_interface_info_test.cpp
   net_launch_order_test.cpp
   net_tc_launch_time_test.cpp

@@ -50,6 +50,22 @@ inline constexpr size_t MMAP_FRAME_SIZE = 2048;        ///< Size of each frame s
 inline constexpr size_t MMAP_MAX_FRAME_LENGTH = 1522;  ///< Maximum Ethernet frame with QinQ VLAN
 inline constexpr size_t MMAP_MIN_FRAME_LENGTH = 64;    ///< IEEE 802.3 minimum frame size
 
+/// What a PACKET_MMAP send may exceed the device MTU by: the Ethernet header
+/// and one 802.1Q tag. af_packet's limit is mtu + hard_header_len + VLAN_HLEN.
+inline constexpr size_t MMAP_TX_MTU_OVERHEAD = 14 + 4;
+
+/// The longest frame tx_commit() takes on a device with @p mtu: the slot's
+/// MMAP_MAX_FRAME_LENGTH, or less where the MTU allows less. The kernel
+/// refuses a longer send with EMSGSIZE and leaves its slot
+/// TP_STATUS_WRONG_FORMAT at the head of the ring, where it stops: nothing
+/// committed after it is sent until the socket closes. So the bound is
+/// applied here, before the kernel sees the frame.
+[[nodiscard]] constexpr auto mmap_max_tx_frame_length(size_t const mtu) noexcept -> size_t
+{
+    size_t const kernel_limit = mtu + MMAP_TX_MTU_OVERHEAD;
+    return kernel_limit < MMAP_MAX_FRAME_LENGTH ? kernel_limit : MMAP_MAX_FRAME_LENGTH;
+}
+
 /// Error codes specific to MMAP operations
 enum class MmapError
 {
@@ -68,6 +84,7 @@ enum class MmapError
     rx_ring_empty,
     invalid_index,
     not_supported_on_platform,
+    frame_too_long,
 };
 
 /// Error category for MmapError
@@ -182,6 +199,12 @@ class MmapContext
     /// Get the interface index
     [[nodiscard]] auto interface_index() const noexcept -> unsigned int { return if_index_; }
 
+    /// The longest frame tx_commit() takes, and the size of the buffer
+    /// tx_start() hands out: mmap_max_tx_frame_length() of the interface's
+    /// MTU as read at open(), MMAP_MAX_FRAME_LENGTH before open and on a
+    /// device that will not say.
+    [[nodiscard]] auto max_tx_frame_length() const noexcept -> size_t { return max_tx_frame_length_; }
+
     //
     // TX API - Zero-copy transmit using start/commit/cancel pattern
     //
@@ -194,6 +217,10 @@ class MmapContext
 
     /// Commit a TX slot for transmission.
     /// The frame_length is the total frame size including Ethernet header (min 64 bytes).
+    /// A frame longer than max_tx_frame_length() is refused with
+    /// MmapError::frame_too_long and its slot given back as tx_cancel()
+    /// gives one back, so the refusal costs the caller that frame and
+    /// nothing committed after it.
     /// @param handle Opaque slot handle from tx_start()
     /// @param frame_length Total frame size including Ethernet header (minimum 64 bytes)
     [[nodiscard]] auto tx_commit(uint64_t handle, size_t frame_length) -> Status;
@@ -301,7 +328,8 @@ class MmapContext
     void* tx_ring_{nullptr};
     tpacket_req tx_req_{};
     size_t tx_index_{0};
-    uint64_t tx_slot_in_use_{UINT64_MAX};  // Handle of slot from tx_start(), or UINT64_MAX if none
+    uint64_t tx_slot_in_use_{UINT64_MAX};                // Handle of slot from tx_start(), or UINT64_MAX if none
+    size_t max_tx_frame_length_{MMAP_MAX_FRAME_LENGTH};  // see max_tx_frame_length()
 
     // RX ring state
     void* rx_ring_{nullptr};
@@ -327,6 +355,7 @@ class MmapContext
         return empty;
     }
     [[nodiscard]] auto interface_index() const noexcept -> unsigned int { return 0; }
+    [[nodiscard]] auto max_tx_frame_length() const noexcept -> size_t { return MMAP_MAX_FRAME_LENGTH; }
     [[nodiscard]] auto tx_start(int64_t = 0) -> StatusValue<EthernetTxSlot>
     {
         return failure(MmapError::not_supported_on_platform);

@@ -40,6 +40,8 @@ auto MmapErrorCategory::message(int ev) const -> std::string
             return "Invalid slot index";
         case MmapError::not_supported_on_platform:
             return "PACKET_MMAP not supported on this platform";
+        case MmapError::frame_too_long:
+            return "Frame longer than the interface takes";
         default:
             return "Unknown MMAP error";
     }
@@ -98,6 +100,7 @@ void MmapContext::swap(MmapContext& other) noexcept
     std::swap(tx_req_, other.tx_req_);
     std::swap(tx_index_, other.tx_index_);
     std::swap(tx_slot_in_use_, other.tx_slot_in_use_);
+    std::swap(max_tx_frame_length_, other.max_tx_frame_length_);
     std::swap(rx_ring_, other.rx_ring_);
     std::swap(rx_req_, other.rx_req_);
     std::swap(rx_index_, other.rx_index_);
@@ -134,6 +137,11 @@ auto MmapContext::open(MmapConfig const& config) -> Status
         return failure(MmapError::get_hwaddr_failed);
     }
     span_copy(hardware_address_.value, hwaddr_bytes(ifr));
+
+    // The MTU bounds what tx_commit() takes (see mmap_max_tx_frame_length).
+    // A device that will not say keeps the slot's own limit.
+    max_tx_frame_length_ =
+        ::ioctl(fd_, SIOCGIFMTU, &ifr) == 0 ? mmap_max_tx_frame_length(static_cast<size_t>(ifr.ifr_mtu)) : MMAP_MAX_FRAME_LENGTH;
 
     // Set non-blocking mode
     int const flags = ::fcntl(fd_, F_GETFL, 0);
@@ -257,6 +265,7 @@ auto MmapContext::close() noexcept -> void
     tx_index_ = 0;
     rx_index_ = 0;
     tx_slot_in_use_ = UINT64_MAX;
+    max_tx_frame_length_ = MMAP_MAX_FRAME_LENGTH;
 }
 
 auto MmapContext::tx_start(int64_t launch_time_ns) -> StatusValue<EthernetTxSlot>
@@ -293,7 +302,7 @@ auto MmapContext::tx_start(int64_t launch_time_ns) -> StatusValue<EthernetTxSlot
     // Return slot with buffer pointing to payload area
     return success(EthernetTxSlot{
         .handle = static_cast<uint64_t>(slot_index),
-        .buffer = std::span<uint8_t>(tx_payload(hdr), MMAP_MAX_FRAME_LENGTH),
+        .buffer = std::span<uint8_t>(tx_payload(hdr), max_tx_frame_length_),
     });
 }
 
@@ -307,6 +316,14 @@ auto MmapContext::tx_commit(uint64_t handle, size_t frame_length) -> Status
 
     if (index >= tx_req_.tp_frame_nr) {
         return failure(MmapError::invalid_index);
+    }
+
+    if (frame_length > max_tx_frame_length_) {
+        // Refused here rather than by the kernel, which would wedge the ring
+        // (see mmap_max_tx_frame_length). The slot goes back the way
+        // tx_cancel() gives one back: no hole, nothing after it held up.
+        (void)tx_cancel(handle);
+        return failure(MmapError::frame_too_long);
     }
 
     auto* hdr = tx_header_at(index);
