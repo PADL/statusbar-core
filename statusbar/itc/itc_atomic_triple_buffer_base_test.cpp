@@ -6,7 +6,10 @@
 #include "statusbar/test/test.hpp"
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <thread>
 
 using statusbar::itc::AtomicTripleBufferBase;
 
@@ -136,6 +139,50 @@ TEST(itc_atb_base_overruns, multiple_publishes_without_consume_count)
 
     (void)buf.acquire_read_slot();
     EXPECT_EQ(buf.overruns(), uint64_t{4});  // still unchanged with no new publish
+}
+
+// The handoff both exchanges are acq_rel for: the publisher may write only
+// the slot the consumer has given back, never the one it still holds, so a
+// consumer that keeps reading its slot across many publishes must see it
+// unchanged until its own next acquire. A test cannot prove the memory
+// ordering; this one drives the protocol hard enough that a slot-index
+// slip or a write into the held slot would show as a changed word.
+TEST(itc_atb_base_handoff, a_held_slot_is_never_written_until_it_is_given_back)
+{
+    AtomicTripleBufferBase buf;
+    std::array<std::array<uint64_t, 4>, 3> slots{};
+    std::atomic<bool> stop{false};
+
+    std::thread producer{[&]() noexcept {
+        uint64_t n = 1;
+        while (!stop.load(std::memory_order_relaxed)) {
+            auto& slot = slots[buf.writer_slot()];
+            slot.fill(n);
+            buf.commit_publish();
+            ++n;
+        }
+    }};
+
+    int64_t holds = 0;
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{300};
+    while (holds < 20'000 && std::chrono::steady_clock::now() < deadline) {
+        if (!buf.can_consume()) {
+            continue;
+        }
+        auto const& held = slots[buf.acquire_read_slot()];
+        auto const first = held;
+        for (int spin = 0; spin < 50; ++spin) {
+            std::atomic_signal_fence(std::memory_order_seq_cst);
+        }
+        auto const again = held;
+        EXPECT_TRUE(first == again);
+        EXPECT_TRUE(first[0] == first[1] && first[1] == first[2] && first[2] == first[3]);
+        ++holds;
+    }
+
+    stop.store(true, std::memory_order_relaxed);
+    producer.join();
+    EXPECT_TRUE(holds >= int64_t{100});
 }
 
 TEST_MAIN(statusbar_itc, itc_atomic_triple_buffer_base_test)

@@ -27,12 +27,17 @@ auto AtomicTripleBufferBase::writer_slot() const noexcept -> uint8_t
 void AtomicTripleBufferBase::commit_publish() noexcept
 {
     // Single atomic exchange: writes new state (back | DIRTY) and
-    // returns the prior state. Release ordering pairs with the
-    // consumer's acquire on the same atomic, so the plain write to
-    // slots[back_] sequenced-before this exchange is visible to the
-    // consumer's subsequent read of the new ready slot.
+    // returns the prior state. Both sides exchange with acq_rel: the
+    // release half pairs with the consumer's acquire so the plain write
+    // to slots[back_] sequenced-before this exchange is visible to the
+    // consumer's read of the new ready slot; the acquire half pairs with
+    // the consumer's release so the consumer's reads of the slot it gave
+    // back (the old ready slot, our next back) happen-before the writes
+    // we make to it next. Release alone on this side left that second
+    // edge missing, so a consumer still reading its slot could see the
+    // publisher's next write land in it.
     uint8_t const desired = static_cast<uint8_t>(back_ | dirty_bit);
-    uint8_t const old = state_.exchange(desired, std::memory_order_release);
+    uint8_t const old = state_.exchange(desired, std::memory_order_acq_rel);
     if ((old & dirty_bit) != 0) {
         // The previous publish hadn't been consumed yet; this publish
         // overwrites the ready slot's logical contents (technically the
@@ -54,11 +59,12 @@ auto AtomicTripleBufferBase::acquire_read_slot() noexcept -> uint8_t
         return front_;
     }
     // Atomic exchange: write new state (front_, dirty cleared) and
-    // pick up the slot index that was ready. Acquire ordering pairs
-    // with the publisher's release on the same atomic, so the
-    // publisher's plain write to slots[old_ready] is visible to the
-    // consumer's subsequent read.
-    uint8_t const old = state_.exchange(front_, std::memory_order_acquire);
+    // pick up the slot index that was ready. acq_rel, as on the
+    // publisher's side: acquire makes the publisher's write to
+    // slots[old_ready] visible to our read; release orders every read
+    // we made of the slot we hand back (front_) before the publisher's
+    // next write to it, once the publisher's exchange has acquired it.
+    uint8_t const old = state_.exchange(front_, std::memory_order_acq_rel);
     front_ = static_cast<uint8_t>(old & slot_mask);
     return front_;
 }
