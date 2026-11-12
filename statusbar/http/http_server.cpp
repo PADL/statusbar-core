@@ -353,7 +353,16 @@ void HttpServer::process(size_t slot, int64_t now_ns)
         switch (c.state) {
             case ConnState::sending:
             case ConnState::awaiting_response:
-                return;  // later bytes wait in the socket until this request finishes
+                // Later bytes wait in the socket until this request finishes.
+                // Without the interest off, the level-triggered multiplexer
+                // would report them on every poll and spin the reactor for as
+                // long as the response takes. next_request() turns it back on.
+                // An upgrade that just completed is ws_process's business: it
+                // has set the interest for the frames that may follow.
+                if (!c.ws_mode) {
+                    pool_.set_read_interest(slot, false);
+                }
+                return;
 
             case ConnState::reading_body: {
                 if (c.body_mode == BodyMode::buffered) {
@@ -869,26 +878,43 @@ void HttpServer::pump_tx(size_t slot, int64_t now_ns)
 void HttpServer::next_request(size_t slot, int64_t now_ns)
 {
     auto& c = connections_[slot];
+    size_t const leftover = compact_leftover(c);
+    reset_request_state(c);
+    begin_reading_head(slot, c, leftover, now_ns);
+    // No recursive process() here: when this runs inside process()'s loop
+    // the loop parses the leftover on its next iteration; the on_writable
+    // and async-respond paths process explicitly afterwards.
+}
+
+auto HttpServer::compact_leftover(Connection& c) -> size_t
+{
     size_t const leftover = c.rx_len > c.leftover_at ? c.rx_len - c.leftover_at : 0;
     if (leftover > 0) {
         std::memmove(c.rx.data(), c.rx.data() + c.leftover_at, leftover);
     }
     c.rx_len = leftover;
     c.leftover_at = 0;
+    return leftover;
+}
+
+void HttpServer::reset_request_state(Connection& c)
+{
     c.handler = nullptr;
     c.body_mode = BodyMode::discard;
     c.pending_status = 0;
     c.response_staged = false;
     c.suppress_body = false;
     c.extra_len = 0;
+}
+
+void HttpServer::begin_reading_head(size_t slot, Connection& c, size_t leftover, int64_t now_ns)
+{
     parsers_[slot].reset();
     c.state = ConnState::reading_head;
     c.head_started = leftover > 0;
     c.head_start_ns = now_ns;
     c.idle_since_ns = now_ns;
-    // No recursive process() here: when this runs inside process()'s loop
-    // the loop parses the leftover on its next iteration; the on_writable
-    // and async-respond paths process explicitly afterwards.
+    pool_.set_read_interest(slot, true);  // bytes that waited out the response may come in now
 }
 
 // ---- WebSocket engine -----------------------------------------------------
@@ -1042,6 +1068,17 @@ void HttpServer::ws_close(size_t slot, uint16_t code) noexcept
 }
 
 void HttpServer::ws_process(size_t slot, int64_t now_ns)
+{
+    auto& c = connections_[slot];
+    ws_read_frames(slot, now_ns);
+    // Frames are read only while the previous one's reply has drained; in
+    // between, the bytes wait in the socket and must not re-wake the poll.
+    if (pool_.is_open(slot)) {
+        pool_.set_read_interest(slot, c.tx_sent >= c.tx_len && c.body_sent >= c.body_size);
+    }
+}
+
+void HttpServer::ws_read_frames(size_t slot, int64_t now_ns)
 {
     auto& c = connections_[slot];
     while (pool_.is_open(slot) && c.tx_sent >= c.tx_len && c.body_sent >= c.body_size) {

@@ -246,6 +246,12 @@ class HttpServer
     void serve_static(size_t slot, StaticRoute const& route, HttpRequest const& request, bool close_after, int64_t now_ns);
     void pump_tx(size_t slot, int64_t now_ns);
     void next_request(size_t slot, int64_t now_ns);
+    /// next_request's three parts: move the bytes after the finished request
+    /// to the front of rx (returns how many), clear the per-request fields,
+    /// and start reading the next head with read interest back on.
+    [[nodiscard]] static auto compact_leftover(Connection& c) -> size_t;
+    static void reset_request_state(Connection& c);
+    void begin_reading_head(size_t slot, Connection& c, size_t leftover, int64_t now_ns);
 
     /// pool_.read that closes the slot on a hard error (only would-block
     /// leaves it open); nullopt means stop reading for now.
@@ -259,6 +265,7 @@ class HttpServer
     void try_upgrade(size_t slot, HttpRequest const& request, WsRoute const& route, int64_t now_ns);
     void enter_ws_mode(size_t slot, int64_t now_ns);
     void ws_process(size_t slot, int64_t now_ns);
+    void ws_read_frames(size_t slot, int64_t now_ns);
     auto ws_stage_frame(size_t slot, WsOpcode opcode, std::span<uint8_t const> payload, bool external, int64_t now_ns) noexcept
         -> bool;
     void ws_fail(size_t slot, uint16_t code, int64_t now_ns);

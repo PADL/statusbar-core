@@ -10,9 +10,11 @@
 #include <unistd.h>
 
 #include <array>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <sys/socket.h>
@@ -618,6 +620,60 @@ TEST(http_handler, expect_continue_on_a_refused_body_is_the_final_status_and_clo
         pump(*fx.server);
         EXPECT_TRUE(body_of(c.recv_for(150)) == "ok");
     }
+}
+
+/// Polls the server's fd like the reactor would and counts the rounds on
+/// which it reported readiness.
+[[nodiscard]] auto ready_rounds(HttpServer& server, int rounds, int64_t now0) -> int
+{
+    int ready = 0;
+    for (int i = 0; i < rounds; ++i) {
+        struct pollfd pfd{.fd = server.fd(), .events = POLLIN, .revents = 0};
+        if (::poll(&pfd, 1, 5) > 0) {
+            ++ready;
+        }
+        server.on_ready(now0 + i);
+        server.tick(now0 + i);
+    }
+    return ready;
+}
+
+TEST(http_handler, bytes_behind_a_held_request_do_not_spin_the_reactor)
+{
+    Fixture fx;
+    AsyncHandler async;
+    EXPECT_TRUE(fx.server->add_route(HttpMethod::get, "/later", async));
+
+    Client c{fx.addr};
+    c.send_all("GET /later HTTP/1.1\r\nHost: t\r\n\r\n");
+    pump(*fx.server);
+    EXPECT_TRUE(async.held_slot >= 0);
+
+    // A pipelined request lands while the first is held. Its bytes stay in
+    // the socket until the response goes out; level-triggered, they are
+    // "readable" on every poll unless the server has turned the slot's
+    // read interest off, and the reactor would spin for as long as the
+    // handler takes.
+    c.send_all("GET /later HTTP/1.1\r\nHost: t\r\n\r\n");
+    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    EXPECT_TRUE(ready_rounds(*fx.server, 30, 100) <= 1);
+    EXPECT_TRUE(c.recv_for(30).empty());  // and nothing was answered early
+
+    // Completing the held request lets the waiting one through to the
+    // handler, which holds it in turn (synchronously, as the response
+    // drains, so the marker is cleared before the send).
+    auto writer = fx.server->respond(size_t(async.held_slot));
+    EXPECT_TRUE(writer.has_value());
+    async.held_slot = -1;
+    writer->send_status(204);
+    pump(*fx.server);
+    EXPECT_TRUE(status_line(c.recv_for(150)) == "HTTP/1.1 204 No Content");
+    EXPECT_TRUE(async.held_slot >= 0);
+    auto writer2 = fx.server->respond(size_t(async.held_slot));
+    EXPECT_TRUE(writer2.has_value());
+    writer2->send_status(204);
+    pump(*fx.server, 5);
+    EXPECT_TRUE(status_line(c.recv_for(150)) == "HTTP/1.1 204 No Content");
 }
 
 TEST_MAIN(statusbar_http, http_handler_test)

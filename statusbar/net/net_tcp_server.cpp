@@ -582,13 +582,33 @@ auto TcpConnectionPool::write(size_t slot, std::span<uint8_t const> data) -> Sta
         }
         return failure(NetError::send_failed);
     }
-    s.last_activity_ns = last_now_ns_;
-    bool const need_write_interest = sent < data.size();
-    if (need_write_interest != s.want_write) {
-        s.want_write = need_write_interest;
-        (void)mux_.modify(s.fd.get(), uint32_t(slot), true, need_write_interest);
-    }
+    finish_write(slot, sent < data.size());
     return sent;
+}
+
+void TcpConnectionPool::finish_write(size_t slot, bool unsent)
+{
+    auto& s = slots_[slot];
+    s.last_activity_ns = last_now_ns_;
+    if (unsent != s.want_write) {
+        s.want_write = unsent;
+        (void)mux_.modify(s.fd.get(), uint32_t(slot), s.want_read, unsent);
+    }
+}
+
+void TcpConnectionPool::set_read_interest(size_t slot, bool want_read)
+{
+    if (!slot_ok(slot) || slots_[slot].want_read == want_read) {
+        return;
+    }
+    auto& s = slots_[slot];
+    s.want_read = want_read;
+    (void)mux_.modify(s.fd.get(), uint32_t(slot), want_read, s.want_write);
+}
+
+auto TcpConnectionPool::read_interest(size_t slot) const noexcept -> bool
+{
+    return slot_ok(slot) && slots_[slot].want_read;
 }
 
 void TcpConnectionPool::close(size_t slot)
@@ -632,7 +652,7 @@ void TcpConnectionPool::on_ready(int64_t now_ns)
             if (ev.writable && slots_[slot].want_write) {
                 handler_.on_writable(slot, now_ns);
             }
-            if (ev.readable && slot_ok(slot)) {
+            if (ev.readable && slot_ok(slot) && slots_[slot].want_read) {
                 handler_.on_readable(slot, now_ns);
             }
         });
@@ -672,32 +692,36 @@ void TcpConnectionPool::accept_ready(int64_t now_ns)
             handler_.on_rejected(peer, now_ns);
             continue;
         }
-        set_accepted_options(fd, options_, peer.family());
-        size_t const slot = free_.back();
-        auto& s = slots_[slot];
-        s.fd = FileDescriptor{fd};
-        if (!mux_.add(fd, uint32_t(slot), true, false)) {
-            s.fd.close();
-            handler_.on_rejected(peer, now_ns);
-            continue;
-        }
-        free_.pop_back();
-        s.peer = peer;
-        s.last_activity_ns = now_ns;
-        s.in_use = true;
-        s.want_write = false;
-        ++active_;
-        handler_.on_accept(slot, s.peer, now_ns);
+        adopt_accepted(fd, peer, now_ns);
     }
+}
+
+void TcpConnectionPool::adopt_accepted(int fd, SocketAddress const& peer, int64_t now_ns)
+{
+    set_accepted_options(fd, options_, peer.family());
+    size_t const slot = free_.back();
+    if (!mux_.add(fd, uint32_t(slot), true, false)) {
+        ::close(fd);
+        handler_.on_rejected(peer, now_ns);
+        return;
+    }
+    slots_[claim_slot()].open(fd, peer, now_ns);
+    handler_.on_accept(slot, peer, now_ns);
+}
+
+auto TcpConnectionPool::claim_slot() -> size_t
+{
+    size_t const slot = free_.back();
+    free_.pop_back();
+    ++active_;
+    return slot;
 }
 
 void TcpConnectionPool::close_slot(size_t slot, int64_t now_ns)
 {
     auto& s = slots_[slot];
     mux_.remove(s.fd.get());
-    s.fd.close();
-    s.in_use = false;
-    s.want_write = false;
+    s.close();
     --active_;
     free_.push_back(uint32_t(slot));
     handler_.on_closed(slot, now_ns);

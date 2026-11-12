@@ -158,6 +158,16 @@ class TcpConnectionPool : public Pollable
     /// Closes the slot's connection and fires on_closed().
     void close(size_t slot);
 
+    /// Whether the slot's unread bytes should raise on_readable(). The
+    /// multiplexer is level-triggered: a handler that leaves bytes in the
+    /// socket on purpose, because it is busy sending a response or waiting
+    /// on one, would otherwise be woken for them on every poll. Off, the
+    /// bytes wait in the socket and TCP flow control holds the peer; on
+    /// again, a pending byte raises on_readable() at the next poll. Every
+    /// accepted connection starts with reads on.
+    void set_read_interest(size_t slot, bool want_read);
+    [[nodiscard]] auto read_interest(size_t slot) const noexcept -> bool;
+
     [[nodiscard]] auto peer(size_t slot) const -> SocketAddress const&;
     [[nodiscard]] auto is_open(size_t slot) const noexcept -> bool;
     [[nodiscard]] auto active_count() const noexcept -> size_t { return active_; }
@@ -178,11 +188,39 @@ class TcpConnectionPool : public Pollable
         SocketAddress peer{};
         int64_t last_activity_ns{0};
         bool in_use{false};
+        bool want_read{true};
         bool want_write{false};
+
+        /// Take an accepted descriptor; interest starts as read-only.
+        void open(int accepted_fd, SocketAddress const& from, int64_t now_ns) noexcept
+        {
+            fd = FileDescriptor{accepted_fd};
+            peer = from;
+            last_activity_ns = now_ns;
+            in_use = true;
+            want_read = true;
+            want_write = false;
+        }
+
+        void close() noexcept
+        {
+            fd.close();
+            in_use = false;
+            want_read = true;
+            want_write = false;
+        }
     };
 
     void accept_ready(int64_t now_ns);
+    /// Puts one accepted descriptor on the multiplexer under the slot at
+    /// the top of the free list, or closes it and reports the rejection.
+    void adopt_accepted(int fd, SocketAddress const& peer, int64_t now_ns);
+    /// Takes the free list's top slot into use.
+    [[nodiscard]] auto claim_slot() -> size_t;
     void close_slot(size_t slot, int64_t now_ns);
+    /// After a send: note the activity and arm or disarm write interest
+    /// according to whether anything is still unsent.
+    void finish_write(size_t slot, bool unsent);
 
     /// The constructor's two halves, one per address family: bind, then
     /// hand the listener to register_listener(). Each leaves the pool

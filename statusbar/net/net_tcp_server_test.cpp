@@ -386,6 +386,46 @@ TEST(net_tcp_server, idle_timeout_sweeps)
     EXPECT_TRUE(c.recv_some().empty());  // server closed the socket
 }
 
+TEST(net_tcp_server, bytes_wait_in_the_socket_while_read_interest_is_off)
+{
+    TcpConnectionPool* pool_ptr = nullptr;
+    EchoHandler handler{pool_ptr};
+    TcpConnectionPool pool{loopback(), 4, handler};
+    pool_ptr = &pool;
+    auto addr = pool.local_addr();
+    EXPECT_TRUE(addr.has_value());
+
+    Client c{*addr};
+    pump(pool, 5);
+    EXPECT_EQ(handler.accepts.size(), 1U);
+    size_t const slot = handler.accepts[0];
+    EXPECT_TRUE(pool.read_interest(slot));
+
+    // Reads off: the bytes sit in the socket, the multiplexer stays quiet
+    // (level-triggered, it would otherwise report them on every poll) and
+    // the handler never sees them.
+    pool.set_read_interest(slot, false);
+    EXPECT_FALSE(pool.read_interest(slot));
+    c.send_all("held back");
+    int ready_polls = 0;
+    for (int i = 0; i < 20; ++i) {
+        struct pollfd pfd{.fd = pool.fd(), .events = POLLIN, .revents = 0};
+        if (::poll(&pfd, 1, 5) > 0) {
+            ++ready_polls;
+        }
+        pool.on_ready(100 + i);
+    }
+    EXPECT_EQ(ready_polls, 0);
+    struct pollfd client_fd{.fd = c.fd, .events = POLLIN, .revents = 0};
+    EXPECT_EQ(::poll(&client_fd, 1, 20), 0);  // nothing echoed
+
+    // Reads on: the waiting bytes raise on_readable at the next poll.
+    pool.set_read_interest(slot, true);
+    EXPECT_TRUE(pool.read_interest(slot));
+    pump(pool, 5);
+    EXPECT_TRUE(c.recv_some() == "held back");
+}
+
 TEST_MAIN(statusbar_net, net_tcp_server_test)
 
 //
