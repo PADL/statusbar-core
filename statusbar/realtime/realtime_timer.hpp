@@ -171,14 +171,15 @@ class Timer : public TimerBase
     {
         int64_t duration_ns_raw = 0;
         if (callback_) {
+            int64_t const callback_start_ns = read_monotonic_raw_ns();
             event_type const event{
                 .scheduled_time = time_point{duration{scheduled_time_ns}},
                 .error = duration{wait.error_ns},
                 .wake_count = wake_count,
                 .skipped_counts = wait.skipped_counts,
+                .wake_raw = MonotonicRawClock::from_ns(callback_start_ns),
             };
 
-            int64_t const callback_start_ns = read_monotonic_raw_ns();
             callback_(event, stats_.snapshot());
             int64_t const callback_end_ns = read_monotonic_raw_ns();
             duration_ns_raw = callback_end_ns - callback_start_ns;

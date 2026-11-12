@@ -1009,4 +1009,29 @@ TEST(realtime_timer_stop, joins_a_thread_that_left_on_its_own)
     EXPECT_FALSE(timer.is_running());
 }
 
+TEST(realtime_timer_event, a_running_timer_tells_the_raw_instant_it_entered_the_callback)
+{
+    TimerConfig config;
+    config.period_ns = 1'000'000;  // 1 ms
+
+    std::atomic<int64_t> told_raw{0};
+    std::atomic<int64_t> read_raw{0};
+    Timer<> timer(config, [&](TimerEvent<MonotonicClock> const& event, AtomicWakeStats::Snapshot const&) {
+        if (told_raw.load() == 0) {
+            told_raw.store(event.wake_raw_ns());
+            read_raw.store(read_monotonic_raw_ns());
+        }
+    });
+    timer.start();
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+    while (told_raw.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    timer.stop();
+
+    EXPECT_NE(told_raw.load(), 0);
+    EXPECT_TRUE(read_raw.load() >= told_raw.load());
+    EXPECT_TRUE(read_raw.load() - told_raw.load() < 100'000'000);  // the same callback, not another clock
+}
+
 TEST_MAIN(statusbar_realtime, realtime_timer_test)

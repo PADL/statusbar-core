@@ -23,7 +23,12 @@ namespace statusbar::realtime {
 /// Uses the shutdown_token passed to TripwireMonitor::start().
 /// @param monitor The TripwireMonitor to observe on
 /// @param event The timer event with timing data
-/// @return Current timestamp in nanoseconds for duration measurement, or 0 if tripwire fired
+/// @return The CLOCK_MONOTONIC_RAW start of the callback, for the duration
+///         measurement, or 0 if the tripwire fired. This is the instant the
+///         timer told in event.wake_raw, so the wake costs no clock read; an
+///         event built by hand (wake_raw zero) is stamped with one RAW read
+///         here. It is never a value in the event's own clock: the schedule
+///         may run on a gPTP domain, and a duration is a RAW difference.
 template <ClockType ClockT>
 inline auto observe_wake_and_handle_tripwire(TripwireMonitor& monitor, TimerEvent<ClockT> const& event) -> int64_t
 {
@@ -32,20 +37,21 @@ inline auto observe_wake_and_handle_tripwire(TripwireMonitor& monitor, TimerEven
     if (monitor.check_and_handle_fired(event.wake_count, event.error_ns())) {
         return 0;  // Tripwire fired, caller should abort
     }
-    return actual_time_ns;
+    return event.wake_raw_ns() != 0 ? event.wake_raw_ns() : read_monotonic_raw_ns();
 }
 
 /// Observe callback duration on a tripwire monitor and handle firing if threshold exceeded.
 /// Call this at the END of your callback, AFTER doing work.
 /// @param monitor The TripwireMonitor to observe on
 /// @param event The timer event with timing data
-/// @param start_time_ns The timestamp returned by observe_wake_and_handle_tripwire()
+/// @param start_time_ns The RAW start returned by observe_wake_and_handle_tripwire()
 /// @return true if tripwire fired and shutdown was requested
 template <ClockType ClockT>
 inline auto observe_duration_and_handle_tripwire(TripwireMonitor& monitor, TimerEvent<ClockT> const& event, int64_t start_time_ns)
     -> bool
 {
-    int64_t const now_ns = read_monotonic_ns();
+    // One RAW read: the end of the work, in the same domain as the start.
+    int64_t const now_ns = read_monotonic_raw_ns();
     int64_t const duration_ns = now_ns - start_time_ns;
     monitor.tripwire().observe_duration(static_cast<uint64_t>(event.wake_count), duration_ns);
     return monitor.check_and_handle_fired(event.wake_count, event.error_ns(), duration_ns);
