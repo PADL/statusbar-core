@@ -60,7 +60,31 @@ auto make_error_code(MmapError e) noexcept -> std::error_code
 
 #if defined(__linux__)
 
+#    include <atomic>
+
 namespace statusbar::net {
+
+namespace {
+
+// tp_status is one side of a handshake over memory shared with the kernel.
+// The kernel fills a slot, then publishes the status behind a write barrier,
+// and reads the status we publish before it touches the slot again. Our side
+// of the handshake has to carry the same ordering: a plain load may be
+// reordered after the reads of the frame it guards, and a plain store before
+// the writes it is meant to publish - the compiler does both, and arm64
+// reorders stores as well. Acquire on the way in, release on the way out.
+
+[[nodiscard]] auto load_status(tpacket2_hdr* hdr) noexcept -> uint32_t
+{
+    return std::atomic_ref<__u32>{hdr->tp_status}.load(std::memory_order_acquire);
+}
+
+void store_status(tpacket2_hdr* hdr, uint32_t const status) noexcept
+{
+    std::atomic_ref<__u32>{hdr->tp_status}.store(status, std::memory_order_release);
+}
+
+}  // namespace
 
 void MmapContext::swap(MmapContext& other) noexcept
 {
@@ -244,8 +268,9 @@ auto MmapContext::tx_start(int64_t launch_time_ns) -> StatusValue<EthernetTxSlot
     // Get header at current TX index
     auto* hdr = tx_header_at(tx_index_);
 
-    // Check if slot is available (TP_STATUS_AVAILABLE == 0 for TX ring)
-    if (hdr->tp_status != TP_STATUS_AVAILABLE) {
+    // Check if slot is available (TP_STATUS_AVAILABLE == 0 for TX ring). The
+    // acquire keeps our writes into the slot after the kernel's reads of it.
+    if (load_status(hdr) != TP_STATUS_AVAILABLE) {
         return failure(MmapError::tx_ring_full);
     }
 
@@ -293,11 +318,9 @@ auto MmapContext::tx_commit(uint64_t handle, size_t frame_length) -> Status
     hdr->tp_len = static_cast<unsigned int>(actual_length);
     hdr->tp_snaplen = static_cast<unsigned int>(actual_length);
 
-    // Memory barrier to ensure data is written before status change
-    __sync_synchronize();
-
-    // Mark for transmission - kernel will pick this up
-    hdr->tp_status = TP_STATUS_SEND_REQUEST;
+    // Mark for transmission - kernel will pick this up. The release publishes
+    // the frame and the lengths above before the status that says to send.
+    store_status(hdr, TP_STATUS_SEND_REQUEST);
 
     tx_slot_in_use_ = UINT64_MAX;
 
@@ -325,7 +348,7 @@ auto MmapContext::tx_cancel(uint64_t handle) -> Status
     // not a send request, so a slot left available behind the index is a
     // hole: every frame committed after it waits until the index has gone
     // round the whole ring and filled it.
-    hdr->tp_status = TP_STATUS_AVAILABLE;
+    store_status(hdr, TP_STATUS_AVAILABLE);
     tx_index_ = index;
     tx_slot_in_use_ = UINT64_MAX;
 
@@ -368,8 +391,10 @@ auto MmapContext::rx_start(RxTimePoint const now) -> StatusValue<std::optional<E
 
     auto* hdr = rx_header_at(rx_index_);
 
-    // Check if frame is available from kernel
-    if ((hdr->tp_status & TP_STATUS_USER) == 0) {
+    // Check if frame is available from kernel. The acquire keeps the reads of
+    // the header fields and the frame after the status that says they are
+    // there.
+    if ((load_status(hdr) & TP_STATUS_USER) == 0) {
         // No frame ready
         return success(std::optional<EthernetRxSlot>{});
     }
@@ -402,8 +427,9 @@ auto MmapContext::rx_release(uint64_t handle) -> Status
 
     auto* hdr = rx_header_at(index);
 
-    // Return slot to kernel
-    hdr->tp_status = TP_STATUS_KERNEL;
+    // Return slot to kernel. The release keeps the caller's reads of the
+    // frame before the status that lets the kernel refill the slot.
+    store_status(hdr, TP_STATUS_KERNEL);
 
     // Advance RX index (wrap around)
     rx_index_ = (rx_index_ + 1) % rx_req_.tp_frame_nr;
