@@ -209,7 +209,11 @@ auto AnyEthernetPort::tx_cancel(uint64_t const handle) -> Status
 auto AnyEthernetPort::tx_set_launch_time(uint64_t const handle, int64_t const launch_time_ns) -> Status
 {
     return on_port(port_, [&](auto& backend) -> Status {
-        if constexpr (requires { backend.tx_set_launch_time(handle, launch_time_ns); }) {
+        if constexpr (requires { backend.try_tx_set_launch_time(handle, launch_time_ns); }) {
+            return backend.try_tx_set_launch_time(handle, launch_time_ns);
+        } else if constexpr (requires {
+                                 { backend.tx_set_launch_time(handle, launch_time_ns) } -> std::same_as<Status>;
+                             }) {
             return backend.tx_set_launch_time(handle, launch_time_ns);
         } else {
             return failure(NetError::not_supported);  // a backend without launch time
