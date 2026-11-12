@@ -110,7 +110,11 @@ class RawnetContext
 
     auto operator=(RawnetContext&& other) noexcept -> RawnetContext&;
 
-    /// Open a raw Ethernet socket
+    /// Open a raw Ethernet socket on one interface. A receiving socket is
+    /// bound to that interface here (on Linux with ETH_P_ALL, which keeps
+    /// same-host delivery; see the implementation), so it hears its
+    /// ethertype from that interface only, whether or not it ever joins a
+    /// group.
     /// @param interface_name Network interface name (e.g., "en0", "eth0")
     /// @param ethertype EtherType to filter/use (e.g., 0x88f7 for gPTP)
     /// @param multicast_mac Optional multicast MAC address to join (nullptr = none)
@@ -175,7 +179,9 @@ class RawnetContext
     /// @return Number of payload bytes received, or error
     [[nodiscard]] auto recv(Eui48* src_mac, Eui48* dest_mac, std::span<uint8_t> payload_buf) noexcept -> StatusValue<ssize_t>;
 
-    /// Join a multicast group
+    /// Join a multicast group. The socket is bound to its interface by
+    /// open(); this adds the group membership (PACKET_ADD_MEMBERSHIP on
+    /// Linux) and nothing else.
     /// @param multicast_mac Multicast MAC address to join
     /// @return Status indicating success or failure
     [[nodiscard]] auto join_multicast(Eui48 const& multicast_mac) const noexcept -> Status;
@@ -289,6 +295,10 @@ class RawnetContext
     /// Read and discard whatever is already queued, bounded so a socket
     /// under live flood cannot turn a filter change into an endless loop.
     void drain_receive_queue() const noexcept;
+
+    /// Bind the socket to interface_index_ on ETH_P_ALL. open() does this
+    /// for every receiving socket; see there for why ETH_P_ALL.
+    [[nodiscard]] auto bind_to_interface() const noexcept -> Status;
 #endif
 
     int fd_{-1};

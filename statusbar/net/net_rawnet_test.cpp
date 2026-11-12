@@ -26,8 +26,14 @@
 #include <vector>
 
 #if defined(__linux__)
+#    include "statusbar/net/net_posix_util.hpp"
+
 #    include <fcntl.h>
 
+#    include <arpa/inet.h>
+#    include <linux/if_ether.h>
+#    include <linux/if_packet.h>
+#    include <net/if.h>
 #    include <sys/socket.h>
 #endif
 
@@ -271,6 +277,50 @@ TEST(rawnet_talker, a_filtered_socket_receives_only_in_set_subtypes)
 
     EXPECT_EQ(out_of_set, 0);
     EXPECT_TRUE(in_set > 0);
+}
+
+/// The address the kernel has the socket bound to, or a zeroed one when
+/// getsockname() refuses.
+[[nodiscard]] auto bound_address(RawnetContext const& ctx) -> sockaddr_ll
+{
+    sockaddr_ll bound{};
+    socklen_t length = sizeof(bound);
+    if (::getsockname(ctx.fd(), sockaddr_cast(bound), &length) != 0) {
+        return sockaddr_ll{};
+    }
+    return bound;
+}
+
+TEST(rawnet_receiver, open_binds_a_receiving_socket_to_its_interface)
+{
+    // An unbound AF_PACKET socket on ETH_P_ALL hears its ethertype from
+    // every interface on the host; the filter narrows what, not where
+    // from. The bind used to come with the first join_multicast(), so a
+    // port that never joined a group listened on every NIC.
+    RawnetContext ctx;
+    if (!open_on_loopback(ctx)) {
+        SKIP(NEEDS_CAP_NET_RAW);
+    }
+
+    auto const bound = bound_address(ctx);
+    EXPECT_EQ(bound.sll_family, AF_PACKET);
+    EXPECT_EQ(bound.sll_ifindex, static_cast<int>(::if_nametoindex("lo")));
+    // And on ETH_P_ALL, which is what keeps the socket in ptype_all for
+    // same-host delivery.
+    EXPECT_EQ(ntohs(bound.sll_protocol), ETH_P_ALL);
+}
+
+TEST(rawnet_talker, a_transmit_only_socket_stays_unbound)
+{
+    // Binding registers the socket for receive, which is the one thing a
+    // transmit-only socket must never be.
+    RawnetContext ctx;
+    if (!open_on_loopback(ctx, /*transmit_only=*/true)) {
+        SKIP(NEEDS_CAP_NET_RAW);
+    }
+
+    auto const bound = bound_address(ctx);
+    EXPECT_EQ(bound.sll_ifindex, 0);
 }
 
 #endif  // __linux__

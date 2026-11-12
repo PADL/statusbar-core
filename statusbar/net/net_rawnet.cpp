@@ -183,6 +183,29 @@ auto RawnetContext::operator=(RawnetContext&& other) noexcept -> RawnetContext&
     ethertype_ = ethertype;
     transmit_only_ = transmit_only;
 
+    // Bind a receiving socket to its interface. Unbound, an AF_PACKET socket
+    // on ETH_P_ALL is delivered that ethertype from every interface on the
+    // host; the cBPF filter above narrows what arrives, not where from.
+    // Binding used to be join_multicast()'s, so a port that never joined a
+    // group (a gPTP or ATDECC listener on a host with two NICs) heard both.
+    //
+    // CRITICAL: bind with sll_protocol = ETH_P_ALL, NOT htons(ethertype).
+    // Binding to a specific protocol re-registers the socket under that
+    // protocol's hash and removes it from the kernel's ptype_all list — which
+    // is exactly the list the egress tap (dev_queue_xmit_nit) feeds. A
+    // protocol-bound socket therefore stops hearing locally-transmitted
+    // (PACKET_OUTGOING) frames, breaking same-host RX (an on-box controller
+    // hearing a co-located entity). The socket was opened on ETH_P_ALL
+    // precisely to stay in ptype_all; keep it there. The filter already
+    // narrows delivery to `ethertype`, so binding to ETH_P_ALL does not widen
+    // what we actually receive — it only preserves same-host delivery.
+    if (!transmit_only) {
+        if (auto status = bind_to_interface(); !status) {
+            close();
+            return status;
+        }
+    }
+
     // Set default destination MAC if provided
     if (multicast_mac != nullptr) {
         default_dest_mac_ = *multicast_mac;
@@ -415,39 +438,34 @@ void RawnetContext::close() noexcept
     return success(payload_len);
 }
 
+[[nodiscard]] auto RawnetContext::bind_to_interface() const noexcept -> Status
+{
+    struct sockaddr_ll saddr{};
+    saddr.sll_family = AF_PACKET;
+    saddr.sll_ifindex = interface_index_;
+    saddr.sll_protocol = htons(ETH_P_ALL);  // see open(): ETH_P_ALL keeps the socket in ptype_all
+
+    if (::bind(fd_, sockaddr_cast(saddr), sizeof(saddr)) < 0) {
+        return failure(NetError::bind_failed);
+    }
+    return success();
+}
+
 [[nodiscard]] auto RawnetContext::join_multicast(Eui48 const& multicast_mac) const noexcept -> Status
 {
     if (fd_ < 0) {
         return failure(NetError::not_connected);
     }
     if (transmit_only_) {
-        // Joining binds the socket, and bind re-registers it for receive —
-        // which is exactly what transmit_only exists to avoid. Refuse rather
-        // than silently do nothing, so a caller that needs RX finds out here
-        // instead of wondering why no frames arrive.
+        // A membership is a receive-side thing, and a transmit-only socket
+        // is not registered for receive at all (open() never bound it).
+        // Refuse rather than silently do nothing, so a caller that needs RX
+        // finds out here instead of wondering why no frames arrive.
         return failure(NetError::invalid_argument);
     }
 
-    // Bind to interface. CRITICAL: bind with sll_protocol = ETH_P_ALL, NOT
-    // htons(ethertype_). Binding to a specific protocol re-registers the socket
-    // under that protocol's hash and removes it from the kernel's ptype_all list
-    // — which is exactly the list the egress tap (dev_queue_xmit_nit) feeds. A
-    // protocol-bound socket therefore stops hearing locally-transmitted
-    // (PACKET_OUTGOING) frames, breaking same-host RX (an on-box controller
-    // hearing a co-located entity). The socket was opened on ETH_P_ALL precisely
-    // to stay in ptype_all; keep it there. The cBPF filter attached in open()
-    // already narrows delivery to `ethertype_`, so binding to ETH_P_ALL does not
-    // widen what we actually receive — it only preserves same-host delivery.
-    struct sockaddr_ll saddr{};
-    saddr.sll_family = AF_PACKET;
-    saddr.sll_ifindex = interface_index_;
-    saddr.sll_pkttype = PACKET_MULTICAST;
-    saddr.sll_protocol = htons(ETH_P_ALL);
-
-    if (::bind(fd_, sockaddr_cast(saddr), sizeof(saddr)) < 0) {
-        return failure(NetError::bind_failed);
-    }
-
+    // The socket is bound to its interface by open(); this only adds the
+    // membership.
     // Add multicast membership
     struct packet_mreq mreq{};
     mreq.mr_ifindex = interface_index_;
