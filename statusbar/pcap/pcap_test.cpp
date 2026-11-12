@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -2705,5 +2706,152 @@ TEST(pcap_replay, for_each_stops_when_callback_returns_false)
 //
 // Test Runner
 //
+
+//
+// Tests: PcapngReader honours if_tsresol
+//
+
+namespace {
+
+/// Hand-built pcapng blocks in the host's byte order (the reader reads the
+/// section header's magic to pick native or swapped; these are native).
+template <typename T>
+void put(std::vector<uint8_t>& out, T value)
+{
+    std::array<uint8_t, sizeof(T)> bytes{};
+    std::memcpy(bytes.data(), &value, sizeof(T));
+    out.insert(out.end(), bytes.begin(), bytes.end());
+}
+
+[[nodiscard]] auto pcapng_block(PcapngBlockType type, std::vector<uint8_t> const& body) -> std::vector<uint8_t>
+{
+    std::vector<uint8_t> out;
+    auto const total = static_cast<uint32_t>(sizeof(PcapngBlockHeader) + body.size() + 4);
+    put(out, static_cast<uint32_t>(type));
+    put(out, total);
+    out.insert(out.end(), body.begin(), body.end());
+    put(out, total);
+    return out;
+}
+
+[[nodiscard]] auto section_header_block() -> std::vector<uint8_t>
+{
+    std::vector<uint8_t> body;
+    put(body, PCAPNG_BYTE_ORDER_MAGIC);
+    put(body, uint16_t{1});
+    put(body, uint16_t{0});
+    put(body, int64_t{-1});
+    return pcapng_block(PcapngBlockType::SectionHeader, body);
+}
+
+/// An Ethernet IDB; with @p tsresol, an if_name option first (so the walk
+/// has to step over a value it does not read) and then if_tsresol.
+[[nodiscard]] auto interface_block(std::optional<uint8_t> tsresol) -> std::vector<uint8_t>
+{
+    std::vector<uint8_t> body;
+    put(body, static_cast<uint16_t>(LinkType::Ethernet));
+    put(body, uint16_t{0});
+    put(body, uint32_t{65535});
+    if (tsresol) {
+        put(body, uint16_t{2});  // if_name
+        put(body, uint16_t{4});
+        body.insert(body.end(), {'e', 't', 'h', '0'});
+        put(body, static_cast<uint16_t>(PcapngIdbOption::if_tsresol));
+        put(body, uint16_t{1});
+        body.insert(body.end(), {*tsresol, 0, 0, 0});
+    }
+    put(body, uint16_t{0});  // opt_endofopt
+    put(body, uint16_t{0});
+    return pcapng_block(PcapngBlockType::InterfaceDescription, body);
+}
+
+[[nodiscard]] auto packet_block(uint64_t timestamp_ticks, std::vector<uint8_t> const& frame) -> std::vector<uint8_t>
+{
+    std::vector<uint8_t> body;
+    put(body, uint32_t{0});
+    put(body, static_cast<uint32_t>(timestamp_ticks >> 32));
+    put(body, static_cast<uint32_t>(timestamp_ticks & 0xffffffffU));
+    put(body, static_cast<uint32_t>(frame.size()));
+    put(body, static_cast<uint32_t>(frame.size()));
+    body.insert(body.end(), frame.begin(), frame.end());
+    body.resize(body.size() + (align_to_4(static_cast<uint32_t>(frame.size())) - frame.size()), 0);
+    return pcapng_block(PcapngBlockType::EnhancedPacket, body);
+}
+
+/// Writes SHB, IDB and two EPBs, reads them back, and returns the second
+/// packet's timestamp as the reader reports it (relative to the first).
+[[nodiscard]] auto second_packet_offset_us(std::string const& filename, std::optional<uint8_t> tsresol, uint64_t t1, uint64_t t2)
+    -> uint64_t
+{
+    std::vector<uint8_t> const frame(64, 0xab);
+    std::vector<uint8_t> file;
+    for (auto const& block : {section_header_block(), interface_block(tsresol), packet_block(t1, frame), packet_block(t2, frame)}) {
+        file.insert(file.end(), block.begin(), block.end());
+    }
+    std::remove(filename.c_str());
+    {
+        std::FILE* f = std::fopen(filename.c_str(), "wb");
+        EXPECT_TRUE(f != nullptr);
+        EXPECT_EQ(std::fwrite(file.data(), 1, file.size(), f), file.size());
+        (void)std::fclose(f);
+    }
+    uint64_t second = 0;
+    {
+        auto rdr = PcapngReader::open(filename);
+        EXPECT_TRUE(rdr.has_value());
+        Packet packet;
+        uint64_t first = 0;
+        auto s1 = rdr->read_packet(&first, packet);
+        EXPECT_TRUE(s1.has_value() && *s1);
+        EXPECT_EQ(first, 0U);
+        EXPECT_EQ(packet.size(), frame.size());
+        auto s2 = rdr->read_packet(&second, packet);
+        EXPECT_TRUE(s2.has_value() && *s2);
+    }
+    std::remove(filename.c_str());
+    return second;
+}
+
+}  // namespace
+
+TEST(pcapng_tsresol, decodes_powers_of_ten_and_two)
+{
+    EXPECT_EQ(pcapng_units_per_second(6), 1'000'000U);
+    EXPECT_EQ(pcapng_units_per_second(9), 1'000'000'000U);
+    EXPECT_EQ(pcapng_units_per_second(0), 1U);
+    EXPECT_EQ(pcapng_units_per_second(0x80U | 10U), 1024U);
+    EXPECT_EQ(pcapng_units_per_second(14), 0U);           // beyond 10^13: out of range
+    EXPECT_EQ(pcapng_units_per_second(0x80U | 44U), 0U);  // beyond 2^43: out of range
+}
+
+TEST(pcapng_tsresol, a_nanosecond_count_since_the_epoch_converts_without_overflow)
+{
+    uint64_t const ns = 1'780'000'000'000'000'000ULL + 123'456ULL;
+    EXPECT_EQ(pcapng_ticks_to_us(ns, 1'000'000'000U), 1'780'000'000'000'123ULL);
+    EXPECT_EQ(pcapng_ticks_to_us(2048, 1024), 2'000'000U);
+    EXPECT_EQ(pcapng_ticks_to_us(1500, 1'000'000), 1500U);
+    EXPECT_EQ(pcapng_ticks_to_us(1500, 0), 1500U);
+}
+
+TEST(pcapng_tsresol, a_nanosecond_capture_reads_as_microseconds)
+{
+    uint64_t const t1 = 1'780'000'000'000'000'000ULL;  // ns, 2026-ish
+    uint64_t const offset =
+        second_packet_offset_us("/tmp/statusbar_pcapng_test_tsresol_ns.pcapng", uint8_t{9}, t1, t1 + 1'500'000'000ULL);
+    EXPECT_EQ(offset, 1'500'000U);  // 1.5 s, not 1500 s
+}
+
+TEST(pcapng_tsresol, a_power_of_two_resolution_is_honoured)
+{
+    uint64_t const offset =
+        second_packet_offset_us("/tmp/statusbar_pcapng_test_tsresol_pow2.pcapng", uint8_t{0x80U | 10U}, 0, 2048);
+    EXPECT_EQ(offset, 2'000'000U);
+}
+
+TEST(pcapng_tsresol, no_option_means_microseconds)
+{
+    uint64_t const offset = second_packet_offset_us("/tmp/statusbar_pcapng_test_tsresol_none.pcapng", std::nullopt, 0, 1500);
+    EXPECT_EQ(offset, 1500U);
+}
 
 TEST_MAIN(statusbar_pcap, pcap_test)

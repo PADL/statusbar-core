@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory_resource>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -84,8 +85,39 @@ class PcapngReader
     {}
 
     [[nodiscard]] auto read_interface_description(size_t body_length) -> bool;
+    [[nodiscard]] auto read_interface_body(InterfaceInfo& info) -> bool;
+
+    /// An option header as read: the code and the value length padded to 4.
+    struct DecodedOption
+    {
+        uint16_t code;
+        size_t padded_length;
+    };
+    enum class OptionStep : uint8_t
+    {
+        more,  ///< an option was consumed, keep walking
+        done,  ///< opt_endofopt
+        bad,   ///< short read or an option longer than the block
+    };
+
+    /// Walk the IDB's options to opt_endofopt or the end of the body,
+    /// then step over the block's trailing length.
+    [[nodiscard]] auto read_interface_options(size_t remaining, InterfaceInfo& info) -> bool;
+    [[nodiscard]] auto read_interface_option(size_t& remaining, InterfaceInfo& info) -> OptionStep;
+    [[nodiscard]] auto read_option_header(size_t& remaining) -> std::optional<DecodedOption>;
+    /// Reads if_tsresol into @p info; any other option's value is skipped.
+    [[nodiscard]] auto read_option_value(DecodedOption const& option, InterfaceInfo& info) -> bool;
     [[nodiscard]] auto read_enhanced_packet(size_t body_length, uint64_t* timestamp_us, Packet& packet, uint32_t* original_len)
         -> bool;
+    /// The EPB's timestamp in microseconds, at its interface's resolution.
+    [[nodiscard]] auto epb_timestamp_us(PcapngEnhancedPacketBody const& epb) const -> uint64_t;
+    /// Reads the captured bytes into @p packet, then steps over the padding,
+    /// any options and the trailing length; @p after_header is the body
+    /// length left after the fixed EPB fields.
+    [[nodiscard]] auto read_captured_bytes(size_t after_header, uint32_t captured_len, Packet& packet) -> bool;
+    void skip_to_next_block(size_t remaining, uint32_t padding);
+    /// Timestamps are reported relative to the first packet's.
+    [[nodiscard]] auto relative_timestamp_us(uint64_t timestamp) -> uint64_t;
     [[nodiscard]] auto read_simple_packet(size_t body_length, uint64_t* timestamp_us, Packet& packet, uint32_t* original_len)
         -> bool;
 

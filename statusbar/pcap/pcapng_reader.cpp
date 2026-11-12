@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -140,56 +141,130 @@ auto PcapngReader::read_packet(uint64_t* timestamp_us, ieee::Eui48& da, ieee::Eu
 
 auto PcapngReader::read_interface_description(size_t body_length) -> bool
 {
-    if (body_length < sizeof(PcapngInterfaceDescBody)) {
-        return false;
-    }
-    PcapngInterfaceDescBody idb{};
-    if (std::fread(&idb, sizeof(idb), 1, file_.get()) != 1) {
-        return false;
-    }
     InterfaceInfo info;
-    info.link_type = static_cast<LinkType>(swap_ ? swap_bytes16(idb.link_type) : idb.link_type);
-    info.snap_length = swap_ ? swap_bytes32(idb.snap_length) : idb.snap_length;
-    size_t const remaining = body_length - sizeof(idb);
-    if (remaining < 1000000) {
-        std::fseek(file_.get(), static_cast<long>(remaining + 4), SEEK_CUR);
+    if (body_length < sizeof(PcapngInterfaceDescBody) || !read_interface_body(info)) {
+        return false;
+    }
+    if (!read_interface_options(body_length - sizeof(PcapngInterfaceDescBody), info)) {
+        return false;
     }
     interfaces_.push_back(info);
     return true;
 }
 
+auto PcapngReader::read_interface_body(InterfaceInfo& info) -> bool
+{
+    PcapngInterfaceDescBody idb{};
+    if (std::fread(&idb, sizeof(idb), 1, file_.get()) != 1) {
+        return false;
+    }
+    info.link_type = static_cast<LinkType>(swap_ ? swap_bytes16(idb.link_type) : idb.link_type);
+    info.snap_length = swap_ ? swap_bytes32(idb.snap_length) : idb.snap_length;
+    return true;
+}
+
+auto PcapngReader::read_interface_options(size_t remaining, InterfaceInfo& info) -> bool
+{
+    if (remaining >= 1000000) {
+        return false;
+    }
+    while (remaining >= sizeof(PcapngOptionHeader)) {
+        OptionStep const step = read_interface_option(remaining, info);
+        if (step == OptionStep::bad) {
+            return false;
+        }
+        if (step == OptionStep::done) {
+            break;
+        }
+    }
+    std::fseek(file_.get(), static_cast<long>(remaining + 4), SEEK_CUR);
+    return true;
+}
+
+auto PcapngReader::read_interface_option(size_t& remaining, InterfaceInfo& info) -> OptionStep
+{
+    auto const option = read_option_header(remaining);
+    if (!option) {
+        return OptionStep::bad;
+    }
+    if (option->code == static_cast<uint16_t>(PcapngIdbOption::end_of_options)) {
+        return OptionStep::done;
+    }
+    if (option->padded_length > remaining || !read_option_value(*option, info)) {
+        return OptionStep::bad;
+    }
+    remaining -= option->padded_length;
+    return OptionStep::more;
+}
+
+auto PcapngReader::read_option_header(size_t& remaining) -> std::optional<DecodedOption>
+{
+    PcapngOptionHeader header{};
+    if (std::fread(&header, sizeof(header), 1, file_.get()) != 1) {
+        return std::nullopt;
+    }
+    remaining -= sizeof(header);
+    uint16_t const length = swap_ ? swap_bytes16(header.length) : header.length;
+    return DecodedOption{.code = swap_ ? swap_bytes16(header.code) : header.code, .padded_length = align_to_4(length)};
+}
+
+auto PcapngReader::read_option_value(DecodedOption const& option, InterfaceInfo& info) -> bool
+{
+    if (option.code != static_cast<uint16_t>(PcapngIdbOption::if_tsresol) || option.padded_length != 4) {
+        return std::fseek(file_.get(), static_cast<long>(option.padded_length), SEEK_CUR) == 0;
+    }
+    uint8_t value[4] = {};
+    if (std::fread(value, sizeof(value), 1, file_.get()) != 1) {
+        return false;
+    }
+    uint64_t const units = pcapng_units_per_second(value[0]);
+    if (units != 0) {
+        info.ts_resol = units;
+    }
+    return true;
+}
+
 auto PcapngReader::read_enhanced_packet(size_t body_length, uint64_t* timestamp_us, Packet& packet, uint32_t* original_len) -> bool
 {
-    if (body_length < sizeof(PcapngEnhancedPacketBody)) {
-        return false;
-    }
     PcapngEnhancedPacketBody epb{};
-    if (std::fread(&epb, sizeof(epb), 1, file_.get()) != 1) {
+    if (body_length < sizeof(epb) || std::fread(&epb, sizeof(epb), 1, file_.get()) != 1) {
         return false;
     }
-    uint32_t const ts_high = swap_ ? swap_bytes32(epb.timestamp_high) : epb.timestamp_high;
-    uint32_t const ts_low = swap_ ? swap_bytes32(epb.timestamp_low) : epb.timestamp_low;
-    uint32_t const captured_len = swap_ ? swap_bytes32(epb.captured_length) : epb.captured_length;
     if (original_len != nullptr) {
         *original_len = swap_ ? swap_bytes32(epb.original_length) : epb.original_length;
     }
-    uint64_t const ts_resol_default = 1000000;
+    if (!read_captured_bytes(body_length - sizeof(epb), swap_ ? swap_bytes32(epb.captured_length) : epb.captured_length, packet)) {
+        return false;
+    }
+    *timestamp_us = relative_timestamp_us(epb_timestamp_us(epb));
+    return true;
+}
+
+auto PcapngReader::epb_timestamp_us(PcapngEnhancedPacketBody const& epb) const -> uint64_t
+{
+    uint32_t const ts_high = swap_ ? swap_bytes32(epb.timestamp_high) : epb.timestamp_high;
+    uint32_t const ts_low = swap_ ? swap_bytes32(epb.timestamp_low) : epb.timestamp_low;
     uint32_t const iface_id = swap_ ? swap_bytes32(epb.interface_id) : epb.interface_id;
-    uint64_t const ts_resol = (iface_id < interfaces_.size()) ? interfaces_[iface_id].ts_resol : ts_resol_default;
-    uint64_t const timestamp_raw = (static_cast<uint64_t>(ts_high) << 32) | ts_low;
-    uint64_t const timestamp = (ts_resol != 1000000 && ts_resol > 0) ? (timestamp_raw * 1000000) / ts_resol : timestamp_raw;
+    uint64_t const ts_resol = (iface_id < interfaces_.size()) ? interfaces_[iface_id].ts_resol : InterfaceInfo{}.ts_resol;
+    return pcapng_ticks_to_us((static_cast<uint64_t>(ts_high) << 32) | ts_low, ts_resol);
+}
+
+auto PcapngReader::read_captured_bytes(size_t after_header, uint32_t captured_len, Packet& packet) -> bool
+{
     if (captured_len > 65535) {
         return false;
     }
     uint32_t const padded_len = align_to_4(captured_len);
     packet.resize(captured_len);
-    if (captured_len > 0) {
-        if (std::fread(packet.data(), captured_len, 1, file_.get()) != 1) {
-            return false;
-        }
+    if (captured_len > 0 && std::fread(packet.data(), captured_len, 1, file_.get()) != 1) {
+        return false;
     }
-    size_t const remaining = body_length - sizeof(epb) - padded_len;
-    uint32_t const padding = padded_len - captured_len;
+    skip_to_next_block(after_header - padded_len, padded_len - captured_len);
+    return true;
+}
+
+void PcapngReader::skip_to_next_block(size_t remaining, uint32_t padding)
+{
     if (padding > 0) {
         std::fseek(file_.get(), static_cast<long>(padding), SEEK_CUR);
     }
@@ -198,12 +273,15 @@ auto PcapngReader::read_enhanced_packet(size_t body_length, uint64_t* timestamp_
     } else {
         std::fseek(file_.get(), 4, SEEK_CUR);
     }
+}
+
+auto PcapngReader::relative_timestamp_us(uint64_t timestamp) -> uint64_t
+{
     if (!seen_first_timestamp_) {
         seen_first_timestamp_ = true;
         first_timestamp_us_ = timestamp;
     }
-    *timestamp_us = timestamp - first_timestamp_us_;
-    return true;
+    return timestamp - first_timestamp_us_;
 }
 
 auto PcapngReader::read_simple_packet(size_t body_length, uint64_t* timestamp_us, Packet& packet, uint32_t* original_len) -> bool

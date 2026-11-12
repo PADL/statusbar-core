@@ -79,6 +79,56 @@ struct PcapngSimplePacketBody
     uint32_t original_length;  ///< Original packet length
 };
 
+/// Option header: options follow a block's fixed body as (code, length,
+/// value padded to 4) and end with opt_endofopt (code 0, length 0).
+struct PcapngOptionHeader
+{
+    uint16_t code;    ///< Option code (block-type specific above 4)
+    uint16_t length;  ///< Value length in octets, before padding
+};
+
+/// Interface Description Block option codes read by this module
+enum class PcapngIdbOption : uint16_t
+{
+    end_of_options = 0,  ///< opt_endofopt
+    if_tsresol = 9,      ///< one octet: timestamp resolution (see pcapng_units_per_second)
+};
+
+/// Timestamp units per second encoded by an if_tsresol option octet: the
+/// low seven bits are a negative power of 10 (MSB clear) or of 2 (MSB set).
+/// 0 means out of this reader's range: above 10^13 or 2^43 a tick count's
+/// conversion to microseconds would overflow, and no capture tool writes
+/// such a resolution. Callers keep the microsecond default then.
+[[nodiscard]] constexpr auto pcapng_units_per_second(uint8_t if_tsresol) noexcept -> uint64_t
+{
+    uint8_t const exponent = if_tsresol & 0x7fU;
+    if ((if_tsresol & 0x80U) != 0) {
+        return exponent <= 43 ? (uint64_t{1} << exponent) : 0;
+    }
+    if (exponent > 13) {
+        return 0;
+    }
+    uint64_t units = 1;
+    for (uint8_t i = 0; i < exponent; ++i) {
+        units *= 10;
+    }
+    return units;
+}
+
+/// A tick count at @p units_per_second as microseconds. Whole seconds and
+/// the remainder are converted apart, so a nanosecond count since the
+/// epoch does not overflow the way (ticks * 10^6) / units would.
+[[nodiscard]] constexpr auto pcapng_ticks_to_us(uint64_t ticks, uint64_t units_per_second) noexcept -> uint64_t
+{
+    constexpr uint64_t us_per_second = 1'000'000;
+    if (units_per_second == 0 || units_per_second == us_per_second) {
+        return ticks;
+    }
+    uint64_t const whole_seconds = ticks / units_per_second;
+    uint64_t const rest = ticks % units_per_second;
+    return (whole_seconds * us_per_second) + ((rest * us_per_second) / units_per_second);
+}
+
 /// Swap bytes of a 16-bit value (for endian conversion)
 [[nodiscard]] constexpr auto swap_bytes16(uint16_t v) noexcept -> uint16_t
 {
