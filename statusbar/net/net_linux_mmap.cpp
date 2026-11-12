@@ -377,9 +377,13 @@ auto MmapContext::rx_start(RxTimePoint const now) -> StatusValue<std::optional<E
     // The kernel's stamp; a frame it did not stamp gets the caller's RX clock
     int64_t const kernel_ns = (static_cast<int64_t>(hdr->tp_sec) * 1'000'000'000) + static_cast<int64_t>(hdr->tp_nsec);
 
+    // tp_snaplen is what the kernel copied into the slot; tp_len is the
+    // frame's length on the wire, which is longer when the frame did not fit
+    // and the kernel truncated it. A span of tp_len would run off the end of
+    // the slot into the next one, or past the mapping on the last.
     return success(std::optional<EthernetRxSlot>{EthernetRxSlot{
         .handle = static_cast<uint64_t>(rx_index_),
-        .buffer = std::span<uint8_t const>(rx_payload(hdr), hdr->tp_len),
+        .buffer = std::span<uint8_t const>(rx_payload(hdr), hdr->tp_snaplen),
         .timestamp_ns = kernel_ns != 0 ? kernel_ns : rx_timestamp_ns(now),
     }});
 }
