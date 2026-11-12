@@ -217,9 +217,9 @@ class MmapContext
 
     /// Start an RX operation, returning received frame data if available.
     /// Returns std::nullopt wrapped in StatusValue if no frame is ready.
-    /// The slot carries the kernel's stamp (tp_sec/tp_nsec); a frame the
-    /// kernel did not stamp gets @p now, the RX clock as the caller read it
-    /// for this pass.
+    /// The slot is stamped @p now, the RX clock as the caller read it for
+    /// this pass. The kernel's own stamp (tp_sec/tp_nsec) is on
+    /// CLOCK_REALTIME, not the RX clock, and is not handed on.
     [[nodiscard]] auto rx_start(RxTimePoint now) -> StatusValue<std::optional<EthernetRxSlot>>;
     /// rx_start(now) with the RX clock read here.
     [[nodiscard]] auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>>;

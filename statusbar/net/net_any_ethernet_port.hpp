@@ -156,9 +156,8 @@ class AnyEthernetPort
     [[nodiscard]] auto tx_cancel(uint64_t handle) -> Status;
     [[nodiscard]] auto tx_flush() -> Status;
 
-    /// The next received frame, stamped as the backend stamps: the kernel's
-    /// time where it gives one (mmap), else @p now, the RX clock as the
-    /// caller read it for this pass.
+    /// The next received frame, stamped @p now: the RX clock as the caller
+    /// read it for this pass.
     [[nodiscard]] auto rx_start(RxTimePoint now) -> StatusValue<std::optional<EthernetRxSlot>>;
     /// rx_start(now) with the RX clock read here.
     [[nodiscard]] auto rx_start() -> StatusValue<std::optional<EthernetRxSlot>>;

@@ -399,8 +399,10 @@ auto MmapContext::rx_start(RxTimePoint const now) -> StatusValue<std::optional<E
         return success(std::optional<EthernetRxSlot>{});
     }
 
-    // The kernel's stamp; a frame it did not stamp gets the caller's RX clock
-    int64_t const kernel_ns = (static_cast<int64_t>(hdr->tp_sec) * 1'000'000'000) + static_cast<int64_t>(hdr->tp_nsec);
+    // The slot is stamped @p now, the RX clock. The kernel's own stamp in
+    // tp_sec/tp_nsec is CLOCK_REALTIME, which is not the clock a stamp is
+    // compared on (RxClock, MONOTONIC_RAW), and moving it onto that clock
+    // would take a REALTIME read on this path. So it is not handed on.
 
     // tp_snaplen is what the kernel copied into the slot; tp_len is the
     // frame's length on the wire, which is longer when the frame did not fit
@@ -409,7 +411,7 @@ auto MmapContext::rx_start(RxTimePoint const now) -> StatusValue<std::optional<E
     return success(std::optional<EthernetRxSlot>{EthernetRxSlot{
         .handle = static_cast<uint64_t>(rx_index_),
         .buffer = std::span<uint8_t const>(rx_payload(hdr), hdr->tp_snaplen),
-        .timestamp_ns = kernel_ns != 0 ? kernel_ns : rx_timestamp_ns(now),
+        .timestamp_ns = rx_timestamp_ns(now),
     }});
 }
 

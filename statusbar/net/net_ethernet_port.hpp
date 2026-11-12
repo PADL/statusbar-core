@@ -129,9 +129,8 @@ struct EthernetRxSlot
 /// The clock a port stamps a received frame on when it stamps in software:
 /// CLOCK_MONOTONIC_RAW, the timing reference clock. It is not configurable:
 /// a stamp is compared with other stamps and with timer deadlines, all of
-/// which are on this clock. A backend whose kernel stamps the frame (mmap,
-/// the macOS BPF reader, Zephyr) keeps that stamp and falls back to this
-/// clock only when the kernel gave none.
+/// which are on this clock. The mmap ring's kernel stamp (tp_sec/tp_nsec,
+/// CLOCK_REALTIME) is on another clock and is not handed on in its place.
 using RxClock = realtime::MonotonicRawClock;
 using RxTimePoint = RxClock::time_point;
 
