@@ -1605,6 +1605,12 @@ auto probe_tx_launch_time(unsigned int const if_index) -> Status
 
 auto XdpContext::tx_commit(uint64_t handle, size_t frame_length) -> Status
 {
+    // No socket, no rings: libxdp's ring helpers read through the ring's
+    // producer and consumer pointers, which are null until open(). The
+    // other backends answer not_open on every path, and so does this one.
+    if (!valid()) {
+        return failure(XdpError::not_open);
+    }
     uint32_t idx = 0;
     if (xsk_ring_prod__reserve(&rings_.tx, 1, &idx) == 0) {
         // The TX ring is full. Return the caller's UMEM frame to the free
@@ -1633,6 +1639,9 @@ auto XdpContext::tx_commit(uint64_t handle, size_t frame_length) -> Status
 
 auto XdpContext::tx_complete() -> Status
 {
+    if (!valid()) {
+        return failure(XdpError::not_open);  // see tx_commit()
+    }
     uint32_t idx = 0;
     auto completed = xsk_ring_cons__peek(&rings_.comp, static_cast<uint32_t>(budget_.completion_drain_max), &idx);
     for (uint32_t i = 0; i < completed; ++i) {
@@ -1652,6 +1661,9 @@ auto XdpContext::rx_start() -> StatusValue<std::optional<EthernetRxSlot>>
 
 auto XdpContext::rx_start(RxTimePoint const now) -> StatusValue<std::optional<EthernetRxSlot>>
 {
+    if (!valid()) {
+        return failure(XdpError::not_open);  // see tx_commit()
+    }
     if (budget_.rx_drain_max > 0 && budget_.rx_cycle_count >= budget_.rx_drain_max) {
         ++stats_.rx_budget_hit_count;
         return std::optional<EthernetRxSlot>{};

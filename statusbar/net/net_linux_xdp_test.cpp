@@ -731,6 +731,37 @@ TEST(xdp_stats, a_kick_with_nothing_waiting_is_skipped_rather_than_made)
     EXPECT_EQ(ctx.socket_stats().tx_flush_transient, 0u);
 }
 
+TEST(xdp_closed, the_ring_paths_answer_not_open_rather_than_touch_rings_that_are_not_there)
+{
+    // A context that is not open has no rings, and libxdp's ring helpers
+    // read through the ring's producer and consumer pointers, null until
+    // open(). The other backends answer not_open on every path; these four
+    // used to go straight to the rings.
+    auto const says_not_open = [](auto const& answer) {
+        EXPECT_FALSE(answer.has_value());
+        if (!answer) {
+            EXPECT_TRUE(answer.error() == XdpError::not_open);
+        }
+    };
+    XdpContext ctx;
+    says_not_open(ctx.rx_start());
+    says_not_open(ctx.rx_start(RxTimePoint{RxClock::duration{5}}));
+    says_not_open(ctx.tx_commit(0, 64));
+    says_not_open(ctx.tx_complete());
+    says_not_open(ctx.end_cycle());
+
+    // The same after a close as before an open.
+    ctx.close();
+    says_not_open(ctx.rx_start());
+    says_not_open(ctx.end_cycle());
+
+    // And nothing was counted as sent, received or refused by a full ring.
+    EXPECT_EQ(ctx.socket_stats().rx_count, 0u);
+    EXPECT_EQ(ctx.socket_stats().tx_count, 0u);
+    EXPECT_EQ(ctx.socket_stats().tx_ring_full_count, 0u);
+    EXPECT_EQ(ctx.socket_stats().rx_budget_hit_count, 0u);
+}
+
 TEST(xdp_stats, closing_puts_every_counter_back)
 {
     XdpContext ctx;

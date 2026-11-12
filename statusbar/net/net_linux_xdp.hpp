@@ -1688,6 +1688,9 @@ class XdpContext
 
     [[nodiscard]] auto end_cycle() -> Status
     {
+        if (!valid()) {
+            return failure(XdpError::not_open);  // no rings to replenish or complete
+        }
         auto fill_status = fill_replenish();
         auto comp_status = tx_complete();
         return fill_status ? comp_status : fill_status;
