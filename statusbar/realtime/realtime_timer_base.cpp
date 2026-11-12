@@ -60,7 +60,13 @@ TimerBase::TimerBase(TimerConfig config) noexcept
     , stats_{config_.error_histogram, config_.duration_histogram}
 {}
 
-TimerBase::~TimerBase() noexcept = default;
+TimerBase::~TimerBase() noexcept
+{
+    // Timer's own destructor has stopped the thread by now; this is the net
+    // under a derived class that did not, for the thread that left on its
+    // own (see stop()): a joinable std::thread destructs into std::terminate.
+    stop();
+}
 
 auto TimerBase::is_running_atomic() const noexcept -> bool
 {
@@ -131,9 +137,11 @@ auto TimerBase::start(statusbar::itc::StopToken* shutdown_token) -> void
 
 auto TimerBase::stop() noexcept -> void
 {
-    if (!try_stop()) {
-        return;  // Not running
-    }
+    // Clearing the flag asks a running thread to leave. A thread that left on
+    // its own (preparation failed, the readiness wait was cut short, a
+    // tripwire fired) cleared it already, and it is joined all the same:
+    // the join cannot wait on whether the flag was ours to clear.
+    (void)try_stop();
     if (timer_thread_.joinable()) {
         timer_thread_.join();
     }

@@ -965,4 +965,48 @@ TEST(realtime_timer_raw, a_raw_reference_timer_wakes_on_period_boundaries_of_the
     EXPECT_TRUE(run.worst_error_ns.load(std::memory_order_relaxed) < 50'000'000);
 }
 
+//
+// Tests: stop() joins a thread that left on its own
+//
+
+namespace {
+
+/// A timer whose thread preparation fails, so the thread leaves on its own
+/// with the running flag cleared: the shape a strict-affinity failure, a
+/// readiness wait cut short by shutdown or a tripwire leaves behind.
+class SelfExitingTimer : public Timer<>
+{
+  public:
+    using Timer<>::Timer;
+
+    [[nodiscard]] auto thread_joinable() const noexcept -> bool { return timer_thread_.joinable(); }
+
+  protected:
+    auto prepare_thread() -> bool override { return false; }
+};
+
+}  // namespace
+
+TEST(realtime_timer_stop, joins_a_thread_that_left_on_its_own)
+{
+    TimerConfig config;
+    config.period_ns = 1'000'000;
+    SelfExitingTimer timer(config, [](TimerEvent<MonotonicClock> const&, AtomicWakeStats::Snapshot const&) {});
+
+    timer.start();
+    // The thread clears the running flag itself as it leaves; the
+    // std::thread stays joinable until somebody joins it.
+    for (int i = 0; i < 1000 && timer.is_running(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    EXPECT_FALSE(timer.is_running());
+    EXPECT_TRUE(timer.thread_joinable());
+
+    // stop() had nothing to clear and must still join; before, it returned
+    // on the clear and the destructor terminated the process.
+    timer.stop();
+    EXPECT_FALSE(timer.thread_joinable());
+    EXPECT_FALSE(timer.is_running());
+}
+
 TEST_MAIN(statusbar_realtime, realtime_timer_test)
