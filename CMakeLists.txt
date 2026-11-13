@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.31)
 project(
   statusbar-core
-  VERSION 2.6.0
+  VERSION 2.7.0
   LANGUAGES CXX)
 
 include(GNUInstallDirs)
