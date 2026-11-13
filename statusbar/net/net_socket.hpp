@@ -346,10 +346,8 @@ using FileDescriptor = ::statusbar::FileDescriptor;
     if (!group.is_multicast() || source.is_multicast() || source.is_unspecified()) {
         return failure(std::errc::invalid_argument);
     }
-    group_source_req request{};
-    request.gsr_interface = interface_index;
-    request.gsr_group = ipv4_sockaddr_storage(group);
-    request.gsr_source = ipv4_sockaddr_storage(source);
+    group_source_req const request{
+        .gsr_interface = interface_index, .gsr_group = ipv4_sockaddr_storage(group), .gsr_source = ipv4_sockaddr_storage(source)};
     if (::setsockopt(fd, IPPROTO_IP, MCAST_JOIN_SOURCE_GROUP, &request, sizeof(request)) != 0) {
         return failure(errno_code());
     }

@@ -1842,18 +1842,7 @@ class XdpContext
             napi_busy_poll_.kicked();
             return success();
         }
-        int const err = errno;
-        stats_.tx_flush_errno = err;
-        tx_pending_.store(true, std::memory_order_release);  // the frames are still waiting
-        if (detail::transient_kick_errno(err)) {
-            // Momentary, and the frames stay pending for the next kick. The
-            // caller hears success so it does not escalate on a hiccup; the
-            // counter is there for when the hiccups do not stop.
-            ++stats_.tx_flush_transient;
-            return success();
-        }
-        ++stats_.tx_flush_failed;
-        return failure(XdpError::tx_flush_failed);
+        return tx_kick_refused(errno);
     }
 
     /// The next received frame, stamped @p now: the RX clock as the caller
@@ -1987,6 +1976,20 @@ class XdpContext
     [[nodiscard]] auto napi_busy_poll() const noexcept -> bool { return napi_busy_poll_.on(); }
 
   private:
+    /// A kick the kernel refused with @p err: the frames stay pending for the next one. A transient
+    /// refusal answers success, so the caller does not escalate on a hiccup; any other tx_flush_failed.
+    [[nodiscard]] auto tx_kick_refused(int const err) noexcept -> Status
+    {
+        stats_.tx_flush_errno = err;
+        tx_pending_.store(true, std::memory_order_release);
+        if (detail::transient_kick_errno(err)) {
+            ++stats_.tx_flush_transient;  // there for when the hiccups do not stop
+            return success();
+        }
+        ++stats_.tx_flush_failed;
+        return failure(XdpError::tx_flush_failed);
+    }
+
     /// Whether tx_flush() kicks, consuming the pending flag: for frames committed since the last kick,
     /// except on a zero-copy queue whose NAPI kthread busy polls, kicked only when it has stalled.
     [[nodiscard]] auto tx_kick_due() noexcept -> bool
@@ -2029,7 +2032,7 @@ class XdpContext
     }
     /// What open() decided and what has happened since.
     void swap_settings(XdpContext& other) noexcept
-    {
+    {  // NOLINT(statusbar-block-statements): one swap per setting, read top to bottom
         std::swap(budget_, other.budget_);
         std::swap(stats_, other.stats_);
         std::swap(program_, other.program_);
