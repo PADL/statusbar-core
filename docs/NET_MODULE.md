@@ -114,7 +114,7 @@ int main() {
 - `Pollable::fd()` may return `-1` for tick-only ports — `tick(now_ns)` still fires each cycle. `poll_events()` defaults to `POLLIN`; override for `POLLOUT` / `on_writable`.
 - `set_dscp` writes IPv4 TOS or IPv6 traffic-class based on `family`; `is_valid_dscp` accepts `-1` (unset) or `0..63`.
 - `join_group()` is an any-source join; `join_source_group()` joins for one source (an IGMPv3 INCLUDE join, RFC 4607
-  Section 4.1) through `MCAST_JOIN_SOURCE_GROUP` (RFC 3678), which takes the interface by index on Linux, Darwin and
+  Section 4.1) through `MCAST_JOIN_SOURCE_GROUP` (RFC 3678), which accepts the interface by index on Linux, Darwin and
   the BSDs. A switch running source-specific multicast drops an any-source join to 232/8 (`is_source_specific_group()`);
   `open_source_group_membership()` holds such a join for an AF_XDP receiver as `open_group_membership()` holds the other.
 - `RawnetContext` needs `CAP_NET_RAW` on Linux; root or BPF device access on macOS. AF_XDP needs a kernel with `CONFIG_XDP_SOCKETS` (≥ 5.4), libbpf, libxdp, and an XDP-capable driver — otherwise `XdpContext` compiles as a stub. A driver without native XDP (the Raspberry Pi 5's `macb`, for one) gets generic attach and a copy-mode bind, which `attach_mode()` and `zero_copy()` report.
