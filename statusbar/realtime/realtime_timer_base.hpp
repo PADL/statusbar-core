@@ -78,6 +78,11 @@ class TimerBase
     /// @return true on success; false only if strict_affinity is set and CPU affinity failed.
     [[nodiscard]] virtual auto prepare_thread() -> bool;
 
+    /// The CPU half of prepare_thread(): the isolated-CPU preparation and the
+    /// affinity, for config_.cpu >= 0. False only if strict_affinity is set and
+    /// the affinity could not be set.
+    [[nodiscard]] auto prepare_cpu() -> bool;
+
     /// Sleep-based wait until an absolute monotonic deadline.
     /// @return wake error in ns (positive = late)
     static auto wait_until_absolute(int64_t deadline_ns) noexcept -> int64_t;

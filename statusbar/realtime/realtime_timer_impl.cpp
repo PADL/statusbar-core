@@ -48,6 +48,11 @@ auto build_timer_arg_specs(TimerConfig& config) -> args::ArgumentSpecs
         "Stack bytes to prefault before the RT loop (0 = skip)",
         static_cast<int64_t>(config.stack_prefault_bytes),
         [&](auto v) -> void { config.stack_prefault_bytes = (v > 0) ? static_cast<size_t>(v) : 0; });
+    specs.add<bool>(
+        "lock_memory",
+        "mlockall(MCL_CURRENT) when the timer thread starts (false: the process locks memory itself, once)",
+        config.lock_memory,
+        [&](auto v) -> void { config.lock_memory = v; });
     specs.add<int64_t>(
         "start_offset_cycles",
         "Cycles ahead of now to schedule the first wake (>=2 avoids a startup race)",

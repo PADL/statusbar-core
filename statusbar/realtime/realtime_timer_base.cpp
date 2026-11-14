@@ -147,6 +147,24 @@ auto TimerBase::stop() noexcept -> void
     }
 }
 
+auto TimerBase::prepare_cpu() -> bool
+{
+    if (config_.cpu < 0) {
+        return true;
+    }
+    // Prepare isolated CPU (sets governor, timer slack, etc.), then pin to it.
+    (void)prepare_isolated_cpu(config_.cpu);
+    auto affinity_result = set_realtime_affinity_ex(config_.cpu);
+    if (!affinity_result) {
+        affinity_result.log_if_failed("Timer CPU affinity");
+        if (config_.strict_affinity) {
+            std::print(stderr, "Error: strict_affinity is set but CPU affinity failed - timer thread exiting\n");
+            return false;
+        }
+    }
+    return true;
+}
+
 auto TimerBase::prepare_thread() -> bool
 {
     stats_.reset();
@@ -156,28 +174,19 @@ auto TimerBase::prepare_thread() -> bool
         prefault_stack_4096(config_.stack_prefault_bytes);
     }
 
-    // Prepare isolated CPU (sets governor, timer slack, etc.)
-    if (config_.cpu >= 0) {
-        (void)prepare_isolated_cpu(config_.cpu);
-    }
-
-    // Set CPU affinity
-    if (config_.cpu >= 0) {
-        auto affinity_result = set_realtime_affinity_ex(config_.cpu);
-        if (!affinity_result) {
-            affinity_result.log_if_failed("Timer CPU affinity");
-            if (config_.strict_affinity) {
-                std::print(stderr, "Error: strict_affinity is set but CPU affinity failed - timer thread exiting\n");
-                return false;
-            }
-        }
+    if (!prepare_cpu()) {
+        return false;
     }
 
     // Set realtime priority (SCHED_FIFO)
     (void)set_realtime_priority_logged(config_.priority, "Timer");
 
-    // Lock memory to prevent page faults
-    (void)lock_memory_ex();
+    // Lock memory to prevent page faults. mlockall is process-wide and takes
+    // in every mapping of the moment, so a process that maps large files and
+    // locks ranges of them itself turns this off and locks once at startup.
+    if (config_.lock_memory) {
+        (void)lock_memory_ex();
+    }
 
     return true;
 }

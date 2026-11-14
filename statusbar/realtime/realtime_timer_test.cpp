@@ -4,9 +4,15 @@
 #include "statusbar/realtime/realtime.hpp"
 #include "statusbar/test/test.hpp"
 
+#if defined(__linux__)
+#    include <sys/mman.h>
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -32,6 +38,7 @@ TEST(realtime_timer_config, default_values)
     EXPECT_FALSE(config.strict_affinity);
     EXPECT_TRUE(config.name.empty());
     EXPECT_EQ(config.stack_prefault_bytes, size_t{128} * 1024);
+    EXPECT_TRUE(config.lock_memory);
     EXPECT_EQ(config.start_offset_cycles, 2);
     EXPECT_EQ(config.resync_interval_cycles, 1000);
 }
@@ -739,6 +746,111 @@ TEST(realtime_timer_base_lifecycle, stop_without_start_is_noop)
     EXPECT_FALSE(base.is_running());
     EXPECT_EQ(base.loop_runs.load(std::memory_order_relaxed), 0);
 }
+
+//
+// prepare_thread(): TimerConfig::lock_memory decides whether the timer locks
+// the process's memory. Measured through VmLck, so Linux only.
+//
+
+#if defined(__linux__)
+
+namespace {
+
+/// The process's locked memory in kB, from /proc/self/status, or -1.
+auto vm_lck_kb() -> long
+{
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.starts_with("VmLck:")) {
+            return std::strtol(line.c_str() + 6, nullptr, 10);
+        }
+    }
+    return -1;
+}
+
+/// A 4 MiB anonymous mapping, every page touched, so mlockall(MCL_CURRENT)
+/// would have that much to take in.
+class TouchedMapping
+{
+  public:
+    static constexpr size_t SIZE = size_t{4} * 1024 * 1024;
+
+    TouchedMapping()
+        : base_{mmap(nullptr, SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)}
+    {
+        if (base_ == MAP_FAILED) {
+            base_ = nullptr;
+            return;
+        }
+        auto* bytes = static_cast<unsigned char volatile*>(base_);
+        for (size_t off = 0; off < SIZE; off += 4096) {
+            bytes[off] = 1;
+        }
+    }
+    ~TouchedMapping()
+    {
+        if (base_ != nullptr) {
+            (void)munmap(base_, SIZE);
+        }
+    }
+    TouchedMapping(TouchedMapping const&) = delete;
+    auto operator=(TouchedMapping const&) -> TouchedMapping& = delete;
+    TouchedMapping(TouchedMapping&&) = delete;
+    auto operator=(TouchedMapping&&) -> TouchedMapping& = delete;
+
+    [[nodiscard]] auto valid() const noexcept -> bool { return base_ != nullptr; }
+
+  private:
+    void* base_;
+};
+
+}  // namespace
+
+TEST(realtime_timer_base_prepare, lock_memory_off_locks_nothing)
+{
+    TouchedMapping const mapping;
+    EXPECT_TRUE(mapping.valid());
+    long const before = vm_lck_kb();
+    EXPECT_TRUE(before >= 0);
+
+    TestTimerBase base{TimerConfig{.cpu = -1, .stack_prefault_bytes = 0, .lock_memory = false}};
+    EXPECT_TRUE(base.call_real_prepare_thread());
+
+    EXPECT_EQ(vm_lck_kb(), before);
+}
+
+TEST(realtime_timer_base_prepare, lock_memory_on_takes_in_every_mapping)
+{
+    TouchedMapping const mapping;
+    EXPECT_TRUE(mapping.valid());
+    long const before = vm_lck_kb();
+
+    TestTimerBase base{TimerConfig{.cpu = -1, .stack_prefault_bytes = 0, .lock_memory = true}};
+    EXPECT_TRUE(base.call_real_prepare_thread());
+    long const after = vm_lck_kb();
+    (void)unlock_memory();  // leave the process as it was for the tests that follow
+
+    if (after == before) {
+        SKIP("mlockall is not permitted here (RLIMIT_MEMLOCK / CAP_IPC_LOCK)");
+    }
+    // The mapping has nothing to do with the timer and is locked all the same.
+    EXPECT_TRUE(after - before >= static_cast<long>(TouchedMapping::SIZE / 1024));
+}
+
+#else
+
+TEST(realtime_timer_base_prepare, lock_memory_off_locks_nothing)
+{
+    SKIP("VmLck is read from /proc/self/status (Linux only)");
+}
+
+TEST(realtime_timer_base_prepare, lock_memory_on_takes_in_every_mapping)
+{
+    SKIP("VmLck is read from /proc/self/status (Linux only)");
+}
+
+#endif
 
 //
 // print_timer_stats(TimerBase const&) free function
