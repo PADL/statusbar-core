@@ -21,6 +21,7 @@ two-minute orientation, then dive into its headers under
 | ieee         | Network byte-order integer wrappers and IEEE 802 wire-format structs and constants. | [IEEE_MODULE.md](IEEE_MODULE.md)           |
 | ip           | Wire-format structs and protocol constants for IPv4, IPv6, UDP, ARP, ICMP, IGMP.    | [IP_MODULE.md](IP_MODULE.md)               |
 | itc          | Inter-thread primitives: typed sync, triple buffer, MessagePipe, stop signal.       | [ITC_MODULE.md](ITC_MODULE.md)             |
+| mem          | Allocator-aware `make_unique`; read-only file mapping with page-range locking.      | [MEM_MODULE.md](MEM_MODULE.md)             |
 | net          | Non-blocking async TCP, UDP, and raw Ethernet on a poll()-driven reactor.           | [NET_MODULE.md](NET_MODULE.md)             |
 | pcap         | Read/write support for Wireshark pcap/pcapng files plus synthetic-time replay.      | [PCAP_MODULE.md](PCAP_MODULE.md)           |
 | realtime     | Hard-realtime utilities: memlock, SCHED_FIFO, affinity, deadline timers, tripwires. | [REALTIME_MODULE.md](REALTIME_MODULE.md)   |
