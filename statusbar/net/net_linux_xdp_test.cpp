@@ -300,6 +300,28 @@ TEST(xdp_attach_plan, generic_attach_stays_generic)
     }
 }
 
+#    if defined(HAVE_XDP)
+TEST(xdp_bind_flags, auto_binds_copy_under_a_generic_program)
+{
+    // The kernel's own choice, which is zero-copy where the driver has it,
+    // is taken only under a native program; a generic attach - the plan's
+    // fall-back, or an adopted generic pin - cannot drive a zero-copy queue.
+    static_assert(detail::bind_flags_for(XdpBindMode::auto_, XdpAttachMode::generic) == XDP_COPY);
+    static_assert(detail::bind_flags_for(XdpBindMode::auto_, XdpAttachMode::native) == 0);
+    EXPECT_EQ(detail::bind_flags_for(XdpBindMode::auto_, XdpAttachMode::generic), XDP_COPY);
+    EXPECT_EQ(detail::bind_flags_for(XdpBindMode::auto_, XdpAttachMode::native), 0);
+}
+
+TEST(xdp_bind_flags, an_explicit_bind_mode_is_kept_whatever_the_attach)
+{
+    for (auto const attached : {XdpAttachMode::native, XdpAttachMode::generic}) {
+        EXPECT_EQ(detail::bind_flags_for(XdpBindMode::copy, attached), XDP_COPY);
+    }
+    // zero_copy under generic never reaches a bind: attach_plan() refused it.
+    EXPECT_EQ(detail::bind_flags_for(XdpBindMode::zero_copy, XdpAttachMode::native), XDP_ZEROCOPY);
+}
+#    endif
+
 TEST(xdp_attach_plan, the_defaults_mean_try_native_fall_back_to_generic)
 {
     // A caller that leaves XdpConfig's fields alone gets the forgiving plan.

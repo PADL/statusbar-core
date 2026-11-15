@@ -994,6 +994,24 @@ namespace detail {
     return 0;
 }
 
+/// The bind flag once the program's attach mode is known. auto_ leaves the
+/// choice to the kernel only under a native program: a zero-copy queue is
+/// driven by the driver's own XDP path, which generic XDP - running in the
+/// stack - never enters, so a zero-copy socket under a generic program has
+/// its frames taken by nobody (igb refuses every TX kick with EINVAL). Under
+/// a generic attach, a fresh fall-back or an adopted pin alike, auto_ binds
+/// copy. An explicit bind mode is kept as asked; zero_copy never meets a
+/// generic attach because attach_plan() refused the pair.
+/// @param bind The bind mode asked for
+/// @param attached The mode the program is attached in
+[[nodiscard]] constexpr auto bind_flags_for(XdpBindMode const bind, XdpAttachMode const attached) noexcept -> uint16_t
+{
+    if (bind == XdpBindMode::auto_ && attached == XdpAttachMode::generic) {
+        return XDP_COPY;
+    }
+    return bind_flags(bind);
+}
+
 /// Wait out one slice of the window in which a just-closed queue is still
 /// registered. On the open path, on the control thread - never on the
 /// real-time path.
@@ -1480,23 +1498,20 @@ class BpfState
     /// @param default_action Action applied to frames that match no user rule
     [[nodiscard]] auto load(std::span<CompiledRule<32> const> rules, XdpAction default_action) -> Status;
 
-    /// Attach XDP program to interface, register XSK fd in xsk_map.
+    /// Attach the loaded XDP program to the interface following `plan`. The
+    /// socket is registered separately (register_xsk()) because it is bound
+    /// after this: the bind flags follow the mode the attach landed in.
     /// @param if_index Network interface index to attach to
-    /// @param queue_id Hardware queue ID for the XSK socket
-    /// @param xsk_fd File descriptor of the XSK socket
     /// @param plan Which attach mode to try, and what to try next
-    [[nodiscard]] auto attach(unsigned int if_index, uint32_t queue_id, int xsk_fd, AttachPlan const& plan) -> Status
+    [[nodiscard]] auto attach(unsigned int if_index, AttachPlan const& plan) -> Status
     {
-        if (auto status = attachment_.attach(std::move(obj_), prog_fd_, if_index, plan); !status) {
-            return status;
-        }
-        return register_xsk(queue_id, xsk_fd);
+        return attachment_.attach(std::move(obj_), prog_fd_, if_index, plan);
     }
 
-    /// Put the XSK socket in xsk_map for its queue. Split out of attach()
-    /// because an adopted program needs this and nothing else: the program on
-    /// the interface is already the right one, but the socket behind the map
-    /// entry belongs to the process that died.
+    /// Put the XSK socket in xsk_map for its queue, once it is bound. The
+    /// same call for a freshly attached program and for an adopted one: the
+    /// program on the interface is the right one either way, and the socket
+    /// behind the map entry is the new one, or belongs to a process that died.
     /// @param queue_id Hardware queue ID for the XSK socket
     /// @param xsk_fd File descriptor of the XSK socket
     [[nodiscard]] auto register_xsk(uint32_t queue_id, int xsk_fd) -> Status

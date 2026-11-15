@@ -1206,7 +1206,9 @@ auto XdpContext::open(XdpConfig const& config) -> Status
 
     // Step 3: The program. With a pin path it may already be on the
     // interface from a previous run, in which case adopting it is the point
-    // of the whole exercise: no detach, no re-attach, no gap.
+    // of the whole exercise: no detach, no re-attach, no gap. Either way the
+    // program is on the interface before the socket binds (step 4), so the
+    // bind can answer to the mode it is attached in.
     if (pinning && config.adopt) {
         // Best effort by design. A pin left by an older build of ours, or a
         // half-written one, is not an error - it only means there is nothing
@@ -1238,9 +1240,20 @@ auto XdpContext::open(XdpConfig const& config) -> Status
             close();
             return status;
         }
+        // Step 3b: Attach it now, before the socket binds, so the bind flags
+        // can follow the mode the attach actually landed in: a fall-back to
+        // generic must not leave a zero-copy socket behind it. Until the
+        // socket is registered (step 5) the program's redirect finds no
+        // socket for the queue and the frame goes on to the kernel, as it
+        // did before the program was there; an adopted program has the same
+        // gap, left by the socket that died.
+        if (auto status = bpf_.attach(interface_.index, *plan); !status) {
+            close();
+            return status;
+        }
     }
 
-    // Step 4: Create XSK socket
+    // Step 4: Create XSK socket, bound the way the attached program allows
     struct xsk_socket_config xsk_cfg{};
     xsk_cfg.rx_size = static_cast<__u32>(config.rx_ring_size);
     xsk_cfg.tx_size = static_cast<__u32>(config.tx_ring_size);
@@ -1250,7 +1263,7 @@ auto XdpContext::open(XdpConfig const& config) -> Status
     // it needs a kick to notice a new fill or TX submission, and sleeps
     // otherwise instead of polling the rings. tx_flush() and the fill path
     // both honour the flag.
-    xsk_cfg.bind_flags = detail::bind_flags(config.bind_mode) | XDP_USE_NEED_WAKEUP;
+    xsk_cfg.bind_flags = detail::bind_flags_for(config.bind_mode, bpf_.attach_mode()) | XDP_USE_NEED_WAKEUP;
 
     std::string const ifname_str(config.interface_name);
     // A bind refused with EBUSY is a queue the last owner has not finished
@@ -1288,26 +1301,18 @@ auto XdpContext::open(XdpConfig const& config) -> Status
     bind_retries_ = pauses;
     zero_copy_ = detail::socket_has_zero_copy(xsk_socket__fd(xsk_));
 
-    // Step 5: Attach BPF + register socket. An adopted program is already
-    // attached and stays as it is; only the xsk_map entry is ours to replace,
-    // since the socket the last process put there died with it.
-    if (bpf_.adopted()) {
-        if (auto status = bpf_.register_xsk(config.queue_id, xsk_socket__fd(xsk_)); !status) {
+    // Step 5: Register the socket with the attached program, adopted or
+    // fresh: the xsk_map entry for the queue is ours to fill either way.
+    if (auto status = bpf_.register_xsk(config.queue_id, xsk_socket__fd(xsk_)); !status) {
+        close();
+        return status;
+    }
+    // Step 5b: Pin what we attached, so the next start can adopt it. From
+    // here close() leaves the program on the interface.
+    if (!bpf_.adopted() && pinning) {
+        if (auto status = bpf_.pin(config.pin_path); !status) {
             close();
             return status;
-        }
-    } else {
-        if (auto status = bpf_.attach(interface_.index, config.queue_id, xsk_socket__fd(xsk_), *plan); !status) {
-            close();
-            return status;
-        }
-        // Step 5b: Pin what we just attached, so the next start can adopt it.
-        // From here close() leaves the program on the interface.
-        if (pinning) {
-            if (auto status = bpf_.pin(config.pin_path); !status) {
-                close();
-                return status;
-            }
         }
     }
 
