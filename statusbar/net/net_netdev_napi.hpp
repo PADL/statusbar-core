@@ -74,7 +74,6 @@ struct NapiInfo
 {
     uint32_t id{0};
     int ifindex{0};
-    std::optional<uint32_t> irq{};
     std::optional<uint32_t> pid{};           ///< its kthread, while threaded
     std::optional<NapiThreaded> threaded{};  ///< none before Linux 6.17
 
