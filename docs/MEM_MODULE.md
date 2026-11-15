@@ -17,10 +17,14 @@ resource, so the `PmrUniquePtr` it returns is self-contained.
 `MAP_SHARED`) and lets a non-real-time thread keep a window of it
 resident and locked while a real-time thread reads inside that window
 without faulting. `lock_range()` locks and reads in the pages covering
-a byte range, `unlock_range()` releases them, `advise()` passes a
-`posix_madvise` hint, and `page_span()` is the page arithmetic the
-three share. Nothing is copied: `bytes()` is the file as the kernel
-holds it.
+a byte range, `unlock_range()` releases them, `advise()` tells the
+kernel how the range will be read, and `page_span()` is the page
+arithmetic the three share. Nothing is copied: `bytes()` is the file
+as the kernel holds it. On Linux `advise()` is `madvise(2)`, not
+`posix_madvise(3)`: glibc and musl answer `POSIX_MADV_DONTNEED` with 0
+and no system call, so a window that advised `dont_need` behind itself
+would keep every page it had passed; `MADV_DONTNEED` drops them. A
+range still locked by `lock_range()` refuses `dont_need` (`EINVAL`).
 
 Every `MappedFile` call is a system call and belongs on a non-real-time
 thread. The real-time thread only reads `bytes()`, and only where a
@@ -75,8 +79,8 @@ std::span<uint8_t const> const bytes = mapped->bytes();
 ## Dependencies
 
 - `statusbar::status` — `Status`, `StatusValue`.
-- POSIX: `mmap`, `munmap`, `mlock`, `munlock`, `posix_madvise`, `openat`,
-  `fstat`, `sysconf`.
+- POSIX: `mmap`, `munmap`, `mlock`, `munlock`, `openat`, `fstat`,
+  `sysconf`; `madvise(2)` on Linux, `posix_madvise` elsewhere.
 
 ## Notes & caveats
 

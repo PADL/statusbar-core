@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <bit>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -70,6 +71,28 @@ class TempFile
 }
 
 #if defined(__linux__)
+/// How many of the mapping's pages this process has a page-table entry for:
+/// bit 63 of each /proc/self/pagemap word, readable without privilege (the
+/// frame number is what needs it, and is not looked at). -1 when the file
+/// cannot be read.
+auto mapped_pages(std::span<uint8_t const> const bytes) -> long
+{
+    size_t const page = MappedFile::page_size();
+    int const fd = ::open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    long count = 0;
+    for (size_t offset = 0; offset < bytes.size() && count >= 0; offset += page) {
+        uint64_t entry = 0;
+        auto const index = std::bit_cast<uintptr_t>(bytes.data() + offset) / page;
+        auto const got = ::pread(fd, &entry, sizeof(entry), static_cast<off_t>(index * sizeof(entry)));
+        count = got == static_cast<ssize_t>(sizeof(entry)) ? count + static_cast<long>((entry >> 63U) & 1U) : -1;
+    }
+    (void)::close(fd);
+    return count;
+}
+
 /// The process's locked memory in kB, from /proc/self/status, or -1.
 auto vm_lck_kb() -> long
 {
@@ -201,6 +224,39 @@ TEST(mem_mapped_file, lock_range_locks_the_pages_and_unlock_range_frees_them)
     EXPECT_EQ(vm_lck_kb(), before);
 #else
     SKIP("VmLck is read from /proc/self/status (Linux only)");
+#endif
+}
+
+TEST(mem_mapped_file, advise_dont_need_drops_the_pages_from_the_mapping)
+{
+#if defined(__linux__)
+    size_t const page = MappedFile::page_size();
+    TempFile const file{page * 4};
+    auto mapped = MappedFile::map(file.fd());
+    EXPECT_TRUE(mapped.has_value());
+    // Read one byte of each page so each has an entry.
+    uint8_t touched = 0;
+    for (size_t p = 0; p < 4; ++p) {
+        touched = static_cast<uint8_t>(touched + mapped->bytes()[p * page]);
+    }
+    EXPECT_TRUE(
+        touched ==
+        static_cast<uint8_t>(
+            TempFile::byte_at(0) + TempFile::byte_at(page) + TempFile::byte_at(2 * page) + TempFile::byte_at(3 * page)));
+    long const before = mapped_pages(mapped->bytes());
+    if (before < 0) {
+        SKIP("/proc/self/pagemap is not readable here");
+    }
+    EXPECT_EQ(before, 4L);
+
+    EXPECT_TRUE(mapped->advise(0, mapped->size(), MappedFile::Advice::dont_need).has_value());
+    // Through posix_madvise this stayed at 4: glibc and musl never make the
+    // call for POSIX_MADV_DONTNEED.
+    EXPECT_EQ(mapped_pages(mapped->bytes()), 0L);
+    // The bytes are still the file's; they come back in on the next read.
+    EXPECT_EQ(mapped->bytes()[page + 1], TempFile::byte_at(page + 1));
+#else
+    SKIP("/proc/self/pagemap is Linux only; posix_madvise is what the other platforms have");
 #endif
 }
 

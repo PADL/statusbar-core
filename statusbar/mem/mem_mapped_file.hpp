@@ -32,7 +32,8 @@ namespace statusbar::mem {
 class MappedFile
 {
   public:
-    /// What posix_madvise() is told about a range.
+    /// What the kernel is told about a range (madvise(2) on Linux,
+    /// posix_madvise(3) elsewhere).
     enum class Advice : uint8_t
     {
         normal,
@@ -85,7 +86,12 @@ class MappedFile
     /// mapped and may be read again; they may then fault.
     [[nodiscard]] auto unlock_range(size_t offset, size_t length) const noexcept -> Status;
 
-    /// Tell the kernel how the range will be read (posix_madvise(3)).
+    /// Tell the kernel how the range will be read. On Linux this is
+    /// madvise(2): posix_madvise(3) there turns dont_need into a no-op (glibc
+    /// and musl answer it with 0 and no system call), where MADV_DONTNEED
+    /// drops the pages from the mapping, which is the point of dont_need for
+    /// a window slid over a large file. dont_need on a range still locked by
+    /// lock_range() is refused (EINVAL): unlock it first.
     [[nodiscard]] auto advise(size_t offset, size_t length, Advice advice) const noexcept -> Status;
 
     /// The page-aligned span of the mapping that covers [offset, offset +

@@ -25,6 +25,25 @@ namespace {
     return failure(std::error_code{errno, std::system_category()});
 }
 
+#if defined(__linux__)
+// madvise(2)'s own flags: see MappedFile::advise() for why not the POSIX ones.
+[[nodiscard]] auto madvise_flag(MappedFile::Advice const advice) noexcept -> int
+{
+    switch (advice) {
+        case MappedFile::Advice::sequential:
+            return MADV_SEQUENTIAL;
+        case MappedFile::Advice::random:
+            return MADV_RANDOM;
+        case MappedFile::Advice::will_need:
+            return MADV_WILLNEED;
+        case MappedFile::Advice::dont_need:
+            return MADV_DONTNEED;
+        case MappedFile::Advice::normal:
+            break;
+    }
+    return MADV_NORMAL;
+}
+#else
 [[nodiscard]] auto madvise_flag(MappedFile::Advice const advice) noexcept -> int
 {
     switch (advice) {
@@ -41,6 +60,7 @@ namespace {
     }
     return POSIX_MADV_NORMAL;
 }
+#endif
 
 /// The size of a regular file open on fd, or the errno.
 [[nodiscard]] auto file_size(int const fd) noexcept -> StatusValue<size_t>
@@ -179,13 +199,26 @@ auto MappedFile::advise(size_t const offset, size_t const length, Advice const a
     if (pages.empty()) {
         return success();
     }
-    // posix_madvise returns the error number itself rather than setting errno.
-    // Its argument is the page-aligned start; the span is const only to us.
+    // The argument is the page-aligned start; the span is const only to us.
     void* const start = const_cast<uint8_t*>(pages.data());  // NOLINT(cppcoreguidelines-pro-type-const-cast)
+#if defined(__linux__)
+    // madvise(2), not posix_madvise(3). POSIX lets a hint be ignored, and
+    // glibc and musl both answer POSIX_MADV_DONTNEED with 0 and no system
+    // call, because Linux's MADV_DONTNEED is not a hint: it drops the pages
+    // from the mapping. That is exactly what dont_need is for here - a
+    // window slid over a large file must not keep every page it has passed
+    // - so the kernel is asked directly. It sets errno.
+    if (::madvise(start, pages.size(), madvise_flag(advice)) != 0) {
+        return errno_status();
+    }
+    return success();
+#else
+    // posix_madvise returns the error number itself rather than setting errno.
     if (int const err = ::posix_madvise(start, pages.size(), madvise_flag(advice)); err != 0) {
         return failure(std::error_code{err, std::system_category()});
     }
     return success();
+#endif
 }
 
 }  // namespace statusbar::mem
