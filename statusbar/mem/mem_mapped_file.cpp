@@ -42,6 +42,33 @@ namespace {
     return POSIX_MADV_NORMAL;
 }
 
+#if defined(__linux__)
+// glibc's and musl's posix_madvise(3) drop POSIX_MADV_DONTNEED, so on Linux
+// advise() calls madvise(2), whose advice values are the same.
+static_assert(POSIX_MADV_NORMAL == MADV_NORMAL && POSIX_MADV_SEQUENTIAL == MADV_SEQUENTIAL);
+static_assert(POSIX_MADV_RANDOM == MADV_RANDOM && POSIX_MADV_WILLNEED == MADV_WILLNEED);
+static_assert(POSIX_MADV_DONTNEED == MADV_DONTNEED);
+
+/// madvise(2) of the page-aligned range at start, the errno as Status.
+[[nodiscard]] auto advise_pages(void* const start, size_t const length, int const advice) noexcept -> Status
+{
+    if (::madvise(start, length, advice) != 0) {
+        return errno_status();
+    }
+    return success();
+}
+#else
+/// posix_madvise(3) of the page-aligned range at start, which returns the
+/// error number itself rather than setting errno.
+[[nodiscard]] auto advise_pages(void* const start, size_t const length, int const advice) noexcept -> Status
+{
+    if (int const err = ::posix_madvise(start, length, advice); err != 0) {
+        return failure(std::error_code{err, std::system_category()});
+    }
+    return success();
+}
+#endif
+
 /// The size of a regular file open on fd, or the errno.
 [[nodiscard]] auto file_size(int const fd) noexcept -> StatusValue<size_t>
 {
@@ -179,13 +206,9 @@ auto MappedFile::advise(size_t const offset, size_t const length, Advice const a
     if (pages.empty()) {
         return success();
     }
-    // posix_madvise returns the error number itself rather than setting errno.
-    // Its argument is the page-aligned start; the span is const only to us.
+    // The argument is the page-aligned start; the span is const only to us.
     void* const start = const_cast<uint8_t*>(pages.data());  // NOLINT(cppcoreguidelines-pro-type-const-cast)
-    if (int const err = ::posix_madvise(start, pages.size(), madvise_flag(advice)); err != 0) {
-        return failure(std::error_code{err, std::system_category()});
-    }
-    return success();
+    return advise_pages(start, pages.size(), madvise_flag(advice));
 }
 
 }  // namespace statusbar::mem

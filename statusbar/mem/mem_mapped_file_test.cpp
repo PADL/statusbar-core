@@ -11,11 +11,13 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <span>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -81,6 +83,32 @@ auto vm_lck_kb() -> long
         }
     }
     return -1;
+}
+
+/// How many pages of `bytes` are mapped into the process (the present bit,
+/// 63, of /proc/self/pagemap, which needs no privilege), or -1.
+auto present_pages(std::span<uint8_t const> const bytes) -> long
+{
+    size_t const page = MappedFile::page_size();
+    auto const address = reinterpret_cast<uintptr_t>(bytes.data());  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+    std::vector<uint64_t> entries(((address + bytes.size() + page - 1) / page) - (address / page));
+    int const fd = ::open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+    auto const size = static_cast<ssize_t>(entries.size() * sizeof(uint64_t));
+    auto const offset = static_cast<off_t>(address / page * sizeof(uint64_t));
+    bool const read = fd >= 0 && ::pread(fd, entries.data(), static_cast<size_t>(size), offset) == size;
+    if (fd >= 0) {
+        (void)::close(fd);
+    }
+    return read ? static_cast<long>(std::ranges::count_if(entries, [](uint64_t const e) { return (e >> 63U) != 0; })) : -1;
+}
+
+/// Read one byte of every page of `bytes`, so each is mapped.
+void touch_pages(std::span<uint8_t const> const bytes)
+{
+    uint8_t volatile sink = 0;
+    for (size_t i = 0; i < bytes.size(); i += MappedFile::page_size()) {
+        sink = static_cast<uint8_t>(sink + bytes[i]);
+    }
 }
 #endif
 
@@ -215,6 +243,47 @@ TEST(mem_mapped_file, advise_accepts_every_advice)
     EXPECT_TRUE(mapped->advise(0, mapped->size(), MappedFile::Advice::will_need).has_value());
     EXPECT_TRUE(mapped->advise(0, mapped->size(), MappedFile::Advice::dont_need).has_value());
     EXPECT_TRUE(mapped->advise(mapped->size(), 10, MappedFile::Advice::will_need).has_value());  // past the end: nothing
+}
+
+TEST(mem_mapped_file, dont_need_drops_the_pages_from_the_process_and_they_read_back)
+{
+#if defined(__linux__)
+    size_t const page = MappedFile::page_size();
+    TempFile const file{page * 8};
+    auto mapped = MappedFile::map(file.fd());
+    EXPECT_TRUE(mapped.has_value());
+    auto const bytes = mapped->bytes();
+    touch_pages(bytes);
+    if (present_pages(bytes) < 0) {
+        SKIP("/proc/self/pagemap is not readable here");
+    }
+    EXPECT_EQ(present_pages(bytes), 8L);
+    EXPECT_TRUE(mapped->advise(page * 2, page * 4, MappedFile::Advice::dont_need).has_value());
+    EXPECT_EQ(present_pages(bytes.subspan(page * 2, page * 4)), 0L);
+    EXPECT_EQ(present_pages(bytes), 4L);
+    EXPECT_EQ(bytes[page * 3 + 5], TempFile::byte_at(page * 3 + 5));  // faulted back in from the file
+#else
+    SKIP("the present bit is read from /proc/self/pagemap (Linux only)");
+#endif
+}
+
+TEST(mem_mapped_file, dont_need_refuses_a_locked_range)
+{
+#if defined(__linux__)
+    size_t const page = MappedFile::page_size();
+    TempFile const file{page * 2};
+    auto mapped = MappedFile::map(file.fd());
+    EXPECT_TRUE(mapped.has_value());
+    if (!mapped->lock_range(0, page)) {
+        SKIP("mlock is not permitted here (RLIMIT_MEMLOCK / CAP_IPC_LOCK)");
+    }
+    auto const advised = mapped->advise(0, page, MappedFile::Advice::dont_need);
+    EXPECT_EQ(advised.has_value() ? 0 : errno_of(advised.error()), EINVAL);
+    EXPECT_TRUE(mapped->unlock_range(0, page).has_value());
+    EXPECT_TRUE(mapped->advise(0, page, MappedFile::Advice::dont_need).has_value());
+#else
+    SKIP("madvise(2) refuses DONTNEED on locked pages on Linux only");
+#endif
 }
 
 TEST(mem_mapped_file, a_move_hands_the_mapping_over_and_the_source_is_empty)

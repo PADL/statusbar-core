@@ -32,7 +32,7 @@ namespace statusbar::mem {
 class MappedFile
 {
   public:
-    /// What posix_madvise() is told about a range.
+    /// What madvise() is told about a range.
     enum class Advice : uint8_t
     {
         normal,
@@ -85,7 +85,11 @@ class MappedFile
     /// mapped and may be read again; they may then fault.
     [[nodiscard]] auto unlock_range(size_t offset, size_t length) const noexcept -> Status;
 
-    /// Tell the kernel how the range will be read (posix_madvise(3)).
+    /// Tell the kernel how the range will be read: madvise(2) on Linux,
+    /// posix_madvise(3) elsewhere. Errors are the errno as Status. On Linux,
+    /// dont_need drops the range's pages from the process's resident set:
+    /// they stay in the page cache and fault back in when read. A range
+    /// lock_range() holds refuses dont_need (EINVAL); unlock it first.
     [[nodiscard]] auto advise(size_t offset, size_t length, Advice advice) const noexcept -> Status;
 
     /// The page-aligned span of the mapping that covers [offset, offset +
