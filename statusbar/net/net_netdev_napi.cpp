@@ -123,8 +123,6 @@ struct NapiFields
             return parse_u32(payload, fields.id);
         case NAPI_IFINDEX:
             return parse_u32(payload, fields.ifindex);
-        case NAPI_IRQ:
-            return parse_u32(payload, fields.napi.irq);
         case NAPI_PID:
             return parse_u32(payload, fields.napi.pid);
         case NAPI_THREADED:
