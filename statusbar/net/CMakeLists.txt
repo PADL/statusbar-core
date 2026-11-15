@@ -75,6 +75,36 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_netlink_fuzzer.cpp)
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_tc_qdisc_fuzzer.cpp)
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_vlan_link_fuzzer.cpp)
+
+  # linux/netdev.h spells its attributes and flags as enumerators, which the
+  # preprocessor cannot test, so the two that arrived after the header - the
+  # xsk-features attribute and its flags (Linux 6.8), the launch-time flag
+  # (6.15) - are probed here and the mirrors in net_netdev_features.cpp are
+  # checked against them where they exist. Debian trixie's linux-libc-dev (6.12)
+  # has the first and not the second.
+  include(CheckCXXSourceCompiles)
+  check_cxx_source_compiles(
+    "
+    #include <linux/netdev.h>
+    int main() {
+      return NETDEV_A_DEV_XSK_FEATURES + NETDEV_A_DEV_XDP_RX_METADATA_FEATURES +
+             NETDEV_XSK_FLAGS_TX_TIMESTAMP + NETDEV_XSK_FLAGS_TX_CHECKSUM;
+    }
+    "
+    HAVE_NETDEV_XSK_FEATURES)
+  check_cxx_source_compiles(
+    "
+    #include <linux/netdev.h>
+    int main() { return NETDEV_XSK_FLAGS_TX_LAUNCH_TIME_FIFO; }
+    "
+    HAVE_NETDEV_XSK_LAUNCH_TIME)
+  if(HAVE_NETDEV_XSK_FEATURES)
+    target_compile_definitions(statusbar-net PUBLIC HAVE_NETDEV_XSK_FEATURES=1)
+  endif()
+  if(HAVE_NETDEV_XSK_LAUNCH_TIME)
+    target_compile_definitions(statusbar-net
+                               PUBLIC HAVE_NETDEV_XSK_LAUNCH_TIME=1)
+  endif()
 endif()
 
 add_executable(net_tcp_echo_example net_tcp_echo_example.cpp)

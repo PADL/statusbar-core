@@ -18,6 +18,10 @@
 #include <span>
 #include <system_error>
 
+#if defined(__linux__) && __has_include(<linux/netdev.h>)
+#    include <linux/netdev.h>
+#endif
+
 using namespace statusbar;
 using namespace statusbar::net::netdev;
 
@@ -68,6 +72,24 @@ constexpr std::array<uint8_t, 72> DEV_REPLY{
 constexpr size_t XSK_ATTRIBUTE_AT = 60;  ///< where the xsk-features attribute starts in DEV_REPLY
 
 }  // namespace
+
+// The header's mirrors of the UAPI enumerators, checked at run time as well
+// as by the static_asserts in net_netdev_features.cpp: those sit behind the
+// configure-time probes, and this is what shows the probes fired.
+TEST(netdev_features, the_mirrored_constants_match_the_kernel_uapi)
+{
+#if defined(__linux__) && defined(HAVE_NETDEV_XSK_FEATURES)
+    EXPECT_EQ(static_cast<uint64_t>(DEV_XDP_RX_METADATA_FEATURES), static_cast<uint64_t>(NETDEV_A_DEV_XDP_RX_METADATA_FEATURES));
+    EXPECT_EQ(static_cast<uint64_t>(DEV_XSK_FEATURES), static_cast<uint64_t>(NETDEV_A_DEV_XSK_FEATURES));
+    EXPECT_EQ(XSK_TX_TIMESTAMP, static_cast<uint64_t>(NETDEV_XSK_FLAGS_TX_TIMESTAMP));
+    EXPECT_EQ(XSK_TX_CHECKSUM, static_cast<uint64_t>(NETDEV_XSK_FLAGS_TX_CHECKSUM));
+#    if defined(HAVE_NETDEV_XSK_LAUNCH_TIME)
+    EXPECT_EQ(XSK_TX_LAUNCH_TIME_FIFO, static_cast<uint64_t>(NETDEV_XSK_FLAGS_TX_LAUNCH_TIME_FIFO));
+#    endif
+#else
+    SKIP("the build's linux/netdev.h predates the xsk-features attribute (Linux 6.8), or this is not Linux");
+#endif
+}
 
 TEST(netdev_features, the_get_family_request_as_the_controller_reads_it)
 {

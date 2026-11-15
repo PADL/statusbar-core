@@ -22,7 +22,10 @@ namespace statusbar::net::netdev {
 #if defined(__linux__)
 // The constants spelled in the header, against the UAPI they mirror. The netdev
 // header arrived with Linux 6.3, xsk-features with 6.8 and the launch-time flag
-// with 6.15: each is checked where the build's headers have it.
+// with 6.15: each is checked where the build's headers have it. The header
+// spells them as enumerators, which #if cannot see (only NETDEV_FAMILY_VERSION
+// is a macro), so the two later arrivals are found at configure time
+// (HAVE_NETDEV_XSK_FEATURES, HAVE_NETDEV_XSK_LAUNCH_TIME; net/CMakeLists.txt).
 static_assert(GENL_MESSAGE_HEADER == sizeof(genlmsghdr) && GENL_HEADER == NLMSG_HDRLEN + GENL_HDRLEN);
 static_assert(GENL_CONTROLLER_ID == GENL_ID_CTRL && CTRL_NEWFAMILY == CTRL_CMD_NEWFAMILY && CTRL_GETFAMILY == CTRL_CMD_GETFAMILY);
 static_assert(
@@ -31,13 +34,13 @@ static_assert(
 static_assert(FAMILY_NAME == NETDEV_FAMILY_NAME && FAMILY_VERSION == NETDEV_FAMILY_VERSION && CMD_DEV_GET == NETDEV_CMD_DEV_GET);
 static_assert(DEV_IFINDEX == NETDEV_A_DEV_IFINDEX && DEV_XDP_FEATURES == NETDEV_A_DEV_XDP_FEATURES);
 static_assert(DEV_XDP_ZC_MAX_SEGS == NETDEV_A_DEV_XDP_ZC_MAX_SEGS);
-#        if defined(NETDEV_A_DEV_MAX) && NETDEV_A_DEV_MAX >= 6
+#        if defined(HAVE_NETDEV_XSK_FEATURES)
 static_assert(
     DEV_XDP_RX_METADATA_FEATURES == NETDEV_A_DEV_XDP_RX_METADATA_FEATURES && DEV_XSK_FEATURES == NETDEV_A_DEV_XSK_FEATURES);
 static_assert(XSK_TX_TIMESTAMP == NETDEV_XSK_FLAGS_TX_TIMESTAMP && XSK_TX_CHECKSUM == NETDEV_XSK_FLAGS_TX_CHECKSUM);
 #        endif
 #    endif
-#    if defined(NETDEV_XSK_FLAGS_TX_LAUNCH_TIME_FIFO)
+#    if defined(HAVE_NETDEV_XSK_LAUNCH_TIME)
 static_assert(XSK_TX_LAUNCH_TIME_FIFO == NETDEV_XSK_FLAGS_TX_LAUNCH_TIME_FIFO);
 #    endif
 #endif
