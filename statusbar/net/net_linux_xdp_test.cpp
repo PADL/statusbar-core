@@ -312,6 +312,20 @@ TEST(xdp_bind_flags, auto_binds_copy_under_a_generic_program)
     EXPECT_EQ(detail::bind_flags_for(XdpBindMode::auto_, XdpAttachMode::native), 0);
 }
 
+TEST(xdp_bind_flags, only_auto_needs_the_attach_before_the_bind)
+{
+    // Under auto_ the flags follow the attach, so the attach goes first.
+    // Under an explicit mode they do not, and the bind goes first so that a
+    // refused zero-copy bind - the one a caller retries in copy mode - costs
+    // no attach and detach round trip on the interface.
+    static_assert(detail::attach_precedes_bind(XdpBindMode::auto_));
+    static_assert(!detail::attach_precedes_bind(XdpBindMode::zero_copy));
+    static_assert(!detail::attach_precedes_bind(XdpBindMode::copy));
+    EXPECT_TRUE(detail::attach_precedes_bind(XdpBindMode::auto_));
+    EXPECT_FALSE(detail::attach_precedes_bind(XdpBindMode::zero_copy));
+    EXPECT_FALSE(detail::attach_precedes_bind(XdpBindMode::copy));
+}
+
 TEST(xdp_bind_flags, an_explicit_bind_mode_is_kept_whatever_the_attach)
 {
     for (auto const attached : {XdpAttachMode::native, XdpAttachMode::generic}) {

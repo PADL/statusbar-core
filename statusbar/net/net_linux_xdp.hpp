@@ -994,6 +994,18 @@ namespace detail {
     return 0;
 }
 
+/// Whether open() must attach the program before the socket binds: only
+/// under auto_, where the bind flags depend on the mode the attach lands in
+/// (bind_flags_for()). Under an explicit mode the flags are fixed, and the
+/// bind goes first so that a bind the driver refuses costs no attach and no
+/// detach - each an adapter reset on some drivers (igb), and the refused
+/// zero-copy bind is exactly the one a caller then retries in copy mode.
+/// @param bind The bind mode asked for
+[[nodiscard]] constexpr auto attach_precedes_bind(XdpBindMode const bind) noexcept -> bool
+{
+    return bind == XdpBindMode::auto_;
+}
+
 /// The bind flag once the program's attach mode is known. auto_ leaves the
 /// choice to the kernel only under a native program: a zero-copy queue is
 /// driven by the driver's own XDP path, which generic XDP - running in the

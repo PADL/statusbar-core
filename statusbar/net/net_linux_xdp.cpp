@@ -1206,9 +1206,9 @@ auto XdpContext::open(XdpConfig const& config) -> Status
 
     // Step 3: The program. With a pin path it may already be on the
     // interface from a previous run, in which case adopting it is the point
-    // of the whole exercise: no detach, no re-attach, no gap. Either way the
-    // program is on the interface before the socket binds (step 4), so the
-    // bind can answer to the mode it is attached in.
+    // of the whole exercise: no detach, no re-attach, no gap. Under auto_
+    // the program is on the interface before the socket binds (step 4), so
+    // the bind can answer to the mode it is attached in.
     if (pinning && config.adopt) {
         // Best effort by design. A pin left by an older build of ours, or a
         // half-written one, is not an error - it only means there is nothing
@@ -1240,16 +1240,23 @@ auto XdpContext::open(XdpConfig const& config) -> Status
             close();
             return status;
         }
-        // Step 3b: Attach it now, before the socket binds, so the bind flags
-        // can follow the mode the attach actually landed in: a fall-back to
-        // generic must not leave a zero-copy socket behind it. Until the
-        // socket is registered (step 5) the program's redirect finds no
-        // socket for the queue and the frame goes on to the kernel, as it
-        // did before the program was there; an adopted program has the same
-        // gap, left by the socket that died.
-        if (auto status = bpf_.attach(interface_.index, *plan); !status) {
-            close();
-            return status;
+        // Step 3b: Under auto_ the bind flags follow the mode the attach
+        // lands in - a fall-back to generic must not leave a zero-copy
+        // socket behind it - so the program is attached now, before the
+        // socket binds. Under an explicit mode the flags are fixed and the
+        // attach waits for the bind (step 5): a bind that fails - zero-copy
+        // refused by the driver, a queue still busy once the retries are
+        // spent - then costs no attach and no detach, each of which is an
+        // adapter reset on some drivers (igb). Until the socket is
+        // registered (step 5) the program's redirect finds no socket for the
+        // queue and the frame goes on to the kernel, as it did before the
+        // program was there; an adopted program has the same gap, left by
+        // the socket that died.
+        if (detail::attach_precedes_bind(config.bind_mode)) {
+            if (auto status = bpf_.attach(interface_.index, *plan); !status) {
+                close();
+                return status;
+            }
         }
     }
 
@@ -1301,8 +1308,16 @@ auto XdpContext::open(XdpConfig const& config) -> Status
     bind_retries_ = pauses;
     zero_copy_ = detail::socket_has_zero_copy(xsk_socket__fd(xsk_));
 
-    // Step 5: Register the socket with the attached program, adopted or
-    // fresh: the xsk_map entry for the queue is ours to fill either way.
+    // Step 5: A fresh program not attached at step 3b is attached now that
+    // the socket is bound; then the socket is registered with the attached
+    // program, adopted or fresh: the xsk_map entry for the queue is ours to
+    // fill either way.
+    if (!bpf_.adopted() && !detail::attach_precedes_bind(config.bind_mode)) {
+        if (auto status = bpf_.attach(interface_.index, *plan); !status) {
+            close();
+            return status;
+        }
+    }
     if (auto status = bpf_.register_xsk(config.queue_id, xsk_socket__fd(xsk_)); !status) {
         close();
         return status;
