@@ -4,8 +4,9 @@
 // SPDX-License-Identifier: MIT
 
 /// One interface's readiness for IPv4 traffic from rtnetlink, for a caller that waits out an adapter reset its own
-/// qdisc change set off (igb and igc reset asynchronously when an offload switches the transmit mode): the carrier
-/// (RTM_NEWLINK), the IPv4 addresses (RTM_NEWADDR, RTM_DELADDR) and the qdisc changes (RTM_NEWQDISC, RTM_DELQDISC).
+/// qdisc change set off (igb and igc reset asynchronously when an offload switches the transmit mode), or another
+/// change it reports (an ethtool ring change): the carrier (RTM_NEWLINK), the IPv4 addresses (RTM_NEWADDR,
+/// RTM_DELADDR) and the qdisc changes (RTM_NEWQDISC, RTM_DELQDISC).
 
 #if defined(__linux__)
 
@@ -64,6 +65,9 @@ class LinkReadiness
     [[nodiscard]] auto apply(std::span<uint8_t const> message, int64_t now_ns) -> StatusValue<bool>;
     /// Forget the addresses, before a dump reports them afresh.
     void forget_addresses() noexcept { address_count_ = 0; }
+    /// The caller made a change at @p now_ns that may reset the adapter and sends no qdisc message (ETHTOOL_SRINGPARAM):
+    /// checked as a qdisc change applied then. Call it after the change and before reading the messages it set off.
+    void notify_change(int64_t const now_ns) noexcept { apply_qdisc_change(now_ns); }
     /// Notifications were lost at @p now_ns (an overrun): a qdisc change may have gone unseen, so one is assumed
     /// unless one was seen; a carrier loss seen still counts.
     void notifications_lost(int64_t now_ns) noexcept;
@@ -79,7 +83,8 @@ class LinkReadiness
     [[nodiscard]] auto carrier_lost() const noexcept -> bool { return carrier_lost_; }
     /// Whether the interface has an IPv4 address.
     [[nodiscard]] auto has_ipv4() const noexcept -> bool { return address_count_ > 0; }
-    /// When a qdisc of the interface was last added, changed or deleted, as read; nullopt for never.
+    /// When a qdisc of the interface was last added, changed or deleted, as read, or a change was notified
+    /// (notify_change()); nullopt for never.
     [[nodiscard]] auto last_qdisc_change_ns() const noexcept -> std::optional<int64_t> { return qdisc_change_ns_; }
 
   private:
@@ -118,6 +123,9 @@ class LinkWatch
     [[nodiscard]] auto read(int64_t now_ns) -> Status;
     /// The interface as read so far.
     [[nodiscard]] auto readiness() const noexcept -> LinkReadiness const& { return readiness_; }
+    /// LinkReadiness::notify_change(): a change of the caller's at @p now_ns that sends no qdisc message, made after
+    /// the watch opened; await_reset() then waits it out.
+    void notify_change(int64_t const now_ns) noexcept { readiness_.notify_change(now_ns); }
 
   private:
     /// What one recv() did.
@@ -170,7 +178,7 @@ struct ResetWaitPolicy
 enum class ResetWaitState : uint8_t
 {
     waiting,    ///< not settled yet
-    unchanged,  ///< no qdisc changed: nothing to wait for
+    unchanged,  ///< no qdisc changed and no change notified: nothing to wait for
     no_reset,   ///< qdiscs changed, but no carrier loss within the settle time
     ready,      ///< the carrier was lost and is back, with an IPv4 address when the policy asks
     timed_out,  ///< the carrier was lost and is not back within the timeout
