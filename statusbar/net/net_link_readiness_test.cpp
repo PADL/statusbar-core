@@ -310,6 +310,35 @@ TEST(net_link_readiness, lost_notifications_assume_a_change_and_keep_a_loss)
     EXPECT_EQ(reset_wait_state(cycled, policy, 4000 * MS), ResetWaitState::waiting);  // the address not back
 }
 
+TEST(net_link_readiness, a_notified_change_is_waited_out_as_a_qdisc_change)
+{
+    if (!LITTLE) {
+        SKIP("the messages are little-endian bytes");
+    }
+    ResetWaitPolicy const policy{.ipv4 = false};
+    LinkReadiness link{3};
+    EXPECT_TRUE(link.apply(link_report(true, 7), 0).has_value());
+    EXPECT_EQ(reset_wait_state(link, policy, 0), ResetWaitState::unchanged);
+    link.notify_change(1000 * MS);  // a ring change: the adapter resets, no qdisc message
+    EXPECT_EQ(reset_wait_state(link, policy, 1000 * MS), ResetWaitState::waiting);
+    EXPECT_TRUE(link.apply(link_report(false, 8), 1500 * MS).has_value());
+    EXPECT_EQ(reset_wait_state(link, policy, 4000 * MS), ResetWaitState::waiting);
+    EXPECT_TRUE(link.apply(link_report(true, 8), 4000 * MS).has_value());
+    EXPECT_EQ(reset_wait_state(link, policy, 4000 * MS), ResetWaitState::ready);
+}
+
+TEST(net_link_readiness, a_notified_change_without_a_loss_is_no_reset)
+{
+    if (!LITTLE) {
+        SKIP("the messages are little-endian bytes");
+    }
+    LinkReadiness link{3};
+    EXPECT_TRUE(link.apply(link_report(true, 7), 0).has_value());
+    link.notify_change(1000 * MS);
+    EXPECT_EQ(reset_wait_state(link, ResetWaitPolicy{}, 2999 * MS), ResetWaitState::waiting);
+    EXPECT_EQ(reset_wait_state(link, ResetWaitPolicy{}, 3000 * MS), ResetWaitState::no_reset);
+}
+
 TEST(net_link_readiness, apply_says_which_message_was_the_link_report)
 {
     if (!LITTLE) {
