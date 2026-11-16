@@ -37,6 +37,68 @@ TEST(buffer_builder_basic, error_stops_chain)
     EXPECT_EQ(builder.get_span().size(), 4);  // Only first append succeeded
 }
 
+TEST(buffer_builder_fail, a_codecs_own_failure_joins_the_chain_and_the_first_error_wins)
+{
+    // A codec that refuses a value has nowhere to put the refusal but a
+    // sticky error of its own beside the builder's; fail() makes it the
+    // chain's, so one status() reports both kinds.
+    BufferSerializerBuilderWithStorage<8> builder;
+    builder.append(uint8_t{1}).fail(std::make_error_code(std::errc::value_too_large)).append(uint8_t{2});
+    EXPECT_FALSE(builder.status().has_value());
+    EXPECT_TRUE(builder.error() == std::make_error_code(std::errc::value_too_large));
+    EXPECT_EQ(builder.get_span().size(), size_t{1});  // the append after the failure was skipped
+
+    // A chain already failed keeps its first error.
+    builder.fail(std::make_error_code(std::errc::invalid_argument));
+    EXPECT_TRUE(builder.error() == std::make_error_code(std::errc::value_too_large));
+
+    // An empty code records nothing.
+    BufferSerializerBuilderWithStorage<8> fine;
+    fine.append(uint8_t{1}).fail(std::error_code{}).append(uint8_t{2});
+    EXPECT_TRUE(fine.status().has_value());
+    EXPECT_EQ(fine.get_span().size(), size_t{2});
+
+    // The same on the reader.
+    std::array<uint8_t, 4> const bytes{1, 2, 3, 4};
+    BufferDeserializerBuilder reader{bytes};
+    uint8_t first = 0;
+    uint8_t second = 0;
+    reader.parse(&first).fail(std::make_error_code(std::errc::result_out_of_range)).parse(&second);
+    EXPECT_EQ(first, 1);
+    EXPECT_EQ(second, 0);  // skipped
+    EXPECT_TRUE(reader.error() == std::make_error_code(std::errc::result_out_of_range));
+}
+
+TEST(buffer_builder_remaining, the_unparsed_bytes_as_a_span)
+{
+    std::array<uint8_t, 6> const bytes{10, 20, 30, 40, 50, 60};
+    BufferDeserializerBuilder reader{bytes};
+    EXPECT_EQ(reader.available(), size_t{6});
+    EXPECT_EQ(reader.remaining().size(), size_t{6});
+    EXPECT_EQ(reader.remaining().data(), bytes.data());
+
+    uint16_t head = 0;
+    reader.parse(&head);
+    EXPECT_EQ(reader.available(), size_t{4});
+    EXPECT_EQ(reader.remaining().size(), size_t{4});
+    EXPECT_EQ(reader.remaining()[0], 30);
+    EXPECT_EQ(reader.remaining().data(), bytes.data() + 2);
+
+    // A nested parser over what is left, as a codec would hand it.
+    BufferDeserializerBuilder nested{reader.remaining()};
+    uint32_t tail = 0;
+    nested.parse(&tail);
+    EXPECT_TRUE(nested.status().has_value());
+    EXPECT_EQ(nested.remaining().size(), size_t{0});
+
+    // Unaffected by the error state; empty at the end.
+    reader.skip(4);
+    EXPECT_TRUE(reader.remaining().empty());
+    reader.skip(1);
+    EXPECT_FALSE(reader.status().has_value());
+    EXPECT_TRUE(reader.remaining().empty());
+}
+
 TEST(buffer_builder_basic, get_buffer)
 {
     BufferSerializerBuilderWithStorage<16> builder{};

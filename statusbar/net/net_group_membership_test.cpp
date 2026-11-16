@@ -4,6 +4,9 @@
 #include "statusbar/net/net_socket.hpp"
 #include "statusbar/test/test.hpp"
 
+#include <array>
+#include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <system_error>
 
@@ -16,6 +19,110 @@ using namespace statusbar::net;
 
 // Joining on loopback needs no privilege and no hardware, so the whole path -
 // socket, setsockopt, the ip_mreqn the platform wants - is exercised here.
+TEST(ipv4_sockaddr, an_endpoint_goes_into_a_sockaddr_in_and_comes_back)
+{
+    statusbar::ip::IPv4Address const address{192, 168, 50, 77};
+    sockaddr_in const in = ipv4_sockaddr_in(address, 319);
+    EXPECT_EQ(in.sin_family, AF_INET);
+    EXPECT_EQ(ntohs(in.sin_port), 319);
+    EXPECT_EQ(ntohl(in.sin_addr.s_addr), address.to_uint32());
+
+    auto const back = ipv4_endpoint(in);
+    EXPECT_TRUE(back.address == address);
+    EXPECT_EQ(back.port, 319);
+    EXPECT_TRUE(back == (IPv4Endpoint{.address = address, .port = 319}));
+
+    // The address-only form leaves the port 0, which the two-argument form
+    // sets; both agree on everything else.
+    sockaddr_in const bare = ipv4_sockaddr_in(address);
+    EXPECT_EQ(bare.sin_port, 0);
+    EXPECT_EQ(bare.sin_addr.s_addr, in.sin_addr.s_addr);
+    EXPECT_EQ(ipv4_endpoint(bare).port, 0);
+}
+
+TEST(multicast_all, a_receiver_turns_host_wide_delivery_off)
+{
+    int const fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    EXPECT_TRUE(fd >= 0);
+    EXPECT_TRUE(set_multicast_all(fd, false).has_value());
+#if defined(IP_MULTICAST_ALL)
+    int value = -1;
+    socklen_t len = sizeof(value);
+    EXPECT_EQ(::getsockopt(fd, IPPROTO_IP, IP_MULTICAST_ALL, &value, &len), 0);
+    EXPECT_EQ(value, 0);
+    EXPECT_TRUE(set_multicast_all(fd, true).has_value());
+    EXPECT_EQ(::getsockopt(fd, IPPROTO_IP, IP_MULTICAST_ALL, &value, &len), 0);
+    EXPECT_EQ(value, 1);
+#else
+    // No such option here: the stack filters per socket, so "off" is the
+    // state in force and "on" cannot be had.
+    auto const on = set_multicast_all(fd, true);
+    EXPECT_FALSE(on.has_value());
+    if (!on) {
+        EXPECT_TRUE((on.error() == std::error_code{ENOPROTOOPT, std::system_category()}));
+    }
+#endif
+    (void)::close(fd);
+}
+
+TEST(pktinfo, a_datagram_is_known_by_the_address_and_interface_it_arrived_on)
+{
+    // A receiver bound to INADDR_ANY on a port, asked for IP_PKTINFO; a
+    // sender on loopback. The control message names 127.0.0.1 and the
+    // loopback interface, and destined_for() reads exactly that.
+    int const rx = ::socket(AF_INET, SOCK_DGRAM, 0);
+    int const tx = ::socket(AF_INET, SOCK_DGRAM, 0);
+    EXPECT_TRUE(rx >= 0 && tx >= 0);
+    EXPECT_TRUE(set_receive_pktinfo(rx).has_value());
+    sockaddr_in any = ipv4_sockaddr_in(statusbar::ip::IPv4Address{0, 0, 0, 0}, 0);
+    EXPECT_EQ(
+        ::bind(rx, reinterpret_cast<sockaddr const*>(&any), sizeof(any)),
+        0);  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+    socklen_t any_len = sizeof(any);
+    EXPECT_EQ(
+        ::getsockname(rx, reinterpret_cast<sockaddr*>(&any), &any_len), 0);  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+    uint16_t const port = ipv4_endpoint(any).port;
+    EXPECT_TRUE(port != 0);
+
+    statusbar::ip::IPv4Address const loopback{127, 0, 0, 1};
+    sockaddr_in const to = ipv4_sockaddr_in(loopback, port);
+    std::array<uint8_t, 4> const payload{0xDE, 0xAD, 0xBE, 0xEF};
+    EXPECT_EQ(
+        ::sendto(tx, payload.data(), payload.size(), 0, reinterpret_cast<sockaddr const*>(&to), sizeof(to)),
+        4);  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+
+    std::array<uint8_t, 64> buffer{};
+    alignas(cmsghdr) std::array<uint8_t, CMSG_SPACE(sizeof(in_pktinfo)) + CMSG_SPACE(64)> control{};
+    iovec iov{.iov_base = buffer.data(), .iov_len = buffer.size()};
+    msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.data();
+    msg.msg_controllen = control.size();
+    ssize_t const got = ::recvmsg(rx, &msg, 0);
+    EXPECT_EQ(got, 4);
+
+    auto const info = pktinfo_of(msg);
+    EXPECT_TRUE(info.has_value());
+    unsigned int lo_index = if_nametoindex("lo");
+    if (lo_index == 0) {
+        lo_index = if_nametoindex("lo0");
+    }
+    EXPECT_TRUE(lo_index != 0);
+    EXPECT_TRUE(destined_for(msg, loopback, 0));
+    EXPECT_TRUE(destined_for(msg, loopback, lo_index));
+    EXPECT_FALSE(destined_for(msg, statusbar::ip::IPv4Address{127, 0, 0, 2}, 0));  // another address
+    EXPECT_FALSE(destined_for(msg, loopback, lo_index + 1000));                    // another interface
+
+    // Without the control message nothing is accepted.
+    msghdr bare{};
+    EXPECT_FALSE(pktinfo_of(bare).has_value());
+    EXPECT_FALSE(destined_for(bare, loopback, 0));
+
+    (void)::close(rx);
+    (void)::close(tx);
+}
+
 TEST(group_membership, a_group_is_joined_on_the_named_interface_and_held)
 {
 #if defined(__linux__)

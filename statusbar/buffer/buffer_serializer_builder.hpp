@@ -175,6 +175,23 @@ class BufferSerializerBuilder
     [[nodiscard]] auto status() const noexcept -> Status { return error_ ? failure(error_) : success(); }
 
     ///
+    /// Record a failure of the caller's own - a value a codec refuses to
+    /// encode, a length that does not fit its field - as this chain's error,
+    /// so the codec needs no sticky error of its own beside the builder's.
+    /// The first error wins, as for every step: a chain already failed keeps
+    /// its error. Steps after it are skipped as usual.
+    ///
+    /// \param error The error to record; an empty code records nothing.
+    ///
+    auto fail(std::error_code const error) noexcept -> BufferSerializerBuilder&
+    {
+        if (!error_ && error) {
+            error_ = error;
+        }
+        return *this;
+    }
+
+    ///
     /// Check if all operations succeeded.
     ///
     /// \return true if no errors occurred.

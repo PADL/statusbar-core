@@ -16,6 +16,7 @@ statusbar_add_module(
   buffer_deserializer_test.cpp
   buffer_protocol_test.cpp
   buffer_traits_test.cpp
+  file_write_test.cpp
   span_utils_test.cpp)
 
 add_executable(buffer_bench_tool

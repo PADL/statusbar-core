@@ -342,6 +342,38 @@ using FileDescriptor = ::statusbar::FileDescriptor;
     return in;
 }
 
+/// `address` and `port` (host order) as a sockaddr_in: what bind(), connect()
+/// and sendto() take for an IPv4 endpoint. sin_len is filled where the field
+/// exists, as above.
+/// @param address The IPv4 address
+/// @param port The UDP or TCP port, host byte order
+[[nodiscard]] inline auto ipv4_sockaddr_in(ip::IPv4Address const& address, uint16_t const port) noexcept -> sockaddr_in
+{
+    sockaddr_in in = ipv4_sockaddr_in(address);
+    in.sin_port = htons(port);
+    return in;
+}
+
+/// An IPv4 endpoint as a program reads it: the address and the port in host
+/// order, out of the sockaddr_in a recvfrom(), accept() or getsockname()
+/// filled. The inverse of ipv4_sockaddr_in(address, port).
+struct IPv4Endpoint
+{
+    ip::IPv4Address address{};
+    uint16_t port{0};
+
+    [[nodiscard]] constexpr auto operator==(IPv4Endpoint const&) const noexcept -> bool = default;
+};
+
+/// The endpoint `in` names. sin_family is not checked: a sockaddr_in is an
+/// IPv4 address by type, and a caller with a sockaddr_storage checks the
+/// family before casting.
+/// @param in The address as the kernel filled it
+[[nodiscard]] inline auto ipv4_endpoint(sockaddr_in const& in) noexcept -> IPv4Endpoint
+{
+    return IPv4Endpoint{.address = ip::IPv4Address{ntohl(in.sin_addr.s_addr)}, .port = ntohs(in.sin_port)};
+}
+
 /// ipv4_sockaddr_in() widened to the sockaddr_storage the options take.
 [[nodiscard]] inline auto ipv4_sockaddr_storage(ip::IPv4Address const& address) noexcept -> sockaddr_storage
 {
@@ -474,6 +506,93 @@ using FileDescriptor = ::statusbar::FileDescriptor;
     bool const set = family == AF_INET6 ? ::setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &hops, sizeof(hops)) == 0
                                         : ::setsockopt(fd, IPPROTO_IP, IP_TTL, &hops, sizeof(hops)) == 0;
     return set ? success() : failure(errno_code());
+}
+
+/// Whether an IPv4 datagram socket receives every multicast group any socket
+/// on the host has joined (IP_MULTICAST_ALL, ip(7)), or only the groups it
+/// joined itself. Linux delivers every group by default, so a socket joined
+/// to one AVB group also hears the mDNS, SSDP and PTP groups its neighbours
+/// joined, each a datagram to read and drop: a receiver turns it off. The
+/// option is Linux's; Darwin and the BSDs filter per socket already and have
+/// no such option, so there `on == false` is the state in force and succeeds,
+/// while `on == true` cannot be had and fails as ENOPROTOOPT.
+/// @param fd An IPv4 datagram socket
+/// @param on Whether every host-wide group is delivered to this socket
+[[nodiscard]] inline auto set_multicast_all(int const fd, bool const on) noexcept -> Status
+{
+#if defined(IP_MULTICAST_ALL)
+    int const value = on ? 1 : 0;
+    if (::setsockopt(fd, IPPROTO_IP, IP_MULTICAST_ALL, &value, sizeof(value)) != 0) {
+        return failure(errno_code());
+    }
+    return success();
+#else
+    (void)fd;
+    return on ? failure(std::error_code{ENOPROTOOPT, std::system_category()}) : success();
+#endif
+}
+
+/// Ask an IPv4 datagram socket for the IP_PKTINFO control message on every
+/// datagram it receives: the interface it arrived on and the address it was
+/// sent to, which destined_for() then reads from the msghdr recvmsg() filled.
+/// IP_PKTINFO on Linux (ip(7)), IP_RECVPKTINFO on Darwin and the BSDs.
+/// @param fd An IPv4 datagram socket
+[[nodiscard]] inline auto set_receive_pktinfo(int const fd) noexcept -> Status
+{
+    int const on = 1;
+#if defined(IP_RECVPKTINFO)
+    int const option = IP_RECVPKTINFO;
+#else
+    int const option = IP_PKTINFO;
+#endif
+    if (::setsockopt(fd, IPPROTO_IP, option, &on, sizeof(on)) != 0) {
+        return failure(errno_code());
+    }
+    return success();
+}
+
+/// The IP_PKTINFO control message in `msg`, if recvmsg() delivered one:
+/// nullopt when the socket was not asked for it (set_receive_pktinfo()) or
+/// the control buffer was too small to hold it.
+/// @param msg The msghdr recvmsg() filled, msg_control pointing at a buffer
+[[nodiscard]] inline auto pktinfo_of(msghdr const& msg) noexcept -> std::optional<in_pktinfo>
+{
+    // CMSG_FIRSTHDR and CMSG_NXTHDR take a non-const msghdr by signature on
+    // every libc, and read it only.
+    auto* const mutable_msg = const_cast<msghdr*>(&msg);  // NOLINT(cppcoreguidelines-pro-type-const-cast)
+    for (cmsghdr const* cmsg = CMSG_FIRSTHDR(mutable_msg); cmsg != nullptr;
+         cmsg = CMSG_NXTHDR(mutable_msg, const_cast<cmsghdr*>(cmsg))) {  // NOLINT(cppcoreguidelines-pro-type-const-cast)
+        if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO && cmsg->cmsg_len >= CMSG_LEN(sizeof(in_pktinfo))) {
+            in_pktinfo info{};
+            std::memcpy(&info, CMSG_DATA(cmsg), sizeof(info));
+            return info;
+        }
+    }
+    return std::nullopt;
+}
+
+/// Whether the datagram recvmsg() described in `msg` was sent to `address`
+/// on the interface with index `interface_index` (0: any interface), read
+/// from its IP_PKTINFO control message. A socket bound to INADDR_ANY, or to a
+/// multicast group, receives datagrams for every address the host answers
+/// to on every interface; this is the check that the one in hand is the one
+/// the protocol wanted - the AVB group on the AVB port, not the same group
+/// arriving over the management interface. False without the control
+/// message, so a socket never asked for it (set_receive_pktinfo()) accepts
+/// nothing rather than everything.
+/// @param msg The msghdr recvmsg() filled, msg_control pointing at a buffer
+/// @param address The destination the datagram must carry
+/// @param interface_index The interface it must have arrived on, or 0 for any
+[[nodiscard]] inline auto destined_for(
+    msghdr const& msg, ip::IPv4Address const& address, unsigned int const interface_index) noexcept -> bool
+{
+    auto const info = pktinfo_of(msg);
+    if (!info) {
+        return false;
+    }
+    bool const same_address = ntohl(info->ipi_addr.s_addr) == address.to_uint32();
+    bool const same_interface = interface_index == 0 || static_cast<unsigned int>(info->ipi_ifindex) == interface_index;
+    return same_address && same_interface;
 }
 
 /// Prepare an IPv4 or IPv6 (`family`) socket to send unicast: out of the

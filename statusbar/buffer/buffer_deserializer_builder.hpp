@@ -124,6 +124,12 @@ class BufferDeserializer
     [[nodiscard]] auto available() const noexcept -> size_t { return next_span_.size(); }
 
     ///
+    /// The bytes not yet parsed, from the cursor to the end of the buffer:
+    /// what a codec hands to a nested parser, or checks the length of.
+    ///
+    [[nodiscard]] auto remaining() const noexcept -> std::span<uint8_t const> { return next_span_; }
+
+    ///
     /// Get the current deserializer position in the buffer.
     ///
     /// \return The byte offset from the start of the buffer.
@@ -338,6 +344,35 @@ class BufferDeserializerBuilder
     /// \return Status indicating success if no errors occurred, or the first error.
     ///
     [[nodiscard]] auto status() const noexcept -> Status { return error_ ? failure(error_) : success(); }
+
+    ///
+    /// Record a failure of the caller's own - a field value the codec
+    /// refuses, a count the remaining bytes cannot hold - as this chain's
+    /// error, so the codec needs no sticky error of its own beside the
+    /// builder's. The first error wins, as for every step: a chain already
+    /// failed keeps its error. Steps after it are skipped as usual.
+    ///
+    /// \param error The error to record; an empty code records nothing.
+    ///
+    auto fail(std::error_code const error) noexcept -> BufferDeserializerBuilder&
+    {
+        if (!error_ && error) {
+            error_ = error;
+        }
+        return *this;
+    }
+
+    ///
+    /// The bytes not yet parsed, from the cursor to the end: what a codec
+    /// hands to a nested parser or measures before a parse() of a counted
+    /// field. Unaffected by the error state; empty at the end.
+    ///
+    [[nodiscard]] auto remaining() const noexcept -> std::span<uint8_t const> { return deserializer_.remaining(); }
+
+    ///
+    /// The number of bytes not yet parsed: remaining().size().
+    ///
+    [[nodiscard]] auto available() const noexcept -> size_t { return deserializer_.available(); }
 
     ///
     /// Check if all operations succeeded.
