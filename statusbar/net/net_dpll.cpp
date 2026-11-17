@@ -1,0 +1,503 @@
+// Copyright 2026 Jeff Koftinoff <jeff.koftinoff@statusbar.com>
+// SPDX-License-Identifier: MIT
+
+#include "statusbar/net/net_dpll.hpp"
+
+#include "statusbar/buffer/buffer.hpp"
+#include "statusbar/buffer/span_utils.hpp"
+
+#include <cerrno>
+#include <system_error>
+#include <utility>
+
+#if defined(__linux__)
+#    include <unistd.h>
+
+#    include <linux/genetlink.h>
+#    include <linux/netlink.h>
+#    include <sys/socket.h>
+#    if __has_include(<linux/dpll.h>)
+#        include <linux/dpll.h>
+#    endif
+#endif
+
+namespace statusbar::net::dpll {
+
+#if defined(__linux__)
+static_assert(CTRL_MCAST_GROUPS == CTRL_ATTR_MCAST_GROUPS && CTRL_MCAST_GRP_NAME == CTRL_ATTR_MCAST_GRP_NAME);
+static_assert(CTRL_MCAST_GRP_ID == CTRL_ATTR_MCAST_GRP_ID);
+#    if defined(DPLL_FAMILY_VERSION)
+// The dpll header spells its attributes and commands as enumerators, so they
+// are checked here, where the build's headers have the family (Linux 6.7).
+static_assert(FAMILY_NAME == DPLL_FAMILY_NAME && FAMILY_VERSION == DPLL_FAMILY_VERSION && MONITOR_GROUP == DPLL_MCGRP_MONITOR);
+static_assert(CMD_DEVICE_GET == DPLL_CMD_DEVICE_GET && CMD_DEVICE_CREATE_NTF == DPLL_CMD_DEVICE_CREATE_NTF);
+static_assert(CMD_DEVICE_DELETE_NTF == DPLL_CMD_DEVICE_DELETE_NTF && CMD_DEVICE_CHANGE_NTF == DPLL_CMD_DEVICE_CHANGE_NTF);
+static_assert(A_ID == DPLL_A_ID && A_MODULE_NAME == DPLL_A_MODULE_NAME && A_CLOCK_ID == DPLL_A_CLOCK_ID && A_MODE == DPLL_A_MODE);
+static_assert(A_LOCK_STATUS == DPLL_A_LOCK_STATUS && A_TEMP == DPLL_A_TEMP && A_TYPE == DPLL_A_TYPE);
+static_assert(A_LOCK_STATUS_ERROR == DPLL_A_LOCK_STATUS_ERROR);
+static_assert(
+    static_cast<uint32_t>(Mode::manual) == DPLL_MODE_MANUAL && static_cast<uint32_t>(Mode::automatic) == DPLL_MODE_AUTOMATIC);
+static_assert(static_cast<uint32_t>(LockStatus::unlocked) == DPLL_LOCK_STATUS_UNLOCKED);
+static_assert(static_cast<uint32_t>(LockStatus::locked) == DPLL_LOCK_STATUS_LOCKED);
+static_assert(static_cast<uint32_t>(LockStatus::locked_holdover_acquired) == DPLL_LOCK_STATUS_LOCKED_HO_ACQ);
+static_assert(static_cast<uint32_t>(LockStatus::holdover) == DPLL_LOCK_STATUS_HOLDOVER);
+static_assert(static_cast<uint32_t>(LockStatusError::none) == DPLL_LOCK_STATUS_ERROR_NONE);
+static_assert(static_cast<uint32_t>(LockStatusError::media_down) == DPLL_LOCK_STATUS_ERROR_MEDIA_DOWN);
+static_assert(
+    static_cast<uint32_t>(LockStatusError::fractional_frequency_offset_too_high) ==
+    DPLL_LOCK_STATUS_ERROR_FRACTIONAL_FREQUENCY_OFFSET_TOO_HIGH);
+static_assert(static_cast<uint32_t>(Type::pps) == DPLL_TYPE_PPS && static_cast<uint32_t>(Type::eec) == DPLL_TYPE_EEC);
+#    endif
+#endif
+
+namespace {
+
+using netdev::GENL_CONTROLLER_ID;
+using netdev::GENL_HEADER;
+
+/// A fixed-size attribute's value into `out`; bad_message when the payload is another size.
+template <typename T>
+[[nodiscard]] auto read_scalar(std::span<uint8_t const> const payload, T& out) -> Status
+{
+    if (payload.size() != sizeof(T)) {
+        return failure(netlink::bad_message());
+    }
+    out = netlink::load<T>(payload, 0);
+    return success();
+}
+
+/// A u32 attribute into an enum of that width.
+template <typename E>
+[[nodiscard]] auto read_enum(std::span<uint8_t const> const payload, E& out) -> Status
+{
+    uint32_t value = 0;
+    if (auto read = read_scalar(payload, value); !read) {
+        return read;
+    }
+    out = static_cast<E>(value);
+    return success();
+}
+
+/// A string attribute, its NUL and anything after it dropped.
+[[nodiscard]] auto read_string(std::span<uint8_t const> const payload) -> std::string
+{
+    std::string text{};
+    for (auto const octet : payload) {
+        if (octet == 0) {
+            break;
+        }
+        text.push_back(static_cast<char>(octet));
+    }
+    return text;
+}
+
+/// One DPLL_A_* attribute into `device`; the id into `id`, so a message
+/// without one is told from a device 0.
+[[nodiscard]] auto read_device_attribute(
+    uint16_t const type, std::span<uint8_t const> const payload, Device& device, std::optional<uint32_t>& id) -> Status
+{
+    switch (type & netlink::TYPE_MASK) {
+        case A_ID:
+            return read_scalar(payload, id.emplace());
+        case A_MODULE_NAME:
+            device.module_name = read_string(payload);
+            return success();
+        case A_CLOCK_ID:
+            return read_scalar(payload, device.clock_id);
+        case A_MODE:
+            return read_enum(payload, device.mode);
+        case A_LOCK_STATUS:
+            return read_enum(payload, device.lock_status);
+        case A_LOCK_STATUS_ERROR:
+            return read_enum(payload, device.lock_status_error);
+        case A_TYPE:
+            return read_enum(payload, device.type);
+        case A_TEMP:
+            return read_scalar(payload, device.temperature_millicelsius.emplace());
+        default:
+            return success();  // the pad, the supported modes, the quality level, whatever a later kernel adds
+    }
+}
+
+/// `found`, or the error that stopped the walk, or bad_message when the walk
+/// finished without finding what the message had to carry.
+template <typename T>
+[[nodiscard]] auto required(Status const& walked, std::optional<T> const& found) -> StatusValue<T>
+{
+    if (!walked) {
+        return failure(walked.error());
+    }
+    if (!found) {
+        return failure(netlink::bad_message());
+    }
+    return *found;
+}
+
+/// One multicast group of a CTRL_ATTR_MCAST_GROUPS list: its name and id.
+struct Group
+{
+    std::string name{};
+    std::optional<uint32_t> id{};
+};
+
+[[nodiscard]] auto read_group(std::span<uint8_t const> const attributes) -> StatusValue<Group>
+{
+    Group group{};
+    auto const walked =
+        netlink::walk_attributes(attributes, [&](uint16_t const type, std::span<uint8_t const> const payload) -> Status {
+            switch (type & netlink::TYPE_MASK) {
+                case CTRL_MCAST_GRP_NAME:
+                    group.name = read_string(payload);
+                    return success();
+                case CTRL_MCAST_GRP_ID:
+                    return read_scalar(payload, group.id.emplace());
+                default:
+                    return success();
+            }
+        });
+    if (!walked) {
+        return failure(walked.error());
+    }
+    return group;
+}
+
+/// The id of the group called MONITOR_GROUP in a CTRL_ATTR_MCAST_GROUPS list,
+/// written to `monitor` when found.
+[[nodiscard]] auto read_groups(std::span<uint8_t const> const groups, uint32_t& monitor) -> Status
+{
+    return netlink::walk_attributes(groups, [&](uint16_t, std::span<uint8_t const> const entry) -> Status {
+        auto const group = read_group(entry);
+        if (!group) {
+            return failure(group.error());
+        }
+        if (group->name == MONITOR_GROUP && group->id.has_value()) {
+            monitor = *group->id;
+        }
+        return success();
+    });
+}
+
+/// One request of `length` octets into `out`: the netlink header under
+/// `flags`, the generic-netlink header for `cmd`, then what `attributes` appends.
+template <typename Attributes>
+[[nodiscard]] auto build_message(
+    std::span<uint8_t> const out,
+    size_t const length,
+    uint16_t const type,
+    uint16_t const flags,
+    uint32_t const seq,
+    uint8_t const cmd,
+    Attributes const& attributes) -> StatusValue<size_t>
+{
+    MutableBuffer buffer{out};
+    BufferSerializerBuilder b{buffer};
+    netlink::put_header(b, length, type, flags, seq);
+    b.append(cmd).append(FAMILY_VERSION).append(uint16_t{0});
+    attributes(b);
+    return netlink::finish(b, length);
+}
+
+[[nodiscard]] constexpr auto is_device_command(uint8_t const cmd) noexcept -> bool
+{
+    return cmd == CMD_DEVICE_GET || cmd == CMD_DEVICE_CREATE_NTF || cmd == CMD_DEVICE_DELETE_NTF || cmd == CMD_DEVICE_CHANGE_NTF;
+}
+
+/// The device command a message carries in its generic-netlink header, or
+/// nullopt when the message is too short to have one or carries another.
+[[nodiscard]] auto device_command_of(std::span<uint8_t const> const message) noexcept -> std::optional<uint8_t>
+{
+    if (message.size() < GENL_HEADER || !is_device_command(message[netlink::MESSAGE_HEADER])) {
+        return std::nullopt;
+    }
+    return message[netlink::MESSAGE_HEADER];
+}
+
+}  // namespace
+
+auto lock_status_name(LockStatus const status) noexcept -> std::string_view
+{
+    switch (status) {
+        case LockStatus::unlocked:
+            return "unlocked";
+        case LockStatus::locked:
+            return "locked";
+        case LockStatus::locked_holdover_acquired:
+            return "locked-ho-acq";
+        case LockStatus::holdover:
+            return "holdover";
+        case LockStatus::unknown:
+            break;
+    }
+    return "unknown";
+}
+
+auto type_name(Type const type) noexcept -> std::string_view
+{
+    switch (type) {
+        case Type::pps:
+            return "pps";
+        case Type::eec:
+            return "eec";
+        case Type::unknown:
+            break;
+    }
+    return "unknown";
+}
+
+//
+// Framing
+//
+
+auto build_get_family(std::span<uint8_t> const out, uint32_t const seq) -> StatusValue<size_t>
+{
+    return netdev::build_get_family(out, FAMILY_NAME, seq);
+}
+
+auto build_device_dump(std::span<uint8_t> const out, uint16_t const family_id, uint32_t const seq) -> StatusValue<size_t>
+{
+    constexpr uint16_t FLAGS = netlink::FLAG_REQUEST | netlink::FLAG_ACK | netlink::FLAG_DUMP;
+    return build_message(out, GENL_HEADER, family_id, FLAGS, seq, CMD_DEVICE_GET, [](BufferSerializerBuilder&) {});
+}
+
+auto build_device_get(std::span<uint8_t> const out, uint16_t const family_id, uint32_t const id, uint32_t const seq)
+    -> StatusValue<size_t>
+{
+    constexpr size_t LENGTH = GENL_HEADER + netlink::attribute_size(sizeof(uint32_t));
+    constexpr uint16_t FLAGS = netlink::FLAG_REQUEST | netlink::FLAG_ACK;
+    return build_message(out, LENGTH, family_id, FLAGS, seq, CMD_DEVICE_GET, [&](BufferSerializerBuilder& b) {
+        netlink::put_attribute(b, A_ID, make_const_span(id));
+    });
+}
+
+auto parse_family(std::span<uint8_t const> const message) -> StatusValue<Family>
+{
+    std::optional<uint16_t> id;
+    uint32_t monitor = 0;
+    auto const walked = netdev::genl_attributes(message, GENL_CONTROLLER_ID, netdev::CTRL_NEWFAMILY)
+                            .and_then([&](std::span<uint8_t const> const attributes) {
+                                return netlink::walk_attributes(
+                                    attributes, [&](uint16_t const type, std::span<uint8_t const> const payload) -> Status {
+                                        switch (type & netlink::TYPE_MASK) {
+                                            case netdev::CTRL_FAMILY_ID:
+                                                return read_scalar(payload, id.emplace());
+                                            case CTRL_MCAST_GROUPS:
+                                                return read_groups(payload, monitor);
+                                            default:
+                                                return success();
+                                        }
+                                    });
+                            });
+    return required(walked, id).transform([&](uint16_t const family_id) {
+        return Family{.id = family_id, .monitor_group = monitor};
+    });
+}
+
+auto parse_device(std::span<uint8_t const> const message, uint16_t const family_id) -> StatusValue<DeviceMessage>
+{
+    auto const cmd = device_command_of(message);
+    if (!cmd) {
+        return failure(netlink::bad_message());
+    }
+    DeviceMessage out{.cmd = *cmd, .device = {}};
+    std::optional<uint32_t> id;
+    auto const walked = netdev::genl_attributes(message, family_id, *cmd).and_then([&](std::span<uint8_t const> const attributes) {
+        return netlink::walk_attributes(attributes, [&](uint16_t const type, std::span<uint8_t const> const payload) -> Status {
+            return read_device_attribute(type, payload, out.device, id);
+        });
+    });
+    return required(walked, id).transform([&](uint32_t const device_id) {
+        out.device.id = device_id;
+        return out;
+    });
+}
+
+#if defined(__linux__)
+
+//
+// The client
+//
+
+auto resolve_family(netlink::Socket& socket, std::span<uint8_t> const reply) -> StatusValue<Family>
+{
+    std::optional<Family> family;
+    auto const asked = socket.request(
+        reply,
+        [](std::span<uint8_t> const out, uint32_t const seq) { return build_get_family(out, seq); },
+        [&](std::span<uint8_t const> const message, uint16_t const type) -> Status {
+            if (type != GENL_CONTROLLER_ID) {
+                return success();
+            }
+            return parse_family(message).transform([&](Family const& got) { family = got; });
+        });
+    return required(asked, family);
+}
+
+auto DpllClient::open() -> Status
+{
+    if (auto opened = socket_.open(NETLINK_GENERIC); !opened) {
+        return opened;
+    }
+    auto const family = resolve_family(socket_, reply_);
+    if (!family) {
+        socket_.close();
+        return failure(family.error());
+    }
+    family_ = *family;
+    return success();
+}
+
+auto DpllClient::devices() -> StatusValue<std::vector<Device>>
+{
+    std::vector<Device> devices;
+    auto const asked = socket_.request(
+        reply_,
+        [&](std::span<uint8_t> const out, uint32_t const seq) { return build_device_dump(out, family_.id, seq); },
+        [&](std::span<uint8_t const> const message, uint16_t const type) -> Status {
+            if (type != family_.id) {
+                return success();
+            }
+            return parse_device(message, family_.id).transform([&](DeviceMessage const& got) { devices.push_back(got.device); });
+        });
+    if (!asked) {
+        return failure(asked.error());
+    }
+    return devices;
+}
+
+auto DpllClient::device(uint32_t const id) -> StatusValue<Device>
+{
+    std::optional<Device> device;
+    auto const asked = socket_.request(
+        reply_,
+        [&](std::span<uint8_t> const out, uint32_t const seq) { return build_device_get(out, family_.id, id, seq); },
+        [&](std::span<uint8_t const> const message, uint16_t const type) -> Status {
+            if (type != family_.id) {
+                return success();
+            }
+            return parse_device(message, family_.id).transform([&](DeviceMessage const& got) { device = got.device; });
+        });
+    return required(asked, device);
+}
+
+//
+// The watch
+//
+
+namespace {
+
+[[nodiscard]] auto errno_failure() noexcept -> std::unexpected<std::error_code>
+{
+    return std::unexpected{std::error_code{errno, std::system_category()}};
+}
+
+/// A NETLINK_GENERIC socket of our own, non-blocking, bound to a port the
+/// kernel picks, joined to multicast group `group`.
+[[nodiscard]] auto open_member_socket(uint32_t const group) -> StatusValue<FileDescriptor>
+{
+    FileDescriptor fd{::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, NETLINK_GENERIC)};
+    if (!fd.valid()) {
+        return errno_failure();
+    }
+    sockaddr_nl local{};
+    local.nl_family = AF_NETLINK;
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    if (::bind(fd.get(), reinterpret_cast<sockaddr const*>(&local), sizeof(local)) != 0) {
+        return errno_failure();
+    }
+    // The membership, not nl_groups in the bind: group ids above 31 have no
+    // bit there, and the controller hands out ids as it pleases.
+    if (::setsockopt(fd.get(), SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &group, sizeof(group)) != 0) {
+        return errno_failure();
+    }
+    return fd;
+}
+
+[[nodiscard]] constexpr auto event_of(uint8_t const cmd) noexcept -> std::optional<DeviceEvent>
+{
+    switch (cmd) {
+        case CMD_DEVICE_CREATE_NTF:
+            return DeviceEvent::created;
+        case CMD_DEVICE_CHANGE_NTF:
+            return DeviceEvent::changed;
+        case CMD_DEVICE_DELETE_NTF:
+            return DeviceEvent::deleted;
+        default:
+            return std::nullopt;  // a pin notification, or a reply to somebody's request
+    }
+}
+
+}  // namespace
+
+auto DpllWatch::open() -> Status
+{
+    close();
+    Family family{};
+    {
+        // The controller is asked on a socket of its own, closed again: the
+        // member socket below is for notifications and nothing else.
+        netlink::Socket control;
+        if (auto opened = control.open(NETLINK_GENERIC); !opened) {
+            return opened;
+        }
+        auto const resolved = resolve_family(control, buffer_);
+        if (!resolved) {
+            return failure(resolved.error());
+        }
+        family = *resolved;
+    }
+    if (family.monitor_group == 0) {
+        return failure(std::make_error_code(std::errc::not_supported));
+    }
+    auto fd = open_member_socket(family.monitor_group);
+    if (!fd) {
+        return failure(fd.error());
+    }
+    fd_ = std::move(*fd);
+    family_ = family;
+    return success();
+}
+
+void DpllWatch::close() noexcept
+{
+    fd_ = FileDescriptor{};
+    family_ = Family{};
+}
+
+void DpllWatch::deliver(std::span<uint8_t const> const datagram, int64_t const now_ns)
+{
+    for (size_t at = 0; at + netlink::MESSAGE_HEADER <= datagram.size();) {
+        size_t const length = netlink::load<uint32_t>(datagram, at + netlink::OFFSET_LENGTH);
+        if (length < netlink::MESSAGE_HEADER || length > datagram.size() - at) {
+            return;  // a datagram that lies about its lengths is dropped from here on
+        }
+        auto const message = datagram.subspan(at, length);
+        if (netlink::load<uint16_t>(message, netlink::OFFSET_TYPE) == family_.id) {
+            if (auto const parsed = parse_device(message, family_.id)) {
+                if (auto const event = event_of(parsed->cmd)) {
+                    ++events_;
+                    on_event_(*event, parsed->device, now_ns);
+                }
+            }
+        }
+        at += netlink::align4(length);
+    }
+}
+
+void DpllWatch::on_ready(int64_t const now_ns)
+{
+    for (;;) {
+        // MSG_TRUNC: a notification too big for the buffer is known to have
+        // been cut, and is dropped whole rather than parsed in part.
+        ssize_t const received = ::recv(fd_.get(), buffer_.data(), buffer_.size(), MSG_TRUNC);
+        if (received < 0) {
+            return;  // EAGAIN: drained; anything else, the next poll will say
+        }
+        if (static_cast<size_t>(received) <= buffer_.size()) {
+            deliver(std::span<uint8_t const>{buffer_.data(), static_cast<size_t>(received)}, now_ns);
+        }
+    }
+}
+
+#endif  // __linux__
+
+}  // namespace statusbar::net::dpll

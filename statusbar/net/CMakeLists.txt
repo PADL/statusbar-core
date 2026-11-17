@@ -8,6 +8,7 @@ statusbar_add_module(
   net_address.cpp
   net_any_ethernet_port.cpp
   net_bpf_port.cpp
+  net_dpll.cpp
   net_error.cpp
   net_interface_info.cpp
   net_linux_mmap.cpp
@@ -15,6 +16,7 @@ statusbar_add_module(
   net_message_reactor.cpp
   net_netdev_features.cpp
   net_netlink.cpp
+  net_phc.cpp
   net_rawnet.cpp
   net_rawnet_port.cpp
   net_ring_buffer_base.cpp
@@ -44,6 +46,7 @@ statusbar_add_module(
   net_rawnet_test.cpp
   net_zephyr_eth_concept_test.cpp
   net_compiled_rule_test.cpp
+  net_dpll_test.cpp
   net_ethernet_port_test.cpp
   net_group_membership_test.cpp
   net_link_monitor_test.cpp
@@ -53,6 +56,7 @@ statusbar_add_module(
   net_launch_order_test.cpp
   net_netdev_features_test.cpp
   net_netlink_test.cpp
+  net_phc_test.cpp
   net_tc_launch_time_test.cpp
   net_tc_qdisc_test.cpp
   net_rss_test.cpp
@@ -73,6 +77,7 @@ statusbar_add_module(
 # runs where the kernel it frames for is.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_netdev_features_fuzzer.cpp)
+  add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_dpll_fuzzer.cpp)
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_netlink_fuzzer.cpp)
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_tc_qdisc_fuzzer.cpp)
   add_core_fuzzer(${CMAKE_CURRENT_LIST_DIR}/net_vlan_link_fuzzer.cpp)
