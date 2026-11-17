@@ -202,6 +202,102 @@ TEST(tc_launch_time, a_ptp_queue_that_leaves_no_room_is_refused)
     EXPECT_FALSE(tc::launch_time_mqprio(last).has_value());
 }
 
+// A NIC whose scheduler weights every TX queue the same has no reason to put
+// the socket on queue 0; its top queue is where a driver without Qav would put
+// SR class A anyway. With rest_below the rest goes under the socket's queue,
+// and the classes are still in queue order - a kernel before 6.4 refuses a
+// class whose queues come before the class before it.
+TEST(tc_launch_time, with_rest_below_the_socket_takes_the_top_queue_and_the_rest_the_queues_under_it)
+{
+    tc::LaunchTimeQueue const top{.major = MAJOR, .queue = 3, .tx_queues = 4, .rest_below = true};
+    auto const root = tc::launch_time_mqprio(top);
+    EXPECT_TRUE(root.has_value());
+    if (!root) {
+        return;
+    }
+    EXPECT_EQ(root->num_tc, std::uint8_t{2});
+    EXPECT_EQ(root->offset[0], std::uint16_t{0});  // the rest: queues 0, 1 and 2
+    EXPECT_EQ(root->count[0], std::uint16_t{3});
+    EXPECT_EQ(root->offset[1], std::uint16_t{3});  // the socket's
+    EXPECT_EQ(root->count[1], std::uint16_t{1});
+    for (auto const tc_index : root->prio_tc_map) {
+        EXPECT_EQ(tc_index, std::uint8_t{0});  // nothing is steered to the socket's class
+    }
+    // The etf hangs on the queue's own class, whichever traffic class the queue is in.
+    EXPECT_EQ(tc::launch_time_class(top), tc::make_handle(MAJOR, 4));
+}
+
+TEST(tc_launch_time, with_rest_below_ptp_sits_between_the_rest_and_the_socket)
+{
+    tc::LaunchTimeQueue const top{.major = MAJOR, .queue = 3, .tx_queues = 4, .ptp_queue = 2, .rest_below = true};
+    auto const root = tc::launch_time_mqprio(top);
+    EXPECT_TRUE(root.has_value());
+    if (!root) {
+        return;
+    }
+    EXPECT_EQ(root->num_tc, std::uint8_t{3});
+    EXPECT_EQ(root->offset[0], std::uint16_t{0});  // the rest: queues 0 and 1
+    EXPECT_EQ(root->count[0], std::uint16_t{2});
+    EXPECT_EQ(root->offset[1], std::uint16_t{2});  // PTP's
+    EXPECT_EQ(root->count[1], std::uint16_t{1});
+    EXPECT_EQ(root->offset[2], std::uint16_t{3});  // the socket's
+    EXPECT_EQ(root->count[2], std::uint16_t{1});
+    EXPECT_EQ(root->prio_tc_map[tc::PTP_PRIORITY], std::uint8_t{1});
+    EXPECT_EQ(root->prio_tc_map[0], std::uint8_t{0});
+}
+
+// Eight queues, the socket on 6: queue 7 is in no class, as queue 1 is in the
+// layout the other way round.
+TEST(tc_launch_time, with_rest_below_a_queue_past_the_socket_is_left_idle)
+{
+    tc::LaunchTimeQueue const sixth{.major = MAJOR, .queue = 6, .tx_queues = 8, .ptp_queue = 4, .rest_below = true};
+    auto const root = tc::launch_time_mqprio(sixth);
+    EXPECT_TRUE(root.has_value());
+    if (!root) {
+        return;
+    }
+    EXPECT_EQ(root->offset[0], std::uint16_t{0});
+    EXPECT_EQ(root->count[0], std::uint16_t{4});  // queues 0 to 3
+    EXPECT_EQ(root->offset[1], std::uint16_t{4});
+    EXPECT_EQ(root->offset[2], std::uint16_t{6});
+    EXPECT_EQ(root->count[2], std::uint16_t{1});  // queue 7 is in no class, and idle; queue 5 likewise
+}
+
+TEST(tc_launch_time, with_rest_below_a_layout_with_nothing_under_the_socket_is_refused)
+{
+    tc::LaunchTimeQueue const bottom{.major = MAJOR, .queue = 0, .tx_queues = 4, .rest_below = true};
+    EXPECT_FALSE(tc::launch_time_mqprio(bottom).has_value());
+
+    tc::LaunchTimeQueue ptp_under_nothing{.major = MAJOR, .queue = 3, .tx_queues = 4, .ptp_queue = 0, .rest_below = true};
+    EXPECT_FALSE(tc::launch_time_mqprio(ptp_under_nothing).has_value());  // no queue under PTP's for the rest
+
+    tc::LaunchTimeQueue ptp_past_the_socket{.major = MAJOR, .queue = 2, .tx_queues = 4, .ptp_queue = 3, .rest_below = true};
+    EXPECT_FALSE(tc::launch_time_mqprio(ptp_past_the_socket).has_value());  // the rest is under the socket, PTP must be too
+
+    tc::LaunchTimeQueue ptp_on_the_socket{.major = MAJOR, .queue = 3, .tx_queues = 4, .ptp_queue = 3, .rest_below = true};
+    EXPECT_FALSE(tc::launch_time_mqprio(ptp_on_the_socket).has_value());
+}
+
+// The whole point of the class numbering: each class's queues past the one
+// before it, whichever way round the rest goes.
+TEST(tc_launch_time, the_classes_are_in_queue_order_either_way_round)
+{
+    for (auto const queue :
+         {four_queues(),
+          three_queues(),
+          tc::LaunchTimeQueue{.major = MAJOR, .queue = 3, .tx_queues = 4, .rest_below = true},
+          tc::LaunchTimeQueue{.major = MAJOR, .queue = 3, .tx_queues = 4, .ptp_queue = 1, .rest_below = true}}) {
+        auto const root = tc::launch_time_mqprio(queue);
+        EXPECT_TRUE(root.has_value());
+        if (!root) {
+            continue;
+        }
+        for (std::uint8_t tc_index = 1; tc_index < root->num_tc; ++tc_index) {
+            EXPECT_TRUE(root->offset[tc_index] >= root->offset[tc_index - 1] + root->count[tc_index - 1]);
+        }
+    }
+}
+
 TEST(tc_launch_time, the_etf_is_offloaded_on_tai_and_takes_frames_with_no_so_txtime)
 {
     auto queue = four_queues();

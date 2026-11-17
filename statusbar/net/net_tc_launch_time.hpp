@@ -82,7 +82,8 @@ struct LaunchTimeQueue
     std::int32_t etf_delta_ns{DEFAULT_ETF_DELTA_NS};
 
     /// PTP event traffic's own queue. Must be past the socket's and must
-    /// leave a queue past itself for everything else; unset means PTP shares
+    /// leave a queue past itself for everything else - or, with `rest_below`,
+    /// below the socket's with a queue below itself; unset means PTP shares
     /// the rest.
     std::optional<std::uint16_t> ptp_queue{};
 
@@ -93,16 +94,25 @@ struct LaunchTimeQueue
     /// and removes only the etf. Worth setting when the layout is wanted for
     /// its own sake - it is what keeps PTP off the socket's queue.
     bool persistent_root{false};
+
+    /// Everything else goes on the queues *below* the socket's instead of
+    /// past it, so the socket's queue can be the top one. For a NIC whose
+    /// scheduler weights every TX queue the same (ice), where the socket's
+    /// queue need not be queue 0 and the top queue is where a driver without
+    /// Qav would put SR class A anyway. The traffic classes stay in queue
+    /// order either way, as a kernel before 6.4 insists.
+    bool rest_below{false};
 };
 
 /// The mqprio root for @p queue: a queue layout with the map **not** offloaded
 /// (see this file's header comment), no priority on the socket's queue, PTP on
-/// its own where there is one, everything else on the queues past it, and any
-/// queue between left idle.
+/// its own where there is one, everything else on the queues past it (below
+/// it with `rest_below`), and any queue between left idle.
 ///
 /// @return The root, or `NetError::invalid_argument` for a `major` of 0, fewer
-///         than 2 TX queues, a `queue` not among them, or a `ptp_queue` that
-///         is not past the socket's with at least one queue past itself.
+///         than 2 TX queues, a `queue` not among them or with no queue on the
+///         side the rest goes, or a `ptp_queue` that is not between the
+///         socket's queue and the rest with at least one queue for the rest.
 [[nodiscard]] auto launch_time_mqprio(LaunchTimeQueue const& queue) noexcept -> StatusValue<MqprioQdisc>;
 
 /// The class the socket's queue hangs on: `major:(queue + 1)`.

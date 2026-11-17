@@ -25,12 +25,30 @@ auto launch_time_mode(bool const wanted, StatusValue<bool> const& driver) noexce
 
 namespace {
 
-/// Traffic class 0 is the socket's queue, 1 is PTP's where it has one, and the
-/// last is everything else. Named so the layout below reads as the thing it
-/// describes. Without a PTP queue there are two classes, and 1 is the rest.
-constexpr std::uint8_t SOCKET_CLASS = 0;
-constexpr std::uint8_t PTP_CLASS = 1;
-constexpr std::uint8_t SHARED_REST_CLASS = 1;
+/// The traffic classes of a layout, numbered in queue order: each class's
+/// queues past the one before it, which is the order a kernel before 6.4
+/// insists on. With the rest past the socket's queue the socket's class is
+/// 0 and the rest is last; with the rest below it (`rest_below`) the rest is
+/// 0 and the socket's class is last. PTP's, where it has one, sits between
+/// the two either way. Named so the layout below reads as the thing it
+/// describes.
+struct Classes
+{
+    std::uint8_t socket;
+    std::uint8_t ptp;  ///< meaningful only with a PTP queue
+    std::uint8_t rest;
+    std::uint8_t count;
+};
+
+[[nodiscard]] constexpr auto classes_for(LaunchTimeQueue const& queue) noexcept -> Classes
+{
+    auto const count = static_cast<std::uint8_t>(queue.ptp_queue.has_value() ? 3 : 2);
+    auto const last = static_cast<std::uint8_t>(count - 1);
+    if (queue.rest_below) {
+        return Classes{.socket = last, .ptp = 1, .rest = 0, .count = count};
+    }
+    return Classes{.socket = 0, .ptp = 1, .rest = last, .count = count};
+}
 
 /// Whether @p queue describes a layout that exists on the interface.
 [[nodiscard]] auto layout_is_possible(LaunchTimeQueue const& queue) noexcept -> bool
@@ -39,12 +57,13 @@ constexpr std::uint8_t SHARED_REST_CLASS = 1;
         return false;
     }
     // Everything that is not the socket's timed traffic goes on the queues
-    // past it, so there has to be one.
-    return queue.queue + 1 < queue.tx_queues;
+    // past it - below it with rest_below - so there has to be one there.
+    return queue.rest_below ? queue.queue > 0 : queue.queue + 1 < queue.tx_queues;
 }
 
-/// Whether @p queue's PTP queue, if it has one, is somewhere it can be: past
-/// the socket's, with at least one queue past itself for everything else.
+/// Whether @p queue's PTP queue, if it has one, is somewhere it can be:
+/// between the socket's queue and the rest, with at least one queue left for
+/// the rest - past the socket's, or below it with rest_below.
 [[nodiscard]] auto ptp_queue_is_possible(LaunchTimeQueue const& queue) noexcept -> bool
 {
     if (!queue.ptp_queue.has_value()) {
@@ -53,7 +72,11 @@ constexpr std::uint8_t SHARED_REST_CLASS = 1;
     if (queue.ptp_priority >= PRIO_MAP_SIZE) {
         return false;
     }
-    return *queue.ptp_queue > queue.queue && *queue.ptp_queue + 1 < queue.tx_queues;
+    auto const ptp = *queue.ptp_queue;
+    if (queue.rest_below) {
+        return ptp < queue.queue && ptp > 0;
+    }
+    return ptp > queue.queue && ptp + 1 < queue.tx_queues;
 }
 
 /// Put traffic class @p tc_index over the queues [@p first, @p first + @p
@@ -64,46 +87,58 @@ auto place(MqprioQdisc& root, std::uint8_t const tc_index, std::uint16_t const f
     root.count[tc_index] = count;
 }
 
-/// The layout with a queue for PTP: the socket's, PTP's, and the rest past it.
-/// Any queue between the socket's and PTP's is in no class at all, and so is
-/// idle - which is what an SR class B queue would be on this NIC.
-/// PTP at its own priority, everything else on the class holding the rest.
-auto map_priorities_with_ptp(MqprioQdisc& root, std::uint8_t const rest_class, std::uint8_t const ptp_priority) noexcept -> void
+/// Put the class holding the rest, @p tc_index, over every queue past @p
+/// edge - or, with rest_below, every queue below it. @p edge is PTP's queue
+/// where there is one, else the socket's: the queue the rest starts beyond.
+auto place_rest(MqprioQdisc& root, LaunchTimeQueue const& queue, std::uint8_t const tc_index, std::uint16_t const edge) noexcept
+    -> void
 {
-    root.prio_tc_map.fill(rest_class);
-    root.prio_tc_map[ptp_priority] = PTP_CLASS;
+    if (queue.rest_below) {
+        place(root, tc_index, 0, edge);
+        return;
+    }
+    auto const first = static_cast<std::uint16_t>(edge + 1);
+    place(root, tc_index, first, static_cast<std::uint16_t>(queue.tx_queues - first));
 }
 
-/// The three classes over the queues: the socket's, PTP's, and the rest past
-/// PTP's. Any queue between the socket's and PTP's is in no class, and idle.
-auto place_classes_with_ptp(
-    MqprioQdisc& root, LaunchTimeQueue const& queue, std::uint16_t const ptp, std::uint8_t const rest_class) noexcept -> void
+/// PTP at its own priority, everything else on the class holding the rest.
+auto map_priorities_with_ptp(MqprioQdisc& root, Classes const& classes, std::uint8_t const ptp_priority) noexcept -> void
 {
-    auto const rest = static_cast<std::uint16_t>(ptp + 1);
-    place(root, SOCKET_CLASS, queue.queue, 1);
-    place(root, PTP_CLASS, ptp, 1);
-    place(root, rest_class, rest, static_cast<std::uint16_t>(queue.tx_queues - rest));
+    root.prio_tc_map.fill(classes.rest);
+    root.prio_tc_map[ptp_priority] = classes.ptp;
+}
+
+/// The three classes over the queues: the socket's, PTP's, and the rest
+/// beyond PTP's. Any queue between the socket's and PTP's is in no class at
+/// all, and so is idle - which is what an SR class B queue would be on this
+/// NIC.
+auto place_classes_with_ptp(
+    MqprioQdisc& root, LaunchTimeQueue const& queue, std::uint16_t const ptp, Classes const& classes) noexcept -> void
+{
+    place(root, classes.socket, queue.queue, 1);
+    place(root, classes.ptp, ptp, 1);
+    place_rest(root, queue, classes.rest, ptp);
 }
 
 /// @p ptp is the PTP queue the caller found in @p queue.ptp_queue: handed over
 /// as a value so no step below has to look into the optional again.
 auto lay_out_with_ptp(MqprioQdisc& root, LaunchTimeQueue const& queue, std::uint16_t const ptp) noexcept -> void
 {
-    std::uint8_t const rest_class = PTP_CLASS + 1;
-    root.num_tc = static_cast<std::uint8_t>(rest_class + 1);
-    place_classes_with_ptp(root, queue, ptp, rest_class);
-    map_priorities_with_ptp(root, rest_class, queue.ptp_priority);
+    auto const classes = classes_for(queue);
+    root.num_tc = classes.count;
+    place_classes_with_ptp(root, queue, ptp, classes);
+    map_priorities_with_ptp(root, classes, queue.ptp_priority);
 }
 
 /// The layout without one: the socket's queue, and everything else - PTP
-/// included - on the queues past it.
+/// included - on the queues beyond it.
 auto lay_out_shared(MqprioQdisc& root, LaunchTimeQueue const& queue) noexcept -> void
 {
-    auto const rest = static_cast<std::uint16_t>(queue.queue + 1);
-    root.num_tc = SHARED_REST_CLASS + 1;
-    place(root, SOCKET_CLASS, queue.queue, 1);
-    place(root, SHARED_REST_CLASS, rest, static_cast<std::uint16_t>(queue.tx_queues - rest));
-    root.prio_tc_map.fill(SHARED_REST_CLASS);
+    auto const classes = classes_for(queue);
+    root.num_tc = classes.count;
+    place(root, classes.socket, queue.queue, 1);
+    place_rest(root, queue, classes.rest, queue.queue);
+    root.prio_tc_map.fill(classes.rest);
 }
 
 }  // namespace
