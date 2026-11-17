@@ -42,8 +42,11 @@ namespace detail {
 {
     while (!bytes.empty()) {
         ssize_t const written = ::write(fd, bytes.data(), bytes.size());
+        if (written < 0 && errno == EINTR) {
+            continue;  // a signal landed before any byte went: the same write again
+        }
         if (written < 0) {
-            return errno == EINTR ? success() : errno_failure();  // EINTR: try again
+            return errno_failure();
         }
         bytes = bytes.subspan(static_cast<size_t>(written));
     }
@@ -82,13 +85,17 @@ namespace detail {
 
 /// The temporary's name: the target's with a suffix no reader looks for and
 /// this process's id, so two writers of one target in two processes do not
-/// share it. Two writers in one process must not race either way.
+/// share it. Two writers in one process must not race either way. A file of
+/// this name already there was left by an earlier life of this process id
+/// that crashed between its open and its rename: it is nobody's, and the
+/// open truncates it rather than refusing it, or a daemon that gets the same
+/// pid at every boot could never write the file again.
 [[nodiscard]] inline auto temporary_name(std::string_view const path) -> std::string
 {
     return std::string{path} + ".tmp." + std::to_string(::getpid());
 }
 
-/// Write, sync and close the temporary, open for creation.
+/// Write and sync the temporary, open and empty.
 [[nodiscard]] inline auto fill_temporary(int const fd, std::span<uint8_t const> const bytes) noexcept -> Status
 {
     if (auto const written = write_all(fd, bytes); !written) {
@@ -115,7 +122,7 @@ namespace detail {
 {
     std::string const temporary = detail::temporary_name(path);
     {
-        FileDescriptor const fd{::openat(dir_fd, temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode)};
+        FileDescriptor const fd{::openat(dir_fd, temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode)};
         if (!fd.valid()) {
             return detail::errno_failure();
         }

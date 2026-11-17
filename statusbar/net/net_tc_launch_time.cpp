@@ -76,20 +76,22 @@ auto map_priorities_with_ptp(MqprioQdisc& root, std::uint8_t const rest_class, s
 
 /// The three classes over the queues: the socket's, PTP's, and the rest past
 /// PTP's. Any queue between the socket's and PTP's is in no class, and idle.
-auto place_classes_with_ptp(MqprioQdisc& root, LaunchTimeQueue const& queue, std::uint8_t const rest_class) noexcept -> void
+auto place_classes_with_ptp(
+    MqprioQdisc& root, LaunchTimeQueue const& queue, std::uint16_t const ptp, std::uint8_t const rest_class) noexcept -> void
 {
-    auto const ptp = *queue.ptp_queue;
     auto const rest = static_cast<std::uint16_t>(ptp + 1);
     place(root, SOCKET_CLASS, queue.queue, 1);
     place(root, PTP_CLASS, ptp, 1);
     place(root, rest_class, rest, static_cast<std::uint16_t>(queue.tx_queues - rest));
 }
 
-auto lay_out_with_ptp(MqprioQdisc& root, LaunchTimeQueue const& queue) noexcept -> void
+/// @p ptp is the PTP queue the caller found in @p queue.ptp_queue: handed over
+/// as a value so no step below has to look into the optional again.
+auto lay_out_with_ptp(MqprioQdisc& root, LaunchTimeQueue const& queue, std::uint16_t const ptp) noexcept -> void
 {
     std::uint8_t const rest_class = PTP_CLASS + 1;
     root.num_tc = static_cast<std::uint8_t>(rest_class + 1);
-    place_classes_with_ptp(root, queue, rest_class);
+    place_classes_with_ptp(root, queue, ptp, rest_class);
     map_priorities_with_ptp(root, rest_class, queue.ptp_priority);
 }
 
@@ -118,7 +120,7 @@ auto launch_time_mqprio(LaunchTimeQueue const& queue) noexcept -> StatusValue<Mq
     // TC offload appears or goes.
     root.offload = false;
     if (queue.ptp_queue.has_value()) {
-        lay_out_with_ptp(root, queue);
+        lay_out_with_ptp(root, queue, *queue.ptp_queue);
     } else {
         lay_out_shared(root, queue);
     }

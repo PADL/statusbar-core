@@ -1,17 +1,21 @@
 // Copyright 2026 Jeff Koftinoff <jeff.koftinoff@statusbar.com>
 // SPDX-License-Identifier: MIT
 // write_file_durably(): the bytes arrive whole, a target is replaced in one
-// step, no temporary is left behind, and a directory that is not there is the
-// errno.
+// step, no temporary is left behind, a temporary left by a crashed earlier
+// life is overwritten, an interrupted write is resumed, and a directory that
+// is not there is the errno.
 #include "statusbar/buffer/file_write.hpp"
 
 #include "statusbar/test/test.hpp"
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -19,6 +23,7 @@
 #include <iterator>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #include <sys/stat.h>
@@ -94,6 +99,46 @@ auto bytes_of(std::string_view const text) -> std::vector<uint8_t>
     return ec.category() == std::system_category() ? ec.value() : -1;
 }
 
+extern "C" void note_the_signal(int /*signal*/)
+{}
+
+/// SIGUSR1 handled without SA_RESTART for the life of this object, so a
+/// blocking write() the signal lands on returns EINTR instead of resuming.
+class InterruptingSignal
+{
+  public:
+    InterruptingSignal()
+    {
+        struct sigaction action{};
+        action.sa_handler = note_the_signal;
+        action.sa_flags = 0;
+        (void)sigemptyset(&action.sa_mask);  // a macro on Darwin, so unqualified
+        (void)::sigaction(SIGUSR1, &action, &previous_);
+    }
+    ~InterruptingSignal() { (void)::sigaction(SIGUSR1, &previous_, nullptr); }
+    InterruptingSignal(InterruptingSignal const&) = delete;
+    auto operator=(InterruptingSignal const&) -> InterruptingSignal& = delete;
+    InterruptingSignal(InterruptingSignal&&) = delete;
+    auto operator=(InterruptingSignal&&) -> InterruptingSignal& = delete;
+
+  private:
+    struct sigaction previous_{};
+};
+
+/// Everything readable from `fd` until end of file.
+auto drain(int const fd) -> std::vector<uint8_t>
+{
+    std::vector<uint8_t> out;
+    std::vector<uint8_t> chunk(65536);
+    for (;;) {
+        ssize_t const got = ::read(fd, chunk.data(), chunk.size());
+        if (got <= 0) {
+            return out;
+        }
+        out.insert(out.end(), chunk.begin(), chunk.begin() + got);
+    }
+}
+
 }  // namespace
 
 TEST(file_write, the_bytes_arrive_whole_and_no_temporary_is_left)
@@ -141,6 +186,51 @@ TEST(file_write, an_empty_file_is_written_too)
     EXPECT_TRUE(read_all(dir.file("empty")).empty());
     struct stat st{};
     EXPECT_EQ(::stat(dir.file("empty").c_str(), &st), 0);
+}
+
+TEST(file_write, a_temporary_left_by_a_crashed_earlier_life_is_overwritten)
+{
+    TempDir const dir;
+    // The leftover is the one this process would make: the same pid, as a
+    // daemon restarted at the same point of every boot sequence gets.
+    std::string const leftover = detail::temporary_name(dir.file("state"));
+    EXPECT_TRUE(write_file_durably(leftover, bytes_of("half-written junk from before the crash")).has_value());
+    EXPECT_TRUE(write_file_durably(dir.file("state"), bytes_of("whole")).has_value());
+    EXPECT_TRUE(read_all(dir.file("state")) == bytes_of("whole"));
+    auto const names = dir.entries();
+    EXPECT_EQ(names.size(), size_t{1});
+    EXPECT_TRUE(names.size() == 1 && names[0] == "state");
+}
+
+TEST(file_write, an_interrupted_write_is_resumed_until_every_byte_is_out)
+{
+    // A pipe holds 64 KiB or so; a 1 MiB write_all() blocks in write() until
+    // the other end reads, and a signal landing on the blocked write() makes
+    // it return EINTR. Nobody reads until the signals have been sent, so the
+    // writer is interrupted while it still has bytes to go. A write_all()
+    // that took EINTR for success would return early and the reader would
+    // see a short file.
+    InterruptingSignal const interrupting;
+    int fds[2] = {-1, -1};
+    EXPECT_EQ(::pipe(fds), 0);
+    std::vector<uint8_t> const payload(1U << 20U, 0x5a);
+    std::vector<uint8_t> received;
+    pthread_t const writer = ::pthread_self();
+    std::thread interrupter([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        for (int i = 0; i < 20; ++i) {
+            (void)::pthread_kill(writer, SIGUSR1);
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        received = drain(fds[0]);
+    });
+    auto const written = detail::write_all(fds[1], payload);
+    (void)::close(fds[1]);
+    interrupter.join();
+    (void)::close(fds[0]);
+    EXPECT_TRUE(written.has_value());
+    EXPECT_EQ(received.size(), payload.size());
+    EXPECT_TRUE(received == payload);
 }
 
 TEST(file_write, a_directory_that_is_not_there_is_the_errno_and_nothing_is_left)
