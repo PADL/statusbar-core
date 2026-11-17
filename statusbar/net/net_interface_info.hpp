@@ -96,6 +96,49 @@ namespace statusbar::net {
 /// @return The MTU, or `no_such_device` / `filename_too_long`.
 [[nodiscard]] auto interface_mtu(std::string_view interface_name) -> StatusValue<uint32_t>;
 
+/// A NIC's descriptor ring sizes as ETHTOOL_GRINGPARAM reports them: the most
+/// the driver allows, and what is set. The mini and jumbo RX rings, which few
+/// drivers have, are not reported; set_rx_ring() leaves them as they are.
+struct RingParams
+{
+    uint32_t rx_max{0};
+    uint32_t tx_max{0};
+    uint32_t rx{0};
+    uint32_t tx{0};
+
+    [[nodiscard]] constexpr auto operator==(RingParams const&) const noexcept -> bool = default;
+};
+
+/// The interface's ring sizes. Needs no privilege.
+/// @param interface_name Interface name
+/// @return The sizes, or `operation_not_supported` for an interface with no
+///         rings (`lo`, most virtual devices), or `no_such_device` /
+///         `filename_too_long`.
+[[nodiscard]] auto ring_params(std::string_view interface_name) -> StatusValue<RingParams>;
+
+/// Whether an RX ring of @p rx_pending descriptors is a change to @p params:
+/// false when it is the size already set, `invalid_argument` when it is 0 or
+/// more than the driver allows. Pure; set_rx_ring() asks it first, so a ring
+/// already the wanted size costs no write.
+[[nodiscard]] auto rx_ring_change(RingParams const& params, uint32_t rx_pending) noexcept -> StatusValue<bool>;
+
+/// Set the RX ring alone to @p rx_pending descriptors (ETHTOOL_SRINGPARAM),
+/// the TX, mini and jumbo rings left as they are: the sizes are read, the one
+/// changed, the lot written back, and the sizes read again, since a driver
+/// may round what it was given. So an RX ring can be sized to an AF_XDP fill
+/// ring, which it feeds: a ring smaller than the fill ring leaves frames in
+/// the fill ring the NIC never takes.
+///
+/// Needs CAP_NET_ADMIN, and most drivers reset the adapter for it - the link
+/// goes down for seconds and a gPTP lock goes with it - which is why a ring
+/// already the wanted size is left alone, read and not written.
+/// @param interface_name Interface name
+/// @param rx_pending The RX ring size wanted, 1 to `RingParams::rx_max`
+/// @return The sizes in force afterwards, or `invalid_argument` for a size
+///         the driver cannot do, else ring_params()'s errors, else the
+///         write's (`operation_not_permitted` without the capability).
+[[nodiscard]] auto set_rx_ring(std::string_view interface_name, uint32_t rx_pending) -> StatusValue<RingParams>;
+
 #endif  // __linux__
 
 }  // namespace statusbar::net

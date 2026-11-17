@@ -117,6 +117,17 @@ struct AnyEthernetPortConfig
     bool xdp_tx_launch_time{false};
 };
 
+/// The backend configs an AnyEthernetPortConfig stands for, one per backend:
+/// what open() hands the backend it was asked for. Public so a caller that
+/// opens a backend itself - an XdpContext for a port whose rules it then
+/// changes, say - configures it the way the port would have, from the one
+/// config its users already read.
+[[nodiscard]] auto rawnet_config_from(AnyEthernetPortConfig const& config) noexcept -> RawnetPortConfig;
+[[nodiscard]] auto mmap_config_from(AnyEthernetPortConfig const& config) noexcept -> MmapConfig;
+/// The xdp ring sizes follow `ring_size`: RX and TX rings of that many
+/// slots, fill and completion rings of twice as many.
+[[nodiscard]] auto xdp_config_from(AnyEthernetPortConfig const& config) noexcept -> XdpConfig;
+
 class AnyEthernetPort
 {
   public:

@@ -251,4 +251,50 @@ TEST(any_ethernet_port, a_ring_backend_shares_state_between_tx_and_rx_or_is_not_
     }
 }
 
+// The one port config stands for a config per backend, and a caller that
+// opens a backend itself gets the same translation the port applies.
+TEST(any_ethernet_port, the_backend_configs_follow_the_one_port_config)
+{
+    AnyEthernetPortConfig const config{
+        .interface_name = "eth7",
+        .ethertype = AVTP,
+        .priority = 3,
+        .ring_size = 512,
+        .xdp_queue_id = 2,
+        .xdp_attach_mode = XdpAttachMode::generic,
+        .xdp_bind_mode = XdpBindMode::copy,
+        .xdp_tx_launch_time = true,
+    };
+
+    auto const rawnet = rawnet_config_from(config);
+    EXPECT_EQ(rawnet.interface_name, std::string_view{"eth7"});
+    EXPECT_EQ(rawnet.ethertype, AVTP);
+    EXPECT_EQ(rawnet.priority, 3);
+
+    auto const mmap = mmap_config_from(config);
+    EXPECT_EQ(mmap.interface_name, std::string_view{"eth7"});
+    EXPECT_EQ(mmap.ethertype, AVTP);
+    EXPECT_EQ(mmap.priority, 3U);
+    EXPECT_EQ(mmap.rx_queue_size, size_t{512});
+    EXPECT_EQ(mmap.tx_queue_size, size_t{512});
+
+    auto const xdp = xdp_config_from(config);
+    EXPECT_EQ(xdp.interface_name, std::string_view{"eth7"});
+    EXPECT_EQ(xdp.queue_id, 2U);
+    EXPECT_EQ(xdp.rx_ring_size, size_t{512});
+    EXPECT_EQ(xdp.tx_ring_size, size_t{512});
+    EXPECT_EQ(xdp.fill_ring_size, size_t{1024});  // twice the ring: the NIC's side of it
+    EXPECT_EQ(xdp.completion_ring_size, size_t{1024});
+    EXPECT_TRUE(xdp.tx_launch_time);
+    EXPECT_TRUE(xdp.attach_mode == XdpAttachMode::generic);
+    EXPECT_TRUE(xdp.bind_mode == XdpBindMode::copy);
+    EXPECT_TRUE(xdp.filter_rules.empty());  // none given: none handed on
+
+    // A negative priority is "leave the socket's default", which mmap spells as 0.
+    auto negative = config;
+    negative.priority = -1;
+    EXPECT_EQ(mmap_config_from(negative).priority, 0U);
+    EXPECT_EQ(rawnet_config_from(negative).priority, -1);
+}
+
 TEST_MAIN(statusbar_net, net_any_ethernet_port_test)

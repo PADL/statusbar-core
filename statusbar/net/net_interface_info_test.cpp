@@ -348,6 +348,109 @@ TEST(interface_info, every_interface_the_host_has_answers_index_mtu_and_queues)
     EXPECT_TRUE(checked > 0);
 }
 
+// `lo` has no rings, and says so the way it says it has no driver.
+TEST(interface_info, lo_has_no_rings_and_says_so_distinguishably)
+{
+    auto const rings = ring_params("lo");
+    EXPECT_FALSE(rings.has_value());
+    if (!rings) {
+        EXPECT_EQ(rings.error(), std::make_error_code(std::errc::operation_not_supported));
+    }
+    auto const set = set_rx_ring("lo", 256);
+    EXPECT_FALSE(set.has_value());
+    if (!set) {
+        EXPECT_EQ(set.error(), std::make_error_code(std::errc::operation_not_supported));
+    }
+}
+
+/// Some interface with descriptor rings, if the host has one: a real NIC,
+/// not a virtual device. Empty when there is none.
+auto an_interface_with_rings() -> std::string
+{
+    DIR* dir = ::opendir("/sys/class/net");
+    if (dir == nullptr) {
+        return {};
+    }
+    std::string found;
+    while (dirent const* entry = ::readdir(dir)) {
+        std::string const name{entry->d_name};
+        if (name != "." && name != ".." && ring_params(name).has_value()) {
+            found = name;
+            break;
+        }
+    }
+    ::closedir(dir);
+    return found;
+}
+
+TEST(interface_info, every_interface_answers_about_its_rings_or_refuses_cleanly)
+{
+    DIR* dir = ::opendir("/sys/class/net");
+    EXPECT_TRUE(dir != nullptr);
+    if (dir == nullptr) {
+        return;
+    }
+    while (dirent const* entry = ::readdir(dir)) {
+        std::string const name{entry->d_name};
+        if (name == "." || name == "..") {
+            continue;
+        }
+        auto const rings = ring_params(name);
+        if (!rings) {
+            // A virtual interface has no rings; the same clean failure lo gives.
+            EXPECT_EQ(rings.error(), std::make_error_code(std::errc::operation_not_supported));
+            continue;
+        }
+        EXPECT_TRUE(rings->rx > 0 && rings->rx <= rings->rx_max);
+        EXPECT_TRUE(rings->tx > 0 && rings->tx <= rings->tx_max);
+    }
+    ::closedir(dir);
+}
+
+// Setting the size the ring already has is read and not written, so it needs
+// no privilege and costs no reset - which is what lets it be proved here.
+TEST(interface_info, setting_the_rx_ring_to_the_size_it_has_writes_nothing)
+{
+    auto const name = an_interface_with_rings();
+    if (name.empty()) {
+        SKIP("no interface here has descriptor rings");
+    }
+    auto const rings = ring_params(name);
+    EXPECT_TRUE(rings.has_value());
+    if (!rings) {
+        return;
+    }
+    auto const same = set_rx_ring(name, rings->rx);
+    EXPECT_TRUE(same.has_value());
+    if (same) {
+        EXPECT_TRUE(*same == *rings);
+    }
+    // A size the driver cannot do is refused before anything is written.
+    auto const too_many = set_rx_ring(name, rings->rx_max + 1);
+    EXPECT_FALSE(too_many.has_value());
+    if (!too_many) {
+        EXPECT_EQ(too_many.error(), std::make_error_code(std::errc::invalid_argument));
+    }
+}
+
+TEST(interface_info, rx_ring_change_decides_without_a_nic)
+{
+    RingParams const params{.rx_max = 4096, .tx_max = 4096, .rx = 256, .tx = 256};
+    auto const same = rx_ring_change(params, 256);
+    EXPECT_TRUE(same.has_value() && !*same);
+    auto const bigger = rx_ring_change(params, 2048);
+    EXPECT_TRUE(bigger.has_value() && *bigger);
+    auto const most = rx_ring_change(params, 4096);
+    EXPECT_TRUE(most.has_value() && *most);
+    for (auto const impossible : {uint32_t{0}, uint32_t{4097}}) {
+        auto const refused = rx_ring_change(params, impossible);
+        EXPECT_FALSE(refused.has_value());
+        if (!refused) {
+            EXPECT_EQ(refused.error(), std::make_error_code(std::errc::invalid_argument));
+        }
+    }
+}
+
 TEST(interface_info, parse_link_speed_reads_a_normal_speed)
 {
     // sysfs writes the number with a trailing newline.

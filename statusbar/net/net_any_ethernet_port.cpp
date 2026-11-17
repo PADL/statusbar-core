@@ -26,7 +26,9 @@ auto on_port(Variant& port, Fn&& fn) -> decltype(fn(std::declval<RawnetPort&>())
         port);
 }
 
-auto rawnet_config_from(AnyEthernetPortConfig const& config) -> RawnetPortConfig
+}  // namespace
+
+auto rawnet_config_from(AnyEthernetPortConfig const& config) noexcept -> RawnetPortConfig
 {
     return RawnetPortConfig{
         .interface_name = config.interface_name,
@@ -35,7 +37,7 @@ auto rawnet_config_from(AnyEthernetPortConfig const& config) -> RawnetPortConfig
     };
 }
 
-auto mmap_config_from(AnyEthernetPortConfig const& config) -> MmapConfig
+auto mmap_config_from(AnyEthernetPortConfig const& config) noexcept -> MmapConfig
 {
     return MmapConfig{
         .interface_name = config.interface_name,
@@ -46,7 +48,7 @@ auto mmap_config_from(AnyEthernetPortConfig const& config) -> MmapConfig
     };
 }
 
-auto xdp_config_from(AnyEthernetPortConfig const& config) -> XdpConfig
+auto xdp_config_from(AnyEthernetPortConfig const& config) noexcept -> XdpConfig
 {
     return XdpConfig{
         .interface_name = config.interface_name,
@@ -61,8 +63,6 @@ auto xdp_config_from(AnyEthernetPortConfig const& config) -> XdpConfig
         .attach_mode = config.xdp_attach_mode,
     };
 }
-
-}  // namespace
 
 auto AnyEthernetPort::open(EthernetBackend const backend, AnyEthernetPortConfig const& config) -> Status
 {

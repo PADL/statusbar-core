@@ -18,6 +18,10 @@
 /// The link reader is injectable so the transition/throttle logic is unit
 /// testable without a real interface; the production constructor uses
 /// read_interface_carrier() (SIOCGIFFLAGS / IFF_RUNNING).
+///
+/// Two ways in besides the poll, for a change the poll would be late to or
+/// never see: recheck() reads the carrier now, told() takes the caller's word
+/// for the state. Either reports a transition the way the poll does.
 
 #include "statusbar/net/net_message_reactor.hpp"  // Pollable
 #include "statusbar/net/net_posix_util.hpp"       // read_interface_carrier
@@ -71,10 +75,37 @@ class LinkMonitor : public Pollable
             return;
         }
         next_poll_ns_ = now_ns + poll_interval_ns_;
+        observe(read(), now_ns);
+    }
 
-        auto const up = reader_ ? reader_() : std::optional<bool>{};
+    /// Read the carrier now, whatever the interval says, for a caller with
+    /// reason to think it changed and no message to say so: an adapter reset
+    /// it ordered, a ring it resized, a program it attached on a driver that
+    /// bounces the link for one. A transition found is reported as the poll
+    /// would report it; the next scheduled poll is left where it was.
+    void recheck(int64_t const now_ns) { observe(read(), now_ns); }
+
+    /// Take the caller's word that the link is @p up at @p now_ns: reported
+    /// when it is a transition, and remembered either way, so the poll that
+    /// follows reports only a further change. For a change the caller knows
+    /// of before the carrier shows it.
+    void told(bool const up, int64_t const now_ns) { observe(up, now_ns); }
+
+    [[nodiscard]] auto finished() const noexcept -> bool override { return false; }
+
+    /// Last observed link state (nullopt until the first successful read).
+    [[nodiscard]] auto link_up() const noexcept -> std::optional<bool> { return last_up_; }
+
+  private:
+    [[nodiscard]] auto read() -> std::optional<bool> { return reader_ ? reader_() : std::optional<bool>{}; }
+
+    /// One observation, from the poll, a recheck or the caller: unknown keeps
+    /// the last-known state and emits nothing; a transition is remembered and
+    /// reported.
+    void observe(std::optional<bool> const up, int64_t const now_ns)
+    {
         if (!up.has_value()) {
-            return;  // unknown — keep the last-known state, emit nothing
+            return;
         }
         if (!last_up_.has_value() || *last_up_ != *up) {
             last_up_ = up;
@@ -84,12 +115,6 @@ class LinkMonitor : public Pollable
         }
     }
 
-    [[nodiscard]] auto finished() const noexcept -> bool override { return false; }
-
-    /// Last observed link state (nullopt until the first successful read).
-    [[nodiscard]] auto link_up() const noexcept -> std::optional<bool> { return last_up_; }
-
-  private:
     Reader reader_;
     OnChange on_change_;
     int64_t poll_interval_ns_;

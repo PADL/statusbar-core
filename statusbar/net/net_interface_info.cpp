@@ -291,6 +291,67 @@ auto tx_queue_count(std::string_view const interface_name) -> StatusValue<uint16
     return success(static_cast<uint16_t>(*count));
 }
 
+namespace {
+
+/// ETHTOOL_GRINGPARAM for `interface_name`, the kernel's struct as it came back.
+[[nodiscard]] auto read_ring_params(std::string_view const interface_name) -> StatusValue<ethtool_ringparam>
+{
+    ethtool_ringparam rings{};
+    rings.cmd = ETHTOOL_GRINGPARAM;
+    if (auto status = info_ethtool_ioctl(interface_name, rings); !status) {
+        return forward_failure(status);
+    }
+    return rings;
+}
+
+[[nodiscard]] auto ring_params_from(ethtool_ringparam const& rings) noexcept -> RingParams
+{
+    return RingParams{
+        .rx_max = rings.rx_max_pending,
+        .tx_max = rings.tx_max_pending,
+        .rx = rings.rx_pending,
+        .tx = rings.tx_pending,
+    };
+}
+
+}  // namespace
+
+auto ring_params(std::string_view const interface_name) -> StatusValue<RingParams>
+{
+    return read_ring_params(interface_name).transform(ring_params_from);
+}
+
+auto rx_ring_change(RingParams const& params, uint32_t const rx_pending) noexcept -> StatusValue<bool>
+{
+    if (rx_pending == 0 || rx_pending > params.rx_max) {
+        return failure(std::make_error_code(std::errc::invalid_argument));
+    }
+    return rx_pending != params.rx;
+}
+
+auto set_rx_ring(std::string_view const interface_name, uint32_t const rx_pending) -> StatusValue<RingParams>
+{
+    auto rings = read_ring_params(interface_name);
+    if (!rings) {
+        return forward_failure(rings);
+    }
+    auto const change = rx_ring_change(ring_params_from(*rings), rx_pending);
+    if (!change) {
+        return forward_failure(change);
+    }
+    if (!*change) {
+        return ring_params_from(*rings);  // the size already set: no write, no reset
+    }
+    // The struct the kernel filled, one field changed: the TX, mini and jumbo
+    // rings go back as they came.
+    rings->cmd = ETHTOOL_SRINGPARAM;
+    rings->rx_pending = rx_pending;
+    if (auto status = info_ethtool_ioctl(interface_name, *rings); !status) {
+        return forward_failure(status);
+    }
+    return ring_params(interface_name);
+}
+
 auto parse_link_speed(std::string_view const text) -> StatusValue<uint32_t>
 {
     // Split out as a pure function on purpose: it is what makes the
