@@ -18,7 +18,9 @@
 ///
 /// The framing (constants, builders, parsers) builds everywhere and is tested
 /// against hand-laid replies; the client and the watch are Linux only. A
-/// kernel without the family answers the controller with ENOENT.
+/// kernel without the family answers the controller with ENOENT. The family's
+/// requests, and the monitor group, are for CAP_NET_ADMIN: without it a query
+/// is refused with EPERM, the family resolved all the same.
 
 #include "statusbar/net/net_message_reactor.hpp"
 #include "statusbar/net/net_netdev_features.hpp"
@@ -198,7 +200,8 @@ class DpllClient
     void close() noexcept { socket_.close(); }
 
     /// Every device the kernel has (a DPLL_CMD_DEVICE_GET dump): none is an
-    /// empty list, not an error. Errors: the request's.
+    /// empty list, not an error. Errors: the request's; EPERM without
+    /// CAP_NET_ADMIN.
     [[nodiscard]] auto devices() -> StatusValue<std::vector<Device>>;
 
     /// The device `id`. Errors: ENODEV for no such device, else the request's.

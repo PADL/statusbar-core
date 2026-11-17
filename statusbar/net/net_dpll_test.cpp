@@ -257,8 +257,11 @@ TEST(dpll_client, the_kernels_devices_are_listed_and_read_back)
     if (!devices && devices.error() == std::errc::timed_out) {
         SKIP("the socket opens but nothing answers (a sandbox)");
     }
-    EXPECT_TRUE(devices.has_value());
+    if (!devices && devices.error() == std::errc::operation_not_permitted) {
+        SKIP("the dpll family's requests need CAP_NET_ADMIN");
+    }
     if (!devices) {
+        EXPECT_EQ(devices.error().message(), std::string{"<a reply>"});  // the reason, in the failure
         return;
     }
     for (auto const& device : *devices) {
@@ -271,7 +274,12 @@ TEST(dpll_client, the_kernels_devices_are_listed_and_read_back)
 
     DpllWatch watch{[](DeviceEvent, Device const&, int64_t) {}};
     auto const watching = watch.open();
-    EXPECT_TRUE(watching.has_value() || watching.error() == std::errc::not_supported);
+    bool const refused_cleanly =
+        !watching && (watching.error() == std::errc::not_supported || watching.error() == std::errc::operation_not_permitted);
+    EXPECT_TRUE(watching.has_value() || refused_cleanly);
+    if (!watching && !refused_cleanly) {
+        EXPECT_EQ(watching.error().message(), std::string{"<joined>"});
+    }
     if (watching) {
         EXPECT_TRUE(watch.fd() >= 0);
         EXPECT_EQ(watch.family().id, client.family().id);
