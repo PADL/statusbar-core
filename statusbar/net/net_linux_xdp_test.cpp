@@ -376,6 +376,16 @@ TEST(xdp_pin_path, a_name_the_kernel_would_refuse_yields_no_path)
     EXPECT_FALSE(XdpProgram::pin_path_for("fifteen-chars-x").empty());
 }
 
+TEST(xdp_program, a_program_not_yet_opened_is_neither_pinned_adopted_nor_swapped)
+{
+    XdpProgram const program{};
+    EXPECT_FALSE(program.pinned());
+    EXPECT_FALSE(program.adopted());
+    EXPECT_FALSE(program.swapped());
+    EXPECT_EQ(program.id(), 0U);
+    EXPECT_TRUE(program.pin_path().empty());
+}
+
 TEST(xdp_pin_path, interface_name_validity_is_constexpr)
 {
     static_assert(detail::valid_interface_name("eth0"));
@@ -1780,6 +1790,118 @@ TEST(xdp_integration, a_pinned_program_outlives_the_context_and_is_adopted)
 
     // And calling it a second time, with nothing left, still succeeds.
     EXPECT_TRUE(XdpProgram::detach(if_index, pin_path).has_value());
+}
+
+// When the program did change - a redeploy built from different source -
+// the pinned program is not adoptable and the new one takes its place. That
+// used to be a detach and then an attach, an adapter reset each on igb; it is
+// now one request, XDP_FLAGS_REPLACE naming the old program by the pin's
+// descriptor, which igb and ice carry out without a reset. An open that
+// declines to adopt stands in for the changed build here: what the pin holds
+// is ours, so it is swapped, in either order of attach and bind.
+TEST(xdp_integration, a_program_of_ours_the_pin_holds_is_swapped_for_the_new_one_in_one_request)
+{
+    if (getuid() != 0) {
+        SKIP("needs root");
+    }
+
+    destroy_veth_pair("xdptest0");
+    if (!create_veth_pair("xdptest0", "xdptest1")) {
+        SKIP("could not create a veth pair");
+    }
+    auto const pin_path = XdpProgram::pin_path_for("xdptest0");
+    auto cleanup = detail::scopeguard([&] {
+        (void)XdpProgram::detach(::if_nametoindex("xdptest0"), pin_path);
+        destroy_veth_pair("xdptest0");
+    });
+    unsigned int const if_index = ::if_nametoindex("xdptest0");
+
+    XdpConfig config{
+        .interface_name = "xdptest0",
+        .default_action = XdpAction::pass_kernel,
+        .umem_frame_count = 64,
+        .pin_path = pin_path,
+    };
+
+    auto const attached_id = [&]() -> uint32_t {
+        auto const found = XdpProgram::query(if_index);
+        return found && found->has_value() ? (*found)->program_id : 0;
+    };
+
+    // First open: a bare interface, attached to and pinned. Nothing swapped.
+    uint32_t first_id = 0;
+    {
+        XdpContext ctx;
+        EXPECT_TRUE(ctx.open(config).has_value());
+        EXPECT_FALSE(ctx.program().swapped());
+        EXPECT_FALSE(ctx.adopted());
+        first_id = ctx.program().id();
+    }
+    EXPECT_TRUE(first_id != 0 && attached_id() == first_id);
+
+    // Second open, not adopting: the new program in place of the first, in
+    // one request, under auto_ (attached before the bind).
+    config.adopt = false;
+    uint32_t second_id = 0;
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            EXPECT_TRUE(ctx.program().swapped());
+            EXPECT_FALSE(ctx.adopted());
+            EXPECT_TRUE(ctx.pinned());
+            second_id = ctx.program().id();
+            EXPECT_TRUE(second_id != 0 && second_id != first_id);
+            EXPECT_EQ(attached_id(), second_id);
+        }
+    }
+    EXPECT_EQ(attached_id(), second_id);  // pinned: it stays
+    EXPECT_EQ(::access(XdpProgram::pin_entry(pin_path, XdpProgram::PIN_PROG).c_str(), F_OK), 0);
+
+    // And under an explicit copy bind, where the attach waits for the bind:
+    // the old program stays on the interface through the bind and is then
+    // swapped.
+    config.bind_mode = XdpBindMode::copy;
+    uint32_t third_id = 0;
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            EXPECT_TRUE(ctx.program().swapped());
+            third_id = ctx.program().id();
+            EXPECT_TRUE(third_id != 0 && third_id != second_id);
+            EXPECT_EQ(attached_id(), third_id);
+        }
+    }
+
+    // Adoption back on: the swapped-in program is the one the pin holds, and
+    // the next open adopts it. Nothing swapped, nothing attached.
+    config.adopt = true;
+    config.bind_mode = XdpBindMode::auto_;
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            EXPECT_TRUE(ctx.adopted());
+            EXPECT_FALSE(ctx.program().swapped());
+            EXPECT_EQ(ctx.program().id(), third_id);
+        }
+    }
+
+    // An interface with nothing of ours on it is attached to, not swapped.
+    EXPECT_TRUE(XdpProgram::detach(if_index, pin_path).has_value());
+    {
+        XdpContext ctx;
+        auto const status = ctx.open(config);
+        EXPECT_TRUE(status.has_value());
+        if (status) {
+            EXPECT_FALSE(ctx.program().swapped());
+            EXPECT_FALSE(ctx.adopted());
+        }
+    }
 }
 
 // Adopting a map that is not the one this build declares would mean writing

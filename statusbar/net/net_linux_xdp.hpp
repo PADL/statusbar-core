@@ -954,6 +954,13 @@ class XdpProgram
     /// one. False after a fresh attach, pinned or not.
     [[nodiscard]] auto adopted() const noexcept -> bool { return adopted_; }
 
+    /// Whether open() put this program on the interface in place of an
+    /// earlier one of ours in one request (XDP_FLAGS_REPLACE), rather than
+    /// detaching that one and attaching this: a redeploy whose program
+    /// changed, without the reset each of those costs on igb and ice. False
+    /// after an adoption or an attach to a bare interface.
+    [[nodiscard]] auto swapped() const noexcept -> bool { return swapped_; }
+
     /// Where it is pinned; empty when it is not.
     [[nodiscard]] auto pin_path() const noexcept -> std::string_view { return pin_path_; }
 
@@ -968,6 +975,7 @@ class XdpProgram
     uint32_t id_{0};
     bool pinned_{false};
     bool adopted_{false};
+    bool swapped_{false};
 };
 
 // ──────────────────────────────────────────────
@@ -1400,6 +1408,33 @@ class BpfAttachment
         return success();
     }
 
+    /// Put the program on the interface in place of `old_prog_fd`, in `mode`
+    /// - the mode the old one is attached in - as one request: XDP_FLAGS_REPLACE
+    /// with the old program named, which the kernel refuses (EEXIST) when what
+    /// is attached is no longer that program, so nothing that arrived in
+    /// between is replaced by accident. igb and ice swap one program for
+    /// another without a reset; only none-to-some and back reset, which is
+    /// what a detach followed by an attach costs twice.
+    /// @param obj BPF object (ownership transferred on success)
+    /// @param prog_fd File descriptor of the new XDP program
+    /// @param if_index Network interface index the old program is attached to
+    /// @param mode The mode the old program is attached in
+    /// @param old_prog_fd A descriptor for the attached program being replaced
+    [[nodiscard]] auto replace(
+        BpfObject&& obj, int const prog_fd, unsigned int const if_index, XdpAttachMode const mode, int const old_prog_fd) -> Status
+    {
+        detach();
+        bpf_xdp_attach_opts opts{};
+        opts.sz = sizeof(opts);
+        opts.old_prog_fd = old_prog_fd;
+        int const ret = bpf_xdp_attach(static_cast<int>(if_index), prog_fd, attach_flags(mode) | XDP_FLAGS_REPLACE, &opts);
+        if (ret != 0) {
+            return failure(ret == -EBUSY || ret == -EEXIST ? XdpError::foreign_program : XdpError::bpf_attach_failed);
+        }
+        hold(std::move(obj), if_index, mode);
+        return success();
+    }
+
     /// One attempt per mode in the plan, the first and then the fallback.
     /// XDP_FLAGS_UPDATE_IF_NOEXIST on each: never over the top of a program
     /// that is already there, whoever's it is.
@@ -1518,6 +1553,13 @@ class BpfState
     [[nodiscard]] auto attach(unsigned int if_index, AttachPlan const& plan) -> Status
     {
         return attachment_.attach(std::move(obj_), prog_fd_, if_index, plan);
+    }
+
+    /// Put the loaded program on the interface in place of the one attached,
+    /// `old_prog_fd` in `mode`, as one request: see BpfAttachment::replace().
+    [[nodiscard]] auto replace(unsigned int if_index, XdpAttachMode mode, int old_prog_fd) -> Status
+    {
+        return attachment_.replace(std::move(obj_), prog_fd_, if_index, mode, old_prog_fd);
     }
 
     /// Put the XSK socket in xsk_map for its queue, once it is bound. The

@@ -1043,6 +1043,52 @@ namespace {
     return attachment_is_ours((*attached)->program_id, pinned_program_id(pin_path));
 }
 
+/// A program of ours that open() can put the new one in place of: the one
+/// attached, when it is the program our pin holds and is attached in a mode
+/// the plan allows. The pin's descriptor is what names it in the swap.
+struct SwapTarget
+{
+    OwnedFd old_prog;
+    XdpAttachMode mode;
+};
+
+/// Whether `mode` is one the plan would attach in.
+[[nodiscard]] auto plan_allows(detail::AttachPlan const& plan, XdpAttachMode const mode) noexcept -> bool
+{
+    return plan.first == mode || plan.fallback == mode;
+}
+
+/// The attached program to swap for the new one, or nullopt when there is
+/// none to swap: nothing attached, a program ours by name but pinned nowhere
+/// (an orphan, with no descriptor to name it by), one the pin does not hold,
+/// or one attached in a mode the plan would not. Those go the long way,
+/// detached and then attached. Asked after attachment_replaceable() has
+/// said what is there is ours.
+[[nodiscard]] auto swap_target(unsigned int const if_index, std::string_view const pin_path, detail::AttachPlan const& plan)
+    -> std::optional<SwapTarget>
+{
+    auto const attached = XdpProgram::query(if_index);
+    if (!attached || !attached->has_value() || (*attached)->program_id == 0) {
+        return std::nullopt;
+    }
+    uint32_t const pinned = pinned_program_id(pin_path);
+    if (pinned == 0 || pinned != (*attached)->program_id || !plan_allows(plan, (*attached)->mode)) {
+        return std::nullopt;
+    }
+    OwnedFd prog{bpf_obj_get(XdpProgram::pin_entry(pin_path, XdpProgram::PIN_PROG).c_str())};
+    if (!prog.valid()) {
+        return std::nullopt;
+    }
+    return SwapTarget{.old_prog = std::move(prog), .mode = (*attached)->mode};
+}
+
+/// The pins alone, the program left attached for the swap to replace.
+auto unpin_only(std::string_view const pin_path) -> void
+{
+    auto const ignore = [](Status) noexcept {};
+    unpin(pin_path, ignore);
+}
+
 }  // namespace
 
 auto detail::BpfState::install_tcam_rules(std::span<CompiledRule<32> const> rules) -> Status
@@ -1084,6 +1130,23 @@ auto detail::BpfState::install_tcam_rules(std::span<CompiledRule<32> const> rule
     return success();
 }
 
+namespace {
+
+/// The new program onto the interface: in place of `swap`'s program where
+/// there is one, else attached by the plan. After a swap the old program is
+/// off the interface; a failed swap leaves it where it was, for the guard in
+/// open() to take off.
+[[nodiscard]] auto put_program_on(
+    detail::BpfState& bpf, unsigned int const if_index, detail::AttachPlan const& plan, std::optional<SwapTarget>& swap) -> Status
+{
+    if (!swap.has_value()) {
+        return bpf.attach(if_index, plan);
+    }
+    return bpf.replace(if_index, swap->mode, swap->old_prog.get());
+}
+
+}  // namespace
+
 auto XdpContext::open(XdpConfig const& config) -> Status
 {  // NOLINT(statusbar-block-statements) the setup sequence, one step after another, each undoing the last on failure
     close();
@@ -1106,6 +1169,17 @@ auto XdpContext::open(XdpConfig const& config) -> Status
             return status;
         }
     }
+    // The program of ours this open() swaps the new one in for, when there is
+    // one (step 3). Its pins go before the load; should the open fail between
+    // that and the swap, the guard takes it off the interface, so a failed
+    // open leaves what a detach would have - not an unpinned program the
+    // next open could not name.
+    std::optional<SwapTarget> swap;
+    auto detach_unswapped = detail::scopeguard([&]() noexcept {
+        if (swap.has_value()) {
+            (void)bpf_xdp_detach(static_cast<int>(interface_.index), detail::BpfAttachment::attach_flags(swap->mode), nullptr);
+        }
+    });
 
     // A name no interface can have is refused here - after the pin path,
     // the earlier of the two pure checks - rather than truncated into an
@@ -1235,7 +1309,19 @@ auto XdpContext::open(XdpConfig const& config) -> Status
             close();
             return failure(XdpError::foreign_program);
         }
-        (void)XdpProgram::detach(interface_.index, config.pin_path);
+        // One of ours that the pin holds is swapped for the new program in
+        // one request (step 3b or 5) rather than detached here and attached
+        // there: igb resets the adapter and ice bounces the VSI for each of
+        // those, and a ptp4l Sync in flight loses its Tx timestamp to the
+        // reset. Only its pins go now; the program stays attached, named by
+        // the pin's descriptor, until the new one takes its place. Anything
+        // else of ours goes the long way.
+        if (auto target = swap_target(interface_.index, config.pin_path, *plan)) {
+            swap.emplace(std::move(*target));
+            unpin_only(config.pin_path);
+        } else {
+            (void)XdpProgram::detach(interface_.index, config.pin_path);
+        }
         if (auto status = bpf_.load(config.filter_rules, config.default_action); !status) {
             close();
             return status;
@@ -1253,7 +1339,7 @@ auto XdpContext::open(XdpConfig const& config) -> Status
         // program was there; an adopted program has the same gap, left by
         // the socket that died.
         if (detail::attach_precedes_bind(config.bind_mode)) {
-            if (auto status = bpf_.attach(interface_.index, *plan); !status) {
+            if (auto status = put_program_on(bpf_, interface_.index, *plan, swap); !status) {
                 close();
                 return status;
             }
@@ -1313,7 +1399,7 @@ auto XdpContext::open(XdpConfig const& config) -> Status
     // program, adopted or fresh: the xsk_map entry for the queue is ours to
     // fill either way.
     if (!bpf_.adopted() && !detail::attach_precedes_bind(config.bind_mode)) {
-        if (auto status = bpf_.attach(interface_.index, *plan); !status) {
+        if (auto status = put_program_on(bpf_, interface_.index, *plan, swap); !status) {
             close();
             return status;
         }
@@ -1335,6 +1421,8 @@ auto XdpContext::open(XdpConfig const& config) -> Status
     program_.id_ = bpf_.program_id();
     program_.pinned_ = pinning;
     program_.adopted_ = bpf_.adopted();
+    program_.swapped_ = swap.has_value();
+    swap.reset();  // the old program is gone from the interface; its descriptor goes too
 
     // Step 6: Register TAP device if requested. An adopted program carries
     // the previous process's devmap, so with no TAP asked for its one slot
