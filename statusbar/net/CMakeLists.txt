@@ -190,14 +190,28 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
       COMMENT "Compiling XDP BPF program"
       VERBATIM)
 
-    add_custom_target(xdp_bpf_obj DEPENDS ${XDP_BPF_OBJ})
+    # The object's bytes as a generated source, xdp_filter_bpf_o[] and its
+    # length, written by cmake/embed_file.cmake whenever the object changes. A
+    # generated source rather than C23 #embed: ccache keys a compilation on the
+    # preprocessed source and never sees the file #embed names, so a rebuilt
+    # object behind an unchanged .cpp came back from the cache with the old
+    # bytes, and the identity hashed from them was the old identity.
+    set(XDP_BPF_EMBED "${CMAKE_CURRENT_BINARY_DIR}/xdp_filter_bpf_embed.cpp")
+    add_custom_command(
+      OUTPUT ${XDP_BPF_EMBED}
+      COMMAND
+        ${CMAKE_COMMAND} -DINPUT=${XDP_BPF_OBJ} -DOUTPUT=${XDP_BPF_EMBED}
+        -DSYMBOL=xdp_filter_bpf_o -P
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/embed_file.cmake
+      DEPENDS ${XDP_BPF_OBJ}
+              ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/embed_file.cmake
+      COMMENT "Embedding the XDP BPF program"
+      VERBATIM)
+
+    add_custom_target(xdp_bpf_obj DEPENDS ${XDP_BPF_OBJ} ${XDP_BPF_EMBED})
     add_dependencies(statusbar-net xdp_bpf_obj)
 
-    target_sources(statusbar-net
-                   PRIVATE ${CMAKE_CURRENT_LIST_DIR}/xdp_filter_bpf_embed.cpp)
-    set_source_files_properties(
-      ${CMAKE_CURRENT_LIST_DIR}/xdp_filter_bpf_embed.cpp
-      PROPERTIES OBJECT_DEPENDS "${XDP_BPF_OBJ}")
+    target_sources(statusbar-net PRIVATE ${XDP_BPF_EMBED})
 
     # HAVE_XDP must be visible to consumers so the gated parts of
     # net_linux_xdp.hpp compile in their TUs too.
@@ -233,17 +247,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     if(HAVE_XDP_TX_METADATA_SUPPORT)
       target_compile_definitions(statusbar-net PUBLIC HAVE_XDP_TX_METADATA=1)
     endif()
-    # The --embed-dir flag is only needed when compiling
-    # xdp_filter_bpf_embed.cpp, which is the only TU using #embed. Scope it to
-    # that source rather than the whole library.
-    set_source_files_properties(
-      ${CMAKE_CURRENT_LIST_DIR}/xdp_filter_bpf_embed.cpp
-      PROPERTIES COMPILE_OPTIONS "--embed-dir=${CMAKE_CURRENT_BINARY_DIR}")
     # libbpf/libxdp leak through net_linux_xdp.hpp (a public header), so
     # consumers of statusbar::net must also see the headers and link the
     # libraries. PUBLIC propagates both for usage and for the exported target.
-    # The $<BUILD_INTERFACE:…> binary-dir entry is build-only (needed for the
-    # embed) and stays out of the install interface.
+    # The $<BUILD_INTERFACE:…> binary-dir entry is build-only (the generated
+    # sources) and stays out of the install interface.
     target_link_libraries(statusbar-net PUBLIC ${LIBBPF_LIBRARIES}
                                                ${LIBXDP_LIBRARIES})
     target_include_directories(statusbar-net PUBLIC ${LIBBPF_INCLUDE_DIRS}

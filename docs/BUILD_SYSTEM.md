@@ -62,8 +62,9 @@ if an actual module is ever introduced.
 valid strings are `Debug`, `Release`, `RelWithDebInfo`, `MinSizeRel`.
 
 **Flags.** `-stdlib=libc++ -fstack-protector-strong` are appended to
-`CMAKE_CXX_FLAGS`. `-Wno-c23-extensions` is also added so C23 `#embed`
-works in C++23 mode (used to embed BPF object files). Per-config:
+`CMAKE_CXX_FLAGS`. `-Wno-c23-extensions` is also added so C23 extensions
+pass in C++23 mode (the BPF object was once pulled in with `#embed`; it is
+now a generated source, see `cmake/embed_file.cmake`). Per-config:
 
 | Build type       | Flags                  |
 |------------------|------------------------|

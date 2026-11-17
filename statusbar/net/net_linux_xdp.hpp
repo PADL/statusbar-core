@@ -9,8 +9,8 @@
 
 #if defined(__linux__) && defined(HAVE_XDP)
 
-// BPF object is embedded via #embed in xdp_filter_bpf_embed.cpp (plain .cpp
-// avoids clang-19 #embed bug in module interface units that places data in BSS).
+// The BPF object's bytes, in a source cmake/embed_file.cmake generates from
+// the object at build time (xdp_filter_bpf_embed.cpp in the binary directory).
 extern unsigned char const xdp_filter_bpf_o[];
 extern unsigned int const xdp_filter_bpf_o_len;
 

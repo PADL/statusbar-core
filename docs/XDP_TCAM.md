@@ -259,7 +259,8 @@ newer Ubuntu):
 make build
 ```
 Should pick up the changed `xdp_filter.bpf.c`, recompile it to
-`.bpf.o`, re-embed via `#embed` into the userspace binary.
+`.bpf.o`, regenerate the source that carries its bytes
+(`cmake/embed_file.cmake`) and link it into the userspace binary.
 
 ### Linux runtime
 
