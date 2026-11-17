@@ -64,7 +64,8 @@ statusbar_add_module(
   net_xdp_abi_test.cpp
   net_xdp_launch_time_test.cpp
   net_xdp_avtp_rules_test.cpp
-  net_xdp_equiv_test.cpp)
+  net_xdp_equiv_test.cpp
+  net_xdp_object_test.cpp)
 
 # The netlink reply parsers read kernel replies at offsets the replies
 # themselves state; the fuzzers feed them arbitrary bytes. The tc and VLAN
@@ -168,10 +169,23 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(XDP_BPF_SRC "${CMAKE_CURRENT_SOURCE_DIR}/xdp_filter.bpf.c")
     set(XDP_BPF_OBJ "${CMAKE_CURRENT_BINARY_DIR}/xdp_filter.bpf.o")
 
+    # The object is hashed into XdpProgram::identity(), which decides whether a
+    # pinned program on the interface is this build's to adopt. Its debug info
+    # (-g, which BTF needs) would otherwise name the source and build
+    # directories, so the same source built in two trees would be two
+    # identities, and every package built in a fresh tree would detach and
+    # re-attach the running program: an adapter reset on igb, a VSI down and up
+    # on ice. The directories are mapped to fixed names and the compilation
+    # directory recorded as ".", so the identity depends on the source, the ABI
+    # header and the compiler alone; net_xdp_object_test checks it.
     add_custom_command(
       OUTPUT ${XDP_BPF_OBJ}
-      COMMAND ${BPF_CLANG} -target bpf -O2 -g -I${LIBBPF_INCLUDE_DIRS}
-              ${MULTIARCH_INCLUDE} -c ${XDP_BPF_SRC} -o ${XDP_BPF_OBJ}
+      COMMAND
+        ${BPF_CLANG} -target bpf -O2 -g -fdebug-compilation-dir=.
+        -fdebug-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=statusbar/net
+        -fdebug-prefix-map=${CMAKE_CURRENT_BINARY_DIR}=statusbar/net
+        -I${LIBBPF_INCLUDE_DIRS} ${MULTIARCH_INCLUDE} -c ${XDP_BPF_SRC} -o
+        ${XDP_BPF_OBJ}
       DEPENDS ${XDP_BPF_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/net_tcam_bpf_abi.h
       COMMENT "Compiling XDP BPF program"
       VERBATIM)
