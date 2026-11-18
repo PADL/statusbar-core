@@ -174,6 +174,22 @@ using RequestBuffer = netlink::RequestBuffer;
 /// malformed, of another family or command, or carries no DPLL_A_ID.
 [[nodiscard]] auto parse_device(std::span<uint8_t const> message, uint16_t family_id) -> StatusValue<DeviceMessage>;
 
+/// The devices of one DPLL_CMD_DEVICE_GET dump, taken reply by reply. The
+/// socket sends a request again when a reply did not fit or a transient
+/// error cut it short, and the dump starts over with it: restart() forgets
+/// the devices of the attempt before, or they would be listed twice.
+struct DeviceDump
+{
+    std::vector<Device> devices{};
+
+    /// A new attempt at the dump: nothing read so far counts.
+    void restart() noexcept { devices.clear(); }
+
+    /// One reply, of netlink type `type`: a device of family `family_id` is
+    /// kept, a message of another family ignored. Errors: parse_device()'s.
+    [[nodiscard]] auto take(std::span<uint8_t const> message, uint16_t type, uint16_t family_id) -> Status;
+};
+
 #if defined(__linux__)
 
 //

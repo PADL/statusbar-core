@@ -109,11 +109,20 @@ struct RingParams
     [[nodiscard]] constexpr auto operator==(RingParams const&) const noexcept -> bool = default;
 };
 
+/// Whether @p params describe descriptor rings at all. A driver may answer
+/// ETHTOOL_GRINGPARAM successfully with every size zero (some Wi-Fi drivers
+/// do): it has no rings to read or set, the same as one that refuses the
+/// request, and ring_params() reports it the same way.
+[[nodiscard]] constexpr auto has_rings(RingParams const& params) noexcept -> bool
+{
+    return params.rx_max > 0 || params.tx_max > 0;
+}
+
 /// The interface's ring sizes. Needs no privilege.
 /// @param interface_name Interface name
 /// @return The sizes, or `operation_not_supported` for an interface with no
-///         rings (`lo`, most virtual devices), or `no_such_device` /
-///         `filename_too_long`.
+///         rings (`lo`, most virtual devices, a driver whose answer is every
+///         size zero), or `no_such_device` / `filename_too_long`.
 [[nodiscard]] auto ring_params(std::string_view interface_name) -> StatusValue<RingParams>;
 
 /// Whether an RX ring of @p rx_pending descriptors is a change to @p params:

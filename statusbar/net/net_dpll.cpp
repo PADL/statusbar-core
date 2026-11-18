@@ -311,6 +311,14 @@ auto parse_device(std::span<uint8_t const> const message, uint16_t const family_
     });
 }
 
+auto DeviceDump::take(std::span<uint8_t const> const message, uint16_t const type, uint16_t const family_id) -> Status
+{
+    if (type != family_id) {
+        return success();
+    }
+    return parse_device(message, family_id).transform([&](DeviceMessage const& got) { devices.push_back(got.device); });
+}
+
 #if defined(__linux__)
 
 //
@@ -348,20 +356,18 @@ auto DpllClient::open() -> Status
 
 auto DpllClient::devices() -> StatusValue<std::vector<Device>>
 {
-    std::vector<Device> devices;
+    DeviceDump dump;
     auto const asked = socket_.request(
         reply_,
-        [&](std::span<uint8_t> const out, uint32_t const seq) { return build_device_dump(out, family_.id, seq); },
-        [&](std::span<uint8_t const> const message, uint16_t const type) -> Status {
-            if (type != family_.id) {
-                return success();
-            }
-            return parse_device(message, family_.id).transform([&](DeviceMessage const& got) { devices.push_back(got.device); });
-        });
+        [&](std::span<uint8_t> const out, uint32_t const seq) {
+            dump.restart();  // built once per attempt: a request sent again starts the dump over
+            return build_device_dump(out, family_.id, seq);
+        },
+        [&](std::span<uint8_t const> const message, uint16_t const type) { return dump.take(message, type, family_.id); });
     if (!asked) {
         return failure(asked.error());
     }
-    return devices;
+    return std::move(dump.devices);
 }
 
 auto DpllClient::device(uint32_t const id) -> StatusValue<Device>

@@ -182,16 +182,25 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # re-attach the running program: an adapter reset on igb, a VSI down and up
     # on ice. The directories are mapped to fixed names and the compilation
     # directory recorded as ".", so the identity depends on the source, the ABI
-    # header and the compiler alone; net_xdp_object_test checks it.
+    # header and the compiler alone; net_xdp_object_test checks it. A cross
+    # build's sysroot is mapped to "/" for the same reason: its headers are then
+    # named as the target names them, wherever the sysroot was unpacked. This
+    # file is a dependency so a changed rule rebuilds the object under a
+    # generator that does not track the command line (Makefiles).
+    set(XDP_BPF_PREFIX_MAPS
+        -fdebug-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=statusbar/net
+        -fdebug-prefix-map=${CMAKE_CURRENT_BINARY_DIR}=statusbar/net)
+    if(CMAKE_SYSROOT)
+      list(APPEND XDP_BPF_PREFIX_MAPS -fdebug-prefix-map=${CMAKE_SYSROOT}=/)
+    endif()
     add_custom_command(
       OUTPUT ${XDP_BPF_OBJ}
       COMMAND
         ${BPF_CLANG} -target bpf -O2 -g -fdebug-compilation-dir=.
-        -fdebug-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=statusbar/net
-        -fdebug-prefix-map=${CMAKE_CURRENT_BINARY_DIR}=statusbar/net
-        -I${LIBBPF_INCLUDE_DIRS} ${MULTIARCH_INCLUDE} -c ${XDP_BPF_SRC} -o
-        ${XDP_BPF_OBJ}
+        ${XDP_BPF_PREFIX_MAPS} -I${LIBBPF_INCLUDE_DIRS} ${MULTIARCH_INCLUDE} -c
+        ${XDP_BPF_SRC} -o ${XDP_BPF_OBJ}
       DEPENDS ${XDP_BPF_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/net_tcam_bpf_abi.h
+              ${CMAKE_CURRENT_LIST_FILE}
       COMMENT "Compiling XDP BPF program"
       VERBATIM)
 

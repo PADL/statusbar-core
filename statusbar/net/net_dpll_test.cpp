@@ -144,6 +144,22 @@ TEST(dpll, a_change_notification_carries_its_command_and_what_it_says)
     EXPECT_FALSE(is_locked(got->device.lock_status));
 }
 
+TEST(dpll, a_dump_sent_again_forgets_the_devices_of_the_attempt_before)
+{
+    DeviceDump dump;
+    EXPECT_TRUE(dump.take(DEVICE_REPLY, DPLL_ID, DPLL_ID).has_value());
+    EXPECT_TRUE(dump.take(DEVICE_REPLY, uint16_t{0x10}, DPLL_ID).has_value());  // another family: ignored
+    EXPECT_EQ(dump.devices.size(), size_t{1});
+    // The socket's second attempt builds the request again, and the dump
+    // starts over: one device, not the first attempt's and the second's.
+    dump.restart();
+    EXPECT_TRUE(dump.take(DEVICE_REPLY, DPLL_ID, DPLL_ID).has_value());
+    EXPECT_EQ(dump.devices.size(), size_t{1});
+    // Without the restart the same reply read twice is two devices.
+    EXPECT_TRUE(dump.take(DEVICE_REPLY, DPLL_ID, DPLL_ID).has_value());
+    EXPECT_EQ(dump.devices.size(), size_t{2});
+}
+
 TEST(dpll, a_message_that_is_not_a_device_of_this_family_is_refused)
 {
     EXPECT_FALSE(parse_device(DEVICE_REPLY, uint16_t{0x1b}).has_value());  // another family

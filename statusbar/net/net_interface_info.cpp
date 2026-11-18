@@ -293,17 +293,6 @@ auto tx_queue_count(std::string_view const interface_name) -> StatusValue<uint16
 
 namespace {
 
-/// ETHTOOL_GRINGPARAM for `interface_name`, the kernel's struct as it came back.
-[[nodiscard]] auto read_ring_params(std::string_view const interface_name) -> StatusValue<ethtool_ringparam>
-{
-    ethtool_ringparam rings{};
-    rings.cmd = ETHTOOL_GRINGPARAM;
-    if (auto status = info_ethtool_ioctl(interface_name, rings); !status) {
-        return forward_failure(status);
-    }
-    return rings;
-}
-
 [[nodiscard]] auto ring_params_from(ethtool_ringparam const& rings) noexcept -> RingParams
 {
     return RingParams{
@@ -312,6 +301,22 @@ namespace {
         .rx = rings.rx_pending,
         .tx = rings.tx_pending,
     };
+}
+
+/// ETHTOOL_GRINGPARAM for `interface_name`, the kernel's struct as it came
+/// back. A driver that answers with every size zero has no rings, and is
+/// reported like one that refused: operation_not_supported.
+[[nodiscard]] auto read_ring_params(std::string_view const interface_name) -> StatusValue<ethtool_ringparam>
+{
+    ethtool_ringparam rings{};
+    rings.cmd = ETHTOOL_GRINGPARAM;
+    if (auto status = info_ethtool_ioctl(interface_name, rings); !status) {
+        return forward_failure(status);
+    }
+    if (!has_rings(ring_params_from(rings))) {
+        return failure(std::make_error_code(std::errc::operation_not_supported));
+    }
+    return rings;
 }
 
 }  // namespace

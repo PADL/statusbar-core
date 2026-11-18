@@ -365,6 +365,8 @@ TEST(interface_info, lo_has_no_rings_and_says_so_distinguishably)
 
 /// Some interface with descriptor rings, if the host has one: a real NIC,
 /// not a virtual device. Empty when there is none.
+/// An interface with an RX ring that is set: one set_rx_ring() can be asked
+/// for the size it has.
 auto an_interface_with_rings() -> std::string
 {
     DIR* dir = ::opendir("/sys/class/net");
@@ -374,7 +376,10 @@ auto an_interface_with_rings() -> std::string
     std::string found;
     while (dirent const* entry = ::readdir(dir)) {
         std::string const name{entry->d_name};
-        if (name != "." && name != ".." && ring_params(name).has_value()) {
+        if (name == "." || name == "..") {
+            continue;
+        }
+        if (auto const rings = ring_params(name); rings && rings->rx > 0) {
             found = name;
             break;
         }
@@ -397,12 +402,15 @@ TEST(interface_info, every_interface_answers_about_its_rings_or_refuses_cleanly)
         }
         auto const rings = ring_params(name);
         if (!rings) {
-            // A virtual interface has no rings; the same clean failure lo gives.
+            // A virtual interface has no rings, and neither has a driver whose
+            // answer is every size zero: the same clean failure lo gives.
             EXPECT_EQ(rings.error(), std::make_error_code(std::errc::operation_not_supported));
             continue;
         }
-        EXPECT_TRUE(rings->rx > 0 && rings->rx <= rings->rx_max);
-        EXPECT_TRUE(rings->tx > 0 && rings->tx <= rings->tx_max);
+        // What came back has rings, and the sizes set fit them.
+        EXPECT_TRUE(has_rings(*rings));
+        EXPECT_TRUE(rings->rx <= rings->rx_max);
+        EXPECT_TRUE(rings->tx <= rings->tx_max);
     }
     ::closedir(dir);
 }
@@ -431,6 +439,18 @@ TEST(interface_info, setting_the_rx_ring_to_the_size_it_has_writes_nothing)
     if (!too_many) {
         EXPECT_EQ(too_many.error(), std::make_error_code(std::errc::invalid_argument));
     }
+}
+
+TEST(interface_info, a_driver_answering_every_size_zero_has_no_rings)
+{
+    EXPECT_FALSE(has_rings(RingParams{}));
+    EXPECT_FALSE(has_rings(RingParams{.rx_max = 0, .tx_max = 0, .rx = 0, .tx = 0}));
+    EXPECT_TRUE(has_rings(RingParams{.rx_max = 4096, .tx_max = 4096, .rx = 256, .tx = 256}));
+    EXPECT_TRUE(has_rings(RingParams{.rx_max = 512, .tx_max = 0, .rx = 512, .tx = 0}));  // RX rings alone are rings
+    // Asked for the size it has (zero), a ringless answer would be refused as
+    // an argument; reported as no rings, it is never asked.
+    auto const refused = rx_ring_change(RingParams{}, 0);
+    EXPECT_FALSE(refused.has_value());
 }
 
 TEST(interface_info, rx_ring_change_decides_without_a_nic)
