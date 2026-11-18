@@ -23,6 +23,7 @@ static_assert(MESSAGE_HEADER == sizeof(nlmsghdr) && ATTRIBUTE_HEADER == sizeof(n
 static_assert(OFFSET_LENGTH == offsetof(nlmsghdr, nlmsg_len) && OFFSET_TYPE == offsetof(nlmsghdr, nlmsg_type));
 static_assert(OFFSET_FLAGS == offsetof(nlmsghdr, nlmsg_flags) && OFFSET_SEQUENCE == offsetof(nlmsghdr, nlmsg_seq));
 static_assert(OFFSET_PORT_ID == offsetof(nlmsghdr, nlmsg_pid) && TYPE_MASK == static_cast<uint16_t>(NLA_TYPE_MASK));
+static_assert(ATTRIBUTE_NESTED == NLA_F_NESTED);
 static_assert(FLAG_REQUEST == NLM_F_REQUEST && FLAG_MULTI == NLM_F_MULTI && FLAG_ACK == NLM_F_ACK);
 static_assert(FLAG_DUMP == NLM_F_DUMP && FLAG_CAPPED == NLM_F_CAPPED && FLAG_ACK_TLVS == NLM_F_ACK_TLVS);
 static_assert(TYPE_ERROR == NLMSG_ERROR && TYPE_DONE == NLMSG_DONE && TYPE_MIN_FAMILY == NLMSG_MIN_TYPE);

@@ -16,6 +16,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <system_error>
 #include <vector>
@@ -82,6 +83,35 @@ constexpr std::array<uint8_t, 44> CHANGE_NOTIFICATION{
     0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,                                // DPLL_A_ID 0
     0x08, 0x00, 0x07, 0x00, 0x04, 0x00, 0x00, 0x00,                                // DPLL_A_LOCK_STATUS holdover
     0x08, 0x00, 0x0a, 0x00, 0x03, 0x00, 0x00, 0x00,                                // DPLL_A_LOCK_STATUS_ERROR media down
+};
+
+/// DPLL_CMD_PIN_GET for an E810-T's pin 76: SMA1, ext, 8 kHz of 1 Hz to 25 MHz, every capability,
+/// an output of devices 6 (disconnected) and 7 (connected, phase offset -66750650).
+constexpr std::array<uint8_t, 212> PIN_SMA1{
+    0xd4, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x08, 0x01, 0x00, 0x00,                                                        // DPLL_CMD_PIN_GET
+    0x08, 0x00, 0x01, 0x00, 0x4c, 0x00, 0x00, 0x00,                                // DPLL_A_PIN_ID 76
+    0x08, 0x00, 0x03, 0x00, 'i', 'c', 'e', 0x00,                                   // DPLL_A_PIN_MODULE_NAME
+    0x0c, 0x00, 0x05, 0x00, 0xb8, 0xc4, 0x69, 0xff, 0xff, 0x6f, 0x7c, 0x50,        // DPLL_A_PIN_CLOCK_ID
+    0x09, 0x00, 0x06, 0x00, 'S', 'M', 'A', '1', 0x00, 0x00, 0x00, 0x00,            // DPLL_A_PIN_BOARD_LABEL
+    0x08, 0x00, 0x09, 0x00, 0x02, 0x00, 0x00, 0x00,                                // DPLL_A_PIN_TYPE ext
+    0x0c, 0x00, 0x0b, 0x00, 0x40, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,        // DPLL_A_PIN_FREQUENCY 8000
+    0x1c, 0x00, 0x0c, 0x00,                                                        // DPLL_A_PIN_FREQUENCY_SUPPORTED
+        0x0c, 0x00, 0x0d, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,    //   _MIN 1
+        0x0c, 0x00, 0x0e, 0x00, 0x40, 0x78, 0x7d, 0x01, 0x00, 0x00, 0x00, 0x00,    //   _MAX 25000000
+    0x08, 0x00, 0x11, 0x00, 0x07, 0x00, 0x00, 0x00,                                // DPLL_A_PIN_CAPABILITIES
+    0x30, 0x00, 0x12, 0x00,                                                        // DPLL_A_PIN_PARENT_DEVICE
+        0x08, 0x00, 0x02, 0x00, 0x06, 0x00, 0x00, 0x00,                            //   _PARENT_ID 6
+        0x08, 0x00, 0x0a, 0x00, 0x02, 0x00, 0x00, 0x00,                            //   _DIRECTION output
+        0x08, 0x00, 0x0f, 0x00, 0xff, 0x00, 0x00, 0x00,                            //   _PRIO 255
+        0x08, 0x00, 0x10, 0x00, 0x02, 0x00, 0x00, 0x00,                            //   _STATE disconnected
+        0x0c, 0x00, 0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,    //   _PHASE_OFFSET 0
+    0x30, 0x00, 0x12, 0x00,                                                        // DPLL_A_PIN_PARENT_DEVICE
+        0x08, 0x00, 0x02, 0x00, 0x07, 0x00, 0x00, 0x00,                            //   _PARENT_ID 7
+        0x08, 0x00, 0x0a, 0x00, 0x02, 0x00, 0x00, 0x00,                            //   _DIRECTION output
+        0x08, 0x00, 0x0f, 0x00, 0xff, 0x00, 0x00, 0x00,                            //   _PRIO 255
+        0x08, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x00,                            //   _STATE connected
+        0x0c, 0x00, 0x17, 0x00, 0x46, 0x77, 0x05, 0xfc, 0xff, 0xff, 0xff, 0xff,    //   _PHASE_OFFSET
 };
 // clang-format on
 
@@ -201,6 +231,105 @@ TEST(dpll, the_names_of_the_states)
     EXPECT_FALSE(is_locked(LockStatus::unknown));
 }
 
+TEST(dpll_pin, a_pin_reads_with_its_ranges_and_parents)
+{
+    if (!LITTLE) {
+        SKIP("the vectors are little-endian");
+    }
+    auto const got = parse_pin(PIN_SMA1, DPLL_ID);
+    EXPECT_TRUE(got.has_value());
+    if (!got) {
+        return;
+    }
+    auto const& pin = got->pin;
+    EXPECT_EQ(got->cmd, CMD_PIN_GET);
+    EXPECT_TRUE(pin.id == 76 && pin.module_name == "ice" && pin.clock_id == 0x507c6fffff69c4b8ULL && pin.label() == "SMA1");
+    EXPECT_TRUE(pin.type == 2 && pin.capabilities == 7 && pin.frequency_hz == std::optional<uint64_t>{8000});
+    EXPECT_TRUE((pin.frequencies.size() == 1 && pin.frequencies[0] == FrequencyRange{.min_hz = 1, .max_hz = 25'000'000}));
+    EXPECT_EQ(pin.parents.size(), size_t{2});
+    auto const pps = pin.parent(7);
+    EXPECT_TRUE(pps && pps->direction == PinDirection::output && pps->state == PinState::connected && pps->prio == 255U);
+    EXPECT_TRUE(pps && pps->phase_offset == std::optional<int64_t>{-66'750'650});
+    auto const eec = pin.parent(6);
+    EXPECT_TRUE(eec && eec->state == PinState::disconnected);
+    EXPECT_FALSE(pin.parent(8).has_value());
+}
+
+TEST(dpll_pin, a_pin_message_with_a_nest_cut_short_or_of_another_kind_is_refused)
+{
+    auto no_max = PIN_SMA1;
+    no_max[98] = 0x0f;  // DPLL_A_PIN_FREQUENCY_MAX becomes an attribute nobody reads: a range without its maximum
+    EXPECT_FALSE(parse_pin(no_max, DPLL_ID).has_value());
+    auto no_parent_id = PIN_SMA1;
+    no_parent_id[122] = 0x03;  // the first parent's id renamed
+    EXPECT_FALSE(parse_pin(no_parent_id, DPLL_ID).has_value());
+    EXPECT_FALSE(parse_pin(DEVICE_REPLY, DPLL_ID).has_value());
+    EXPECT_FALSE(parse_device(PIN_SMA1, DPLL_ID).has_value());
+    EXPECT_FALSE(parse_pin(std::span<uint8_t const>{PIN_SMA1}.first(60), DPLL_ID).has_value());
+}
+
+TEST(dpll_pin, a_frequency_is_supported_within_a_range)
+{
+    Pin const pin{.frequencies = {{.min_hz = 1, .max_hz = 1}, {.min_hz = 10'000'000, .max_hz = 10'000'000}}};
+    EXPECT_TRUE(pin.supports_frequency(1));
+    EXPECT_TRUE(pin.supports_frequency(10'000'000));
+    EXPECT_FALSE(pin.supports_frequency(8000));
+    EXPECT_FALSE(Pin{}.supports_frequency(1));
+}
+
+TEST(dpll_pin, the_label_is_the_board_then_panel_then_package_one)
+{
+    EXPECT_TRUE((Pin{.board_label = "SMA1", .panel_label = "A"}.label() == "SMA1"));
+    EXPECT_TRUE((Pin{.panel_label = "A", .package_label = "B"}.label() == "A"));
+    EXPECT_TRUE((Pin{.package_label = "B"}.label() == "B"));
+    EXPECT_TRUE(Pin{}.label().empty());
+    EXPECT_EQ(pin_direction_name(PinDirection::output), std::string_view{"output"});
+    EXPECT_EQ(pin_state_name(PinState::selectable), std::string_view{"selectable"});
+    EXPECT_EQ(pin_state_name(static_cast<PinState>(9)), std::string_view{"unknown"});
+}
+
+TEST(dpll_pin, the_pin_requests_as_the_kernel_reads_them)
+{
+    if (!LITTLE) {
+        SKIP("the expected bytes are little-endian");
+    }
+    // clang-format off
+    constexpr std::array<uint8_t, 48> output{
+        0x30, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x09, 0x01, 0x00, 0x00,                                                    // DPLL_CMD_PIN_SET
+        0x08, 0x00, 0x01, 0x00, 0x4c, 0x00, 0x00, 0x00,                            // DPLL_A_PIN_ID 76
+        0x14, 0x00, 0x12, 0x80,                                                    // DPLL_A_PIN_PARENT_DEVICE (nested)
+            0x08, 0x00, 0x02, 0x00, 0x07, 0x00, 0x00, 0x00,                        //   _PARENT_ID 7
+            0x08, 0x00, 0x0a, 0x00, 0x02, 0x00, 0x00, 0x00,                        //   _DIRECTION output
+    };
+    constexpr std::array<uint8_t, 40> frequency{
+        0x28, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x05, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x09, 0x01, 0x00, 0x00,                                                    // DPLL_CMD_PIN_SET
+        0x08, 0x00, 0x01, 0x00, 0x4c, 0x00, 0x00, 0x00,                            // DPLL_A_PIN_ID 76
+        0x0c, 0x00, 0x0b, 0x00, 0x40, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,    // DPLL_A_PIN_FREQUENCY 8000
+    };
+    // clang-format on
+    RequestBuffer out{};
+    auto length = build_pin_parent_set(out, DPLL_ID, 76, {.device_id = 7, .direction = PinDirection::output}, 1);
+    EXPECT_TRUE(length && same_bytes(std::span{out}.first(*length), output));
+    length = build_pin_frequency_set(out, DPLL_ID, 76, 8000, 2);
+    EXPECT_TRUE(length && same_bytes(std::span{out}.first(*length), frequency));
+    length = build_pin_dump(out, DPLL_ID, 3);
+    EXPECT_TRUE(length && *length == 20 && out[16] == CMD_PIN_GET && out[7] == 0x03);
+}
+
+TEST(dpll_pin, a_parent_setting_carries_only_what_it_sets)
+{
+    RequestBuffer out{};
+    auto const both = build_pin_parent_set(
+        out, DPLL_ID, 76, {.device_id = 7, .direction = PinDirection::output, .state = PinState::connected}, 1);
+    EXPECT_TRUE(both && *both == 56);
+    auto const state = build_pin_parent_set(out, DPLL_ID, 76, {.device_id = 7, .state = PinState::connected}, 1);
+    EXPECT_TRUE(state && *state == 48);
+    std::array<uint8_t, 16> small{};
+    EXPECT_FALSE(build_pin_parent_set(small, DPLL_ID, 76, {.device_id = 7}, 1).has_value());
+}
+
 #if defined(__linux__)
 
 TEST(dpll_watch, a_datagram_of_notifications_is_handed_on_one_event_each)
@@ -292,6 +421,7 @@ TEST(dpll_client, the_kernels_devices_are_listed_and_read_back)
     }
     auto const missing = client.device(0x7fff'fff0);
     EXPECT_FALSE(missing.has_value());
+    EXPECT_TRUE(client.pins().has_value());
 
     DpllWatch watch{[](DeviceEvent, Device const&, int64_t) {}};
     auto const watching = watch.open();

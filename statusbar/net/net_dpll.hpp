@@ -10,10 +10,12 @@
 /// driven from an external reference is only as good as that reference, and
 /// the lock status is how the hardware says whether it has one.
 ///
-/// `DpllClient` lists the devices and reads one; `DpllWatch` joins the
-/// family's `monitor` multicast group and reports every device change the
-/// kernel announces, as a reactor Pollable, so a daemon follows the lock
-/// without polling. Both resolve the family through the generic-netlink
+/// `DpllClient` lists the devices and reads one, lists the pins, and sets a
+/// pin's direction and state toward a parent device, or its frequency, as
+/// `dpll pin set` does (an E810 SMA connector as an input or an output of
+/// the PPS DPLL). `DpllWatch` joins the family's `monitor` multicast group
+/// and reports every device change the kernel announces, as a reactor
+/// Pollable, so a daemon follows the lock without polling. Both resolve the family through the generic-netlink
 /// controller, which also names the multicast group's id.
 ///
 /// The framing (constants, builders, parsers) builds everywhere and is tested
@@ -55,6 +57,12 @@ inline constexpr uint8_t CMD_DEVICE_GET = 2;
 inline constexpr uint8_t CMD_DEVICE_CREATE_NTF = 4;
 inline constexpr uint8_t CMD_DEVICE_DELETE_NTF = 5;
 inline constexpr uint8_t CMD_DEVICE_CHANGE_NTF = 6;
+/// DPLL_CMD_*: the pin commands, and the pin notifications.
+inline constexpr uint8_t CMD_PIN_GET = 8;
+inline constexpr uint8_t CMD_PIN_SET = 9;
+inline constexpr uint8_t CMD_PIN_CREATE_NTF = 10;
+inline constexpr uint8_t CMD_PIN_DELETE_NTF = 11;
+inline constexpr uint8_t CMD_PIN_CHANGE_NTF = 12;
 
 /// DPLL_A_*: a device's attributes.
 inline constexpr uint16_t A_ID = 1;                  ///< u32
@@ -65,6 +73,35 @@ inline constexpr uint16_t A_LOCK_STATUS = 7;         ///< u32, LockStatus
 inline constexpr uint16_t A_TEMP = 8;                ///< s32, millidegrees Celsius
 inline constexpr uint16_t A_TYPE = 9;                ///< u32, Type
 inline constexpr uint16_t A_LOCK_STATUS_ERROR = 10;  ///< u32, LockStatusError
+
+/// DPLL_A_PIN_*: a pin's attributes, and those of its parent-device and
+/// frequency-supported nests.
+inline constexpr uint16_t A_PIN_ID = 1;                    ///< u32
+inline constexpr uint16_t A_PIN_PARENT_ID = 2;             ///< u32, in a parent nest
+inline constexpr uint16_t A_PIN_MODULE_NAME = 3;           ///< a NUL-terminated string
+inline constexpr uint16_t A_PIN_CLOCK_ID = 5;              ///< u64
+inline constexpr uint16_t A_PIN_BOARD_LABEL = 6;           ///< a NUL-terminated string
+inline constexpr uint16_t A_PIN_PANEL_LABEL = 7;           ///< a NUL-terminated string
+inline constexpr uint16_t A_PIN_PACKAGE_LABEL = 8;         ///< a NUL-terminated string
+inline constexpr uint16_t A_PIN_TYPE = 9;                  ///< u32, dpll_pin_type
+inline constexpr uint16_t A_PIN_DIRECTION = 10;            ///< u32, PinDirection
+inline constexpr uint16_t A_PIN_FREQUENCY = 11;            ///< u64, Hz
+inline constexpr uint16_t A_PIN_FREQUENCY_SUPPORTED = 12;  ///< nest of A_PIN_FREQUENCY_MIN and _MAX
+inline constexpr uint16_t A_PIN_FREQUENCY_MIN = 13;        ///< u64, Hz
+inline constexpr uint16_t A_PIN_FREQUENCY_MAX = 14;        ///< u64, Hz
+inline constexpr uint16_t A_PIN_PRIO = 15;                 ///< u32
+inline constexpr uint16_t A_PIN_STATE = 16;                ///< u32, PinState
+inline constexpr uint16_t A_PIN_CAPABILITIES = 17;         ///< u32, CAN_CHANGE_*
+inline constexpr uint16_t A_PIN_PARENT_DEVICE = 18;        ///< nest
+inline constexpr uint16_t A_PIN_PHASE_OFFSET = 23;         ///< s64, ps * PHASE_OFFSET_DIVIDER
+
+/// dpll_pin_capabilities: what a pin lets be changed.
+inline constexpr uint32_t CAN_CHANGE_DIRECTION = 1;
+inline constexpr uint32_t CAN_CHANGE_PRIORITY = 2;
+inline constexpr uint32_t CAN_CHANGE_STATE = 4;
+
+/// DPLL_PHASE_OFFSET_DIVIDER: a phase offset's units per picosecond.
+inline constexpr int64_t PHASE_OFFSET_DIVIDER = 1000;
 
 /// CTRL_ATTR_MCAST_GROUPS, and the attributes of each group within it.
 inline constexpr uint16_t CTRL_MCAST_GROUPS = 7;
@@ -107,6 +144,23 @@ enum class Type : uint32_t
     eec = 2,  ///< an Ethernet Equipment Clock: frequency, SyncE
 };
 
+/// dpll_pin_direction: a pin's direction toward one parent device.
+enum class PinDirection : uint32_t
+{
+    unknown = 0,
+    input = 1,
+    output = 2,
+};
+
+/// dpll_pin_state: a pin's state toward one parent device.
+enum class PinState : uint32_t
+{
+    unknown = 0,
+    connected = 1,
+    disconnected = 2,
+    selectable = 3,  ///< an input the device may choose (automatic mode)
+};
+
 /// Whether a lock status is one a clock can be relied on in.
 [[nodiscard]] constexpr auto is_locked(LockStatus const status) noexcept -> bool
 {
@@ -115,6 +169,9 @@ enum class Type : uint32_t
 
 [[nodiscard]] auto lock_status_name(LockStatus status) noexcept -> std::string_view;
 [[nodiscard]] auto type_name(Type type) noexcept -> std::string_view;
+/// The names the kernel's dpll tool prints ("output", "selectable"); "unknown" otherwise.
+[[nodiscard]] auto pin_direction_name(PinDirection direction) noexcept -> std::string_view;
+[[nodiscard]] auto pin_state_name(PinState state) noexcept -> std::string_view;
 
 /// One device as DPLL_CMD_DEVICE_GET reports it, and as a change notification
 /// describes it. An attribute the kernel did not send reads as its `unknown`,
@@ -131,6 +188,64 @@ struct Device
     std::optional<int32_t> temperature_millicelsius{};
 
     [[nodiscard]] auto operator==(Device const&) const noexcept -> bool = default;
+};
+
+/// One range of a pin's supported frequencies, in Hz (min == max: one frequency).
+struct FrequencyRange
+{
+    uint64_t min_hz{0};
+    uint64_t max_hz{0};
+
+    [[nodiscard]] constexpr auto operator==(FrequencyRange const&) const noexcept -> bool = default;
+};
+
+/// A pin's relation to one parent device.
+struct PinParent
+{
+    uint32_t device_id{0};
+    PinDirection direction{PinDirection::unknown};
+    PinState state{PinState::unknown};
+    std::optional<uint32_t> prio{};
+    std::optional<int64_t> phase_offset{};  ///< ps * PHASE_OFFSET_DIVIDER, where the driver measures it
+
+    [[nodiscard]] constexpr auto operator==(PinParent const&) const noexcept -> bool = default;
+};
+
+/// One pin as DPLL_CMD_PIN_GET reports it, and as a pin notification describes
+/// it. An attribute the kernel did not send reads as empty, 0 or nullopt.
+struct Pin
+{
+    uint32_t id{0};
+    uint64_t clock_id{0};
+    std::string module_name{};
+    std::string board_label{};
+    std::string panel_label{};
+    std::string package_label{};
+    uint32_t type{0};  ///< dpll_pin_type
+    std::optional<uint64_t> frequency_hz{};
+    std::vector<FrequencyRange> frequencies{};  ///< what A_PIN_FREQUENCY may be set to
+    uint32_t capabilities{0};                   ///< CAN_CHANGE_*
+    std::vector<PinParent> parents{};           ///< its parent devices; parent pins are not kept
+
+    /// The board label, else the panel label, else the package label; empty when it has none.
+    [[nodiscard]] auto label() const noexcept -> std::string_view;
+    /// Its relation to device `device_id`; nullopt when that is no parent of it.
+    [[nodiscard]] auto parent(uint32_t device_id) const -> std::optional<PinParent>;
+    /// Whether `hz` lies in one of its frequency ranges.
+    [[nodiscard]] auto supports_frequency(uint64_t hz) const noexcept -> bool;
+
+    [[nodiscard]] auto operator==(Pin const&) const -> bool = default;
+};
+
+/// What DPLL_CMD_PIN_SET changes of a pin's relation to the parent device
+/// `device_id`; an unset field is left as it is.
+struct ParentSetting
+{
+    uint32_t device_id{0};
+    std::optional<PinDirection> direction{};
+    std::optional<PinState> state{};
+
+    [[nodiscard]] constexpr auto operator==(ParentSetting const&) const noexcept -> bool = default;
 };
 
 /// What the controller says of the family: its id and its monitor group's.
@@ -150,6 +265,13 @@ struct DeviceMessage
     Device device{};
 };
 
+/// A pin message: which command carried it, and the pin.
+struct PinMessage
+{
+    uint8_t cmd{0};  ///< CMD_PIN_GET, or one of the pin notifications
+    Pin pin{};
+};
+
 using RequestBuffer = netlink::RequestBuffer;
 
 //
@@ -165,6 +287,18 @@ using RequestBuffer = netlink::RequestBuffer;
 /// DPLL_CMD_DEVICE_GET for the device `id`, addressed to `family_id`.
 [[nodiscard]] auto build_device_get(std::span<uint8_t> out, uint16_t family_id, uint32_t id, uint32_t seq) -> StatusValue<size_t>;
 
+/// DPLL_CMD_PIN_GET as a dump (every pin), addressed to `family_id`.
+[[nodiscard]] auto build_pin_dump(std::span<uint8_t> out, uint16_t family_id, uint32_t seq) -> StatusValue<size_t>;
+
+/// DPLL_CMD_PIN_SET of pin `pin_id`'s relation to one parent device, one nest
+/// carrying only what `setting` sets.
+[[nodiscard]] auto build_pin_parent_set(
+    std::span<uint8_t> out, uint16_t family_id, uint32_t pin_id, ParentSetting const& setting, uint32_t seq) -> StatusValue<size_t>;
+
+/// DPLL_CMD_PIN_SET of pin `pin_id`'s frequency, in Hz.
+[[nodiscard]] auto build_pin_frequency_set(std::span<uint8_t> out, uint16_t family_id, uint32_t pin_id, uint64_t hz, uint32_t seq)
+    -> StatusValue<size_t>;
+
 /// The family's id and monitor group from one CTRL_CMD_NEWFAMILY message.
 /// bad_message when it is truncated, malformed, another message, or carries
 /// no id; a family with no `monitor` group reads as monitor_group 0.
@@ -174,6 +308,11 @@ using RequestBuffer = netlink::RequestBuffer;
 /// reply or a device notification. bad_message when it is truncated,
 /// malformed, of another family or command, or carries no DPLL_A_ID.
 [[nodiscard]] auto parse_device(std::span<uint8_t const> message, uint16_t family_id) -> StatusValue<DeviceMessage>;
+
+/// The pin in one message of family `family_id`: a DPLL_CMD_PIN_GET reply or
+/// a pin notification. bad_message when it is truncated, malformed, of another
+/// family or command, carries no A_PIN_ID, or a nest without its id or bounds.
+[[nodiscard]] auto parse_pin(std::span<uint8_t const> message, uint16_t family_id) -> StatusValue<PinMessage>;
 
 #if defined(__linux__)
 
@@ -208,6 +347,18 @@ class DpllClient
     /// The device `id`. Errors: ENODEV for no such device, else the request's.
     [[nodiscard]] auto device(uint32_t id) -> StatusValue<Device>;
 
+    /// Every pin the kernel has (a DPLL_CMD_PIN_GET dump). Errors: the
+    /// request's; EPERM without CAP_NET_ADMIN.
+    [[nodiscard]] auto pins() -> StatusValue<std::vector<Pin>>;
+
+    /// Pin `pin_id`'s relation to a parent device set. Errors: the kernel's
+    /// refusal (last_message() says why); EPERM without CAP_NET_ADMIN.
+    [[nodiscard]] auto set_parent(uint32_t pin_id, ParentSetting const& setting) -> Status;
+
+    /// Pin `pin_id`'s frequency set, in Hz. Errors: the kernel's refusal
+    /// (EINVAL: a frequency the pin does not support).
+    [[nodiscard]] auto set_frequency(uint32_t pin_id, uint64_t hz) -> Status;
+
     /// The family as open() resolved it (zeros when closed).
     [[nodiscard]] auto family() const noexcept -> Family { return family_; }
 
@@ -217,7 +368,7 @@ class DpllClient
   private:
     netlink::Socket socket_{};
     Family family_{};
-    std::array<uint8_t, 8192> reply_{};  ///< a dump of a few devices is well under this
+    std::array<uint8_t, 8192> reply_{};  ///< a dump datagram of devices or pins (each pin well under 1 KiB)
 };
 
 /// What the monitor group announced about a device.
