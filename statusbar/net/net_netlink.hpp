@@ -47,6 +47,8 @@ inline constexpr size_t OFFSET_SEQUENCE = 8;
 inline constexpr size_t OFFSET_PORT_ID = 12;
 /// nlattr::nla_type without NLA_F_NESTED (bit 15) and NLA_F_NET_BYTEORDER (bit 14).
 inline constexpr uint16_t TYPE_MASK = 0x3FFF;
+/// NLA_F_NESTED: the kernel's strict validation wants it on every nest a request carries.
+inline constexpr uint16_t ATTRIBUTE_NESTED = 0x8000;
 
 /// nlmsg_flags: NLM_F_REQUEST, NLM_F_MULTI, NLM_F_ACK, NLM_F_DUMP (ROOT | MATCH),
 /// and the two an NLMSG_ERROR carries: NLM_F_CAPPED (the request is not echoed)

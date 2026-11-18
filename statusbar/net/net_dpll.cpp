@@ -6,6 +6,7 @@
 #include "statusbar/buffer/buffer.hpp"
 #include "statusbar/buffer/span_utils.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <system_error>
 #include <utility>
@@ -47,6 +48,26 @@ static_assert(
     static_cast<uint32_t>(LockStatusError::fractional_frequency_offset_too_high) ==
     DPLL_LOCK_STATUS_ERROR_FRACTIONAL_FREQUENCY_OFFSET_TOO_HIGH);
 static_assert(static_cast<uint32_t>(Type::pps) == DPLL_TYPE_PPS && static_cast<uint32_t>(Type::eec) == DPLL_TYPE_EEC);
+static_assert(CMD_PIN_GET == DPLL_CMD_PIN_GET && CMD_PIN_SET == DPLL_CMD_PIN_SET && CMD_PIN_CREATE_NTF == DPLL_CMD_PIN_CREATE_NTF);
+static_assert(CMD_PIN_DELETE_NTF == DPLL_CMD_PIN_DELETE_NTF && CMD_PIN_CHANGE_NTF == DPLL_CMD_PIN_CHANGE_NTF);
+static_assert(A_PIN_ID == DPLL_A_PIN_ID && A_PIN_PARENT_ID == DPLL_A_PIN_PARENT_ID && A_PIN_MODULE_NAME == DPLL_A_PIN_MODULE_NAME);
+static_assert(A_PIN_CLOCK_ID == DPLL_A_PIN_CLOCK_ID && A_PIN_BOARD_LABEL == DPLL_A_PIN_BOARD_LABEL);
+static_assert(A_PIN_PANEL_LABEL == DPLL_A_PIN_PANEL_LABEL && A_PIN_PACKAGE_LABEL == DPLL_A_PIN_PACKAGE_LABEL);
+static_assert(A_PIN_TYPE == DPLL_A_PIN_TYPE && A_PIN_DIRECTION == DPLL_A_PIN_DIRECTION && A_PIN_FREQUENCY == DPLL_A_PIN_FREQUENCY);
+static_assert(A_PIN_FREQUENCY_SUPPORTED == DPLL_A_PIN_FREQUENCY_SUPPORTED && A_PIN_FREQUENCY_MIN == DPLL_A_PIN_FREQUENCY_MIN);
+static_assert(A_PIN_FREQUENCY_MAX == DPLL_A_PIN_FREQUENCY_MAX && A_PIN_PRIO == DPLL_A_PIN_PRIO && A_PIN_STATE == DPLL_A_PIN_STATE);
+static_assert(A_PIN_CAPABILITIES == DPLL_A_PIN_CAPABILITIES && A_PIN_PARENT_DEVICE == DPLL_A_PIN_PARENT_DEVICE);
+static_assert(A_PIN_PHASE_OFFSET == DPLL_A_PIN_PHASE_OFFSET && PHASE_OFFSET_DIVIDER == DPLL_PHASE_OFFSET_DIVIDER);
+static_assert(
+    CAN_CHANGE_DIRECTION == DPLL_PIN_CAPABILITIES_DIRECTION_CAN_CHANGE &&
+    CAN_CHANGE_PRIORITY == DPLL_PIN_CAPABILITIES_PRIORITY_CAN_CHANGE && CAN_CHANGE_STATE == DPLL_PIN_CAPABILITIES_STATE_CAN_CHANGE);
+static_assert(
+    static_cast<uint32_t>(PinDirection::input) == DPLL_PIN_DIRECTION_INPUT &&
+    static_cast<uint32_t>(PinDirection::output) == DPLL_PIN_DIRECTION_OUTPUT);
+static_assert(
+    static_cast<uint32_t>(PinState::connected) == DPLL_PIN_STATE_CONNECTED &&
+    static_cast<uint32_t>(PinState::disconnected) == DPLL_PIN_STATE_DISCONNECTED &&
+    static_cast<uint32_t>(PinState::selectable) == DPLL_PIN_STATE_SELECTABLE);
 #    endif
 #endif
 
@@ -133,6 +154,93 @@ template <typename T>
     return *found;
 }
 
+/// One attribute of an A_PIN_PARENT_DEVICE nest into `parent`; the parent's id into `id`.
+[[nodiscard]] auto read_parent_attribute(
+    uint16_t const type, std::span<uint8_t const> const payload, PinParent& parent, std::optional<uint32_t>& id) -> Status
+{
+    switch (type & netlink::TYPE_MASK) {
+        case A_PIN_PARENT_ID:
+            return read_scalar(payload, id.emplace());
+        case A_PIN_DIRECTION:
+            return read_enum(payload, parent.direction);
+        case A_PIN_STATE:
+            return read_enum(payload, parent.state);
+        case A_PIN_PRIO:
+            return read_scalar(payload, parent.prio.emplace());
+        case A_PIN_PHASE_OFFSET:
+            return read_scalar(payload, parent.phase_offset.emplace());
+        default:
+            return success();
+    }
+}
+
+/// An A_PIN_PARENT_DEVICE nest appended to `parents`; bad_message without the parent's id.
+[[nodiscard]] auto read_parent(std::span<uint8_t const> const nest, std::vector<PinParent>& parents) -> Status
+{
+    PinParent parent{};
+    std::optional<uint32_t> id;
+    auto const walked = netlink::walk_attributes(nest, [&](uint16_t const type, std::span<uint8_t const> const payload) {
+        return read_parent_attribute(type, payload, parent, id);
+    });
+    return required(walked, id).transform([&](uint32_t const device_id) {
+        parent.device_id = device_id;
+        parents.push_back(parent);
+    });
+}
+
+/// An A_PIN_FREQUENCY_SUPPORTED nest appended to `ranges`; bad_message without both bounds.
+[[nodiscard]] auto read_range(std::span<uint8_t const> const nest, std::vector<FrequencyRange>& ranges) -> Status
+{
+    std::optional<uint64_t> min;
+    std::optional<uint64_t> max;
+    auto const walked = netlink::walk_attributes(nest, [&](uint16_t const type, std::span<uint8_t const> const payload) -> Status {
+        auto const masked = type & netlink::TYPE_MASK;
+        return masked == A_PIN_FREQUENCY_MIN ? read_scalar(payload, min.emplace())
+            : masked == A_PIN_FREQUENCY_MAX  ? read_scalar(payload, max.emplace())
+                                             : success();
+    });
+    if (walked && (!min || !max)) {
+        return failure(netlink::bad_message());
+    }
+    return walked.transform([&] { ranges.push_back({.min_hz = *min, .max_hz = *max}); });
+}
+
+/// One DPLL_A_PIN_* attribute into `pin`; the id into `id`.
+[[nodiscard]] auto read_pin_attribute(
+    uint16_t const type, std::span<uint8_t const> const payload, Pin& pin, std::optional<uint32_t>& id) -> Status
+{
+    switch (type & netlink::TYPE_MASK) {
+        case A_PIN_ID:
+            return read_scalar(payload, id.emplace());
+        case A_PIN_MODULE_NAME:
+            pin.module_name = read_string(payload);
+            return success();
+        case A_PIN_CLOCK_ID:
+            return read_scalar(payload, pin.clock_id);
+        case A_PIN_BOARD_LABEL:
+            pin.board_label = read_string(payload);
+            return success();
+        case A_PIN_PANEL_LABEL:
+            pin.panel_label = read_string(payload);
+            return success();
+        case A_PIN_PACKAGE_LABEL:
+            pin.package_label = read_string(payload);
+            return success();
+        case A_PIN_TYPE:
+            return read_scalar(payload, pin.type);
+        case A_PIN_FREQUENCY:
+            return read_scalar(payload, pin.frequency_hz.emplace());
+        case A_PIN_FREQUENCY_SUPPORTED:
+            return read_range(payload, pin.frequencies);
+        case A_PIN_CAPABILITIES:
+            return read_scalar(payload, pin.capabilities);
+        case A_PIN_PARENT_DEVICE:
+            return read_parent(payload, pin.parents);
+        default:
+            return success();  // parent pins, phase adjustment, esync, whatever a later kernel adds
+    }
+}
+
 /// One multicast group of a CTRL_ATTR_MCAST_GROUPS list: its name and id.
 struct Group
 {
@@ -202,6 +310,31 @@ template <typename Attributes>
     return cmd == CMD_DEVICE_GET || cmd == CMD_DEVICE_CREATE_NTF || cmd == CMD_DEVICE_DELETE_NTF || cmd == CMD_DEVICE_CHANGE_NTF;
 }
 
+[[nodiscard]] constexpr auto is_pin_command(uint8_t const cmd) noexcept -> bool
+{
+    return cmd == CMD_PIN_GET || cmd == CMD_PIN_CREATE_NTF || cmd == CMD_PIN_DELETE_NTF || cmd == CMD_PIN_CHANGE_NTF;
+}
+
+/// The pin command a message carries in its generic-netlink header, or
+/// nullopt when the message is too short to have one or carries another.
+[[nodiscard]] auto pin_command_for(std::span<uint8_t const> const message) noexcept -> std::optional<uint8_t>
+{
+    if (message.size() < GENL_HEADER || !is_pin_command(message[netlink::MESSAGE_HEADER])) {
+        return std::nullopt;
+    }
+    return message[netlink::MESSAGE_HEADER];
+}
+
+/// A u32 attribute appended.
+void put_u32(BufferSerializerBuilder& b, uint16_t const type, uint32_t const value)
+{
+    netlink::put_attribute(b, type, make_const_span(value));
+}
+
+constexpr uint16_t REQUEST_ACK = netlink::FLAG_REQUEST | netlink::FLAG_ACK;
+constexpr size_t U32_ATTRIBUTE = netlink::attribute_size(sizeof(uint32_t));
+constexpr size_t U64_ATTRIBUTE = netlink::attribute_size(sizeof(uint64_t));
+
 /// The device command a message carries in its generic-netlink header, or
 /// nullopt when the message is too short to have one or carries another.
 [[nodiscard]] auto device_command_of(std::span<uint8_t const> const message) noexcept -> std::optional<uint8_t>
@@ -244,6 +377,57 @@ auto type_name(Type const type) noexcept -> std::string_view
     return "unknown";
 }
 
+auto pin_direction_name(PinDirection const direction) noexcept -> std::string_view
+{
+    switch (direction) {
+        case PinDirection::input:
+            return "input";
+        case PinDirection::output:
+            return "output";
+        case PinDirection::unknown:
+            break;
+    }
+    return "unknown";
+}
+
+auto pin_state_name(PinState const state) noexcept -> std::string_view
+{
+    switch (state) {
+        case PinState::connected:
+            return "connected";
+        case PinState::disconnected:
+            return "disconnected";
+        case PinState::selectable:
+            return "selectable";
+        case PinState::unknown:
+            break;
+    }
+    return "unknown";
+}
+
+//
+// Pin
+//
+
+auto Pin::label() const noexcept -> std::string_view
+{
+    if (!board_label.empty()) {
+        return board_label;
+    }
+    return panel_label.empty() ? std::string_view{package_label} : std::string_view{panel_label};
+}
+
+auto Pin::parent(uint32_t const device_id) const -> std::optional<PinParent>
+{
+    auto const it = std::ranges::find(parents, device_id, &PinParent::device_id);
+    return it == parents.end() ? std::nullopt : std::optional{*it};
+}
+
+auto Pin::supports_frequency(uint64_t const hz) const noexcept -> bool
+{
+    return std::ranges::any_of(frequencies, [hz](FrequencyRange const& r) { return r.min_hz <= hz && hz <= r.max_hz; });
+}
+
 //
 // Framing
 //
@@ -266,6 +450,42 @@ auto build_device_get(std::span<uint8_t> const out, uint16_t const family_id, ui
     constexpr uint16_t FLAGS = netlink::FLAG_REQUEST | netlink::FLAG_ACK;
     return build_message(out, LENGTH, family_id, FLAGS, seq, CMD_DEVICE_GET, [&](BufferSerializerBuilder& b) {
         netlink::put_attribute(b, A_ID, make_const_span(id));
+    });
+}
+
+auto build_pin_dump(std::span<uint8_t> const out, uint16_t const family_id, uint32_t const seq) -> StatusValue<size_t>
+{
+    constexpr uint16_t FLAGS = netlink::FLAG_REQUEST | netlink::FLAG_ACK | netlink::FLAG_DUMP;
+    return build_message(out, GENL_HEADER, family_id, FLAGS, seq, CMD_PIN_GET, [](BufferSerializerBuilder&) {});
+}
+
+auto build_pin_parent_set(
+    std::span<uint8_t> const out, uint16_t const family_id, uint32_t const pin_id, ParentSetting const& setting, uint32_t const seq)
+    -> StatusValue<size_t>
+{
+    size_t const nest = U32_ATTRIBUTE * (1U + (setting.direction ? 1U : 0U) + (setting.state ? 1U : 0U));
+    size_t const length = GENL_HEADER + U32_ATTRIBUTE + netlink::ATTRIBUTE_HEADER + nest;
+    return build_message(out, length, family_id, REQUEST_ACK, seq, CMD_PIN_SET, [&](BufferSerializerBuilder& b) {
+        put_u32(b, A_PIN_ID, pin_id);
+        netlink::put_attribute_header(b, nest, A_PIN_PARENT_DEVICE | netlink::ATTRIBUTE_NESTED);
+        put_u32(b, A_PIN_PARENT_ID, setting.device_id);
+        if (setting.direction) {
+            put_u32(b, A_PIN_DIRECTION, std::to_underlying(*setting.direction));
+        }
+        if (setting.state) {
+            put_u32(b, A_PIN_STATE, std::to_underlying(*setting.state));
+        }
+    });
+}
+
+auto build_pin_frequency_set(
+    std::span<uint8_t> const out, uint16_t const family_id, uint32_t const pin_id, uint64_t const hz, uint32_t const seq)
+    -> StatusValue<size_t>
+{
+    constexpr size_t LENGTH = GENL_HEADER + U32_ATTRIBUTE + U64_ATTRIBUTE;
+    return build_message(out, LENGTH, family_id, REQUEST_ACK, seq, CMD_PIN_SET, [&](BufferSerializerBuilder& b) {
+        put_u32(b, A_PIN_ID, pin_id);
+        netlink::put_attribute(b, A_PIN_FREQUENCY, make_const_span(hz));
     });
 }
 
@@ -317,6 +537,33 @@ auto DeviceDump::take(std::span<uint8_t const> const message, uint16_t const typ
         return success();
     }
     return parse_device(message, family_id).transform([&](DeviceMessage const& got) { devices.push_back(got.device); });
+}
+
+auto PinDump::read(std::span<uint8_t const> const message, uint16_t const type, uint16_t const family_id) -> Status
+{
+    if (type != family_id) {
+        return success();
+    }
+    return parse_pin(message, family_id).transform([&](PinMessage got) { pins.push_back(std::move(got.pin)); });
+}
+
+auto parse_pin(std::span<uint8_t const> const message, uint16_t const family_id) -> StatusValue<PinMessage>
+{
+    auto const cmd = pin_command_for(message);
+    if (!cmd) {
+        return failure(netlink::bad_message());
+    }
+    PinMessage out{.cmd = *cmd, .pin = {}};
+    std::optional<uint32_t> id;
+    auto const walked = netdev::genl_attributes(message, family_id, *cmd).and_then([&](std::span<uint8_t const> const attributes) {
+        return netlink::walk_attributes(attributes, [&](uint16_t const type, std::span<uint8_t const> const payload) -> Status {
+            return read_pin_attribute(type, payload, out.pin, id);
+        });
+    });
+    return required(walked, id).transform([&](uint32_t const pin_id) {
+        out.pin.id = pin_id;
+        return std::move(out);
+    });
 }
 
 #if defined(__linux__)
@@ -383,6 +630,36 @@ auto DpllClient::device(uint32_t const id) -> StatusValue<Device>
             return parse_device(message, family_.id).transform([&](DeviceMessage const& got) { device = got.device; });
         });
     return required(asked, device);
+}
+
+auto DpllClient::pins() -> StatusValue<std::vector<Pin>>
+{
+    PinDump dump;
+    auto const asked = socket_.request(
+        reply_,
+        [&](std::span<uint8_t> const out, uint32_t const seq) {
+            dump.restart();  // built once per attempt: a request sent again starts the dump over
+            return build_pin_dump(out, family_.id, seq);
+        },
+        [&](std::span<uint8_t const> const message, uint16_t const type) { return dump.read(message, type, family_.id); });
+    if (!asked) {
+        return failure(asked.error());
+    }
+    return std::move(dump.pins);
+}
+
+auto DpllClient::set_parent(uint32_t const pin_id, ParentSetting const& setting) -> Status
+{
+    return socket_.request(reply_, [&](std::span<uint8_t> const out, uint32_t const seq) {
+        return build_pin_parent_set(out, family_.id, pin_id, setting, seq);
+    });
+}
+
+auto DpllClient::set_frequency(uint32_t const pin_id, uint64_t const hz) -> Status
+{
+    return socket_.request(reply_, [&](std::span<uint8_t> const out, uint32_t const seq) {
+        return build_pin_frequency_set(out, family_.id, pin_id, hz, seq);
+    });
 }
 
 //
