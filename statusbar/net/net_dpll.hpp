@@ -29,6 +29,7 @@
 #include "statusbar/status/status.hpp"
 
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -227,17 +228,41 @@ enum class DeviceEvent : uint8_t
     deleted,
 };
 
+/// What one recv() on the watch's socket said: a datagram to deliver; the
+/// socket drained (or failing, which the next poll says again); or
+/// notifications lost, to an overrun (ENOBUFS) or a datagram cut short.
+enum class Received : uint8_t
+{
+    datagram,
+    drained,
+    lost,
+};
+
+/// The kind of a recv() that returned @p received octets of a datagram (its
+/// whole length, MSG_TRUNC) into @p capacity, @p error its errno when negative.
+[[nodiscard]] constexpr auto received_kind(int64_t const received, int const error, size_t const capacity) noexcept -> Received
+{
+    if (received < 0) {
+        return error == ENOBUFS ? Received::lost : Received::drained;
+    }
+    return static_cast<uint64_t>(received) <= capacity ? Received::datagram : Received::lost;
+}
+
 /// The family's `monitor` multicast group on the reactor: every device
 /// notification the kernel sends is parsed and handed to the callback, with
 /// the reactor time it arrived at. A lock status that moved shows as a
 /// `changed` event carrying the whole device, so the callback compares with
 /// what it last saw. Notifications are not acknowledged and not replayed:
-/// read the devices once through DpllClient after open(), then follow.
+/// read the devices once through DpllClient after open(), then follow. A
+/// notification lost to an overrun, or cut short, goes to the loss callback
+/// where one is set, for the caller to read the devices again.
 class DpllWatch : public Pollable
 {
   public:
     /// Allocation-free; captures must fit in 64 bytes.
     using OnEvent = statusbar::sg14::inplace_function<void(DeviceEvent event, Device const& device, int64_t now_ns), 64>;
+    /// Told the reactor time notifications were found lost at; captures must fit in 64 bytes.
+    using OnLoss = statusbar::sg14::inplace_function<void(int64_t now_ns), 64>;
 
     explicit DpllWatch(OnEvent on_event) noexcept
         : on_event_{std::move(on_event)}
@@ -259,6 +284,9 @@ class DpllWatch : public Pollable
     [[nodiscard]] auto is_open() const noexcept -> bool { return fd_.valid(); }
     [[nodiscard]] auto family() const noexcept -> Family { return family_; }
 
+    /// Report each loss to @p on_loss from now on; empty, the default, says nothing of one.
+    void set_on_loss(OnLoss on_loss) noexcept { on_loss_ = std::move(on_loss); }
+
     /// Notifications read and handed on so far; for a test, and a log line.
     [[nodiscard]] auto events() const noexcept -> uint64_t { return events_; }
 
@@ -274,6 +302,7 @@ class DpllWatch : public Pollable
 
   private:
     OnEvent on_event_;
+    OnLoss on_loss_{};
     FileDescriptor fd_{};
     Family family_{};
     uint64_t events_{0};

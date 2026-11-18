@@ -13,6 +13,7 @@
 
 #include <array>
 #include <bit>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -239,6 +240,26 @@ TEST(dpll_watch, a_datagram_of_notifications_is_handed_on_one_event_each)
     watch.deliver(theirs, 1236);
     EXPECT_EQ(seen.size(), size_t{1});
     EXPECT_FALSE(watch.is_open());
+}
+
+TEST(dpll_watch, an_overrun_or_a_cut_datagram_is_a_loss_and_an_empty_socket_is_drained)
+{
+    EXPECT_TRUE(received_kind(-1, ENOBUFS, 8192) == Received::lost);
+    EXPECT_TRUE(received_kind(9000, 0, 8192) == Received::lost);  // MSG_TRUNC: longer than the buffer
+    EXPECT_TRUE(received_kind(8192, 0, 8192) == Received::datagram);
+    EXPECT_TRUE(received_kind(0, 0, 8192) == Received::datagram);
+    EXPECT_TRUE(received_kind(-1, EAGAIN, 8192) == Received::drained);
+    EXPECT_TRUE(received_kind(-1, EBADF, 8192) == Received::drained);
+}
+
+TEST(dpll_watch, a_closed_watch_is_drained_and_reports_no_loss)
+{
+    int64_t lost_at = 0;
+    DpllWatch watch{[](DeviceEvent, Device const&, int64_t) {}, Family{.id = DPLL_ID, .monitor_group = 5}};
+    watch.on_ready(1);  // closed: drained at once, and no loss
+    watch.set_on_loss([&lost_at](int64_t const now_ns) { lost_at = now_ns; });
+    watch.on_ready(2);
+    EXPECT_EQ(lost_at, int64_t{0});
 }
 
 TEST(dpll_client, the_kernels_devices_are_listed_and_read_back)

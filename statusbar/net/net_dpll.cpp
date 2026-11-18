@@ -489,11 +489,17 @@ void DpllWatch::on_ready(int64_t const now_ns)
         // MSG_TRUNC: a notification too big for the buffer is known to have
         // been cut, and is dropped whole rather than parsed in part.
         ssize_t const received = ::recv(fd_.get(), buffer_.data(), buffer_.size(), MSG_TRUNC);
-        if (received < 0) {
-            return;  // EAGAIN: drained; anything else, the next poll will say
-        }
-        if (static_cast<size_t>(received) <= buffer_.size()) {
-            deliver(std::span<uint8_t const>{buffer_.data(), static_cast<size_t>(received)}, now_ns);
+        switch (received_kind(received, received < 0 ? errno : 0, buffer_.size())) {
+            case Received::datagram:
+                deliver(std::span<uint8_t const>{buffer_.data(), static_cast<size_t>(received)}, now_ns);
+                break;
+            case Received::lost:
+                if (on_loss_) {
+                    on_loss_(now_ns);
+                }
+                break;
+            case Received::drained:
+                return;
         }
     }
 }
