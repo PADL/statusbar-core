@@ -363,8 +363,15 @@ TEST(interface_info, lo_has_no_rings_and_says_so_distinguishably)
     }
 }
 
-/// Some interface with descriptor rings, if the host has one: a real NIC,
-/// not a virtual device. Empty when there is none.
+/// Whether @p rings has any to size: a driver may answer GRINGPARAM with
+/// every size 0 (mt7925e, a Wi-Fi NIC).
+auto sized(RingParams const& rings) -> bool
+{
+    return rings.rx_max > 0 && rings.tx_max > 0;
+}
+
+/// Some interface with descriptor rings to size, if the host has one: a real
+/// NIC, not a virtual device. Empty when there is none.
 auto an_interface_with_rings() -> std::string
 {
     DIR* dir = ::opendir("/sys/class/net");
@@ -374,7 +381,10 @@ auto an_interface_with_rings() -> std::string
     std::string found;
     while (dirent const* entry = ::readdir(dir)) {
         std::string const name{entry->d_name};
-        if (name != "." && name != ".." && ring_params(name).has_value()) {
+        if (name == "." || name == "..") {
+            continue;
+        }
+        if (auto const rings = ring_params(name); rings && sized(*rings)) {
             found = name;
             break;
         }
@@ -399,6 +409,10 @@ TEST(interface_info, every_interface_answers_about_its_rings_or_refuses_cleanly)
         if (!rings) {
             // A virtual interface has no rings; the same clean failure lo gives.
             EXPECT_EQ(rings.error(), std::make_error_code(std::errc::operation_not_supported));
+            continue;
+        }
+        if (!sized(*rings)) {
+            EXPECT_TRUE(rings->rx == 0 && rings->tx == 0);  // nothing to size, and nothing set
             continue;
         }
         EXPECT_TRUE(rings->rx > 0 && rings->rx <= rings->rx_max);
