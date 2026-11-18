@@ -467,6 +467,7 @@ void DpllWatch::close() noexcept
 {
     fd_ = FileDescriptor{};
     family_ = Family{};
+    failed_ = false;
 }
 
 void DpllWatch::deliver(std::span<uint8_t const> const datagram, int64_t const now_ns)
@@ -489,18 +490,48 @@ void DpllWatch::deliver(std::span<uint8_t const> const datagram, int64_t const n
     }
 }
 
-void DpllWatch::on_ready(int64_t const now_ns)
+void DpllWatch::lose(Loss const loss, std::error_code const error, int64_t const now_ns)
 {
-    for (;;) {
-        // MSG_TRUNC: a notification too big for the buffer is known to have
-        // been cut, and is dropped whole rather than parsed in part.
-        ssize_t const received = ::recv(fd_.get(), buffer_.data(), buffer_.size(), MSG_TRUNC);
-        if (received < 0) {
-            return;  // EAGAIN: drained; anything else, the next poll will say
-        }
-        if (static_cast<size_t>(received) <= buffer_.size()) {
+    ++losses_;
+    if (on_loss_) {
+        on_loss_(loss, error, now_ns);
+    }
+}
+
+auto DpllWatch::read_one(int64_t const now_ns) -> bool
+{
+    // MSG_TRUNC: a notification too big for the buffer is known to have
+    // been cut, and is dropped whole rather than parsed in part.
+    ssize_t const received = ::recv(fd_.get(), buffer_.data(), buffer_.size(), MSG_TRUNC);
+    if (received >= 0) {
+        if (static_cast<size_t>(received) > buffer_.size()) {
+            lose(Loss::truncated, {}, now_ns);
+        } else {
             deliver(std::span<uint8_t const>{buffer_.data(), static_cast<size_t>(received)}, now_ns);
         }
+        return true;
+    }
+    int const error = errno;
+    if (error == EAGAIN || error == EWOULDBLOCK) {
+        return false;  // drained
+    }
+    if (error == EINTR) {
+        return true;
+    }
+    if (error == ENOBUFS) {
+        // The queue overflowed: what was queued is still there to read, what
+        // arrived while it was full is gone.
+        lose(Loss::overrun, std::error_code{error, std::system_category()}, now_ns);
+        return true;
+    }
+    failed_ = true;
+    lose(Loss::failed, std::error_code{error, std::system_category()}, now_ns);
+    return false;
+}
+
+void DpllWatch::on_ready(int64_t const now_ns)
+{
+    while (read_one(now_ns)) {
     }
 }
 

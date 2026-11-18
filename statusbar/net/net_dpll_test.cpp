@@ -19,6 +19,15 @@
 #include <system_error>
 #include <vector>
 
+#if defined(__linux__)
+#    include "statusbar/buffer/file_descriptor.hpp"
+
+#    include <fcntl.h>
+
+#    include <sys/socket.h>
+#    include <sys/types.h>
+#endif
+
 using namespace statusbar;
 using namespace statusbar::net::dpll;
 
@@ -255,6 +264,97 @@ TEST(dpll_watch, a_datagram_of_notifications_is_handed_on_one_event_each)
     watch.deliver(theirs, 1236);
     EXPECT_EQ(seen.size(), size_t{1});
     EXPECT_FALSE(watch.is_open());
+}
+
+/// A loss the test saw.
+struct SeenLoss
+{
+    Loss loss;
+    std::error_code error;
+    int64_t now_ns;
+};
+
+/// A non-blocking datagram pair: the watch reads `watched`, the test writes `feed`.
+struct DatagramPair
+{
+    FileDescriptor watched{};
+    FileDescriptor feed{};
+};
+
+[[nodiscard]] auto a_datagram_pair() -> DatagramPair
+{
+    std::array<int, 2> fds{-1, -1};
+    if (::socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0, fds.data()) != 0) {
+        return {};
+    }
+    return {.watched = FileDescriptor{fds[0]}, .feed = FileDescriptor{fds[1]}};
+}
+
+TEST(dpll_watch, a_truncated_notification_is_a_loss_the_caller_is_told_of)
+{
+    auto pair = a_datagram_pair();
+    EXPECT_TRUE(pair.watched.valid() && pair.feed.valid());
+    if (!pair.watched.valid()) {
+        return;
+    }
+    int events = 0;
+    std::vector<SeenLoss> losses;
+    DpllWatch watch{
+        [&](DeviceEvent, Device const&, int64_t) { ++events; }, Family{.id = DPLL_ID, .monitor_group = 5}, std::move(pair.watched)};
+    watch.on_loss(
+        [&](Loss const loss, std::error_code const error, int64_t const now_ns) { losses.push_back({loss, error, now_ns}); });
+
+    // A notification, then one larger than the watch's buffer, then another notification.
+    std::vector<uint8_t> const too_big(9000, 0);
+    EXPECT_TRUE(::send(pair.feed.get(), CHANGE_NOTIFICATION.data(), CHANGE_NOTIFICATION.size(), 0) > 0);
+    auto const sent_big = ::send(pair.feed.get(), too_big.data(), too_big.size(), 0);
+    if (sent_big < 0) {
+        SKIP("this host's datagram sockets refuse a 9000-byte message");
+    }
+    EXPECT_TRUE(::send(pair.feed.get(), CHANGE_NOTIFICATION.data(), CHANGE_NOTIFICATION.size(), 0) > 0);
+    watch.on_ready(777);
+    // Both notifications were handed on; the big one was dropped whole and said so.
+    EXPECT_EQ(events, 2);
+    EXPECT_EQ(watch.events(), uint64_t{2});
+    EXPECT_EQ(watch.losses(), uint64_t{1});
+    EXPECT_EQ(losses.size(), size_t{1});
+    if (losses.size() == 1) {
+        EXPECT_TRUE(losses[0].loss == Loss::truncated);
+        EXPECT_FALSE(static_cast<bool>(losses[0].error));
+        EXPECT_EQ(losses[0].now_ns, int64_t{777});
+    }
+    // Drained, not failed: the reactor keeps the watch.
+    EXPECT_FALSE(watch.finished());
+}
+
+TEST(dpll_watch, a_lasting_socket_error_finishes_the_watch_and_is_reported)
+{
+    FileDescriptor not_a_socket{::open("/dev/null", O_RDONLY)};
+    EXPECT_TRUE(not_a_socket.valid());
+    std::vector<SeenLoss> losses;
+    DpllWatch watch{[](DeviceEvent, Device const&, int64_t) {}, Family{.id = DPLL_ID, .monitor_group = 5}, std::move(not_a_socket)};
+    uint64_t silent = 0;
+    // Unset, a loss is counted and nothing more.
+    watch.on_ready(1);
+    EXPECT_TRUE(watch.finished());
+    EXPECT_EQ(watch.losses(), uint64_t{1});
+    EXPECT_EQ(losses.size(), silent);
+
+    FileDescriptor another{::open("/dev/null", O_RDONLY)};
+    DpllWatch told{[](DeviceEvent, Device const&, int64_t) {}, Family{.id = DPLL_ID, .monitor_group = 5}, std::move(another)};
+    told.on_loss(
+        [&](Loss const loss, std::error_code const error, int64_t const now_ns) { losses.push_back({loss, error, now_ns}); });
+    told.on_ready(2);
+    EXPECT_TRUE(told.finished());
+    EXPECT_EQ(losses.size(), size_t{1});
+    if (losses.size() == 1) {
+        EXPECT_TRUE(losses[0].loss == Loss::failed);
+        EXPECT_TRUE(losses[0].error == std::errc::not_a_socket);  // the socket's errno, as a condition
+        EXPECT_EQ(losses[0].now_ns, int64_t{2});
+    }
+    // close() takes the failure with it, so open() can start the watch over.
+    told.close();
+    EXPECT_FALSE(told.finished());
 }
 
 TEST(dpll_client, the_kernels_devices_are_listed_and_read_back)

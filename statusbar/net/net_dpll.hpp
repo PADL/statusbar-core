@@ -243,17 +243,32 @@ enum class DeviceEvent : uint8_t
     deleted,
 };
 
+/// What a watch could not hand on. Notifications are not replayed, so after
+/// an `overrun` or a `truncated` loss the devices are read again through
+/// DpllClient to learn what was missed; after `failed` the watch is
+/// finished() and is opened again.
+enum class Loss : uint8_t
+{
+    overrun,    ///< ENOBUFS: the socket's queue overflowed, notifications are gone
+    truncated,  ///< a datagram larger than the buffer, dropped whole
+    failed,     ///< a lasting socket error: the watch reads no more
+};
+
 /// The family's `monitor` multicast group on the reactor: every device
 /// notification the kernel sends is parsed and handed to the callback, with
 /// the reactor time it arrived at. A lock status that moved shows as a
 /// `changed` event carrying the whole device, so the callback compares with
 /// what it last saw. Notifications are not acknowledged and not replayed:
-/// read the devices once through DpllClient after open(), then follow.
+/// read the devices once through DpllClient after open(), then follow, and
+/// read them again when on_loss() says some were missed.
 class DpllWatch : public Pollable
 {
   public:
     /// Allocation-free; captures must fit in 64 bytes.
     using OnEvent = statusbar::sg14::inplace_function<void(DeviceEvent event, Device const& device, int64_t now_ns), 64>;
+    /// A loss, with the socket's error (ENOBUFS, the lasting error; zero
+    /// for a truncated datagram) and the reactor time.
+    using OnLoss = statusbar::sg14::inplace_function<void(Loss loss, std::error_code error, int64_t now_ns), 64>;
 
     explicit DpllWatch(OnEvent on_event) noexcept
         : on_event_{std::move(on_event)}
@@ -266,6 +281,17 @@ class DpllWatch : public Pollable
         , family_{family}
     {}
 
+    /// Test seam: a watch reading `fd` as if it were the member socket, so
+    /// on_ready() can be driven without a kernel. open() replaces it.
+    DpllWatch(OnEvent on_event, Family const& family, FileDescriptor fd) noexcept
+        : on_event_{std::move(on_event)}
+        , fd_{std::move(fd)}
+        , family_{family}
+    {}
+
+    /// Told of every loss (unset: losses are counted and nothing more).
+    void on_loss(OnLoss on_loss) noexcept { on_loss_ = std::move(on_loss); }
+
     /// Resolve the family, open a non-blocking NETLINK_GENERIC socket and
     /// join the monitor group. Errors: ENOENT when the kernel has no dpll
     /// family; `not_supported` when the family has no monitor group; else
@@ -277,6 +303,8 @@ class DpllWatch : public Pollable
 
     /// Notifications read and handed on so far; for a test, and a log line.
     [[nodiscard]] auto events() const noexcept -> uint64_t { return events_; }
+    /// Losses so far, reported or not.
+    [[nodiscard]] auto losses() const noexcept -> uint64_t { return losses_; }
 
     /// One datagram's worth of notifications, parsed and handed to the
     /// callback. Public so a test can feed the watch bytes without a kernel.
@@ -286,13 +314,23 @@ class DpllWatch : public Pollable
     [[nodiscard]] auto fd() const noexcept -> int override { return fd_.get(); }
     void on_ready(int64_t now_ns) override;
     void tick(int64_t /*now_ns*/) override {}
-    [[nodiscard]] auto finished() const noexcept -> bool override { return false; }
+    /// True after a lasting socket error: the reactor drops the watch, and
+    /// open() starts it over.
+    [[nodiscard]] auto finished() const noexcept -> bool override { return failed_; }
 
   private:
+    /// One recv(): true when there may be more to read, false when drained
+    /// or failed.
+    [[nodiscard]] auto read_one(int64_t now_ns) -> bool;
+    void lose(Loss loss, std::error_code error, int64_t now_ns);
+
     OnEvent on_event_;
+    OnLoss on_loss_{};
     FileDescriptor fd_{};
     Family family_{};
     uint64_t events_{0};
+    uint64_t losses_{0};
+    bool failed_{false};
     std::array<uint8_t, 8192> buffer_{};
 };
 
