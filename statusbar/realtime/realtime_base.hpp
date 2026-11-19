@@ -93,6 +93,30 @@ inline auto now_monotonic_raw_ns() noexcept -> int64_t
     return (static_cast<int64_t>(ts.tv_sec) * 1000000000LL) + ts.tv_nsec;
 }
 
+/// mlockall(2) for lock_memory(): 0 on success, else the errno.
+/// With `lock_future`, the pages mapped now are read in and locked whole
+/// first, and then every later mapping is locked as its pages are faulted
+/// in (MCL_ONFAULT) rather than read in whole when it is made. The first
+/// call is what makes the pages mapped now but never touched (text, data,
+/// thread stacks) resident; MCL_ONFAULT on its own would leave them to
+/// fault later. Where MCL_ONFAULT does not exist, later mappings are
+/// locked whole as they are made.
+inline auto mlockall_errno(bool const lock_future) noexcept -> int
+{
+    if (mlockall(MCL_CURRENT) != 0) {
+        return errno;
+    }
+    if (!lock_future) {
+        return 0;
+    }
+#if defined(MCL_ONFAULT)
+    constexpr int future = MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT;
+#else
+    constexpr int future = MCL_CURRENT | MCL_FUTURE;
+#endif
+    return mlockall(future) == 0 ? 0 : errno;
+}
+
 }  // namespace detail
 
 //
@@ -166,13 +190,15 @@ struct RealtimeResult
 /// Pass `lock_future = true` on memory-constrained hosts where any
 /// unlocked page risks being swapped out under pressure (the
 /// allocate-time lock cost is preferable to a multi-ms swap-in stall in
-/// the RT loop).
+/// the RT loop). Later mappings are then locked as their pages are
+/// faulted in, not read in whole when they are made, so a large file
+/// mapped after the lock (`mem::MappedFile`) pins only the pages it
+/// touches. See `detail::mlockall_errno()`.
 /// Requires root or CAP_IPC_LOCK capability.
 /// @return true on success, false if permission denied or error
 [[nodiscard]] inline auto lock_memory(bool lock_future = false) noexcept -> bool
 {
-    int const flags = lock_future ? (MCL_CURRENT | MCL_FUTURE) : MCL_CURRENT;
-    return mlockall(flags) == 0;
+    return detail::mlockall_errno(lock_future) == 0;
 }
 
 /// Lock memory with detailed result. See `lock_memory(bool)` for the
@@ -180,11 +206,11 @@ struct RealtimeResult
 /// @return RealtimeResult with success status and error details
 [[nodiscard]] inline auto lock_memory_ex(bool lock_future = false) noexcept -> RealtimeResult
 {
-    int const flags = lock_future ? (MCL_CURRENT | MCL_FUTURE) : MCL_CURRENT;
-    if (mlockall(flags) == 0) {
+    int const err = detail::mlockall_errno(lock_future);
+    if (err == 0) {
         return realtime_success();
     }
-    return realtime_failure_errno();
+    return realtime_failure(err);
 }
 
 /// Unlock all memory pages locked by mlockall
@@ -193,6 +219,15 @@ struct RealtimeResult
 {
     return munlockall() == 0;
 }
+
+/// Grow the calling thread's stack by `bytes` and write every page of it,
+/// so the kernel commits those pages now and the loop that follows faults
+/// on none of them: the classic real-time stack prefault, paired with
+/// lock_memory(). `Timer` does this for its own thread
+/// (`TimerConfig::stack_prefault_bytes`); any other real-time thread calls
+/// it itself before its loop. `bytes` must fit the thread's stack with
+/// room for what runs after it; 0 does nothing.
+auto prefault_stack(size_t bytes) noexcept -> void;
 
 //
 // Thread Priority - Platform-Specific Implementations

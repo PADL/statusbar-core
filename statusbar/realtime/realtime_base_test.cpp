@@ -16,13 +16,20 @@
 #include "statusbar/realtime/realtime.hpp"
 #include "statusbar/test/test.hpp"
 
+#include <unistd.h>
+
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <csignal>
 #include <cstdint>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
+
+#include <sys/mman.h>
+#include <sys/resource.h>
 
 using namespace statusbar;
 
@@ -266,6 +273,130 @@ TEST(realtime_detail, save_file_noop_on_missing_src)
     // save_file reads the source and writes it to dst; missing source
     // is a silent no-op. We just exercise the call site.
     realtime::detail::save_file("/nonexistent/src/12345", std::string{"/tmp/realtime_base_test_save_file_noop"});
+}
+
+//
+// lock_memory(true) and the stack prefault
+//
+
+namespace {
+
+#if defined(__linux__)
+/// How many of the `pages` pages at `mapping` are resident, by mincore(2).
+auto resident_pages(void* const mapping, size_t const pages, size_t const page) -> long
+{
+    std::vector<unsigned char> vec(pages);
+    if (mincore(mapping, pages * page, vec.data()) != 0) {
+        return -1;
+    }
+    long n = 0;
+    for (auto const v : vec) {
+        n += (v & 1U);
+    }
+    return n;
+}
+
+auto map_pages(size_t const bytes) -> void*
+{
+    return mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+}
+
+/// Minor faults this thread has taken so far.
+auto minor_faults() -> long
+{
+    rusage usage{};
+    (void)getrusage(RUSAGE_THREAD, &usage);
+    return usage.ru_minflt;
+}
+#endif
+
+/// Use 64 KiB of stack, one write per page.
+[[gnu::noinline]] auto use_stack() noexcept -> unsigned char
+{
+    constexpr size_t bytes = size_t{64} * 1024;
+    unsigned char volatile buf[bytes];
+    for (size_t i = 0; i < bytes; i += 4096) {
+        buf[i] = static_cast<unsigned char>(i);
+    }
+    asm volatile("" : : "r"(&buf[0]) : "memory");
+    return buf[0];
+}
+
+}  // namespace
+
+TEST(realtime_base, lock_future_makes_the_present_resident_and_lets_the_future_fault_in)
+{
+#if defined(__linux__)
+    if (statusbar::test::under_address_sanitizer) {
+        SKIP("AddressSanitizer reports mlockall success without locking anything");
+    }
+    auto const page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    constexpr size_t pages = 32;
+    void* const present = map_pages(pages * page);
+    EXPECT_TRUE(present != MAP_FAILED);
+    // Anonymous pages are not there until something touches them.
+    EXPECT_EQ(resident_pages(present, pages, page), 0);
+
+    auto const locked = realtime::lock_memory_ex(true);
+    if (!locked) {
+        EXPECT_TRUE(locked.error_code == EPERM || locked.error_code == ENOMEM);
+        (void)munmap(present, pages * page);
+        SKIP("mlockall is not permitted here (RLIMIT_MEMLOCK / CAP_IPC_LOCK)");
+    }
+    // What was mapped at the lock is read in whole ...
+    EXPECT_EQ(resident_pages(present, pages, page), static_cast<long>(pages));
+    // ... and a mapping made afterwards is left to fault in page by page.
+    void* const later = map_pages(pages * page);
+    EXPECT_TRUE(later != MAP_FAILED);
+    EXPECT_EQ(resident_pages(later, pages, page), 0);
+    static_cast<unsigned char volatile*>(later)[3 * page] = 1;
+    EXPECT_EQ(resident_pages(later, pages, page), 1);
+
+    (void)munmap(later, pages * page);
+    (void)munmap(present, pages * page);
+    EXPECT_TRUE(realtime::unlock_memory());
+#else
+    SKIP("residency is read with mincore(2) on Linux only");
+#endif
+}
+
+TEST(realtime_base, prefault_stack_leaves_the_thread_nothing_to_fault_on)
+{
+    (void)use_stack();  // its code is resident before anything is counted
+    std::atomic<long> faults{-1};
+    std::thread t([&faults]() -> void {
+        realtime::prefault_stack(size_t{128} * 1024);
+#if defined(__linux__)
+        (void)minor_faults();  // and so is getrusage's
+        long const before = minor_faults();
+        (void)use_stack();
+        faults.store(minor_faults() - before);
+#else
+        (void)use_stack();
+        faults.store(0);
+#endif
+    });
+    t.join();
+    EXPECT_EQ(faults.load(), 0);
+}
+
+TEST(realtime_base, prefault_stack_of_nothing_does_nothing)
+{
+    realtime::prefault_stack(0);
+}
+
+TEST(realtime_base, capabilities_are_reported_consistently)
+{
+    auto const caps = realtime::check_realtime_capabilities();
+    EXPECT_EQ(caps.has_isolated_cpus, !caps.isolated_cpus.empty());
+    EXPECT_EQ(caps.is_root, geteuid() == 0);
+#if defined(__linux__)
+    EXPECT_EQ(caps.recommendations.find("CAP_SYS_NICE") != std::string::npos, !caps.can_use_realtime);
+    EXPECT_EQ(caps.recommendations.find("isolcpus") != std::string::npos, !caps.has_isolated_cpus);
+#else
+    EXPECT_TRUE(caps.can_use_realtime);
+    EXPECT_TRUE(!caps.recommendations.empty());
+#endif
 }
 
 TEST_MAIN(statusbar_realtime, realtime_base_test)

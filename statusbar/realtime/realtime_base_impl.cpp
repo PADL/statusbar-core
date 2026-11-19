@@ -5,6 +5,9 @@
 
 #include "statusbar/realtime/realtime_base.hpp"
 
+#include <optional>
+#include <utility>
+
 namespace statusbar::realtime {
 
 namespace detail {
@@ -27,87 +30,210 @@ auto write_all(int fd, std::string_view s) noexcept -> bool
     return true;
 }
 
+namespace {
+
+/// Append everything `fd` has left to `out`. False on a read error.
+auto append_all(int const fd, std::string& out) -> bool
+{
+    char buf[1 << 16];
+    for (;;) {
+        ssize_t const r = ::read(fd, buf, sizeof(buf));
+        if (r == 0) {
+            return true;
+        }
+        if (r < 0 && errno != EINTR) {
+            return false;
+        }
+        if (r > 0) {
+            out.append(buf, static_cast<size_t>(r));
+        }
+    }
+}
+
+}  // namespace
+
 auto read_all(char const* path, std::string& out) -> bool
 {
     int const fd = ::open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         return false;
     }
-
     out.clear();
-    char buf[1 << 16];
-    for (;;) {
-        ssize_t const r = ::read(fd, buf, sizeof(buf));
-        if (r == 0) {
-            break;
-        }
-        if (r < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            ::close(fd);
-            return false;
-        }
-        out.append(buf, static_cast<size_t>(r));
-    }
+    bool const ok = append_all(fd, out);
     ::close(fd);
-    return true;
+    return ok;
 }
 
 }  // namespace detail
 
-auto check_realtime_capabilities() -> RealtimeCapabilities
+namespace {
+
+/// Recursively grow the stack in 4096-byte chunks, writing each chunk so the
+/// kernel commits a physical page for every stack page the chunks span.
+///
+/// The chunk size intentionally does not depend on the platform page size —
+/// touching any byte of a page commits the whole page, and consecutive frames
+/// are contiguous on the stack, so a 4 KB chunk trivially hits every page on
+/// 4 KB, 16 KB (Apple Silicon), and 64 KB page systems alike.
+///
+/// noinline + the post-recursion volatile read block tail-call optimization,
+/// which would otherwise collapse the recursion and leave the stack ungrown.
+// clang-format off
+// Keep [[gnu::noinline]] on its own line — clang-19 leaves it, clang-22+
+// rewraps it. Wrap-off lets both versions produce identical output.
+[[gnu::noinline]] auto
+prefault_stack_4096(size_t remaining_bytes) noexcept -> void
+// clang-format on
 {
-    RealtimeCapabilities caps;
+    if (remaining_bytes == 0) {
+        return;
+    }
+    constexpr size_t chunk = 4096;
+    char volatile buf[chunk] = {};
+    size_t const next = (remaining_bytes > chunk) ? remaining_bytes - chunk : 0;
+    prefault_stack_4096(next);
+    asm volatile("" : : "r"(&buf[0]) : "memory");
+}
 
+/// Whether this thread may take SCHED_FIFO: tried, then undone.
+[[nodiscard]] auto can_use_sched_fifo() noexcept -> bool
+{
 #if defined(__linux__)
-    // Check if running as root
-    caps.is_root = (geteuid() == 0);
-
-    // Try to set SCHED_FIFO to check capability
     sched_param param{};
     param.sched_priority = 1;
-    caps.can_use_realtime = (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) == 0);
-    if (caps.can_use_realtime) {
-        // Reset back to normal
-        param.sched_priority = 0;
-        pthread_setschedparam(pthread_self(), SCHED_OTHER, &param);
+    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) != 0) {
+        return false;
     }
+    param.sched_priority = 0;
+    (void)pthread_setschedparam(pthread_self(), SCHED_OTHER, &param);
+    return true;
+#else
+    return true;  // macOS doesn't require root for thread priorities
+#endif
+}
 
-    // Check for PREEMPT_RT kernel
+/// Whether the running kernel is a PREEMPT_RT build (Linux; false elsewhere).
+[[nodiscard]] auto kernel_is_preempt_rt() -> bool
+{
+#if defined(__linux__)
     std::string version;
-    if (detail::read_all("/proc/version", version)) {
-        caps.has_preempt_rt = (version.find("PREEMPT_RT") != std::string::npos || version.find("PREEMPT RT") != std::string::npos);
+    if (!detail::read_all("/proc/version", version)) {
+        return false;
     }
+    return version.find("PREEMPT_RT") != std::string::npos || version.find("PREEMPT RT") != std::string::npos;
+#else
+    return false;
+#endif
+}
 
-    // Check for isolated CPUs
-    if (detail::read_all("/sys/devices/system/cpu/isolated", caps.isolated_cpus)) {
-        // Remove trailing whitespace
-        while (!caps.isolated_cpus.empty() && (std::isspace(caps.isolated_cpus.back()) != 0)) {
-            caps.isolated_cpus.pop_back();
-        }
-        caps.has_isolated_cpus = !caps.isolated_cpus.empty() && caps.isolated_cpus != "\n";
+/// The kernel's isolated CPU list ("3", "2-3", "2,3" ...), trailing
+/// whitespace removed; nothing when the kernel does not say.
+[[nodiscard]] auto isolated_cpu_list() -> std::optional<std::string>
+{
+#if defined(__linux__)
+    std::string isolated;
+    if (!detail::read_all("/sys/devices/system/cpu/isolated", isolated)) {
+        return std::nullopt;
     }
+    while (!isolated.empty() && (std::isspace(isolated.back()) != 0)) {
+        isolated.pop_back();
+    }
+    return isolated;
+#else
+    return std::nullopt;
+#endif
+}
 
-    // Build recommendations
+/// What the host could do better for real-time work, one line each.
+[[nodiscard]] auto recommendations_for(RealtimeCapabilities const& caps) -> std::string
+{
+#if defined(__linux__)
+    std::string text;
     if (!caps.can_use_realtime) {
-        caps.recommendations += "Run as root or add CAP_SYS_NICE capability.\n";
+        text += "Run as root or add CAP_SYS_NICE capability.\n";
     }
     if (!caps.has_preempt_rt) {
-        caps.recommendations += "Consider using a PREEMPT_RT kernel for better realtime performance.\n";
+        text += "Consider using a PREEMPT_RT kernel for better realtime performance.\n";
     }
     if (!caps.has_isolated_cpus) {
-        caps.recommendations += "Consider isolating CPUs with isolcpus= boot parameter (e.g., isolcpus=3 for CPU 3).\n";
+        text += "Consider isolating CPUs with isolcpus= boot parameter (e.g., isolcpus=3 for CPU 3).\n";
     }
+    return text;
+#else
+    (void)caps;
+    return "macOS uses Mach thread policies; no special setup required.\n";
+#endif
+}
 
-#elif defined(__APPLE__)
-    caps.can_use_realtime = true;  // macOS doesn't require root for thread priorities
-    caps.is_root = (geteuid() == 0);
-    caps.has_preempt_rt = false;
-    caps.has_isolated_cpus = false;
-    caps.recommendations = "macOS uses Mach thread policies; no special setup required.\n";
+/// Print what the host offers for real-time work.
+auto print_capabilities(RealtimeCapabilities const& caps) -> void
+{
+    std::print("Realtime Capabilities:\n  Running as root: {}\n", caps.is_root ? "yes" : "no");
+    std::print("  Can use SCHED_FIFO: {}\n", caps.can_use_realtime ? "yes" : "no");
+    std::print("  PREEMPT_RT kernel: {}\n", caps.has_preempt_rt ? "yes" : "no");
+    std::print("  Has isolated CPUs: {}\n", caps.has_isolated_cpus ? "yes" : "no");
+    if (caps.has_isolated_cpus) {
+        std::print("  Isolated CPUs: {}\n", caps.isolated_cpus);
+    }
+    if (!caps.recommendations.empty()) {
+        std::print("\nRecommendations:\n{}\n", caps.recommendations);
+    }
+}
+
+#if defined(__linux__)
+
+/// Ask for the "performance" cpufreq governor on `cpu`: a warning when the
+/// host refuses, a note when it has no frequency scaling.
+auto set_performance_governor(int const cpu) -> void
+{
+    std::string const governor_path =
+        std::string("/sys/devices/system/cpu/cpu") + std::to_string(cpu) + "/cpufreq/scaling_governor";
+    if (!detail::file_exists(governor_path.c_str())) {
+        std::print(stderr, "Info: CPU{} frequency scaling not available (file does not exist)\n", cpu);
+        return;
+    }
+    if (!detail::write_text(governor_path.c_str(), "performance\n")) {
+        std::print(
+            stderr,
+            "Warning: Failed to set CPU{} governor to performance (errno={}). This may reduce timer accuracy.\n",
+            cpu,
+            errno);
+    }
+}
+
+/// A warning when the kernel's isolated list does not name `cpu`.
+auto warn_if_not_isolated(int const cpu) -> void
+{
+    auto const isolated = isolated_cpu_list();
+    if (!isolated) {
+        return;
+    }
+    // Simple check: see if the CPU number appears in the isolated list.
+    if (isolated->empty() || isolated->find(std::to_string(cpu)) == std::string::npos) {
+        std::print(stderr, "Warning: CPU{} is not isolated. Consider adding isolcpus={} to kernel boot parameters.\n", cpu, cpu);
+    }
+}
+
 #endif
 
+}  // namespace
+
+auto prefault_stack(size_t const bytes) noexcept -> void
+{
+    prefault_stack_4096(bytes);
+}
+
+auto check_realtime_capabilities() -> RealtimeCapabilities
+{
+    std::string isolated = isolated_cpu_list().value_or(std::string{});
+    RealtimeCapabilities caps{
+        .can_use_realtime = can_use_sched_fifo(),
+        .is_root = (geteuid() == 0),
+        .has_preempt_rt = kernel_is_preempt_rt(),
+        .has_isolated_cpus = !isolated.empty(),
+        .isolated_cpus = std::move(isolated),
+    };
+    caps.recommendations = recommendations_for(caps);
     return caps;
 }
 
@@ -118,45 +244,8 @@ auto prepare_isolated_cpu(int const cpu) noexcept -> RealtimeResult
     if (prctl(PR_SET_TIMERSLACK, 0) != 0) {
         std::print(stderr, "Warning: Failed to set timer slack to 0 (errno={})\n", errno);
     }
-
-    // Set CPU governor to "performance" for the specified CPU
-    std::string const governor_path =
-        std::string("/sys/devices/system/cpu/cpu") + std::to_string(cpu) + "/cpufreq/scaling_governor";
-
-    if (detail::file_exists(governor_path.c_str())) {
-        if (!detail::write_text(governor_path.c_str(), "performance\n")) {
-            std::print(
-                stderr,
-                "Warning: Failed to set CPU{} governor to performance (errno={}). This may reduce timer accuracy.\n",
-                cpu,
-                errno);
-        }
-    } else {
-        std::print(stderr, "Info: CPU{} frequency scaling not available (file does not exist)\n", cpu);
-    }
-
-    // Check if CPU is isolated
-    std::string isolated;
-    if (detail::read_all("/sys/devices/system/cpu/isolated", isolated)) {
-        // Remove trailing whitespace
-        while (!isolated.empty() && (std::isspace(isolated.back()) != 0)) {
-            isolated.pop_back();
-        }
-
-        bool is_isolated = false;
-        if (!isolated.empty()) {
-            // Simple check: see if the CPU number appears in the isolated list
-            // Format can be "3" or "2-3" or "2,3" etc.
-            std::string const cpu_str = std::to_string(cpu);
-            is_isolated = (isolated.find(cpu_str) != std::string::npos);
-        }
-
-        if (!is_isolated) {
-            std::print(
-                stderr, "Warning: CPU{} is not isolated. Consider adding isolcpus={} to kernel boot parameters.\n", cpu, cpu);
-        }
-    }
-
+    set_performance_governor(cpu);
+    warn_if_not_isolated(cpu);
     return realtime_success();
 #elif defined(__APPLE__)
     (void)cpu;
@@ -199,19 +288,7 @@ auto prepare_realtime_system(bool const verbose, bool const lock_future) -> Real
 auto print_realtime_diagnostics_and_prepare(bool const verbose, bool const lock_future) -> RealtimeResult
 {
     if (verbose) {
-        // Check realtime capabilities
-        auto caps = check_realtime_capabilities();
-        std::print("Realtime Capabilities:\n");
-        std::print("  Running as root: {}\n", caps.is_root ? "yes" : "no");
-        std::print("  Can use SCHED_FIFO: {}\n", caps.can_use_realtime ? "yes" : "no");
-        std::print("  PREEMPT_RT kernel: {}\n", caps.has_preempt_rt ? "yes" : "no");
-        std::print("  Has isolated CPUs: {}\n", caps.has_isolated_cpus ? "yes" : "no");
-        if (caps.has_isolated_cpus) {
-            std::print("  Isolated CPUs: {}\n", caps.isolated_cpus);
-        }
-        if (!caps.recommendations.empty()) {
-            std::print("\nRecommendations:\n{}\n", caps.recommendations);
-        }
+        print_capabilities(check_realtime_capabilities());
     }
     // Prepare system for realtime operation
     auto sys_result = prepare_realtime_system(verbose, lock_future);
@@ -261,41 +338,52 @@ auto set_realtime_affinity_ex(int const cpu) noexcept -> RealtimeResult
 }
 
 #if defined(__APPLE__)
+
+namespace {
+
+/// The Mach time-constraint policy for these nanosecond figures:
+/// absolute_time = nanoseconds * timebase.denom / timebase.numer.
+[[nodiscard]] auto time_constraint_policy(
+    mach_timebase_info_data_t const& timebase,
+    uint32_t const period_ns,
+    uint32_t const computation_ns,
+    uint32_t const constraint_ns,
+    bool const preemptible) noexcept -> thread_time_constraint_policy_data_t
+{
+    auto ns_to_abs = [&](uint32_t ns) -> uint32_t {
+        return static_cast<uint32_t>((static_cast<uint64_t>(ns) * timebase.denom) / timebase.numer);
+    };
+    return thread_time_constraint_policy_data_t{
+        .period = ns_to_abs(period_ns),
+        .computation = ns_to_abs(computation_ns),
+        .constraint = ns_to_abs(constraint_ns),
+        .preemptible = preemptible ? TRUE : FALSE,
+    };
+}
+
+}  // namespace
+
 auto set_time_constraint_policy(
     uint32_t const period_ns, uint32_t const computation_ns, uint32_t const constraint_ns, bool const preemptible) noexcept
     -> RealtimeResult
 {
-    // Get Mach timebase info for converting ns to absolute time units
     mach_timebase_info_data_t timebase;
     if (mach_timebase_info(&timebase) != KERN_SUCCESS) {
         return realtime_failure(EINVAL, "Failed to get Mach timebase info");
     }
-
-    // Convert nanoseconds to Mach absolute time units
-    // absolute_time = nanoseconds * timebase.denom / timebase.numer
-    auto ns_to_abs = [&](uint32_t ns) -> uint32_t {
-        return static_cast<uint32_t>((static_cast<uint64_t>(ns) * timebase.denom) / timebase.numer);
-    };
-
-    thread_time_constraint_policy_data_t policy;
-    policy.period = ns_to_abs(period_ns);
-    policy.computation = ns_to_abs(computation_ns);
-    policy.constraint = ns_to_abs(constraint_ns);
-    policy.preemptible = preemptible ? TRUE : FALSE;
-
+    auto policy = time_constraint_policy(timebase, period_ns, computation_ns, constraint_ns, preemptible);
     kern_return_t const kr = thread_policy_set(
         mach_thread_self(),
         THREAD_TIME_CONSTRAINT_POLICY,
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) — Mach API requires thread_policy_t
         reinterpret_cast<thread_policy_t>(&policy),
         THREAD_TIME_CONSTRAINT_POLICY_COUNT);
-
     if (kr != KERN_SUCCESS) {
         return realtime_failure(static_cast<int>(kr), mach_error_string(kr));
     }
-
     return realtime_success();
 }
+
 #endif
 
 }  // namespace statusbar::realtime

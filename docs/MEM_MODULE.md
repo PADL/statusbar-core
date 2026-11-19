@@ -89,6 +89,8 @@ std::span<uint8_t const> const bytes = mapped->bytes();
   `TimerConfig::lock_memory` is false. That takes in the whole mapping
   and overrides the window; a process that uses `MappedFile` turns it
   off and locks once at startup with `realtime::lock_memory()`.
+  `lock_memory(true)` locks later mappings as their pages fault in, so a
+  `MappedFile` mapped after it is not read in whole either.
 - **Limits.** `mlock` is bounded by `RLIMIT_MEMLOCK` (or needs
   `CAP_IPC_LOCK`); a window that does not fit fails with `ENOMEM`.
 - **Ranges are pages.** Every range is widened to the pages that hold

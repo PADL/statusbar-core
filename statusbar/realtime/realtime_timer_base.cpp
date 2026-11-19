@@ -22,39 +22,6 @@
 
 namespace statusbar::realtime {
 
-namespace {
-
-/// Recursively grow the stack in 4096-byte chunks, writing each chunk so the
-/// kernel commits a physical page for every stack page the chunks span. This
-/// is the classic RT-programming "stack prefault" step that, combined with
-/// mlockall(MCL_CURRENT), prevents page faults inside the hot loop.
-///
-/// The chunk size intentionally does not depend on the platform page size —
-/// touching any byte of a page commits the whole page, and consecutive frames
-/// are contiguous on the stack, so a 4 KB chunk trivially hits every page on
-/// 4 KB, 16 KB (Apple Silicon), and 64 KB page systems alike.
-///
-/// noinline + the post-recursion volatile read block tail-call optimization,
-/// which would otherwise collapse the recursion and leave the stack ungrown.
-// clang-format off
-// Keep [[gnu::noinline]] on its own line — clang-19 leaves it, clang-22+
-// rewraps it. Wrap-off lets both versions produce identical output.
-[[gnu::noinline]] auto
-prefault_stack_4096(size_t remaining_bytes) noexcept -> void
-// clang-format on
-{
-    if (remaining_bytes == 0) {
-        return;
-    }
-    constexpr size_t chunk = 4096;
-    char volatile buf[chunk] = {};
-    size_t const next = (remaining_bytes > chunk) ? remaining_bytes - chunk : 0;
-    prefault_stack_4096(next);
-    asm volatile("" : : "r"(&buf[0]) : "memory");
-}
-
-}  // namespace
-
 TimerBase::TimerBase(TimerConfig config) noexcept
     : config_{config}
     , stats_{config_.error_histogram, config_.duration_histogram}
@@ -169,10 +136,8 @@ auto TimerBase::prepare_thread() -> bool
 {
     stats_.reset();
 
-    // Pre-fault stack to avoid page faults in the RT loop (skipped when 0).
-    if (config_.stack_prefault_bytes > 0) {
-        prefault_stack_4096(config_.stack_prefault_bytes);
-    }
+    // Pre-fault stack to avoid page faults in the RT loop (nothing when 0).
+    prefault_stack(config_.stack_prefault_bytes);
 
     if (!prepare_cpu()) {
         return false;
