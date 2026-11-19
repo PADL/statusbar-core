@@ -1599,6 +1599,28 @@ TEST(UmemRegion, one_mapped_area_is_registered_again_for_a_retried_bind)
     EXPECT_TRUE(region.writable_span(frame.value_or(0)).data() == area);
 }
 
+#        if defined(HAVE_XDP_TX_METADATA)
+// The kernel reads a UMEM's TX metadata length only when the registration flags it
+// (XDP_UMEM_TX_METADATA_LEN, Linux 6.11): a length it refuses shows it was read.
+TEST(UmemRegion, the_kernel_reads_the_tx_metadata_length_it_is_given)
+{
+    if (getuid() != 0) {
+        SKIP("needs root");
+    }
+    detail::RingSet rings{};
+    detail::UmemRegion region{};
+    auto const sized = region.allocate(64, 4096, 64, 64, 64, rings, detail::xdp_tx_metadata_len);
+    if (!sized) {
+        SKIP("this kernel registers no TX metadata (before 6.11)");
+    }
+    EXPECT_EQ(region.tx_metadata_len(), detail::xdp_tx_metadata_len);
+    detail::RingSet odd_rings{};
+    auto const odd = region.allocate(64, 4096, 64, 64, 64, odd_rings, 12);  // xdp_umem_reg(): not a multiple of 8
+    EXPECT_FALSE(odd.has_value());
+    EXPECT_EQ(region.create_errno(), EINVAL);
+}
+#        endif
+
 TEST(xdp_integration, open_close_lifecycle)
 {
     if (getuid() != 0) {

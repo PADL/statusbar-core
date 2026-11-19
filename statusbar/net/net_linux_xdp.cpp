@@ -699,6 +699,8 @@ namespace {
         .comp_size = static_cast<__u32>(comp_ring_size),
         .frame_size = static_cast<__u32>(frame_size),
         .frame_headroom = static_cast<__u32>(headroom),
+        // Without the flag a kernel from 6.11 ignores tx_metadata_len, and every frame's metadata with it.
+        .flags = XDP_UMEM_TX_METADATA_LEN,
         .tx_metadata_len = static_cast<__u32>(tx_metadata_len),
     };
     *umem = xsk_umem__create_opts(area, &rings.fill, &rings.comp, &opts);
