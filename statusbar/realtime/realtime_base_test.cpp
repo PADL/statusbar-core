@@ -16,13 +16,20 @@
 #include "statusbar/realtime/realtime.hpp"
 #include "statusbar/test/test.hpp"
 
+#include <unistd.h>
+
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <csignal>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
+
+#include <sys/mman.h>
 
 using namespace statusbar;
 
@@ -116,6 +123,89 @@ TEST(realtime_base, lock_memory_logged_accepts_permission_denied)
         (void)realtime::unlock_memory();
     }
 }
+
+#if defined(__linux__)
+
+namespace {
+
+/// AddressSanitizer intercepts mlock(2) and mlockall(2) and returns success having locked nothing.
+#    if defined(__SANITIZE_ADDRESS__)
+constexpr bool LOCKS_ARE_IGNORED = true;
+#    elif defined(__has_feature)
+#        if __has_feature(address_sanitizer)
+constexpr bool LOCKS_ARE_IGNORED = true;
+#        else
+constexpr bool LOCKS_ARE_IGNORED = false;
+#        endif
+#    else
+constexpr bool LOCKS_ARE_IGNORED = false;
+#    endif
+
+/// A 64-page anonymous mapping's resident pages (mincore(2)), -1 when unread.
+auto resident_pages(void* const area, size_t const page) -> int64_t
+{
+    std::array<unsigned char, 64> resident{};
+    if (::mincore(area, resident.size() * page, resident.data()) != 0) {
+        return -1;
+    }
+    return std::ranges::count_if(resident, [](unsigned char const r) { return (r & 1U) != 0; });
+}
+
+/// Map 64 anonymous pages, or nullptr.
+auto map_64_pages(size_t const page) -> void*
+{
+    void* const area = ::mmap(nullptr, 64 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return area == MAP_FAILED ? nullptr : area;
+}
+
+/// Lock to @p scope between two 64-page mappings, the second written once after it: their resident pages,
+/// or nullopt when the lock is refused.
+auto resident_around_a_lock(realtime::MemoryLockScope const scope) -> std::optional<std::pair<int64_t, int64_t>>
+{
+    auto const page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+    void* const earlier = map_64_pages(page);
+    bool const locked = realtime::lock_memory_ex(scope).success;
+    void* const later = map_64_pages(page);
+    if (later != nullptr) {
+        static_cast<char volatile*>(later)[0] = 1;
+    }
+    std::pair const counts{resident_pages(earlier, page), resident_pages(later, page)};
+    (void)realtime::unlock_memory();
+    (void)::munmap(earlier, 64 * page);
+    (void)::munmap(later, 64 * page);
+    return locked ? std::optional{counts} : std::nullopt;
+}
+
+}  // namespace
+
+TEST(realtime_base, lock_future_as_faulted_populates_what_exists_and_a_later_mapping_only_where_touched)
+{
+    if (LOCKS_ARE_IGNORED) {
+        SKIP("AddressSanitizer's mlockall locks nothing");
+    }
+    auto const counts = resident_around_a_lock(realtime::MemoryLockScope::future_as_faulted);
+    if (!counts) {
+        SKIP("mlockall is not permitted here (RLIMIT_MEMLOCK / CAP_IPC_LOCK)");
+    }
+    EXPECT_EQ(counts->first, int64_t{64});
+    EXPECT_TRUE(counts->second >= 1);
+    EXPECT_TRUE(counts->second <= 16);  // one write: its page, or a multi-size THP folio where those are on
+}
+
+TEST(realtime_base, lock_current_and_future_populates_a_later_mapping_whole)
+{
+    if (LOCKS_ARE_IGNORED) {
+        SKIP("AddressSanitizer's mlockall locks nothing");
+    }
+    auto const counts = resident_around_a_lock(realtime::MemoryLockScope::current_and_future);
+    if (!counts) {
+        SKIP("mlockall is not permitted here (RLIMIT_MEMLOCK / CAP_IPC_LOCK)");
+    }
+    EXPECT_EQ(counts->first, int64_t{64});
+    EXPECT_EQ(counts->second, int64_t{64});
+}
+
+#endif  // __linux__
 
 //
 // Thread priority — accept EPERM.

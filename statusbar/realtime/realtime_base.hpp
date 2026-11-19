@@ -34,6 +34,7 @@
 #include <cctype>
 #include <csignal>
 #include <cstddef>
+#include <cstdint>
 #include <print>
 #include <string>
 #include <string_view>
@@ -185,6 +186,36 @@ struct RealtimeResult
         return realtime_success();
     }
     return realtime_failure_errno();
+}
+
+/// What mlockall(2) locks: the pages mapped now, populated (`current`); those and every later
+/// mapping, populated whole (`current_and_future`); or those, populated, and every later page only
+/// as it is faulted in (`future_as_faulted`: MCL_ONFAULT, Linux 4.4), so a file mapped later is never
+/// read in whole and memory made later is locked as it is touched (MAP_POPULATE then populates nothing).
+enum class MemoryLockScope : uint8_t
+{
+    current,
+    current_and_future,
+    future_as_faulted,
+};
+
+/// Lock memory to @p scope with detailed result. `future_as_faulted` is two calls, MCL_CURRENT then
+/// MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT, and fails with ENOTSUP where the platform has no
+/// MCL_ONFAULT (after the first has locked what exists). Requires root or CAP_IPC_LOCK.
+[[nodiscard]] inline auto lock_memory_ex(MemoryLockScope const scope) noexcept -> RealtimeResult
+{
+    auto populated = lock_memory_ex(scope == MemoryLockScope::current_and_future);
+    if (!populated || scope != MemoryLockScope::future_as_faulted) {
+        return populated;
+    }
+#if defined(MCL_ONFAULT)
+    if (mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) == 0) {
+        return realtime_success();
+    }
+    return realtime_failure_errno();
+#else
+    return realtime_failure(ENOTSUP, "mlockall has no MCL_ONFAULT on this platform");
+#endif
 }
 
 /// Unlock all memory pages locked by mlockall
@@ -534,11 +565,11 @@ inline void set_current_thread_name(std::string_view name) noexcept
     return result.success;
 }
 
-/// Lock memory with automatic logging on failure
+/// Lock memory to @p scope with automatic logging on failure
 /// @return true on success
-[[nodiscard]] inline auto lock_memory_logged() -> bool
+[[nodiscard]] inline auto lock_memory_logged(MemoryLockScope const scope = MemoryLockScope::current) -> bool
 {
-    auto result = lock_memory_ex();
+    auto result = lock_memory_ex(scope);
     result.log_if_failed("Memory locking");
     return result.success;
 }
