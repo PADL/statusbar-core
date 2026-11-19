@@ -822,6 +822,9 @@ TEST(realtime_timer_base_prepare, lock_memory_off_locks_nothing)
 
 TEST(realtime_timer_base_prepare, lock_memory_on_takes_in_every_mapping)
 {
+    if (statusbar::test::under_address_sanitizer) {
+        SKIP("AddressSanitizer reports mlockall success without locking anything");
+    }
     TouchedMapping const mapping;
     EXPECT_TRUE(mapping.valid());
     long const before = vm_lck_kb();

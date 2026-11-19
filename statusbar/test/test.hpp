@@ -44,6 +44,22 @@ struct TestInfo
 struct TestFailedException : std::exception
 {};
 
+/// True when the test binary runs under AddressSanitizer. Its runtime
+/// intercepts mlock(2) and mlockall(2) and reports success without locking
+/// anything, so a test that counts locked pages has nothing to count and
+/// skips on this.
+#if defined(__SANITIZE_ADDRESS__)
+inline constexpr bool under_address_sanitizer = true;
+#elif defined(__has_feature)
+#    if __has_feature(address_sanitizer)
+inline constexpr bool under_address_sanitizer = true;
+#    else
+inline constexpr bool under_address_sanitizer = false;
+#    endif
+#else
+inline constexpr bool under_address_sanitizer = false;
+#endif
+
 /// Check if section matches filename (handles .cpp extension on either/both)
 /// Compares after stripping .cpp from both arguments
 constexpr auto section_matches(std::string_view sec, std::string_view file) -> bool

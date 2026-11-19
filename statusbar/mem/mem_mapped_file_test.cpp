@@ -203,6 +203,9 @@ TEST(mem_mapped_file, page_span_is_page_aligned_and_clipped)
 TEST(mem_mapped_file, lock_range_locks_the_pages_and_unlock_range_frees_them)
 {
 #if defined(__linux__)
+    if (statusbar::test::under_address_sanitizer) {
+        SKIP("AddressSanitizer reports mlock success without locking anything");
+    }
     size_t const page = MappedFile::page_size();
     TempFile const file{page * 4};
     auto mapped = MappedFile::map(file.fd());
