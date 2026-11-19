@@ -18,6 +18,7 @@
 #    include <net/if.h>
 #endif
 
+#include <cerrno>
 #include <cstdint>
 
 using namespace statusbar;
@@ -74,6 +75,28 @@ TEST(xdp_launch_time, the_tx_metadata_probe_answers_one_way_or_the_other)
         // Unprivileged, or a kernel or libxdp without it. All are reasons.
         EXPECT_FALSE(probed.error().message().empty());
     }
+}
+
+// The kernel reads the metadata length only when XDP_UMEM_TX_METADATA_LEN is
+// among the registration flags, and then refuses a length that is not a
+// multiple of 8 with EINVAL. A registration without the flag would take this
+// length, register no metadata, and drop every launch time after it while
+// open() reported success; the probe passes either way, so this is the test
+// that sees the flag. Registering a UMEM needs CAP_NET_RAW.
+TEST(xdp_launch_time, a_metadata_length_the_kernel_cannot_take_is_refused_at_registration)
+{
+#if defined(__linux__) && defined(HAVE_XDP_TX_METADATA)
+    detail::RingSet rings{};
+    detail::UmemRegion umem;
+    auto const registered = umem.allocate(2, 2048, 16, 8, 8, rings, 12);
+    if (!registered && umem.create_errno() == EPERM) {
+        SKIP("registering a UMEM needs CAP_NET_RAW");
+    }
+    EXPECT_FALSE(registered.has_value());
+    EXPECT_EQ(umem.create_errno(), EINVAL);
+#else
+    SKIP("no AF_XDP TX metadata in this build");
+#endif
 }
 
 // Counters are a soak readout; a run that has been going for days needs them

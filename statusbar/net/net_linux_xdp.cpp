@@ -691,7 +691,12 @@ namespace {
     detail::RingSet& rings) noexcept -> bool
 {
     // Designated, and in declaration order: xsk_umem_opts carries its own size
-    // in `sz` so libxdp can tell which fields a caller knew about.
+    // in `sz` so libxdp can tell which fields a caller knew about. The kernel
+    // reads tx_metadata_len only when XDP_UMEM_TX_METADATA_LEN is among the
+    // registration flags (libxdp passes them through unchanged); without it
+    // the UMEM registers with no metadata, open() succeeds, and every launch
+    // time written afterwards is dropped. A kernel too old for the flag
+    // refuses it with EINVAL, which create_refusal() reads as no metadata.
     struct xsk_umem_opts opts{
         .sz = sizeof(struct xsk_umem_opts),
         .size = total_size,
@@ -699,6 +704,7 @@ namespace {
         .comp_size = static_cast<__u32>(comp_ring_size),
         .frame_size = static_cast<__u32>(frame_size),
         .frame_headroom = static_cast<__u32>(headroom),
+        .flags = XDP_UMEM_TX_METADATA_LEN,
         .tx_metadata_len = static_cast<__u32>(tx_metadata_len),
     };
     *umem = xsk_umem__create_opts(area, &rings.fill, &rings.comp, &opts);

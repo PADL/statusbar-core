@@ -250,6 +250,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         meta.flags = XDP_TXMD_FLAGS_LAUNCH_TIME;
         meta.request.launch_time = 1;
         struct xsk_umem_opts opts{};
+        opts.flags = XDP_UMEM_TX_METADATA_LEN;
         opts.tx_metadata_len = sizeof(meta);
         (void)xsk_umem__create_opts(nullptr, nullptr, nullptr, &opts);
         return XDP_TX_METADATA;
