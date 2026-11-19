@@ -218,6 +218,11 @@ enum class MemoryLockScope : uint8_t
 #endif
 }
 
+/// Touch @p bytes of the calling thread's stack below this call, so its pages are committed (and locked,
+/// under an earlier MCL_CURRENT or MemoryLockScope::future_as_faulted lock) before a real-time loop needs them. Not for a
+/// real-time loop itself: call it once, at the thread's start.
+auto prefault_stack(size_t remaining_bytes) noexcept -> void;
+
 /// Unlock all memory pages locked by mlockall
 /// @return true on success
 [[nodiscard]] inline auto unlock_memory() noexcept -> bool

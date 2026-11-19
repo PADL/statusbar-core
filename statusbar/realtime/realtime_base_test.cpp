@@ -30,6 +30,7 @@
 #include <utility>
 
 #include <sys/mman.h>
+#include <sys/resource.h>
 
 using namespace statusbar;
 
@@ -203,6 +204,48 @@ TEST(realtime_base, lock_current_and_future_populates_a_later_mapping_whole)
     }
     EXPECT_EQ(counts->first, int64_t{64});
     EXPECT_EQ(counts->second, int64_t{64});
+}
+
+#endif  // __linux__
+
+//
+// Stack prefault: a thread that prefaulted takes no fault using its stack
+//
+
+#if defined(__linux__)
+
+namespace {
+
+/// Use @p bytes of stack below this call, writing each page.
+[[gnu::noinline]] auto use_stack(size_t const bytes) -> void
+{
+    std::array<char volatile, 4096> chunk{};
+    if (bytes > chunk.size()) {
+        use_stack(bytes - chunk.size());
+    }
+    asm volatile("" : : "r"(&chunk[0]) : "memory");
+}
+
+/// The calling thread's minor page faults so far (getrusage(RUSAGE_THREAD)).
+auto thread_minor_faults() -> long
+{
+    struct rusage usage{};
+    (void)::getrusage(RUSAGE_THREAD, &usage);
+    return usage.ru_minflt;
+}
+
+}  // namespace
+
+TEST(realtime_base, a_prefaulted_stack_takes_no_fault_when_used)
+{
+    long faults = -1;
+    std::thread{[&faults] {
+        realtime::prefault_stack(size_t{128} * 1024);
+        long const before = thread_minor_faults();
+        use_stack(size_t{64} * 1024);
+        faults = thread_minor_faults() - before;
+    }}.join();
+    EXPECT_EQ(faults, 0L);
 }
 
 #endif  // __linux__
