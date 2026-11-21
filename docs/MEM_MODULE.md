@@ -3,7 +3,8 @@
 # mem
 
 Memory helpers that keep allocation and residency under the caller's
-control: an allocator-aware `make_unique`, and a read-only file mapping
+control: an allocator-aware `make_unique`, and a file mapping (whole or a
+page-aligned region)
 with page-range locking for real-time readers.
 
 ## Overview
@@ -14,7 +15,9 @@ returned to that same resource on destruction; the deleter carries the
 resource, so the `PmrUniquePtr` it returns is self-contained.
 
 `MappedFile` maps a whole file read-only (`mmap` with `PROT_READ`,
-`MAP_SHARED`) and lets a non-real-time thread keep a window of it
+`MAP_SHARED`), or with `MapOptions` a page-aligned region of it, of a
+regular file or of a device that maps (which has no size, so the length is
+given). It lets a non-real-time thread keep a window of it
 resident and locked while a real-time thread reads inside that window
 without faulting. `lock_range()` locks and reads in the pages covering
 a byte range, `unlock_range()` releases them, `advise()` tells the
@@ -32,11 +35,14 @@ thread. The real-time thread only reads `bytes()`, and only where a
 
 ## Key types
 
-- `MappedFile` — move-only; `map(fd)` and `open(dir_fd, path)` return
+- `MappedFile` — move-only; `map(fd, options)` and `open(dir_fd, path)` return
   `StatusValue<MappedFile>`; `bytes()`, `size()`, `valid()`;
   `lock_range()`, `unlock_range()`, `advise()`, `page_span()`;
   `page_size()`. Errors are the `errno` as `Status`. A zero-length file
   is a valid, empty mapping.
+- `MapOptions` — `offset` (page-aligned), `length` (none: to the end of a
+  regular file); the default maps the whole file. A region past the end of a
+  regular file is refused.
 - `MappedFile::Advice` — `normal`, `sequential`, `random`, `will_need`,
   `dont_need`.
 - `PmrDeleter<T>`, `PmrUniquePtr<T>`, `pmr_make_unique<T>()` — the
@@ -94,11 +100,13 @@ std::span<uint8_t const> const bytes = mapped->bytes();
 - **Limits.** `mlock` is bounded by `RLIMIT_MEMLOCK` (or needs
   `CAP_IPC_LOCK`); a window that does not fit fails with `ENOMEM`.
 - **Ranges are pages.** Every range is widened to the pages that hold
-  it and clipped to the file; `page_span()` shows the result. A range
+  it and clipped to the mapping; `page_span()` shows the result. A range
   past the end, or an empty one, is a successful no-op.
-- **MAP_SHARED, read-only.** The mapping sees the file as the kernel
-  holds it, within the size at the time of the map. Only regular files
-  map; anything else is `invalid_argument`.
+- **MAP_SHARED, read-only by default.** The mapping sees the file as the
+  kernel holds it, within the size at the time of the map. A regular file
+  maps whole, or as a region within its size; a file that is not regular
+  (a device) maps only as a region with a length, which the caller must get
+  right: a read past what the device backs raises `SIGBUS`.
 - **Descriptor.** Neither `map()` nor `open()` keeps the descriptor;
   `open()` closes its own, `map()` leaves the caller's for the caller.
 
