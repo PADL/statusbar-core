@@ -1,7 +1,8 @@
 // Copyright 2026 Jeff Koftinoff <jeff.koftinoff@statusbar.com>
 // SPDX-License-Identifier: MIT
 //
-// MappedFile — a whole file mapped read-only, with page-range locking.
+// MappedFile — a file, or a region of it, mapped read-only, with page-range
+// locking.
 //
 // A real-time thread may read inside a mapping only where the pages are
 // resident and locked; everything else here is a system call for a
@@ -15,7 +16,10 @@
 //
 // The mapping is PROT_READ, MAP_SHARED: the file's bytes as the kernel has
 // them, including what another process appends after the map (within the
-// size at the time of the map), and nothing is copied.
+// size at the time of the map), and nothing is copied. MapOptions maps a
+// page-aligned region instead, of a regular file or of a device that maps;
+// the pages are not populated. Every offset given to the methods counts from
+// the start of the mapping, a region's and not the file's.
 
 #pragma once
 
@@ -23,11 +27,23 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <utility>
 
 namespace statusbar::mem {
+
+/// What MappedFile::map() maps: by default the whole file, read-only.
+struct MapOptions
+{
+    /// Where the region starts in the file, in bytes; a multiple of the page size that fits off_t.
+    uint64_t offset{0};
+    /// The region's length in bytes; none: to the end of a regular file. A file that is
+    /// not regular (a device) has no size, so it needs one, and the caller is to get it
+    /// right: a read past what the device backs raises SIGBUS.
+    std::optional<size_t> length{};
+};
 
 class MappedFile
 {
@@ -43,10 +59,13 @@ class MappedFile
         dont_need,
     };
 
-    /// Map the whole of the file open on @p fd, read-only. The descriptor is
-    /// not kept: the caller may close it once this returns. A zero-length
-    /// file gives a valid, empty mapping. Errors are the errno as Status.
-    [[nodiscard]] static auto map(int fd) -> StatusValue<MappedFile>;
+    /// Map the file open on @p fd as @p options says: by default all of it,
+    /// read-only. The descriptor is not kept: the caller may close it once
+    /// this returns. A zero-length region gives a valid, empty mapping.
+    /// invalid_argument for an offset off a page boundary, a region past the
+    /// end of a regular file, or a file that is neither regular nor given a
+    /// length; otherwise errors are the errno as Status.
+    [[nodiscard]] static auto map(int fd, MapOptions const& options = {}) -> StatusValue<MappedFile>;
 
     /// Open @p path read-only, relative to @p dir_fd (AT_FDCWD for the
     /// working directory, as openat(2)), map it, and close it. @p path must
@@ -71,14 +90,14 @@ class MappedFile
     /// True once a map succeeded, an empty file included.
     [[nodiscard]] auto valid() const noexcept -> bool { return valid_; }
 
-    /// The file's bytes. Reading them is safe on a real-time thread only
+    /// The mapping's bytes. Reading them is safe on a real-time thread only
     /// inside a range lock_range() has locked.
     [[nodiscard]] auto bytes() const noexcept -> std::span<uint8_t const> { return {static_cast<uint8_t const*>(base_), size_}; }
 
     [[nodiscard]] auto size() const noexcept -> size_t { return size_; }
 
-    /// Lock the pages covering [offset, offset + length), clipped to the
-    /// file, into memory and read them in (mlock(2) populates). Nothing to
+    /// Lock the pages covering [offset, offset + length) of the mapping,
+    /// clipped to it, into memory and read them in (mlock(2) populates). Nothing to
     /// lock, because the range lies past the end or is empty, is success.
     [[nodiscard]] auto lock_range(size_t offset, size_t length) const noexcept -> Status;
 
