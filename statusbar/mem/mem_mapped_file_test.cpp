@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <array>
 #include <bit>
 #include <cerrno>
 #include <cstdint>
@@ -355,6 +356,31 @@ TEST(mem_mapped_file, a_zero_length_region_is_a_valid_empty_mapping)
     EXPECT_TRUE(mapped->lock_range(0, page).has_value());  // nothing to lock
 }
 
+TEST(mem_mapped_file, a_writable_region_writes_through_to_the_file)
+{
+    size_t const page = MappedFile::page_size();
+    TempFile const file{page * 2};
+    {
+        auto mapped = MappedFile::map(file.fd(), {.offset = page, .length = page, .writable = true});
+        EXPECT_TRUE(mapped.has_value());
+        EXPECT_TRUE(mapped->writable());
+        auto const bytes = mapped->writable_bytes();
+        EXPECT_EQ(bytes.size(), page);
+        bytes[3] = 0xA5;
+    }
+    uint8_t read_back = 0;
+    EXPECT_EQ(::pread(file.fd(), &read_back, 1, static_cast<off_t>(page + 3)), ssize_t{1});
+    EXPECT_EQ(read_back, uint8_t{0xA5});
+}
+
+TEST(mem_mapped_file, a_read_only_mapping_has_no_writable_bytes)
+{
+    TempFile const file{100};
+    auto mapped = MappedFile::map(file.fd());
+    EXPECT_TRUE(mapped.has_value());
+    EXPECT_TRUE(mapped->writable_bytes().empty());
+}
+
 TEST(mem_mapped_file, an_unaligned_offset_is_refused)
 {
     TempFile const file{MappedFile::page_size() * 2};
@@ -375,6 +401,61 @@ TEST(mem_mapped_file, a_region_past_the_end_is_refused)
     EXPECT_EQ(too_far.error(), std::make_error_code(std::errc::invalid_argument));
     auto exact = MappedFile::map(file.fd(), {.offset = page, .length = 10});
     EXPECT_TRUE(exact.has_value());
+}
+
+TEST(mem_mapped_file, a_zero_length_writable_region_still_checks_the_descriptor)
+{
+    TempFile const file{MappedFile::page_size()};
+    int const fd = ::open(file.path().c_str(), O_RDONLY | O_CLOEXEC);
+    EXPECT_TRUE(fd >= 0);
+    auto refused = MappedFile::map(fd, {.length = 0, .writable = true});
+    (void)::close(fd);
+    EXPECT_FALSE(refused.has_value());
+    EXPECT_EQ(errno_of(refused.error()), EACCES);
+    int const write_only = ::open(file.path().c_str(), O_WRONLY | O_CLOEXEC);
+    EXPECT_TRUE(write_only >= 0);
+    auto const not_readable = MappedFile::map(write_only, {.length = 0});
+    auto const not_read_write = MappedFile::map(write_only, {.length = 0, .writable = true});
+    auto const sized = MappedFile::map(write_only, {.length = 16, .writable = true});
+    (void)::close(write_only);
+    EXPECT_EQ(errno_of(not_readable.error()), EACCES);  // as mmap refuses O_WRONLY, whatever the length
+    EXPECT_EQ(errno_of(not_read_write.error()), EACCES);
+    EXPECT_EQ(errno_of(sized.error()), EACCES);
+    auto allowed = MappedFile::map(file.fd(), {.length = 0, .writable = true});
+    EXPECT_TRUE(allowed.has_value());
+    EXPECT_TRUE(allowed->writable_bytes().empty());
+}
+
+TEST(mem_mapped_file, a_moved_writable_mapping_stays_writable)
+{
+    size_t const page = MappedFile::page_size();
+    TempFile const file{page};
+    auto mapped = MappedFile::map(file.fd(), {.writable = true});
+    EXPECT_TRUE(mapped.has_value());
+    MappedFile moved{std::move(*mapped)};
+    EXPECT_TRUE(moved.writable());
+    EXPECT_FALSE(mapped->writable());  // NOLINT(bugprone-use-after-move) the moved-from state is what is under test
+    EXPECT_TRUE(mapped->writable_bytes().empty());
+    moved.writable_bytes()[7] = 0x5A;
+    MappedFile assigned;
+    assigned = std::move(moved);
+    EXPECT_TRUE(assigned.writable());
+    assigned.writable_bytes()[8] = 0xA5;
+    std::array<uint8_t, 2> read_back{};
+    EXPECT_EQ(::pread(file.fd(), read_back.data(), read_back.size(), 7), ssize_t{2});  // both writes reach the file
+    EXPECT_EQ(read_back[0], uint8_t{0x5A});
+    EXPECT_EQ(read_back[1], uint8_t{0xA5});
+}
+
+TEST(mem_mapped_file, a_writable_region_of_a_read_only_descriptor_is_refused)
+{
+    TempFile const file{MappedFile::page_size()};
+    int const fd = ::open(file.path().c_str(), O_RDONLY | O_CLOEXEC);
+    EXPECT_TRUE(fd >= 0);
+    auto mapped = MappedFile::map(fd, {.writable = true});
+    (void)::close(fd);
+    EXPECT_FALSE(mapped.has_value());
+    EXPECT_EQ(errno_of(mapped.error()), EACCES);
 }
 
 TEST(mem_mapped_file, an_offset_past_off_t_is_refused)

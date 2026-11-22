@@ -4,7 +4,7 @@
 
 Memory helpers that keep allocation and residency under the caller's
 control: an allocator-aware `make_unique`, and a file mapping (whole or a
-page-aligned region)
+page-aligned region, read-only or writable)
 with page-range locking for real-time readers.
 
 ## Overview
@@ -15,9 +15,10 @@ returned to that same resource on destruction; the deleter carries the
 resource, so the `PmrUniquePtr` it returns is self-contained.
 
 `MappedFile` maps a whole file read-only (`mmap` with `PROT_READ`,
-`MAP_SHARED`), or with `MapOptions` a page-aligned region of it, of a
-regular file or of a device that maps (which has no size, so the length is
-given). It lets a non-real-time thread keep a window of it
+`MAP_SHARED`), or with `MapOptions` a page-aligned region of it,
+writable on request (`PROT_WRITE`, `writable_bytes()`), of a regular file
+or of a device that maps (which has no size, so the length is given). It
+lets a non-real-time thread keep a window of it
 resident and locked while a real-time thread reads inside that window
 without faulting. `lock_range()` locks and reads in the pages covering
 a byte range, `unlock_range()` releases them, `advise()` tells the
@@ -31,18 +32,21 @@ range still locked by `lock_range()` refuses `dont_need` (`EINVAL`).
 
 Every `MappedFile` call is a system call and belongs on a non-real-time
 thread. The real-time thread only reads `bytes()`, and only where a
-`lock_range()` is in force.
+`lock_range()` is in force; it may also write `writable_bytes()` of a
+device's or shared memory's mapping (not of a file a disk filesystem
+holds, whose first write after each writeback faults).
 
 ## Key types
 
 - `MappedFile` — move-only; `map(fd, options)` and `open(dir_fd, path)` return
-  `StatusValue<MappedFile>`; `bytes()`, `size()`, `valid()`;
+  `StatusValue<MappedFile>`; `bytes()`, `writable_bytes()`, `size()`, `valid()`, `writable()`;
   `lock_range()`, `unlock_range()`, `advise()`, `page_span()`;
   `page_size()`. Errors are the `errno` as `Status`. A zero-length file
-  is a valid, empty mapping.
+  or region is a valid, empty mapping, its descriptor's access mode
+  checked as `mmap` would.
 - `MapOptions` — `offset` (page-aligned), `length` (none: to the end of a
-  regular file); the default maps the whole file. A region past the end of a
-  regular file is refused.
+  regular file), `writable`; the default maps the whole file read-only. A
+  region past the end of a regular file is refused.
 - `MappedFile::Advice` — `normal`, `sequential`, `random`, `will_need`,
   `dont_need`.
 - `PmrDeleter<T>`, `PmrUniquePtr<T>`, `pmr_make_unique<T>()` — the
@@ -86,7 +90,7 @@ std::span<uint8_t const> const bytes = mapped->bytes();
 
 - `statusbar::status` — `Status`, `StatusValue`.
 - POSIX: `mmap`, `munmap`, `mlock`, `munlock`, `openat`, `fstat`,
-  `sysconf`; `madvise(2)` on Linux, `posix_madvise` elsewhere.
+  `fcntl` (`F_GETFL`), `sysconf`; `madvise(2)` on Linux, `posix_madvise` elsewhere.
 
 ## Notes & caveats
 
@@ -107,6 +111,10 @@ std::span<uint8_t const> const bytes = mapped->bytes();
   maps whole, or as a region within its size; a file that is not regular
   (a device) maps only as a region with a length, which the caller must get
   right: a read past what the device backs raises `SIGBUS`.
+- **Writable.** `MapOptions::writable` adds `PROT_WRITE`; the descriptor must
+  be open `O_RDWR` (`O_RDONLY` and `O_WRONLY` are refused with `EACCES`, a
+  zero-length region included). Writing to a file a disk filesystem holds is
+  not for a real-time thread: the first write after each writeback faults.
 - **Descriptor.** Neither `map()` nor `open()` keeps the descriptor;
   `open()` closes its own, `map()` leaves the caller's for the caller.
 
