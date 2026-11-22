@@ -1,8 +1,8 @@
 // Copyright 2026 Jeff Koftinoff <jeff.koftinoff@statusbar.com>
 // SPDX-License-Identifier: MIT
 //
-// MappedFile — a file, or a region of it, mapped read-only, with page-range
-// locking.
+// MappedFile — a file mapped read-only (or a region of it, writable on
+// request), with page-range locking.
 //
 // A real-time thread may read inside a mapping only where the pages are
 // resident and locked; everything else here is a system call for a
@@ -17,9 +17,10 @@
 // The mapping is PROT_READ, MAP_SHARED: the file's bytes as the kernel has
 // them, including what another process appends after the map (within the
 // size at the time of the map), and nothing is copied. MapOptions maps a
-// page-aligned region instead, of a regular file or of a device that maps;
-// the pages are not populated. Every offset given to the methods counts from
-// the start of the mapping, a region's and not the file's.
+// page-aligned region instead, of a regular file or of a device that maps,
+// and adds PROT_WRITE on request; the pages are not populated. Every offset
+// given to the methods counts from the start of the mapping, a region's and
+// not the file's.
 
 #pragma once
 
@@ -43,6 +44,9 @@ struct MapOptions
     /// not regular (a device) has no size, so it needs one, and the caller is to get it
     /// right: a read past what the device backs raises SIGBUS.
     std::optional<size_t> length{};
+    /// PROT_READ | PROT_WRITE (the descriptor must be O_RDWR: O_RDONLY and O_WRONLY are refused EACCES);
+    /// else PROT_READ.
+    bool writable{false};
 };
 
 class MappedFile
@@ -80,6 +84,7 @@ class MappedFile
         : base_{other.base_}
         , size_{other.size_}
         , valid_{other.valid_}
+        , writable_{other.writable_}
     {
         other.forget();
     }
@@ -93,6 +98,19 @@ class MappedFile
     /// The mapping's bytes. Reading them is safe on a real-time thread only
     /// inside a range lock_range() has locked.
     [[nodiscard]] auto bytes() const noexcept -> std::span<uint8_t const> { return {static_cast<uint8_t const*>(base_), size_}; }
+
+    /// The mapping's bytes to write through: empty unless it was mapped
+    /// writable (MapOptions::writable). Writing to a file a disk filesystem
+    /// holds is not for a real-time thread, locked or not: the first write
+    /// after each writeback faults to mark the page dirty, and that may block.
+    /// A device's or shared memory's mapping has no such fault.
+    [[nodiscard]] auto writable_bytes() noexcept -> std::span<uint8_t>
+    {
+        return writable_ ? std::span<uint8_t>{static_cast<uint8_t*>(base_), size_} : std::span<uint8_t>{};
+    }
+
+    /// Whether the mapping was made writable.
+    [[nodiscard]] auto writable() const noexcept -> bool { return writable_; }
 
     [[nodiscard]] auto size() const noexcept -> size_t { return size_; }
 
@@ -123,11 +141,16 @@ class MappedFile
     [[nodiscard]] static auto page_size() noexcept -> size_t;
 
   private:
-    MappedFile(void* base, size_t size) noexcept
+    MappedFile(void* base, size_t size, bool writable) noexcept
         : base_{base}
         , size_{size}
         , valid_{true}
+        , writable_{writable}
     {}
+
+    /// The valid, empty mapping of a zero-length region, the descriptor's access mode checked as mmap(2) checks it
+    /// (EACCES, or EBADF for O_PATH); mmap's other refusals (a pipe, a sealed memfd) are not repeated.
+    [[nodiscard]] static auto empty_region(int fd, MapOptions const& options) noexcept -> StatusValue<MappedFile>;
 
     void unmap() noexcept;
     void forget() noexcept
@@ -135,11 +158,13 @@ class MappedFile
         base_ = nullptr;
         size_ = 0;
         valid_ = false;
+        writable_ = false;
     }
 
     void* base_{nullptr};
     size_t size_{0};
     bool valid_{false};
+    bool writable_{false};
 };
 
 }  // namespace statusbar::mem
