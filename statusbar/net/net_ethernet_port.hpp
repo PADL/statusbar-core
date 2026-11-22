@@ -139,7 +139,7 @@ using RxTimePoint = RxClock::time_point;
 /// pass costs one clock read however many frames it takes.
 [[nodiscard]] inline auto rx_clock_now() noexcept -> RxTimePoint
 {
-    return RxTimePoint{RxClock::duration{realtime::read_monotonic_raw_ns()}};
+    return realtime::read_monotonic_raw();
 }
 
 /// @p now as an EthernetRxSlot::timestamp_ns.

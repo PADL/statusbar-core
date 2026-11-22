@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <type_traits>
 
 using namespace statusbar;
 using namespace statusbar::realtime;
@@ -25,6 +26,12 @@ constexpr int64_t LONG_UPTIME_NS = 400LL * 24 * 3600 * 1'000'000'000LL;
 [[nodiscard]] auto within(int64_t a, int64_t b, int64_t tolerance) -> bool
 {
     return std::llabs(a - b) <= tolerance;
+}
+
+/// A told sample: the same instant as a count on each clock.
+[[nodiscard]] auto push(MonotonicRawTracker& tracker, int64_t raw_ns, int64_t mono_ns) -> bool
+{
+    return tracker.push(MonotonicRawClock::from_ns(raw_ns), MonotonicClock::from_ns(mono_ns));
 }
 
 }  // namespace
@@ -66,11 +73,27 @@ TEST(monotonic_raw_line, typed_conversions_change_the_clock_tag)
     EXPECT_EQ(MonotonicRawClock::to_ns(raw), int64_t{100});
 }
 
+TEST(monotonic_raw_tracker, a_sample_names_the_clock_of_each_reading)
+{
+    // The two readings cannot be passed the wrong way round.
+    static_assert(std::is_invocable_v<
+                  decltype(&MonotonicRawTracker::push),
+                  MonotonicRawTracker&,
+                  MonotonicRawClock::time_point,
+                  MonotonicClock::time_point>);
+    static_assert(!std::is_invocable_v<
+                  decltype(&MonotonicRawTracker::push),
+                  MonotonicRawTracker&,
+                  MonotonicClock::time_point,
+                  MonotonicRawClock::time_point>);
+    static_assert(!std::is_invocable_v<decltype(&MonotonicRawTracker::push), MonotonicRawTracker&, int64_t, int64_t>);
+}
+
 TEST(monotonic_raw_tracker, one_sample_publishes_the_offset_at_rate_one)
 {
     MonotonicRawLine line;
     MonotonicRawTracker tracker{line};
-    EXPECT_TRUE(tracker.push(1'000, 1'000'000));
+    EXPECT_TRUE(push(tracker, 1'000, 1'000'000));
     auto const published = line.consume();
     EXPECT_EQ(published.rate, 1.0);
     EXPECT_EQ(published.offset_ns, int64_t{999'000});
@@ -86,7 +109,7 @@ TEST(monotonic_raw_tracker, told_samples_on_a_line_recover_its_rate_and_offset)
     for (int i = 0; i < 16; ++i) {
         int64_t const raw = LONG_UPTIME_NS + (i * 100'000'000LL);
         int64_t const mono = raw + (raw / 2000) + OFFSET_NS;
-        EXPECT_TRUE(tracker.push(raw, mono));
+        EXPECT_TRUE(push(tracker, raw, mono));
     }
     auto const published = line.consume();
     EXPECT_TRUE(published.rate > 1.00049 && published.rate < 1.00051);
@@ -102,10 +125,10 @@ TEST(monotonic_raw_tracker, a_rate_outside_the_window_is_rejected_and_the_old_li
 {
     MonotonicRawLine line;
     MonotonicRawTracker tracker{line};
-    EXPECT_TRUE(tracker.push(0, 100));
-    EXPECT_TRUE(tracker.push(1'000'000, 1'000'100));
+    EXPECT_TRUE(push(tracker, 0, 100));
+    EXPECT_TRUE(push(tracker, 1'000'000, 1'000'100));
     // A pair that says MONOTONIC runs at twice RAW: not a clock, a glitch.
-    EXPECT_FALSE(tracker.push(2'000'000, 3'000'100));
+    EXPECT_FALSE(push(tracker, 2'000'000, 3'000'100));
     auto const published = line.consume();
     EXPECT_EQ(published.rate, 1.0);
     EXPECT_EQ(published.offset_ns, int64_t{100});
@@ -116,7 +139,7 @@ TEST(monotonic_raw_tracker, the_window_forgets_old_samples)
     MonotonicRawLine line;
     MonotonicRawTracker tracker{line, 4};
     for (int i = 0; i < 10; ++i) {
-        (void)tracker.push(i * 1'000'000LL, (i * 1'000'000LL) + 50);
+        (void)push(tracker, i * 1'000'000LL, (i * 1'000'000LL) + 50);
     }
     EXPECT_EQ(tracker.size(), size_t{4});
 }
@@ -125,7 +148,7 @@ TEST(monotonic_raw_tracker, sampling_the_clocks_gives_a_line_near_the_live_offse
 {
     MonotonicRawLine line;
     MonotonicRawTracker tracker{line};
-    int64_t const bracket = tracker.sample();
+    int64_t const bracket = tracker.sample().count();
     EXPECT_TRUE(bracket >= 0);
     // Right after one sample the line maps now to now, give or take the
     // bracket and the time these reads took.

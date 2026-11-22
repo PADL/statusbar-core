@@ -85,10 +85,11 @@ class MonotonicRawLine
 class MonotonicRawTracker
 {
   public:
+    /// One paired reading: the same instant on each clock.
     struct Sample
     {
-        int64_t raw_ns{0};
-        int64_t mono_ns{0};
+        MonotonicRawClock::time_point raw{};
+        MonotonicClock::time_point mono{};
     };
 
     static constexpr size_t DEFAULT_WINDOW = 64;
@@ -105,14 +106,16 @@ class MonotonicRawTracker
 
     /// Told form: one paired reading, taken by the caller. Refits the window
     /// and publishes. One sample publishes an offset-only line.
+    /// @param raw The CLOCK_MONOTONIC_RAW reading
+    /// @param mono The CLOCK_MONOTONIC reading of the same instant
     /// @return false when the fit was rejected (rate out of range); the
     ///         previous line stands.
-    auto push(int64_t raw_ns, int64_t mono_ns) noexcept -> bool;
+    auto push(MonotonicRawClock::time_point raw, MonotonicClock::time_point mono) noexcept -> bool;
 
     /// Asking form, for the tick owner: reads RAW, MONOTONIC, RAW and pushes
     /// the pair at the RAW midpoint of the bracket.
-    /// @return the bracket width in ns (how uncertain the pairing is).
-    auto sample() noexcept -> int64_t;
+    /// @return the bracket width (how uncertain the pairing is).
+    auto sample() noexcept -> Nanoseconds;
 
     [[nodiscard]] auto size() const noexcept -> size_t { return window_.size(); }
     void clear() noexcept { window_.clear(); }

@@ -40,10 +40,10 @@ class AnyTimer
         : impl_{std::move(impl)}
     {}
 
-    /// Create an AnyTimer with a monotonic clock timer
+    /// Create an AnyTimer scheduled on the reference clock (CLOCK_MONOTONIC_RAW)
     /// @param config Timer configuration
     /// @param callback Callback function
-    static auto create(TimerConfig const& config, TimerCallback<MonotonicClock> callback) -> AnyTimer
+    static auto create(TimerConfig const& config, TimerCallback<MonotonicRawClock> callback) -> AnyTimer
     {
         return AnyTimer{std::make_unique<Timer<>>(config, std::move(callback))};
     }

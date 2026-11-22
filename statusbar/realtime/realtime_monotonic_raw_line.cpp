@@ -28,7 +28,8 @@ using Window = TimingSampleWindow<Sample>;
 /// The line through one sample at rate 1.
 [[nodiscard]] auto offset_only(Sample const& sample) noexcept -> Fit
 {
-    return Fit{.rate = 1.0, .offset_ns = sample.mono_ns - sample.raw_ns};
+    // An offset between two clocks belongs to neither: a bare count.
+    return Fit{.rate = 1.0, .offset_ns = MonotonicClock::to_ns(sample.mono) - MonotonicRawClock::to_ns(sample.raw)};
 }
 
 /// Least-squares sums over the window, centred on its first sample so the
@@ -46,8 +47,8 @@ struct Sums
 {
     Sums sums{.n = static_cast<double>(window.size())};
     for (size_t i = 0; i < window.size(); ++i) {
-        auto const dx = static_cast<double>(window[i].raw_ns - first.raw_ns);
-        auto const dy = static_cast<double>(window[i].mono_ns - first.mono_ns);
+        auto const dx = static_cast<double>((window[i].raw - first.raw).count());
+        auto const dy = static_cast<double>((window[i].mono - first.mono).count());
         sums.sx += dx;
         sums.sy += dy;
         sums.sxx += dx * dx;
@@ -67,8 +68,8 @@ struct Sums
     }
     double const rate = ((s.n * s.sxy) - (s.sx * s.sy)) / denominator;
     double const intercept_delta = (s.sy - (rate * s.sx)) / s.n;
-    int64_t const offset = first.mono_ns + std::llround(intercept_delta) -
-        scale(first.raw_ns, MonotonicRawLine::slope_numerator(rate), MonotonicRawLine::SLOPE_DENOMINATOR);
+    int64_t const offset = MonotonicClock::to_ns(first.mono) + std::llround(intercept_delta) -
+        scale(MonotonicRawClock::to_ns(first.raw), MonotonicRawLine::slope_numerator(rate), MonotonicRawLine::SLOPE_DENOMINATOR);
     return Fit{.rate = rate, .offset_ns = offset};
 }
 
@@ -110,9 +111,9 @@ auto MonotonicRawLine::from_monotonic_ns(int64_t mono_ns) const noexcept -> int6
     return scale(mono_ns - line.offset_ns, SLOPE_DENOMINATOR, slope_numerator(line.rate));
 }
 
-auto MonotonicRawTracker::push(int64_t raw_ns, int64_t mono_ns) noexcept -> bool
+auto MonotonicRawTracker::push(MonotonicRawClock::time_point const raw, MonotonicClock::time_point const mono) noexcept -> bool
 {
-    window_.push({.raw_ns = raw_ns, .mono_ns = mono_ns});
+    window_.push({.raw = raw, .mono = mono});
     auto const fit = fit_window(window_);
     if (!fit || !rate_in_range(fit->rate)) {
         return false;
@@ -121,31 +122,14 @@ auto MonotonicRawTracker::push(int64_t raw_ns, int64_t mono_ns) noexcept -> bool
     return true;
 }
 
-auto MonotonicRawTracker::sample() noexcept -> int64_t
+auto MonotonicRawTracker::sample() noexcept -> Nanoseconds
 {
-    int64_t const raw_before = read_monotonic_raw_ns();
-    int64_t const mono = read_monotonic_ns();
-    int64_t const raw_after = read_monotonic_raw_ns();
-    (void)push(raw_before + ((raw_after - raw_before) / 2), mono);
-    return raw_after - raw_before;
-}
-
-// MonotonicRawClockAdapter's line conversions (declared in realtime_clock.hpp).
-
-auto MonotonicRawClockAdapter::to_monotonic_ns(int64_t raw_ns) const noexcept -> int64_t
-{
-    if (line_ != nullptr) {
-        return line_->to_monotonic_ns(raw_ns);
-    }
-    return raw_ns + (read_monotonic_ns() - read_monotonic_raw_ns());
-}
-
-auto MonotonicRawClockAdapter::from_monotonic_ns(int64_t mono_ns) const noexcept -> int64_t
-{
-    if (line_ != nullptr) {
-        return line_->from_monotonic_ns(mono_ns);
-    }
-    return mono_ns - (read_monotonic_ns() - read_monotonic_raw_ns());
+    auto const raw_before = read_monotonic_raw();
+    auto const mono = read_monotonic();
+    auto const raw_after = read_monotonic_raw();
+    Nanoseconds const bracket = raw_after - raw_before;
+    (void)push(raw_before + (bracket / 2), mono);
+    return bracket;
 }
 
 }  // namespace statusbar::realtime
