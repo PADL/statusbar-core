@@ -202,6 +202,31 @@ class HttpEngine : private net::TcpConnectionHandler
         WsEndpoint* endpoint;
     };
 
+    /// What a complete request head says about its body.
+    struct HeadFraming
+    {
+        size_t head_len{0};
+        uint64_t body_len{0};
+        uint64_t body_in_rx{0};  ///< body bytes that arrived with the head
+        bool expects_continue{false};
+    };
+
+    /// Whether the bytes in rx hold a whole WebSocket frame yet.
+    enum class FrameReady : uint8_t
+    {
+        failed,      ///< refused: the close is already on its way
+        need_bytes,  ///< read more
+        ready,
+    };
+
+    /// What became of one WebSocket frame.
+    enum class FrameOutcome : uint8_t
+    {
+        failed,     ///< refused: the close is already on its way
+        close_now,  ///< the peer answered our close
+        handled,
+    };
+
     struct Connection
     {
         std::vector<uint8_t> rx;  ///< head + buffered body + pipelined tail
@@ -240,6 +265,45 @@ class HttpEngine : private net::TcpConnectionHandler
         bool upgrade_pending{false};
         int64_t ws_last_rx_ns{0};
         int64_t ws_last_ping_ns{0};
+
+        // The fields that always change together, changed together.
+
+        /// A new connection lands in the slot: everything as constructed,
+        /// the buffers kept.
+        void reopen(int64_t now_ns) noexcept;
+        void closed() noexcept;
+        /// A request head is complete: nothing staged, nothing queued.
+        void begin_response(bool head_request) noexcept;
+        /// Where the body ends in rx and how much of it is still to come.
+        void frame_body(HeadFraming const& head) noexcept;
+        /// @p len more bytes of a head, or of a buffered body, were read into rx.
+        void took_head_bytes(size_t len, int64_t now_ns) noexcept;
+        void took_body_into_rx(size_t len) noexcept;
+
+        void clear_body() noexcept;
+        void set_body(std::span<uint8_t const> map, int fd, uint64_t size) noexcept;
+        /// A body served from the caller's bytes. Always true.
+        auto reference_body(std::span<uint8_t const> bytes) noexcept -> bool;
+        /// A body copied in behind what tx holds; false when it does not fit.
+        auto append_tx(std::span<uint8_t const> bytes) noexcept -> bool;
+        /// tx holds @p len bytes to send from its start.
+        void stage_tx(size_t len) noexcept;
+        void stage_fixed(std::string_view bytes) noexcept;
+        /// The response cannot be built: nothing queued, single-shot spent,
+        /// the connection to close after what goes out instead.
+        void abandon_response() noexcept;
+
+        /// Nothing staged is waiting to go out.
+        [[nodiscard]] auto tx_drained() const noexcept -> bool;
+        /// A handler may send now: from on_complete or an asynchronous respond(), once.
+        [[nodiscard]] auto may_send() const noexcept -> bool;
+        [[nodiscard]] auto tx_chars() noexcept -> char*;
+
+        void enter_ws(int64_t now_ns) noexcept;
+        /// A frame's payload, unmasked where it lies in rx.
+        auto ws_payload(WsFrameHeader const& header, int64_t now_ns) noexcept -> std::span<uint8_t>;
+        /// Drop the first @p len bytes of rx.
+        void consume_rx(size_t len) noexcept;
     };
 
     // -- TcpConnectionHandler --
@@ -249,14 +313,46 @@ class HttpEngine : private net::TcpConnectionHandler
     void on_closed(size_t slot, int64_t now_ns) override;
 
     void process(size_t slot, int64_t now_ns);
+    /// One pass of process() in each reading state. False when the loop must
+    /// stop: nothing more to read now, or the slot is closed.
+    [[nodiscard]] auto read_body(size_t slot, int64_t now_ns) -> bool;
+    [[nodiscard]] auto read_buffered_body(size_t slot) -> bool;
+    [[nodiscard]] auto read_passing_body(size_t slot) -> bool;  ///< streamed to the handler, or discarded
+    void pass_body_chunk(size_t slot, size_t len);
+    [[nodiscard]] auto read_head(size_t slot, int64_t now_ns) -> bool;
+    [[nodiscard]] auto read_more_head(size_t slot, int64_t now_ns) -> bool;
+
+    [[nodiscard]] static auto head_framing(HttpRequest const& request, size_t head_len, size_t rx_len) noexcept -> HeadFraming;
     void handle_complete_head(size_t slot, int64_t now_ns);
+    /// handle_complete_head's steps. The two that return bool say whether
+    /// the request goes on: false means it has been answered already.
+    [[nodiscard]] auto upgrade_if_websocket(size_t slot, HeadFraming const& head, int64_t now_ns) -> bool;  ///< true: it was one
+    [[nodiscard]] auto choose_body_mode(size_t slot, HeadFraming const& head, int64_t now_ns) -> bool;
+    [[nodiscard]] auto ask_handler(size_t slot, HeadFraming const& head, int64_t now_ns) -> bool;
+    [[nodiscard]] auto reject_body(size_t slot, uint16_t status, HeadFraming const& head, int64_t now_ns) -> bool;
+    [[nodiscard]] auto buffer_body(size_t slot, HeadFraming const& head, int64_t now_ns) -> bool;
+    void stream_body(size_t slot, HeadFraming const& head);
+    /// True when the body is over the buffered cap and a 413 went out.
+    [[nodiscard]] auto refuse_oversize_body(size_t slot, HeadFraming const& head, int64_t now_ns) -> bool;
+    void finish_head(size_t slot, HeadFraming const& head, int64_t now_ns);
+    /// The interim 100, or the final status when no route wants the body.
+    [[nodiscard]] auto answer_expect_continue(size_t slot, int64_t now_ns) -> bool;
     void body_finished(size_t slot, int64_t now_ns);
     /// The answer for a request no handler took: pending status, static
     /// manifest, 405, or 404.
     void respond_unhandled(size_t slot, bool close_after, int64_t now_ns);
     void respond_status(size_t slot, uint16_t status, bool close_after, int64_t now_ns);
     void serve_static(size_t slot, StaticRoute const& route, HttpRequest const& request, bool close_after, int64_t now_ns);
+    void serve_not_modified(size_t slot, StaticRoute const& route, bool close_after, int64_t now_ns);
+    void serve_found(size_t slot, StaticRoute const& route, bool close_after, int64_t now_ns);
+    /// Send what tx and the body fields hold; start_sending says first
+    /// whether the connection closes afterwards.
+    void send_staged(size_t slot, int64_t now_ns);
+    void start_sending(size_t slot, bool close_after, int64_t now_ns);
     void pump_tx(size_t slot, int64_t now_ns);
+    /// Stage the next chunk of a pread body in tx; false when the file is
+    /// shorter than promised and the slot was closed.
+    [[nodiscard]] auto stage_file_chunk(size_t slot) -> bool;
     void next_request(size_t slot, int64_t now_ns);
     /// next_request's three parts: move the bytes after the finished request
     /// to the front of rx (returns how many), clear the per-request fields,
@@ -272,14 +368,39 @@ class HttpEngine : private net::TcpConnectionHandler
     /// — stages a fixed 500 + close instead (false).
     [[nodiscard]] auto stage_head(size_t slot, int head_len, int64_t now_ns) noexcept -> bool;
     void fail_response(size_t slot, int64_t now_ns) noexcept;
+    /// fail_response at the slot's latest event time. Always false.
+    auto refuse_response(size_t slot) noexcept -> bool;
 
     // WebSocket engine.
     void try_upgrade(size_t slot, HttpRequest const& request, WsRoute const& route, int64_t now_ns);
+    [[nodiscard]] auto stage_switching_protocols(size_t slot, HttpRequest const& request, int64_t now_ns) -> bool;
+    void begin_upgrade(size_t slot, WsRoute const& route, int64_t now_ns);
     void enter_ws_mode(size_t slot, int64_t now_ns);
     void ws_process(size_t slot, int64_t now_ns);
     void ws_read_frames(size_t slot, int64_t now_ns);
+    /// One pass of the frame loop: read more bytes, or handle one whole
+    /// frame. False when the loop must stop.
+    [[nodiscard]] auto ws_read_step(size_t slot, int64_t now_ns) -> bool;
+    [[nodiscard]] auto ws_frame_ready(size_t slot, WsFrameHeader& header, int64_t now_ns) -> FrameReady;
+    [[nodiscard]] auto ws_read_more(size_t slot, int64_t now_ns) -> bool;
+    [[nodiscard]] auto ws_handle_frame(size_t slot, WsFrameHeader const& header, int64_t now_ns) -> bool;
+    [[nodiscard]] auto ws_apply_frame(size_t slot, WsFrameHeader const& header, std::span<uint8_t const> payload, int64_t now_ns)
+        -> FrameOutcome;
+    [[nodiscard]] auto ws_peer_closes(size_t slot, std::span<uint8_t const> payload, int64_t now_ns) -> FrameOutcome;
+    [[nodiscard]] auto ws_begin_message(size_t slot, WsFrameHeader const& header, std::span<uint8_t const> payload, int64_t now_ns)
+        -> FrameOutcome;
+    [[nodiscard]] auto ws_continue_message(
+        size_t slot, WsFrameHeader const& header, std::span<uint8_t const> payload, int64_t now_ns) -> FrameOutcome;
+    [[nodiscard]] auto ws_append_message(size_t slot, WsFrameHeader const& header, std::span<uint8_t const> payload, int64_t now_ns)
+        -> FrameOutcome;
+    [[nodiscard]] auto ws_finish_frame(size_t slot, WsFrameHeader const& header, FrameOutcome outcome) -> bool;
+    [[nodiscard]] auto ws_deliver_message(size_t slot) -> bool;
     auto ws_stage_frame(size_t slot, WsOpcode opcode, std::span<uint8_t const> payload, bool external, int64_t now_ns) noexcept
         -> bool;
+    /// The frame's header and payload into tx and the body fields; false
+    /// when the header cannot be written or a copied payload does not fit.
+    [[nodiscard]] static auto ws_stage_frame_bytes(
+        Connection& c, WsOpcode opcode, std::span<uint8_t const> payload, bool external) noexcept -> bool;
     void ws_fail(size_t slot, uint16_t code, int64_t now_ns);
     [[nodiscard]] auto find_ws_route(std::string_view path) const noexcept -> WsRoute const*;
 
@@ -287,6 +408,13 @@ class HttpEngine : private net::TcpConnectionHandler
     auto writer_add_header(size_t slot, std::string_view name, std::string_view value) noexcept -> bool;
     auto writer_send(
         size_t slot, uint16_t status, std::string_view content_type, std::span<uint8_t const> body, bool external) noexcept -> bool;
+    /// writer_send's steps: stage the head, then the body, and send. Each
+    /// false means a fixed 500 went out instead.
+    [[nodiscard]] auto send_response(
+        size_t slot, uint16_t status, std::string_view content_type, std::span<uint8_t const> body, bool external) noexcept -> bool;
+    [[nodiscard]] auto stage_response_head(
+        size_t slot, uint16_t status, std::string_view content_type, size_t body_size, bool close_after) noexcept -> bool;
+    [[nodiscard]] auto stage_response_body(size_t slot, std::span<uint8_t const> body, bool external) noexcept -> bool;
     [[nodiscard]] auto writer_sent(size_t slot) const noexcept -> bool;
 
     [[nodiscard]] auto find_route(HttpMethod method, std::string_view path) const noexcept -> HttpHandler*;
