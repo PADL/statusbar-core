@@ -115,7 +115,13 @@ class HardwareTimer
     static auto start() noexcept -> HardwareTimer { return HardwareTimer{hw_detail::read_counter()}; }
 
     /// Raw tick count since start — the cheapest possible query.
-    [[nodiscard]] auto elapsed_ticks() const noexcept -> Tick { return hw_detail::read_counter() - start_; }
+    [[nodiscard]] auto elapsed_ticks() const noexcept -> Tick { return elapsed_ticks_at(hw_detail::read_counter()); }
+
+    /// Told form: the ticks elapsed when the counter reads @p now.
+    [[nodiscard]] auto elapsed_ticks_at(Tick now) const noexcept -> Tick { return now - start_; }
+
+    /// Told form: the nanoseconds elapsed when the counter reads @p now.
+    [[nodiscard]] auto elapsed_ns_at(Tick now) const noexcept -> int64_t { return hw_detail::ticks_to_ns(elapsed_ticks_at(now)); }
 
     /// Elapsed time in nanoseconds (converted at call time).
     [[nodiscard]] auto elapsed_ns() const noexcept -> int64_t { return hw_detail::ticks_to_ns(elapsed_ticks()); }

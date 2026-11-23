@@ -21,6 +21,7 @@ static auto stats_through_an_incomplete_type(statusbar::net::XdpSocketStats cons
 #    include "statusbar/net/net.hpp"
 #    include "statusbar/status/status.hpp"
 
+#    include <poll.h>
 #    include <unistd.h>
 
 #    include <array>
@@ -2415,8 +2416,10 @@ TEST(xdp_integration, tx_rx_loopback)
     (void)tx_ctx.tx_commit(tx_slot->handle, 64);  // Min frame size
     (void)tx_ctx.tx_flush();
 
-    // Give kernel a moment to deliver
-    usleep(10000);  // 10ms
+    // Block until the kernel has delivered, however long that takes. The
+    // timeout only ends the wait for a frame that never comes.
+    struct pollfd waiting{.fd = rx_ctx.fd(), .events = POLLIN, .revents = 0};
+    (void)::poll(&waiting, 1, 2'000);
 
     // RX: check for received frame
     rx_ctx.begin_cycle();
@@ -2528,8 +2531,7 @@ TEST(xdp_integration, multiple_inflight_tx)
     EXPECT_EQ(ctx.socket_stats().tx_flush_count, 1u);
     EXPECT_EQ(ctx.socket_stats().tx_flush_failed, 0u);
 
-    // Reclaim via tx_complete
-    usleep(10000);
+    // Reclaim via tx_complete: whatever the kernel has completed by now.
     (void)ctx.tx_complete();
 }
 

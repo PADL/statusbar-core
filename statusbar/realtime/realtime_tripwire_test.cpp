@@ -5,7 +5,6 @@
 #include "statusbar/test/test.hpp"
 
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <thread>
 
@@ -339,10 +338,7 @@ TEST(tripwire_monitor_lifecycle, start_stop)
 
     EXPECT_TRUE(monitor.is_running());
 
-    // Let the monitor thread start
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-    // Stop monitor - should exit cleanly
+    // Stop monitor - should exit cleanly, wherever its thread has got to
     monitor.stop();
 
     EXPECT_FALSE(monitor.is_running());
@@ -360,10 +356,7 @@ TEST(tripwire_monitor_lifecycle, stop_without_shutdown_flag)
 
     EXPECT_TRUE(monitor.is_running());
 
-    // Let the monitor thread start
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-    // Stop should work via local running flag
+    // Stop should work via local running flag, wherever its thread has got to
     monitor.stop();
 
     EXPECT_FALSE(monitor.is_running());

@@ -10,11 +10,9 @@
 #include <unistd.h>
 
 #include <array>
-#include <chrono>
 #include <memory>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <vector>
 
 #include <sys/socket.h>
@@ -655,7 +653,6 @@ TEST(http_handler, bytes_behind_a_held_request_do_not_spin_the_reactor)
     // read interest off, and the reactor would spin for as long as the
     // handler takes.
     c.send_all("GET /later HTTP/1.1\r\nHost: t\r\n\r\n");
-    std::this_thread::sleep_for(std::chrono::milliseconds{20});
     EXPECT_TRUE(ready_rounds(*fx.server, 30, 100) <= 1);
     EXPECT_TRUE(c.recv_for(30).empty());  // and nothing was answered early
 

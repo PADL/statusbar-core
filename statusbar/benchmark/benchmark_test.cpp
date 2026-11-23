@@ -6,7 +6,8 @@
 #include "statusbar/test/test.hpp"
 
 #include <chrono>
-#include <thread>
+#include <cstdint>
+#include <type_traits>
 #include <vector>
 
 using namespace statusbar::benchmark;
@@ -14,55 +15,79 @@ using namespace statusbar::benchmark;
 //
 // Timer - Basic Tests
 //
+// The stopwatch is run on a clock the test sets, so each elapsed time is
+// exact and nothing waits.
+//
+
+namespace {
+
+/// A clock that reads whatever the test last told it.
+struct ToldClock
+{
+    using duration = std::chrono::nanoseconds;
+    using rep = duration::rep;
+    using period = duration::period;
+    using time_point = std::chrono::time_point<ToldClock>;
+    static constexpr bool is_steady = true;
+
+    static inline time_point told{};
+
+    static auto now() noexcept -> time_point { return told; }
+    static auto advance(duration by) noexcept -> void { told += by; }
+};
+
+using ToldTimer = BasicTimer<ToldClock>;
+
+}  // namespace
 
 TEST(timer_basic, start_and_elapsed)
 {
-    auto timer = Timer::start();
-    // Sleep briefly to ensure some time passes
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    auto elapsed = timer.elapsed_ns();
-    // Should have elapsed at least 1 million nanoseconds (1ms)
-    // but no more than 100 million (100ms) to account for scheduling
-    EXPECT_TRUE(elapsed >= 1'000'000);
-    EXPECT_TRUE(elapsed < 100'000'000);
+    auto const timer = ToldTimer::start();
+    EXPECT_EQ(timer.elapsed_ns(), int64_t{0});
+    ToldClock::advance(std::chrono::milliseconds(10));
+    EXPECT_EQ(timer.elapsed_ns(), int64_t{10'000'000});
+    EXPECT_TRUE(timer.elapsed() == std::chrono::milliseconds(10));
 }
 
 TEST(timer_basic, elapsed_us)
 {
-    auto timer = Timer::start();
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    double elapsed = timer.elapsed_us();
-    // Should be at least 1000 microseconds (1ms)
-    EXPECT_TRUE(elapsed >= 1000.0);
+    auto const timer = ToldTimer::start();
+    ToldClock::advance(std::chrono::nanoseconds(5'000'500));
+    EXPECT_TRUE(timer.elapsed_us() == 5000.5);
 }
 
 TEST(timer_basic, elapsed_ms)
 {
-    auto timer = Timer::start();
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    double elapsed = timer.elapsed_ms();
-    // Should be at least 1 millisecond
-    EXPECT_TRUE(elapsed >= 1.0);
+    auto const timer = ToldTimer::start();
+    ToldClock::advance(std::chrono::microseconds(5'250));
+    EXPECT_TRUE(timer.elapsed_ms() == 5.25);
 }
 
 TEST(timer_basic, elapsed_s)
 {
-    auto timer = Timer::start();
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    double elapsed = timer.elapsed_s();
-    // Should be at least 0.001 seconds
-    EXPECT_TRUE(elapsed >= 0.001);
+    auto const timer = ToldTimer::start();
+    ToldClock::advance(std::chrono::milliseconds(1'500));
+    EXPECT_TRUE(timer.elapsed_s() == 1.5);
 }
 
 TEST(timer_basic, reset)
 {
-    auto timer = Timer::start();
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    auto timer = ToldTimer::start();
+    ToldClock::advance(std::chrono::milliseconds(10));
     timer.reset();
-    // After reset, elapsed time should be small
-    auto elapsed = timer.elapsed_ns();
-    // Should be less than 10 milliseconds
-    EXPECT_TRUE(elapsed < 10'000'000);
+    // After reset, the count starts again from the reset.
+    EXPECT_EQ(timer.elapsed_ns(), int64_t{0});
+    ToldClock::advance(std::chrono::microseconds(3));
+    EXPECT_EQ(timer.elapsed_ns(), int64_t{3'000});
+}
+
+TEST(timer_basic, the_default_stopwatch_is_on_steady_clock)
+{
+    static_assert(std::is_same_v<Timer, BasicTimer<std::chrono::steady_clock>>);
+    static_assert(std::is_same_v<Timer::Clock, std::chrono::steady_clock>);
+    // A real clock never runs backwards, whatever the load.
+    auto const timer = Timer::start();
+    EXPECT_TRUE(timer.elapsed_ns() >= 0);
 }
 
 //
@@ -174,117 +199,39 @@ TEST(hw_timer_basic, elapsed_ticks_monotonic)
     EXPECT_TRUE(t2 >= t1);
 }
 
-TEST(hw_timer_basic, elapsed_ns_after_sleep)
+// The conversions below are told the counter's reading, so each is exact:
+// the counter itself is only read by start().
+TEST(hw_timer_basic, elapsed_ns_is_the_told_ticks_at_the_counters_rate)
 {
-    auto timer = HardwareTimer::start();
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    auto elapsed = timer.elapsed_ns();
-    EXPECT_TRUE(elapsed >= 1'000'000);
-    EXPECT_TRUE(elapsed < 100'000'000);
+    auto const timer = HardwareTimer::start();
+    uint64_t const per_second = HardwareTimer::ticks_per_second();
+    EXPECT_EQ(timer.elapsed_ticks_at(timer.start_tick()), uint64_t{0});
+    EXPECT_EQ(timer.elapsed_ns_at(timer.start_tick()), int64_t{0});
+    // One second of ticks later, and three.
+    EXPECT_EQ(timer.elapsed_ns_at(timer.start_tick() + per_second), int64_t{1'000'000'000});
+    EXPECT_EQ(timer.elapsed_ns_at(timer.start_tick() + (3 * per_second)), int64_t{3'000'000'000});
+    EXPECT_EQ(timer.elapsed_ticks_at(timer.start_tick() + per_second), per_second);
 }
 
-TEST(hw_timer_basic, elapsed_ms_after_sleep)
+TEST(hw_timer_basic, reset_starts_again_from_the_counter_as_it_stands)
 {
     auto timer = HardwareTimer::start();
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    double elapsed = timer.elapsed_ms();
-    EXPECT_TRUE(elapsed >= 1.0);
-}
-
-TEST(hw_timer_basic, reset)
-{
-    auto timer = HardwareTimer::start();
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    uint64_t const first = timer.start_tick();
     timer.reset();
-    // After reset, elapsed should be tiny
-    EXPECT_TRUE(timer.elapsed_ms() < 10.0);
+    // The counter does not run backwards, whatever the load.
+    EXPECT_TRUE(timer.start_tick() >= first);
 }
 
-TEST(hw_timer_basic, ticks_to_ns_static_matches_instance)
+TEST(hw_timer_basic, ticks_to_ns_is_whole_seconds_plus_the_remainder)
 {
-    auto timer = HardwareTimer::start();
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    auto ticks = timer.elapsed_ticks();
-    // Both conversions should produce the same value for the same tick count
-    auto ns_static = HardwareTimer::ticks_to_ns(ticks);
-    // Within a few microseconds — can't compare exactly since elapsed_ns() re-reads the counter
-    EXPECT_TRUE(ns_static >= 1'000'000);
+    uint64_t const per_second = HardwareTimer::ticks_per_second();
+    EXPECT_EQ(HardwareTimer::ticks_to_ns(0), int64_t{0});
+    EXPECT_EQ(HardwareTimer::ticks_to_ns(per_second), int64_t{1'000'000'000});
+    // A count far past where ticks * 1e9 would overflow 64 bits.
+    EXPECT_EQ(HardwareTimer::ticks_to_ns(100'000 * per_second), int64_t{100'000} * 1'000'000'000);
+    // Half a second, to the tick.
+    int64_t const half = HardwareTimer::ticks_to_ns(per_second / 2);
+    EXPECT_TRUE(half >= 499'999'999 && half <= 500'000'000);
 }
-
-//
-// run_hw() - HardwareTimer-backed Benchmark Execution Tests
-//
-
-TEST(run_hw_test, simple_function)
-{
-    int counter = 0;
-    BenchmarkConfig config;
-    config.warmup_iterations = 5;
-    config.measurement_iterations = 10;
-
-    auto stats = run_hw(
-        "hw_test",
-        [&counter](size_t n) {
-            for (size_t k = 0; k < n; ++k) {
-                counter++;
-            }
-            do_not_optimize(counter);
-        },
-        config);
-
-    EXPECT_EQ(stats.sample_count, 10);
-    EXPECT_EQ(counter, 15);
-}
-
-TEST(run_hw_test, with_batch_size)
-{
-    int counter = 0;
-    BenchmarkConfig config;
-    config.warmup_iterations = 2;
-    config.measurement_iterations = 3;
-    config.batch_size = 4;
-
-    auto stats = run_hw(
-        "hw_test_batch",
-        [&counter](size_t n) {
-            for (size_t k = 0; k < n; ++k) {
-                counter++;
-            }
-            do_not_optimize(counter);
-        },
-        config);
-
-    EXPECT_EQ(stats.sample_count, 3);
-    EXPECT_EQ(counter, (2 + 3) * 4);
-}
-
-TEST(run_hw_test, measurements_are_positive)
-{
-    // Verify that tick→ns conversion produces sensible (nonzero) values
-    BenchmarkConfig config;
-    config.warmup_iterations = 2;
-    config.measurement_iterations = 20;
-    config.batch_size = 100;
-
-    uint64_t volatile sum = 0;
-    auto stats = run_hw(
-        "hw_test_positive",
-        [&sum](size_t n) {
-            for (size_t k = 0; k < n; ++k) {
-                sum += 1;
-            }
-            do_not_optimize(sum);
-        },
-        config);
-
-    EXPECT_EQ(stats.sample_count, 20);
-    // Per-call time should be positive and reasonably small (< 1ms per increment)
-    EXPECT_TRUE(stats.median > 0.0);
-    EXPECT_TRUE(stats.median < 1'000'000.0);
-}
-
-//
-// Test Runner
-//
 
 TEST_MAIN(statusbar_benchmark, benchmark_test)

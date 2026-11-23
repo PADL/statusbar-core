@@ -14,11 +14,12 @@
 #include "statusbar/net/net_error.hpp"
 #include "statusbar/test/test.hpp"
 
+#include <poll.h>
+
 #include <array>
 #include <cstdint>
 #include <cstdio>
 #include <span>
-#include <thread>
 
 using namespace statusbar;
 using namespace statusbar::net;
@@ -161,7 +162,13 @@ TEST(any_ethernet_port, rawnet_round_trips_a_frame_on_loopback)
             break;
         }
         if (!rx->has_value()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            // Nothing yet: block until the socket has a frame, however long
+            // the host takes to loop it back. The timeout only ends the
+            // test for a frame that never comes.
+            struct pollfd waiting{.fd = port.fd(), .events = POLLIN, .revents = 0};
+            if (::poll(&waiting, 1, 10'000) <= 0) {
+                break;
+            }
             continue;
         }
         auto const& frame = (*rx)->buffer;

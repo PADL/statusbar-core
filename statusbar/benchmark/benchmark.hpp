@@ -103,17 +103,19 @@ inline auto do_not_optimize(T& value)
 //
 // High-Resolution Timing Utilities
 //
-/// High-resolution timer for benchmarking
-/// Uses steady_clock which is monotonic and best for measuring intervals
-class Timer
+/// High-resolution stopwatch for benchmarking, on the clock it is given.
+/// The clock is a parameter so that the arithmetic can be run on a clock a
+/// test controls; Timer, below, is the one on steady_clock.
+template <typename ClockT>
+class BasicTimer
 {
   public:
-    using Clock = std::chrono::steady_clock;
+    using Clock = ClockT;
     using TimePoint = Clock::time_point;
     using Duration = std::chrono::nanoseconds;
 
     /// Start timing
-    static auto start() noexcept -> Timer { return Timer{Clock::now()}; }
+    static auto start() noexcept -> BasicTimer { return BasicTimer{Clock::now()}; }
 
     /// Get elapsed time since timer started
     [[nodiscard]] auto elapsed() const noexcept -> Duration { return std::chrono::duration_cast<Duration>(Clock::now() - start_); }
@@ -134,12 +136,15 @@ class Timer
     auto reset() noexcept { start_ = Clock::now(); }
 
   private:
-    explicit Timer(TimePoint start) noexcept
+    explicit BasicTimer(TimePoint start) noexcept
         : start_{start}
     {}
 
     TimePoint start_;
 };
+
+/// The stopwatch on steady_clock, which is monotonic and best for measuring intervals.
+using Timer = BasicTimer<std::chrono::steady_clock>;
 
 //
 // Statistical Analysis (delegated to statusbar::stats)

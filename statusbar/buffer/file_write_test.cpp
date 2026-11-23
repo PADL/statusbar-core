@@ -14,8 +14,8 @@
 #include <signal.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
-#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -26,6 +26,7 @@
 #include <thread>
 #include <vector>
 
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 
 using namespace statusbar;
@@ -99,8 +100,22 @@ auto bytes_of(std::string_view const text) -> std::vector<uint8_t>
     return ec.category() == std::system_category() ? ec.value() : -1;
 }
 
+/// How many times the handler has run. A lock-free atomic is the one thing
+/// a handler may write that another thread may wait on.
+std::atomic<int> signals_handled{0};
+
 extern "C" void note_the_signal(int /*signal*/)
-{}
+{
+    signals_handled.fetch_add(1, std::memory_order_relaxed);
+}
+
+/// Bytes waiting in a pipe, as its read end sees them.
+auto bytes_in_pipe(int const read_fd) -> int
+{
+    int waiting = 0;
+    (void)::ioctl(read_fd, FIONREAD, &waiting);
+    return waiting;
+}
 
 /// SIGUSR1 handled without SA_RESTART for the life of this object, so a
 /// blocking write() the signal lands on returns EINTR instead of resuming.
@@ -216,11 +231,21 @@ TEST(file_write, an_interrupted_write_is_resumed_until_every_byte_is_out)
     std::vector<uint8_t> const payload(1U << 20U, 0x5a);
     std::vector<uint8_t> received;
     pthread_t const writer = ::pthread_self();
+    signals_handled.store(0);
     std::thread interrupter([&] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        // The writer has filled the pipe once nothing more goes in: it is
+        // in write(), or on its way back there, with bytes still to go.
+        for (int before = -1, now = bytes_in_pipe(fds[0]); now == 0 || now != before; now = bytes_in_pipe(fds[0])) {
+            before = now;
+            std::this_thread::yield();
+        }
+        // Twenty signals, each sent once the one before has been handled,
+        // so none of them merges into its neighbour.
         for (int i = 0; i < 20; ++i) {
             (void)::pthread_kill(writer, SIGUSR1);
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            while (signals_handled.load(std::memory_order_relaxed) <= i) {
+                std::this_thread::yield();
+            }
         }
         received = drain(fds[0]);
     });
