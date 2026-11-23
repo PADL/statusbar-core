@@ -8,7 +8,6 @@
 #include "statusbar/stats/stats.hpp"
 
 #include <cstdint>
-#include <optional>
 #include <print>
 
 namespace statusbar::realtime {
@@ -24,16 +23,26 @@ struct TimerEvent
     using time_point = ClockT::time_point;
     using duration = ClockT::duration;
 
-    time_point scheduled_time;  ///< The scheduled wake time (uncompensated), on the schedule's clock
-    duration error;             ///< Wake error (positive = late, negative = early), measured on CLOCK_MONOTONIC_RAW
+    time_point scheduled_time;  ///< The scheduled wake time (uncompensated)
+    duration error;             ///< Wake error (positive = late, negative = early)
     int64_t wake_count;         ///< The wake number (starting from 1)
     int64_t skipped_counts;     ///< Number of missed wakes (0 = no misses)
 
     /// The CLOCK_MONOTONIC_RAW instant the timer entered the callback: the
     /// start the callback's own duration is measured from, told rather than
     /// re-read, and in the timing domain whatever clock the schedule is in.
-    /// Empty for an event built by hand (tests): it was not told.
-    std::optional<MonotonicRawClock::time_point> wake_raw{};
+    /// Zero for an event built by hand (tests), which readers treat as
+    /// "not told".
+    MonotonicRawClock::time_point wake_raw{};
+
+    /// Get scheduled time as raw nanoseconds (for backward compatibility)
+    [[nodiscard]] constexpr auto scheduled_time_ns() const noexcept -> int64_t { return scheduled_time.time_since_epoch().count(); }
+
+    /// Get error as raw nanoseconds (for backward compatibility)
+    [[nodiscard]] constexpr auto error_ns() const noexcept -> int64_t { return error.count(); }
+
+    /// The RAW callback-entry instant in nanoseconds, 0 when not told
+    [[nodiscard]] constexpr auto wake_raw_ns() const noexcept -> int64_t { return wake_raw.time_since_epoch().count(); }
 
     /// Print this event to stdout
     /// @param stats Snapshot of cumulative statistics
@@ -41,8 +50,8 @@ struct TimerEvent
     {
         std::print(
             "Wake: scheduled={} ns  error={} ns  count={}  skipped={} total_skipped={}\n",
-            ClockT::to_ns(self.scheduled_time),
-            self.error.count(),
+            self.scheduled_time_ns(),
+            self.error_ns(),
             self.wake_count,
             self.skipped_counts,
             stats.skipped_counts);

@@ -15,13 +15,16 @@
 ///   rate is slewed, so it is for sleeping, not for timing.
 /// - GptpClock<N>: gPTP clock domains (rate may differ from the local
 ///   oscillator, and the time steps when the grandmaster changes).
-/// - GpsClock, TaiClock: the GPS and TAI time domains.
+/// - UtcClock: UTC as the system clock keeps it, whatever disciplines it.
+/// - TaiClock: International Atomic Time, a constant offset from UTC.
 ///
 /// Integers enter and leave a domain only through Clock::from_ns() and
 /// Clock::to_ns(). A ClockAdapter binds a clock type to a ClockSource and
 /// is the one place a source's bare nanoseconds are given their domain.
-
-#include "statusbar/realtime/realtime_base.hpp"
+///
+/// This header includes no operating-system header. The clock reads and
+/// the sleep it declares are implemented in realtime_clock.cpp, which is
+/// the one place the platform is named.
 
 #include <chrono>
 #include <concepts>
@@ -57,8 +60,8 @@ struct GptpClockTag
     static constexpr int domain_id = DomainId;
 };
 
-/// Tag type for GPS clock
-struct GpsClockTag
+/// Tag type for UTC as the system clock keeps it
+struct UtcClockTag
 {};
 
 /// Tag type for TAI clock
@@ -122,13 +125,30 @@ using GptpClock = Clock<GptpClockTag<DomainId>>;
 /// Default gPTP clock (domain 0)
 using GptpClock0 = GptpClock<0>;
 
-/// GPS clock - time from GPS receivers.
-/// GPS time has a fixed epoch (January 6, 1980) and does not include leap seconds.
-using GpsClock = Clock<GpsClockTag>;
+/// UTC clock - the system clock (CLOCK_REALTIME on POSIX), counted from
+/// 1970-01-01 UTC. The type names the timescale only: the clock may be
+/// disciplined by a local GPS receiver, by a distant NTP server, or by
+/// nothing at all, and how well it is known is a ClockQuality, not a type.
+using UtcClock = Clock<UtcClockTag>;
 
-/// TAI clock - International Atomic Time.
-/// TAI has a fixed epoch and a known offset from UTC (currently 37 seconds).
+/// TAI clock - International Atomic Time. A constant offset from UTC: no
+/// further leap seconds are to be applied to UTC, so the offset is fixed.
 using TaiClock = Clock<TaiClockTag>;
+
+/// TAI - UTC, in force since 2017-01-01 and fixed from here on.
+inline constexpr Nanoseconds TAI_MINUS_UTC{37'000'000'000LL};
+
+/// The TAI instant of a UTC one (exact: a constant offset)
+[[nodiscard]] constexpr auto to_tai(UtcClock::time_point utc) noexcept -> TaiClock::time_point
+{
+    return TaiClock::from_ns(UtcClock::to_ns(utc)) + TAI_MINUS_UTC;
+}
+
+/// The UTC instant of a TAI one (exact: a constant offset)
+[[nodiscard]] constexpr auto to_utc(TaiClock::time_point tai) noexcept -> UtcClock::time_point
+{
+    return UtcClock::from_ns(TaiClock::to_ns(tai)) - TAI_MINUS_UTC;
+}
 
 //
 // Concept for Clock Types
@@ -151,6 +171,28 @@ concept ClockType = detail::is_clock<T>;
 //
 // Reading the Two Clocks That Need No Bridge
 //
+// Declared here, implemented per platform in realtime_clock.cpp.
+//
+
+/// CLOCK_MONOTONIC_RAW in nanoseconds: the reference clock, immune to
+/// frequency slew. Not sleepable; a deadline on it is reached by sleeping
+/// early on CLOCK_MONOTONIC through a MonotonicRawLine and spinning here.
+auto read_monotonic_raw_ns() noexcept -> int64_t;
+
+/// CLOCK_MONOTONIC in nanoseconds (it keeps counting through a system
+/// sleep, and NTP slews its rate). This is the clock the kernel sleeps on:
+/// use it for sleeping, not for timing. Timing, stamps and deadlines take
+/// read_monotonic_raw_ns().
+auto read_monotonic_ns() noexcept -> int64_t;
+
+/// Sleep until an absolute CLOCK_MONOTONIC deadline, the one kernel sleep
+/// primitive every sleeper goes through. Returns 0 when the deadline has
+/// passed (a missed or non-positive deadline returns at once rather than
+/// failing), EINTR when a signal cut the sleep short, or the errno of a
+/// failed sleep. Where the platform has no absolute sleep the wait is
+/// relative, over the remaining time as read on entry.
+/// @param deadline_ns The CLOCK_MONOTONIC instant to sleep to, in nanoseconds
+auto sleep_until_monotonic_ns(int64_t deadline_ns) noexcept -> int;
 
 /// CLOCK_MONOTONIC_RAW now: the reference clock, read once and passed on.
 [[nodiscard]] inline auto read_monotonic_raw() noexcept -> MonotonicRawClock::time_point
@@ -170,6 +212,42 @@ concept ClockType = detail::is_clock<T>;
 inline auto sleep_until_monotonic(MonotonicClock::time_point const deadline) noexcept -> int
 {
     return sleep_until_monotonic_ns(MonotonicClock::to_ns(deadline));
+}
+
+//
+// Drift Over a Span
+//
+
+namespace detail {
+
+/// `seconds * ppb + part` in nanoseconds, or the largest count when that
+/// would not fit. All three are non-negative and @p ppb is not zero.
+[[nodiscard]] constexpr auto saturating_drift_ns(int64_t const seconds, int64_t const ppb, int64_t const part) noexcept -> int64_t
+{
+    constexpr int64_t LIMIT = Nanoseconds::max().count();
+    return seconds > (LIMIT - part) / ppb ? LIMIT : (seconds * ppb) + part;
+}
+
+}  // namespace detail
+
+/// How far a clock running @p ppb parts per billion off can move in
+/// @p elapsed: `elapsed * ppb / 1e9`, rounded up, in integers only. A
+/// result that would not fit saturates to Nanoseconds::max(). A span that
+/// is not positive drifts nothing.
+/// @param elapsed The span the drift accumulates over
+/// @param ppb The rate error, in nanoseconds per second
+[[nodiscard]] constexpr auto accumulated_drift(Nanoseconds const elapsed, uint32_t const ppb) noexcept -> Nanoseconds
+{
+    constexpr int64_t BILLION = 1'000'000'000;
+    if (elapsed <= Nanoseconds::zero() || ppb == 0) {
+        return Nanoseconds::zero();
+    }
+    int64_t const seconds = elapsed.count() / BILLION;
+    int64_t const remainder_ns = elapsed.count() % BILLION;
+    // remainder_ns is below 1e9 and ppb below 2^32: the product is under
+    // 4.3e18 and fits, with room for the rounding term.
+    int64_t const part = ((remainder_ns * int64_t{ppb}) + (BILLION - 1)) / BILLION;
+    return Nanoseconds{detail::saturating_drift_ns(seconds, int64_t{ppb}, part)};
 }
 
 //

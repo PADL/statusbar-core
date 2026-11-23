@@ -15,7 +15,6 @@
 #include "statusbar/status/throw_or_abort.hpp"
 
 #include <cstdint>
-#include <optional>
 
 namespace statusbar::realtime {
 
@@ -25,40 +24,37 @@ namespace statusbar::realtime {
 /// @param monitor The TripwireMonitor to observe on
 /// @param event The timer event with timing data
 /// @return The CLOCK_MONOTONIC_RAW start of the callback, for the duration
-///         measurement, or nothing if the tripwire fired. This is the
-///         instant the timer told in event.wake_raw, so the wake costs no
-///         clock read; an event built by hand (no wake_raw) is stamped with
-///         one RAW read here. It is never a value in the event's own clock:
-///         the schedule may run on a gPTP domain, and a duration is a RAW
-///         difference.
+///         measurement, or 0 if the tripwire fired. This is the instant the
+///         timer told in event.wake_raw, so the wake costs no clock read; an
+///         event built by hand (wake_raw zero) is stamped with one RAW read
+///         here. It is never a value in the event's own clock: the schedule
+///         may run on a gPTP domain, and a duration is a RAW difference.
 template <ClockType ClockT>
-inline auto observe_wake_and_handle_tripwire(TripwireMonitor& monitor, TimerEvent<ClockT> const& event)
-    -> std::optional<MonotonicRawClock::time_point>
+inline auto observe_wake_and_handle_tripwire(TripwireMonitor& monitor, TimerEvent<ClockT> const& event) -> int64_t
 {
-    // The tripwire record keeps bare counts on the schedule's clock: it
-    // serves timers of any domain and only ever compares the two.
-    int64_t const scheduled_ns = ClockT::to_ns(event.scheduled_time);
-    monitor.tripwire().observe(event.wake_count, scheduled_ns, scheduled_ns + event.error.count());
-    if (monitor.check_and_handle_fired(event.wake_count, event.error.count())) {
-        return std::nullopt;  // Tripwire fired, caller should abort
+    int64_t const actual_time_ns = event.scheduled_time_ns() + event.error_ns();
+    monitor.tripwire().observe(event.wake_count, event.scheduled_time_ns(), actual_time_ns);
+    if (monitor.check_and_handle_fired(event.wake_count, event.error_ns())) {
+        return 0;  // Tripwire fired, caller should abort
     }
-    return event.wake_raw ? *event.wake_raw : read_monotonic_raw();
+    return event.wake_raw_ns() != 0 ? event.wake_raw_ns() : read_monotonic_raw_ns();
 }
 
 /// Observe callback duration on a tripwire monitor and handle firing if threshold exceeded.
 /// Call this at the END of your callback, AFTER doing work.
 /// @param monitor The TripwireMonitor to observe on
 /// @param event The timer event with timing data
-/// @param start The RAW start returned by observe_wake_and_handle_tripwire()
+/// @param start_time_ns The RAW start returned by observe_wake_and_handle_tripwire()
 /// @return true if tripwire fired and shutdown was requested
 template <ClockType ClockT>
-inline auto observe_duration_and_handle_tripwire(
-    TripwireMonitor& monitor, TimerEvent<ClockT> const& event, MonotonicRawClock::time_point start) -> bool
+inline auto observe_duration_and_handle_tripwire(TripwireMonitor& monitor, TimerEvent<ClockT> const& event, int64_t start_time_ns)
+    -> bool
 {
     // One RAW read: the end of the work, in the same domain as the start.
-    int64_t const duration_ns = (read_monotonic_raw() - start).count();
+    int64_t const now_ns = read_monotonic_raw_ns();
+    int64_t const duration_ns = now_ns - start_time_ns;
     monitor.tripwire().observe_duration(static_cast<uint64_t>(event.wake_count), duration_ns);
-    return monitor.check_and_handle_fired(event.wake_count, event.error.count(), duration_ns);
+    return monitor.check_and_handle_fired(event.wake_count, event.error_ns(), duration_ns);
 }
 
 /// Observe a timer event on a tripwire monitor and handle firing if threshold exceeded.
@@ -70,9 +66,9 @@ inline auto observe_duration_and_handle_tripwire(
 template <ClockType ClockT>
 inline auto observe_and_handle_tripwire(TripwireMonitor& monitor, TimerEvent<ClockT> const& event) -> bool
 {
-    int64_t const scheduled_ns = ClockT::to_ns(event.scheduled_time);
-    monitor.tripwire().observe(event.wake_count, scheduled_ns, scheduled_ns + event.error.count());
-    return monitor.check_and_handle_fired(event.wake_count, event.error.count());
+    int64_t const actual_time_ns = event.scheduled_time_ns() + event.error_ns();
+    monitor.tripwire().observe(event.wake_count, event.scheduled_time_ns(), actual_time_ns);
+    return monitor.check_and_handle_fired(event.wake_count, event.error_ns());
 }
 
 /// RAII helper for tripwire observation.
@@ -92,9 +88,9 @@ class ScopedTripwireObserver
     ScopedTripwireObserver(TripwireMonitor& monitor, TimerEvent<ClockT> const& event)
         : monitor_{monitor}
         , event_{event}
-        , start_{observe_wake_and_handle_tripwire(monitor_, event_)}
     {
-        if (!start_) {
+        start_time_ns_ = observe_wake_and_handle_tripwire(monitor_, event_);
+        if (start_time_ns_ == 0) {
 #if __cpp_exceptions
             throw TripwireFiredException{};
 #else
@@ -107,8 +103,8 @@ class ScopedTripwireObserver
 
     ~ScopedTripwireObserver() noexcept
     {
-        if (start_) {
-            (void)observe_duration_and_handle_tripwire(monitor_, event_, *start_);
+        if (start_time_ns_ != 0) {
+            (void)observe_duration_and_handle_tripwire(monitor_, event_, start_time_ns_);
         }
     }
 
@@ -121,7 +117,7 @@ class ScopedTripwireObserver
   private:
     TripwireMonitor& monitor_;
     TimerEvent<ClockT> const& event_;
-    std::optional<MonotonicRawClock::time_point> start_;
+    int64_t start_time_ns_{0};
 };
 
 }  // namespace statusbar::realtime

@@ -329,7 +329,23 @@ TEST(realtime_timer_event, an_event_built_by_hand_was_not_told_its_raw_entry)
         .skipped_counts = 0,
     };
     static_assert(std::is_same_v<TimerEvent<>, TimerEvent<MonotonicRawClock>>);
-    EXPECT_FALSE(by_hand.wake_raw.has_value());
+    EXPECT_EQ(by_hand.wake_raw_ns(), int64_t{0});
+}
+
+TEST(realtime_timer_event, the_nanosecond_accessors_read_the_typed_fields)
+{
+    // Kept for callbacks written against them.
+    TimerEvent<GptpClock0> const event{
+        .scheduled_time = GptpClock0::from_ns(1'000'000'000),
+        .error = Nanoseconds{-250},
+        .wake_count = 1,
+        .skipped_counts = 0,
+        .wake_raw = MonotonicRawClock::from_ns(77),
+    };
+
+    EXPECT_EQ(event.scheduled_time_ns(), int64_t{1'000'000'000});
+    EXPECT_EQ(event.error_ns(), int64_t{-250});
+    EXPECT_EQ(event.wake_raw_ns(), int64_t{77});
 }
 
 //
@@ -1161,7 +1177,7 @@ TEST(realtime_timer_domain, a_timer_on_a_gptp_adapter_schedules_in_gptp_and_meas
         config,
         [&](TimerEvent<GptpClock0> const& event, AtomicWakeStats::Snapshot const&) {
             last_scheduled_gptp_ns.store(GptpClock0::to_ns(event.scheduled_time), std::memory_order_relaxed);
-            last_wake_raw_ns.store(MonotonicRawClock::to_ns(event.wake_raw.value_or(MonotonicRawClock::time_point{})));
+            last_wake_raw_ns.store(MonotonicRawClock::to_ns(event.wake_raw));
             last_error_ns.store(event.error.count(), std::memory_order_relaxed);
             wakes.fetch_add(1, std::memory_order_release);
         },
@@ -1237,8 +1253,8 @@ TEST(realtime_timer_event, a_running_timer_tells_the_raw_instant_it_entered_the_
     std::atomic<int64_t> told_raw{0};
     std::atomic<int64_t> read_raw{0};
     Timer<> timer(config, [&](TimerEvent<MonotonicRawClock> const& event, AtomicWakeStats::Snapshot const&) {
-        if (told_raw.load() == 0 && event.wake_raw.has_value()) {
-            told_raw.store(MonotonicRawClock::to_ns(*event.wake_raw));
+        if (told_raw.load() == 0) {
+            told_raw.store(event.wake_raw_ns());
             read_raw.store(read_monotonic_raw_ns());
         }
     });

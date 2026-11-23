@@ -36,6 +36,15 @@ struct MonotonicRawRateOffset
     int64_t offset_ns{0};
 };
 
+/// The same line as the conversions use it: the slope as an integer number
+/// of parts per MonotonicRawLine::SLOPE_DENOMINATOR, so a conversion is
+/// integer arithmetic only.
+struct MonotonicRawFixedLine
+{
+    int64_t slope_numerator{1'000'000'000};
+    int64_t offset_ns{0};
+};
+
 /// The shared line. Reads are wait-free and consistent (seqlock); the
 /// conversions are exact to the nanosecond for any uptime, so a deadline
 /// hours away converts the same way a deadline microseconds away does.
@@ -43,6 +52,7 @@ class MonotonicRawLine
 {
   public:
     using RateOffset = MonotonicRawRateOffset;
+    using FixedLine = MonotonicRawFixedLine;
 
     /// Fixed-point slope resolution: rate is published as an integer number
     /// of parts per 1e9, which carries the sub-ppm steps adjtimex makes.
@@ -51,10 +61,36 @@ class MonotonicRawLine
     MonotonicRawLine() noexcept = default;
 
     /// Writer side (one thread at a time). A default line is the identity.
-    void publish(RateOffset line) noexcept { line_.store(line); }
+    /// The rate is rounded to the integer slope once, here, so that no
+    /// reader does floating point.
+    void publish(RateOffset line) noexcept
+    {
+        publish_fixed({.slope_numerator = slope_numerator(line.rate), .offset_ns = line.offset_ns});
+    }
 
-    /// Reader side (any thread).
-    [[nodiscard]] auto consume() const noexcept -> RateOffset { return line_.load(); }
+    /// Writer side, for a writer that already holds the integer slope.
+    void publish_fixed(FixedLine line) noexcept { line_.store(line); }
+
+    /// Reader side (any thread): the line with its rate as a ratio, for
+    /// reports and tests. The conversions do not go through this.
+    [[nodiscard]] auto consume() const noexcept -> RateOffset
+    {
+        auto const line = line_.load();
+        return {
+            .rate = static_cast<double>(line.slope_numerator) / static_cast<double>(SLOPE_DENOMINATOR),
+            .offset_ns = line.offset_ns};
+    }
+
+    /// Reader side (any thread): the line as the conversions use it.
+    [[nodiscard]] auto consume_fixed() const noexcept -> FixedLine { return line_.load(); }
+
+    /// How far the line's rate is from 1, in parts per billion (never
+    /// negative): the slew a sleeper has to allow for.
+    [[nodiscard]] auto rate_deviation_ppb() const noexcept -> int64_t
+    {
+        int64_t const deviation = line_.load().slope_numerator - SLOPE_DENOMINATOR;
+        return deviation < 0 ? -deviation : deviation;
+    }
 
     /// CLOCK_MONOTONIC instant for a CLOCK_MONOTONIC_RAW one.
     [[nodiscard]] auto to_monotonic_ns(int64_t raw_ns) const noexcept -> int64_t;
@@ -76,7 +112,7 @@ class MonotonicRawLine
     [[nodiscard]] static auto slope_numerator(double rate) noexcept -> int64_t;
 
   private:
-    itc::SeqlockValue<RateOffset> line_{RateOffset{}};
+    itc::SeqlockValue<FixedLine> line_{FixedLine{}};
 };
 
 /// The writer side of a line: takes paired readings of the two clocks,

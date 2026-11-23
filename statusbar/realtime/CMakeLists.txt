@@ -7,6 +7,7 @@ statusbar_add_module(
   SOURCES
   realtime_base.cpp
   realtime_base_impl.cpp
+  realtime_clock.cpp
   realtime_monotonic_raw_line.cpp
   realtime_timer_base.cpp
   realtime_timer_impl.cpp

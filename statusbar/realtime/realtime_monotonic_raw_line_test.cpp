@@ -61,6 +61,29 @@ TEST(monotonic_raw_line, a_published_line_converts_both_ways_exactly_at_long_upt
     EXPECT_TRUE(within(line.from_monotonic_ns(mono), raw, 1));
 }
 
+TEST(monotonic_raw_line, the_published_line_is_integers)
+{
+    MonotonicRawLine line;
+    auto const identity = line.consume_fixed();
+    EXPECT_EQ(identity.slope_numerator, MonotonicRawLine::SLOPE_DENOMINATOR);
+    EXPECT_EQ(identity.offset_ns, int64_t{0});
+    EXPECT_EQ(line.rate_deviation_ppb(), int64_t{0});
+
+    // A rate is rounded to the integer slope once, by the writer.
+    line.publish({.rate = 1.000'013'6, .offset_ns = 42});
+    auto const fixed = line.consume_fixed();
+    EXPECT_EQ(fixed.slope_numerator, int64_t{1'000'013'600});
+    EXPECT_EQ(fixed.offset_ns, int64_t{42});
+    EXPECT_EQ(line.rate_deviation_ppb(), int64_t{13'600});
+
+    // A slow clock deviates by the same measure.
+    line.publish_fixed({.slope_numerator = 999'996'700, .offset_ns = 0});
+    EXPECT_EQ(line.rate_deviation_ppb(), int64_t{3'300});
+    EXPECT_EQ(line.to_monotonic_ns(1'000'000'000), int64_t{999'996'700});
+    // The line read back as a ratio is the integer slope, for reports.
+    EXPECT_EQ(line.consume().rate, 0.9999967);
+}
+
 TEST(monotonic_raw_line, typed_conversions_change_the_clock_tag)
 {
     MonotonicRawLine line;

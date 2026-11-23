@@ -7,9 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <optional>
 #include <thread>
-#include <type_traits>
 
 using namespace statusbar::realtime;
 
@@ -453,7 +451,7 @@ namespace {
         .error = GptpClock0::duration{0},
         .wake_count = 7,
         .skipped_counts = 0,
-        .wake_raw = read_monotonic_raw(),
+        .wake_raw = MonotonicRawClock::from_ns(read_monotonic_raw_ns()),
     };
 }
 
@@ -480,12 +478,10 @@ TEST(tripwire_bridge, the_wake_hands_back_the_told_raw_start_not_a_schedule_cloc
     TripwireMonitor monitor(duration_only_monitor_config(1'000'000));
     auto const event = gptp_event_told_now();
 
-    auto const start = observe_wake_and_handle_tripwire(monitor, event);
+    int64_t const start = observe_wake_and_handle_tripwire(monitor, event);
 
-    static_assert(std::is_same_v<decltype(start), std::optional<MonotonicRawClock::time_point> const>);
-    EXPECT_TRUE(start.has_value());
-    EXPECT_TRUE(start == event.wake_raw);
-    EXPECT_NE(MonotonicRawClock::to_ns(*start), GptpClock0::to_ns(event.scheduled_time) + event.error.count());
+    EXPECT_EQ(start, event.wake_raw_ns());
+    EXPECT_NE(start, event.scheduled_time_ns() + event.error_ns());
 }
 
 TEST(tripwire_bridge, a_gptp_scheduled_callback_that_overruns_trips_the_duration_tripwire)
@@ -493,11 +489,10 @@ TEST(tripwire_bridge, a_gptp_scheduled_callback_that_overruns_trips_the_duration
     TripwireMonitor monitor(duration_only_monitor_config(1'000'000));  // 1 ms budget
     auto const event = gptp_event_told_now();
 
-    auto const start = observe_wake_and_handle_tripwire(monitor, event);
-    EXPECT_TRUE(start.has_value());
+    int64_t const start = observe_wake_and_handle_tripwire(monitor, event);
     spin_raw_for(3'000'000);  // 3 ms of "work"
 
-    EXPECT_TRUE(observe_duration_and_handle_tripwire(monitor, event, *start));
+    EXPECT_TRUE(observe_duration_and_handle_tripwire(monitor, event, start));
     EXPECT_TRUE(monitor.tripwire().has_fired());
     EXPECT_TRUE(monitor.tripwire().was_duration_trip());
 }
@@ -507,10 +502,9 @@ TEST(tripwire_bridge, a_gptp_scheduled_callback_within_budget_does_not_trip)
     TripwireMonitor monitor(duration_only_monitor_config(500'000'000));  // 500 ms budget
     auto const event = gptp_event_told_now();
 
-    auto const start = observe_wake_and_handle_tripwire(monitor, event);
-    EXPECT_TRUE(start.has_value());
+    int64_t const start = observe_wake_and_handle_tripwire(monitor, event);
 
-    EXPECT_FALSE(observe_duration_and_handle_tripwire(monitor, event, *start));
+    EXPECT_FALSE(observe_duration_and_handle_tripwire(monitor, event, start));
     EXPECT_FALSE(monitor.tripwire().has_fired());
 }
 
@@ -524,14 +518,12 @@ TEST(tripwire_bridge, an_event_not_told_its_raw_entry_is_stamped_with_one_raw_re
         .skipped_counts = 0,
     };
 
-    auto const before = read_monotonic_raw();
-    auto const start = observe_wake_and_handle_tripwire(monitor, event);
-    auto const after = read_monotonic_raw();
+    int64_t const before = read_monotonic_raw_ns();
+    int64_t const start = observe_wake_and_handle_tripwire(monitor, event);
+    int64_t const after = read_monotonic_raw_ns();
 
-    EXPECT_FALSE(event.wake_raw.has_value());
-    EXPECT_TRUE(start.has_value());
-    EXPECT_TRUE(*start >= before);
-    EXPECT_TRUE(*start <= after);
+    EXPECT_TRUE(start >= before);
+    EXPECT_TRUE(start <= after);
 }
 
 //

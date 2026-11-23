@@ -43,7 +43,7 @@ TEST(clock_types, each_domain_has_its_own_time_point)
     static_assert(!std::is_same_v<MonotonicRawClock::time_point, MonotonicClock::time_point>);
     static_assert(!std::is_same_v<GptpClock<0>::time_point, GptpClock<1>::time_point>);
     static_assert(!std::is_same_v<GptpClock<0>::time_point, MonotonicRawClock::time_point>);
-    static_assert(!std::is_same_v<GpsClock::time_point, TaiClock::time_point>);
+    static_assert(!std::is_same_v<UtcClock::time_point, TaiClock::time_point>);
     static_assert(std::is_same_v<GptpClock0, GptpClock<0>>);
 
     // A time on one clock is not accepted where another clock's is wanted.
@@ -72,7 +72,7 @@ TEST(clock_types, from_ns_to_ns)
 
     // A default time_point is the clock's zero.
     EXPECT_EQ(MonotonicClock::to_ns(MonotonicClock::time_point{}), int64_t{0});
-    EXPECT_EQ(GpsClock::to_ns(GpsClock::time_point{}), int64_t{0});
+    EXPECT_EQ(UtcClock::to_ns(UtcClock::time_point{}), int64_t{0});
 }
 
 TEST(clock_types, duration_arithmetic)
@@ -85,6 +85,54 @@ TEST(clock_types, duration_arithmetic)
     static_assert(std::is_same_v<decltype(later - tp), Nanoseconds>);
 }
 
+TEST(clock_types, tai_is_a_constant_offset_from_utc)
+{
+    static_assert(TAI_MINUS_UTC == std::chrono::seconds{37});
+    constexpr auto utc = UtcClock::from_ns(1'795'000'000'000'000'000LL);
+    static_assert(std::is_same_v<decltype(to_tai(utc)), TaiClock::time_point>);
+    static_assert(TaiClock::to_ns(to_tai(utc)) == 1'795'000'037'000'000'000LL);
+    static_assert(to_utc(to_tai(utc)) == utc);
+}
+
+//
+// Drift Over a Span
+//
+
+TEST(accumulated_drift, a_part_per_billion_is_a_nanosecond_per_second)
+{
+    static_assert(accumulated_drift(std::chrono::seconds{1}, 1) == Nanoseconds{1});
+    static_assert(accumulated_drift(std::chrono::seconds{30}, 1'000) == Nanoseconds{30'000});     // 1 ppm for 30 s
+    static_assert(accumulated_drift(std::chrono::milliseconds{375}, 1'000) == Nanoseconds{375});  // three Syncs at 1 ppm
+    static_assert(accumulated_drift(std::chrono::hours{1}, 1) == Nanoseconds{3'600});
+}
+
+TEST(accumulated_drift, a_fraction_of_a_nanosecond_rounds_up)
+{
+    // A worst-case figure never understates.
+    static_assert(accumulated_drift(Nanoseconds{1}, 1) == Nanoseconds{1});
+    static_assert(accumulated_drift(std::chrono::milliseconds{1}, 1) == Nanoseconds{1});
+    static_assert(accumulated_drift(Nanoseconds{1'000'000'001}, 1) == Nanoseconds{2});
+    static_assert(accumulated_drift(std::chrono::milliseconds{1'500}, 3) == Nanoseconds{5});  // 4.5 rounds up
+}
+
+TEST(accumulated_drift, nothing_drifts_over_no_span_or_at_no_rate)
+{
+    static_assert(accumulated_drift(Nanoseconds{0}, 1'000) == Nanoseconds{0});
+    static_assert(accumulated_drift(Nanoseconds{-5}, 1'000) == Nanoseconds{0});
+    static_assert(accumulated_drift(std::chrono::hours{24}, 0) == Nanoseconds{0});
+}
+
+TEST(accumulated_drift, a_result_that_does_not_fit_saturates)
+{
+    constexpr uint32_t WORST_PPB = 0xFFFF'FFFFU;
+    static_assert(accumulated_drift(Nanoseconds::max(), WORST_PPB) == Nanoseconds::max());
+    static_assert(accumulated_drift(Nanoseconds::max(), 1'000'000'000) == Nanoseconds::max());
+    // The largest span at 1 ppb still fits: 292 years drift 9.2 seconds.
+    static_assert(accumulated_drift(Nanoseconds::max(), 1) == Nanoseconds{9'223'372'037});
+    // The largest product of the sub-second part does not overflow.
+    static_assert(accumulated_drift(Nanoseconds{999'999'999}, WORST_PPB) == Nanoseconds{4'294'967'291});
+}
+
 //
 // ClockType Concept Tests
 //
@@ -95,7 +143,7 @@ TEST(clock_concepts, clock_type_concept)
     static_assert(ClockType<MonotonicClock>);
     static_assert(ClockType<GptpClock0>);
     static_assert(ClockType<GptpClock<7>>);
-    static_assert(ClockType<GpsClock>);
+    static_assert(ClockType<UtcClock>);
     static_assert(ClockType<TaiClock>);
 
     static_assert(!ClockType<int>);

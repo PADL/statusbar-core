@@ -15,7 +15,6 @@
 
 #include <atomic>
 #include <cerrno>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -214,16 +213,13 @@ auto TimerBase::track_raw_line(MonotonicRawClock::time_point const raw_now) noex
 
 auto TimerBase::sleep_early_for_raw(MonotonicRawClock::time_point const target_raw) noexcept -> void
 {
-    // The line's rate error after the 1 ms priming baseline, as a fraction;
-    // added to the measured slew so the early wake stays early.
-    constexpr double RATE_MARGIN = 100e-6;
-    auto const line = raw_line_.consume();
+    // The line's rate error after the 1 ms priming baseline, in parts per
+    // billion; added to the measured slew so the early wake stays early.
+    constexpr int64_t RATE_MARGIN_PPB = 100'000;
+    auto const slew_ppb = static_cast<uint32_t>(raw_line_.rate_deviation_ppb() + RATE_MARGIN_PPB);
     Nanoseconds const remaining = target_raw - read_monotonic_raw();
     Nanoseconds const base_guard{config_.busy_wait ? config_.busy_wait_threshold_ns : config_.raw_spin_guard_ns};
-    Nanoseconds const slew_guard{
-        remaining > Nanoseconds::zero()
-            ? static_cast<int64_t>((std::fabs(line.rate - 1.0) + RATE_MARGIN) * static_cast<double>(remaining.count()))
-            : 0};
+    Nanoseconds const slew_guard = accumulated_drift(remaining, slew_ppb);
     if (remaining > base_guard + slew_guard) {
         (void)wait_until_absolute(raw_line_.to_monotonic(target_raw) - base_guard - slew_guard);
     }

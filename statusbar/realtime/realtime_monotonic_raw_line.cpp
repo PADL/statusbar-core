@@ -3,8 +3,6 @@
 
 #include "statusbar/realtime/realtime_monotonic_raw_line.hpp"
 
-#include "statusbar/realtime/realtime_base.hpp"
-
 #include <cmath>
 #include <cstdint>
 #include <optional>
@@ -101,14 +99,14 @@ auto MonotonicRawLine::slope_numerator(double rate) noexcept -> int64_t
 
 auto MonotonicRawLine::to_monotonic_ns(int64_t raw_ns) const noexcept -> int64_t
 {
-    auto const line = consume();
-    return scale(raw_ns, slope_numerator(line.rate), SLOPE_DENOMINATOR) + line.offset_ns;
+    auto const line = consume_fixed();
+    return scale(raw_ns, line.slope_numerator, SLOPE_DENOMINATOR) + line.offset_ns;
 }
 
 auto MonotonicRawLine::from_monotonic_ns(int64_t mono_ns) const noexcept -> int64_t
 {
-    auto const line = consume();
-    return scale(mono_ns - line.offset_ns, SLOPE_DENOMINATOR, slope_numerator(line.rate));
+    auto const line = consume_fixed();
+    return scale(mono_ns - line.offset_ns, SLOPE_DENOMINATOR, line.slope_numerator);
 }
 
 auto MonotonicRawTracker::push(MonotonicRawClock::time_point const raw, MonotonicClock::time_point const mono) noexcept -> bool
