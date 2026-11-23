@@ -92,6 +92,34 @@ TEST(utc_clock_quality, the_systems_own_growth_is_not_an_update)
     EXPECT_EQ(quality.uncertainty(at(14 * BILLION).raw).count(), int64_t{1'470'000 + 60'000});
 }
 
+TEST(utc_clock_quality, a_reading_that_straddles_a_second_boundary_is_still_the_systems_growth)
+{
+    // The clock is read, then the report: two calls. When a second ticks over
+    // between them the report holds one more step of growth than the clock
+    // reading accounts for, or on the next reading one fewer. Seen on a node:
+    // the tracker took that for a daemon update and anchored on a figure the
+    // system had been growing for a minute, 22 ms where the daemon said 2.
+    UtcClockQualityTracker tracker;
+    observe(tracker, at(0), reported(true, 1'500));
+
+    // The clock is read a microsecond before its tenth second and the report
+    // just after: nine seconds counted, ten steps of growth reported.
+    observe(tracker, at((10 * BILLION) - 1'000), reported(true, 1'500 + (10 * 500)));
+    EXPECT_TRUE(tracker.quality().synced_at == MonotonicRawClock::from_ns(0));
+    EXPECT_TRUE(tracker.quality().bound_at_sync == std::chrono::microseconds{1'500});
+
+    // The next reading is whole again: twelve seconds counted since the one
+    // remembered as the ninth, and only eleven more steps.
+    observe(tracker, at((21 * BILLION) + 1'000), reported(true, 1'500 + (21 * 500)));
+    EXPECT_TRUE(tracker.quality().synced_at == MonotonicRawClock::from_ns(0));
+    EXPECT_TRUE(tracker.quality().bound_at_sync == std::chrono::microseconds{1'500});
+
+    // A write by the daemon is still seen, whatever it is.
+    observe(tracker, at(30 * BILLION), reported(true, 1'480));
+    EXPECT_TRUE(tracker.quality().synced_at == MonotonicRawClock::from_ns(30 * BILLION));
+    EXPECT_TRUE(tracker.quality().bound_at_sync == std::chrono::microseconds{1'480});
+}
+
 TEST(utc_clock_quality, a_value_the_daemon_wrote_moves_the_anchor)
 {
     UtcClockQualityTracker tracker;

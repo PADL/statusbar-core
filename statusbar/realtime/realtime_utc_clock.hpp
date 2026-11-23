@@ -113,14 +113,20 @@ class UtcClockQualityTracker
     /// Whether the time daemon has set the system's worst-case error since
     /// the last observation. Left alone, the system adds exactly
     /// SYSTEM_GROWTH_PER_SECOND at each whole second of its clock; any
-    /// other value was written by the daemon. A reading that races the
-    /// system's own increment looks like an update too: it anchors on a
-    /// figure the system has grown, which is the looser one.
+    /// other value was written by the daemon. The clock and the report are
+    /// two readings, not one instant: when a second boundary falls between
+    /// them the count of seconds is one out, either way, and the report
+    /// differs from the expected growth by exactly one step. That is still
+    /// the system's growth. Taking it for an update would anchor the bound on
+    /// a figure the system has been growing at 500 ppm, tens of milliseconds
+    /// loose, until the daemon next writes.
     [[nodiscard]] auto is_update(UtcClock::time_point utc, Nanoseconds max_error) const noexcept -> bool
     {
         constexpr int64_t BILLION = 1'000'000'000;
         int64_t const seconds_crossed = (UtcClock::to_ns(utc) / BILLION) - (UtcClock::to_ns(last_utc_) / BILLION);
-        return max_error != last_max_error_ + (SYSTEM_GROWTH_PER_SECOND * seconds_crossed);
+        Nanoseconds const beyond_growth = max_error - (last_max_error_ + (SYSTEM_GROWTH_PER_SECOND * seconds_crossed));
+        return beyond_growth != Nanoseconds::zero() && beyond_growth != SYSTEM_GROWTH_PER_SECOND &&
+            beyond_growth != -SYSTEM_GROWTH_PER_SECOND;
     }
 
     auto remember(MonotonicRawClock::time_point raw, UtcClock::time_point utc, Nanoseconds max_error) noexcept -> void
