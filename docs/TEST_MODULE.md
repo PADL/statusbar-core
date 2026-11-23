@@ -123,6 +123,18 @@ assertion to pass.
 
 ## Notes & caveats
 
+- **Two kinds of test, kept apart.** A module's `TESTS` are unit tests:
+  they test logic, told its inputs and its time. They open no socket,
+  sleep for nothing and assert nothing about how long anything took, so a
+  loaded build host cannot fail them. A module's `FUNCTIONAL_TESTS`
+  exercise the real thing end to end (real sockets, a real kernel, real
+  waits). They build into a binary of their own,
+  `statusbar_functional_test`, and each carries the ctest label
+  `functional`: `ctest -LE functional` runs the unit tests alone,
+  `ctest -L functional` the rest. When logic is tangled with I/O, split
+  it out (as `http::HttpEngine` is split from `HttpServer`, and
+  `realtime::TimerSchedule` from `Timer`) and unit-test the logic on a
+  told stand-in such as `net::ToldConnectionTransport`.
 - **This is the test framework every other statusbar module uses.** It
   has no `*_test.cpp` of its own — exercising the framework is what the
   rest of the codebase does. Treat changes here as cross-cutting: a

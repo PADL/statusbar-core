@@ -3,11 +3,10 @@
 
 #include "statusbar/http/http_static.hpp"
 
-#include "statusbar/http/http_server.hpp"
+#include "statusbar/http/http_engine.hpp"
+#include "statusbar/http/http_test_support.hpp"
 #include "statusbar/test/test.hpp"
 
-#include <fcntl.h>
-#include <poll.h>
 #include <unistd.h>
 
 #include <array>
@@ -17,10 +16,9 @@
 #include <string_view>
 #include <vector>
 
-#include <sys/socket.h>
-
 using namespace statusbar;
 using namespace statusbar::http;
+using namespace statusbar::http::test_support;
 
 namespace {
 
@@ -81,71 +79,8 @@ struct Site
     }
 };
 
-struct Client
-{
-    int fd{-1};
-
-    explicit Client(net::SocketAddress const& to)
-    {
-        fd = ::socket(to.family(), SOCK_STREAM, 0);
-        if (fd >= 0 && ::connect(fd, to.sockaddr(), to.length()) < 0) {
-            ::close(fd);
-            fd = -1;
-        }
-    }
-    ~Client()
-    {
-        if (fd >= 0) {
-            ::close(fd);
-        }
-    }
-    Client(Client const&) = delete;
-    auto operator=(Client const&) -> Client& = delete;
-
-    void send_all(std::string_view text) const
-    {
-        auto const n = ::send(fd, text.data(), text.size(), 0);
-        (void)n;
-    }
-
-    [[nodiscard]] auto recv_for(int budget_ms) const -> std::string
-    {
-        std::string out;
-        std::array<char, 65536> buf{};
-        for (int spent = 0; spent < budget_ms; spent += 10) {
-            struct pollfd pfd{.fd = fd, .events = POLLIN, .revents = 0};
-            if (::poll(&pfd, 1, 10) <= 0) {
-                continue;
-            }
-            auto const n = ::recv(fd, buf.data(), buf.size(), 0);
-            if (n <= 0) {
-                break;
-            }
-            out.append(buf.data(), size_t(n));
-        }
-        return out;
-    }
-};
-
-void pump(HttpServer& server, int rounds = 20, int64_t now0 = 1)
-{
-    for (int i = 0; i < rounds; ++i) {
-        struct pollfd pfd{.fd = server.fd(), .events = POLLIN, .revents = 0};
-        (void)::poll(&pfd, 1, 5);
-        server.on_ready(now0 + i);
-        server.tick(now0 + i);
-    }
-}
-
-[[nodiscard]] auto header_value(std::string const& response, std::string_view name) -> std::string
-{
-    auto const at = response.find(std::string(name) + ": ");
-    if (at == std::string::npos) {
-        return {};
-    }
-    auto const start = at + name.size() + 2;
-    return response.substr(start, response.find('\r', start) - start);
-}
+// The serving tests run the engine on a made-up wire (http_test_support.hpp):
+// the files are real, the connection is not. No socket, and nothing waits.
 
 }  // namespace
 
@@ -201,14 +136,12 @@ TEST(http_static, serves_get_head_and_conditional)
     EXPECT_TRUE(manifest.has_value());
     HttpLimits limits;
     limits.max_connections = 2;
-    HttpServer server{net::SocketAddress::ipv4_loopback(0), limits, &*manifest};
-    EXPECT_TRUE(server.valid());
-    auto const addr = *server.local_addr();
+    ToldSite<> web{limits, &*manifest};
 
-    Client c{addr};
+    ToldClient c{web.wire};
     c.send_all("GET / HTTP/1.1\r\nHost: t\r\n\r\n");
-    pump(server);
-    auto const index = c.recv_for(100);
+    web.pump();
+    auto const index = c.received();
     EXPECT_TRUE(index.starts_with("HTTP/1.1 200 OK\r\n"));
     EXPECT_TRUE(header_value(index, "Content-Type") == "text/html; charset=utf-8");
     EXPECT_TRUE(header_value(index, "Cache-Control") == "max-age=60");
@@ -218,29 +151,29 @@ TEST(http_static, serves_get_head_and_conditional)
 
     // Conditional GET with the matching ETag -> 304, no body, keep-alive.
     c.send_all("GET / HTTP/1.1\r\nHost: t\r\nIf-None-Match: " + etag + "\r\n\r\n");
-    pump(server);
-    auto const not_modified = c.recv_for(100);
+    web.pump();
+    auto const not_modified = c.received();
     EXPECT_TRUE(not_modified.starts_with("HTTP/1.1 304 Not Modified\r\n"));
     EXPECT_TRUE(not_modified.ends_with("\r\n\r\n"));
     EXPECT_TRUE(header_value(not_modified, "ETag") == etag);
 
     // A stale ETag serves the full body again.
     c.send_all("GET / HTTP/1.1\r\nHost: t\r\nIf-None-Match: \"stale\"\r\n\r\n");
-    pump(server);
-    EXPECT_TRUE(c.recv_for(100).ends_with("<html>hello</html>"));
+    web.pump();
+    EXPECT_TRUE(c.received().ends_with("<html>hello</html>"));
 
     // HEAD: identical headers, no body, keep-alive framing intact.
     c.send_all("HEAD / HTTP/1.1\r\nHost: t\r\n\r\n");
-    pump(server);
-    auto const head = c.recv_for(100);
+    web.pump();
+    auto const head = c.received();
     EXPECT_TRUE(head.starts_with("HTTP/1.1 200 OK\r\n"));
     EXPECT_TRUE(header_value(head, "Content-Length") == "18");
     EXPECT_TRUE(head.ends_with("\r\n\r\n"));
 
     // Unmapped path falls through to the dispatch seam (404), same socket.
     c.send_all("GET /nope HTTP/1.1\r\nHost: t\r\n\r\n");
-    pump(server);
-    EXPECT_TRUE(c.recv_for(100).starts_with("HTTP/1.1 404 Not Found\r\n"));
+    web.pump();
+    EXPECT_TRUE(c.received().starts_with("HTTP/1.1 404 Not Found\r\n"));
 }
 
 namespace {
@@ -251,27 +184,22 @@ void stream_big(std::string_view uri, Site const& site)
     EXPECT_TRUE(manifest.has_value());
     HttpLimits limits;
     limits.max_connections = 1;
-    HttpServer server{net::SocketAddress::ipv4_loopback(0), limits, &*manifest};
-    auto const addr = *server.local_addr();
+    ToldSite<> web{limits, &*manifest};
 
-    Client c{addr};
+    ToldClient c{web.wire};
     c.send_all(std::string("GET ") + std::string(uri) + " HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
-    (void)::fcntl(c.fd, F_SETFL, O_NONBLOCK);
 
-    // Drain slowly while pumping — the body must survive backpressure and
+    // A peer that reads slowly, a few kilobytes a turn and never the same
+    // amount twice running: the body must survive the backpressure and
     // arrive byte-exact.
     std::string response;
-    std::array<char, 32768> buf{};
-    for (int i = 0; i < 20000 && response.size() < site.big.size(); ++i) {
-        pump(server, 1, i + 1);
-        for (;;) {
-            auto const n = ::recv(c.fd, buf.data(), buf.size(), 0);
-            if (n <= 0) {
-                break;
-            }
-            response.append(buf.data(), size_t(n));
-        }
+    for (int i = 0; i < 20000 && !c.at_eof(); ++i) {
+        c.accept_only(size_t{1500} + (size_t(i % 7) * 1777));
+        web.pump(1, i + 1);
+        response += c.received();
     }
+    response += c.received();
+    EXPECT_TRUE(c.at_eof());
     auto const body_at = response.find("\r\n\r\n");
     EXPECT_TRUE(body_at != std::string::npos);
     auto const body = std::string_view{response}.substr(body_at + 4);

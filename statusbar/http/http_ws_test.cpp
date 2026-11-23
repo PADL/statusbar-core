@@ -3,12 +3,10 @@
 
 #include "statusbar/http/http_ws.hpp"
 
-#include "statusbar/http/http_server.hpp"
+#include "statusbar/http/http_engine.hpp"
 #include "statusbar/http/http_sha1.hpp"
+#include "statusbar/http/http_test_support.hpp"
 #include "statusbar/test/test.hpp"
-
-#include <poll.h>
-#include <unistd.h>
 
 #include <array>
 #include <memory>
@@ -16,76 +14,15 @@
 #include <string_view>
 #include <vector>
 
-#include <sys/socket.h>
-
 using namespace statusbar;
 using namespace statusbar::http;
+using namespace statusbar::http::test_support;
 
 namespace {
 
-// ---- raw masked-frame test client -----------------------------------------
-
-struct Client
-{
-    int fd{-1};
-
-    explicit Client(net::SocketAddress const& to)
-    {
-        fd = ::socket(to.family(), SOCK_STREAM, 0);
-        if (fd >= 0 && ::connect(fd, to.sockaddr(), to.length()) < 0) {
-            ::close(fd);
-            fd = -1;
-        }
-    }
-    ~Client()
-    {
-        if (fd >= 0) {
-            ::close(fd);
-        }
-    }
-    Client(Client const&) = delete;
-    auto operator=(Client const&) -> Client& = delete;
-
-    void send_bytes(std::span<uint8_t const> bytes) const
-    {
-        auto const n = ::send(fd, bytes.data(), bytes.size(), 0);
-        (void)n;
-    }
-
-    void send_text(std::string_view text) const
-    {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-        send_bytes({reinterpret_cast<uint8_t const*>(text.data()), text.size()});
-    }
-
-    [[nodiscard]] auto recv_for(int budget_ms) const -> std::vector<uint8_t>
-    {
-        std::vector<uint8_t> out;
-        std::array<uint8_t, 65536> buf{};
-        for (int spent = 0; spent < budget_ms; spent += 10) {
-            struct pollfd pfd{.fd = fd, .events = POLLIN, .revents = 0};
-            if (::poll(&pfd, 1, 10) <= 0) {
-                continue;
-            }
-            auto const n = ::recv(fd, buf.data(), buf.size(), 0);
-            if (n <= 0) {
-                break;
-            }
-            out.insert(out.end(), buf.begin(), buf.begin() + n);
-        }
-        return out;
-    }
-
-    [[nodiscard]] auto at_eof() const -> bool
-    {
-        std::array<uint8_t, 16> buf{};
-        struct pollfd pfd{.fd = fd, .events = POLLIN, .revents = 0};
-        if (::poll(&pfd, 1, 50) <= 0) {
-            return false;
-        }
-        return ::recv(fd, buf.data(), buf.size(), 0) == 0;
-    }
-};
+// The engine runs here on a made-up wire (http_test_support.hpp): each test
+// says what the peer sends, turns the reactor by hand on a clock it makes up,
+// and reads back exactly what the engine wrote. No socket, and nothing waits.
 
 /// Builds one masked client frame.
 auto masked_frame(WsOpcode opcode, bool fin, std::string_view payload, uint8_t mask_seed = 0x5A) -> std::vector<uint8_t>
@@ -144,12 +81,12 @@ auto parse_server_frames(std::vector<uint8_t> const& bytes) -> std::vector<Serve
     return frames;
 }
 
-// ---- server fixture --------------------------------------------------------
+// ---- engine fixture --------------------------------------------------------
 
 class EchoEndpoint : public WsEndpoint
 {
   public:
-    explicit EchoEndpoint(HttpServer*& server)
+    explicit EchoEndpoint(HttpEngine*& server)
         : server_{server}
     {}
 
@@ -168,7 +105,7 @@ class EchoEndpoint : public WsEndpoint
 
     void on_ws_closed(size_t slot) override { closes.push_back(slot); }
 
-    HttpServer*& server_;
+    HttpEngine*& server_;
     std::vector<size_t> opens;
     std::vector<size_t> closes;
     std::vector<std::vector<uint8_t>> messages;
@@ -176,43 +113,31 @@ class EchoEndpoint : public WsEndpoint
     bool last_text{false};
 };
 
-void pump(HttpServer& server, int rounds = 20, int64_t now0 = 1)
+auto ws_limits() -> HttpLimits
 {
-    for (int i = 0; i < rounds; ++i) {
-        struct pollfd pfd{.fd = server.fd(), .events = POLLIN, .revents = 0};
-        (void)::poll(&pfd, 1, 5);
-        server.on_ready(now0 + i);
-        server.tick(now0 + i);
-    }
+    HttpLimits limits;
+    limits.max_connections = 2;
+    limits.max_ws_message = 4096;
+    return limits;
 }
 
 struct Fixture
 {
-    HttpLimits limits;
-    std::unique_ptr<HttpServer> server;
-    HttpServer* server_raw{nullptr};
-    EchoEndpoint echo{server_raw};
-    net::SocketAddress addr{};
+    ToldSite<> site{ws_limits()};
+    HttpEngine* server{&site.engine};
+    EchoEndpoint echo{server};
 
-    Fixture()
-    {
-        limits.max_connections = 2;
-        limits.max_ws_message = 4096;
-        server = std::make_unique<HttpServer>(net::SocketAddress::ipv4_loopback(0), limits);
-        server_raw = server.get();
-        EXPECT_TRUE(server->add_ws_route("/ws", echo));
-        addr = *server->local_addr();
-    }
+    Fixture() { EXPECT_TRUE(server->add_ws_route("/ws", echo)); }
+
+    auto pump(int rounds = 20, int64_t now0 = 1) -> size_t { return site.pump(rounds, now0); }
 
     /// Performs the upgrade handshake; returns the raw 101 response text.
-    auto upgrade(Client const& c) -> std::string
+    auto upgrade(ToldClient const& c) -> std::string
     {
-        c.send_text("GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-                    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
-        pump(*server);
-        auto const raw = c.recv_for(100);
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-        return std::string{reinterpret_cast<char const*>(raw.data()), raw.size()};
+        c.send_all("GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                   "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+        pump();
+        return c.received();
     }
 };
 
@@ -284,12 +209,12 @@ TEST(http_ws, frame_codec_round_trip_and_validation)
     EXPECT_TRUE(ws_parse_frame_header(bad, header) == WsParse::protocol_error);
 }
 
-// ---- live server tests -----------------------------------------------------
+// ---- the engine, told its frames --------------------------------------------
 
 TEST(http_ws, upgrade_and_text_echo)
 {
     Fixture fx;
-    Client c{fx.addr};
+    ToldClient c{fx.site.wire};
     auto const response = fx.upgrade(c);
     EXPECT_TRUE(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
     EXPECT_TRUE(response.find("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n") != std::string::npos);
@@ -298,9 +223,9 @@ TEST(http_ws, upgrade_and_text_echo)
     EXPECT_EQ(fx.echo.opens.size(), 1U);
     EXPECT_TRUE(fx.echo.open_path == "/ws");
 
-    c.send_bytes(masked_frame(WsOpcode::text, true, "ping pong"));
-    pump(*fx.server);
-    auto const frames = parse_server_frames(c.recv_for(150));
+    c.send_all(masked_frame(WsOpcode::text, true, "ping pong"));
+    fx.pump();
+    auto const frames = parse_server_frames(c.received_bytes());
     EXPECT_EQ(frames.size(), 1U);
     EXPECT_TRUE(frames[0].opcode == WsOpcode::text);
     EXPECT_TRUE(frames[0].payload == "ping pong");
@@ -315,13 +240,13 @@ TEST(http_ws, upgrade_and_text_echo)
 TEST(http_ws, upgrade_echoes_first_offered_subprotocol)
 {
     Fixture fx;
-    Client c{fx.addr};
-    c.send_text("GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
-                "Sec-WebSocket-Protocol: statusbar.widgets.v1 , other.v2\r\n"
-                "Sec-WebSocket-Version: 13\r\n\r\n");
-    pump(*fx.server);
-    auto const raw = c.recv_for(100);
+    ToldClient c{fx.site.wire};
+    c.send_all("GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+               "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+               "Sec-WebSocket-Protocol: statusbar.widgets.v1 , other.v2\r\n"
+               "Sec-WebSocket-Version: 13\r\n\r\n");
+    fx.pump();
+    auto const raw = c.received_bytes();
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
     std::string const response{reinterpret_cast<char const*>(raw.data()), raw.size()};
     EXPECT_TRUE(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
@@ -331,16 +256,16 @@ TEST(http_ws, upgrade_echoes_first_offered_subprotocol)
 TEST(http_ws, fragmentation_reassembles_with_interleaved_ping)
 {
     Fixture fx;
-    Client c{fx.addr};
+    ToldClient c{fx.site.wire};
     (void)fx.upgrade(c);
 
     // "hello world" in three fragments, a ping wedged between them.
-    c.send_bytes(masked_frame(WsOpcode::text, false, "hel"));
-    c.send_bytes(masked_frame(WsOpcode::ping, true, "pip"));
-    c.send_bytes(masked_frame(WsOpcode::continuation, false, "lo wo"));
-    c.send_bytes(masked_frame(WsOpcode::continuation, true, "rld"));
-    pump(*fx.server);
-    auto const frames = parse_server_frames(c.recv_for(150));
+    c.send_all(masked_frame(WsOpcode::text, false, "hel"));
+    c.send_all(masked_frame(WsOpcode::ping, true, "pip"));
+    c.send_all(masked_frame(WsOpcode::continuation, false, "lo wo"));
+    c.send_all(masked_frame(WsOpcode::continuation, true, "rld"));
+    fx.pump();
+    auto const frames = parse_server_frames(c.received_bytes());
     // The pong answers mid-message; the echo carries the whole message.
     EXPECT_EQ(frames.size(), 2U);
     EXPECT_TRUE(frames[0].opcode == WsOpcode::pong);
@@ -353,16 +278,16 @@ TEST(http_ws, fragmentation_reassembles_with_interleaved_ping)
 TEST(http_ws, binary_echo_and_server_push)
 {
     Fixture fx;
-    Client c{fx.addr};
+    ToldClient c{fx.site.wire};
     (void)fx.upgrade(c);
 
     std::string blob(1000, '\0');
     for (size_t i = 0; i < blob.size(); ++i) {
         blob[i] = char(i * 7);
     }
-    c.send_bytes(masked_frame(WsOpcode::binary, true, blob));
-    pump(*fx.server);
-    auto frames = parse_server_frames(c.recv_for(150));
+    c.send_all(masked_frame(WsOpcode::binary, true, blob));
+    fx.pump();
+    auto frames = parse_server_frames(c.received_bytes());
     EXPECT_EQ(frames.size(), 1U);
     EXPECT_TRUE(frames[0].opcode == WsOpcode::binary);
     EXPECT_TRUE(frames[0].payload == blob);
@@ -371,8 +296,8 @@ TEST(http_ws, binary_echo_and_server_push)
     std::string_view const push{"{\"gain\":-3.5}"};
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
     EXPECT_TRUE(fx.server->ws_send(fx.echo.opens[0], {reinterpret_cast<uint8_t const*>(push.data()), push.size()}, true));
-    pump(*fx.server, 5);
-    frames = parse_server_frames(c.recv_for(150));
+    fx.pump(5);
+    frames = parse_server_frames(c.received_bytes());
     EXPECT_EQ(frames.size(), 1U);
     EXPECT_TRUE(frames[0].payload == push);
 }
@@ -381,11 +306,11 @@ TEST(http_ws, close_handshake_and_protocol_errors)
 {
     Fixture fx;
     {
-        Client c{fx.addr};
+        ToldClient c{fx.site.wire};
         (void)fx.upgrade(c);
-        c.send_bytes(masked_frame(WsOpcode::close, true, std::string{"\x03\xe8", 2}));  // 1000
-        pump(*fx.server);
-        auto const frames = parse_server_frames(c.recv_for(150));
+        c.send_all(masked_frame(WsOpcode::close, true, std::string{"\x03\xe8", 2}));  // 1000
+        fx.pump();
+        auto const frames = parse_server_frames(c.received_bytes());
         EXPECT_EQ(frames.size(), 1U);
         EXPECT_TRUE(frames[0].opcode == WsOpcode::close);
         EXPECT_TRUE(frames[0].payload == std::string("\x03\xe8", 2));
@@ -394,12 +319,12 @@ TEST(http_ws, close_handshake_and_protocol_errors)
     }
     {
         // An unmasked client frame is a protocol error: close 1002.
-        Client c{fx.addr};
+        ToldClient c{fx.site.wire};
         (void)fx.upgrade(c);
         std::array<uint8_t, 4> unmasked{0x81, 0x02, 'h', 'i'};
-        c.send_bytes(unmasked);
-        pump(*fx.server);
-        auto const frames = parse_server_frames(c.recv_for(150));
+        c.send_all(unmasked);
+        fx.pump();
+        auto const frames = parse_server_frames(c.received_bytes());
         EXPECT_EQ(frames.size(), 1U);
         EXPECT_TRUE(frames[0].opcode == WsOpcode::close);
         EXPECT_TRUE(frames[0].payload == std::string("\x03\xea", 2));  // 1002
@@ -407,11 +332,11 @@ TEST(http_ws, close_handshake_and_protocol_errors)
     }
     {
         // A message over max_ws_message closes 1009.
-        Client c{fx.addr};
+        ToldClient c{fx.site.wire};
         (void)fx.upgrade(c);
-        c.send_bytes(masked_frame(WsOpcode::binary, true, std::string(8192, 'x')));
-        pump(*fx.server, 40);
-        auto const frames = parse_server_frames(c.recv_for(200));
+        c.send_all(masked_frame(WsOpcode::binary, true, std::string(8192, 'x')));
+        fx.pump(40);
+        auto const frames = parse_server_frames(c.received_bytes());
         EXPECT_EQ(frames.size(), 1U);
         EXPECT_TRUE(frames[0].opcode == WsOpcode::close);
         EXPECT_TRUE(frames[0].payload == std::string("\x03\xf1", 2));  // 1009
@@ -423,19 +348,19 @@ TEST(http_ws, plain_get_answers_426_and_idle_policy_pings_then_drops)
 {
     Fixture fx;
     {
-        Client c{fx.addr};
-        c.send_text("GET /ws HTTP/1.1\r\nHost: t\r\n\r\n");
-        pump(*fx.server);
-        auto const raw = c.recv_for(100);
+        ToldClient c{fx.site.wire};
+        c.send_all("GET /ws HTTP/1.1\r\nHost: t\r\n\r\n");
+        fx.pump();
+        auto const raw = c.received_bytes();
         std::string const response{raw.begin(), raw.end()};
         EXPECT_TRUE(response.starts_with("HTTP/1.1 426 "));
     }
     {
-        Client c{fx.addr};
+        ToldClient c{fx.site.wire};
         (void)fx.upgrade(c);
         // Idle past ws_ping_ns: a ping goes out.
         fx.server->tick(int64_t(40) * 1'000'000'000);
-        auto frames = parse_server_frames(c.recv_for(100));
+        auto frames = parse_server_frames(c.received_bytes());
         EXPECT_EQ(frames.size(), 1U);
         EXPECT_TRUE(frames[0].opcode == WsOpcode::ping);
         // No pong ever: past ws_drop_ns the connection is dropped.

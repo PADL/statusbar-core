@@ -8,6 +8,16 @@ thread), ~140k req/s pipelined ×8; `statusbar-http-bench --check` gates
 regressions in CI-shaped optimized builds, and
 `http_alloc_gate_test.cpp` proves the zero-allocation steady state.
 
+The logic and the sockets are separate. `HttpEngine` is the whole of the
+server's logic and names no socket: it is told its connections' events
+and reaches them through `net::ConnectionTransport`. `HttpServer` is that
+engine on a `TcpConnectionPool`. The unit tests run the engine on
+`net::ToldConnectionTransport`, a transport made of memory: they say what
+each peer sends, turn the reactor by hand on a clock they make up, and
+read back what the engine wrote. The same scenarios over real sockets are
+the functional tests (`http_*_functional_test.cpp`, ctest label
+`functional`).
+
 ## 0. Purpose
 
 An embedded web server for control-surface UIs: small enough to reason
@@ -61,23 +71,27 @@ statusbar/http/
   http_parser.{hpp,cpp}      incremental request parser
   http_router.{hpp,cpp}      manifest table + registered handlers
   http_static.{hpp,cpp}      manifest load, file sources, conditional GET
-  http_server.{hpp,cpp}      HttpServer: TcpConnectionHandler impl
+  http_engine.{hpp,cpp}      HttpEngine: the logic, on any ConnectionTransport
+  http_server.{hpp,cpp}      HttpServer: the engine on a TcpConnectionPool
   http_ws.{hpp,cpp}          WebSocket handshake + frame codec
   http_sha1.{hpp,cpp}        handshake-only SHA-1 + base64
   http_server_example.cpp    manifest site + echo WS endpoint
-  *_test.cpp                 per-unit tests (see milestones)
+  http_test_support.hpp      ToldSite / ToldClient: an engine on a made-up wire
+  *_test.cpp                 unit tests: logic only, no socket, no waiting
+  *_functional_test.cpp      the same engine end to end on real sockets
 ```
 
 ## 2. Architecture
 
-One `HttpServer` implements `net::TcpConnectionHandler` over one
-`TcpConnectionPool`; the whole server is a single `Pollable` in the
+One `HttpEngine` implements `net::TcpConnectionHandler` over one
+`net::ConnectionTransport`. `HttpServer` gives it a `TcpConnectionPool`
+as that transport; the whole server is a single `Pollable` in the
 reactor. Per pool slot there is one `Connection` record — parser state,
 fixed rx buffer, fixed tx buffer, mode (http / websocket), timers —
 all preallocated from `HttpLimits` at construction.
 
 ```
-reactor ── TcpConnectionPool ── HttpServer (TcpConnectionHandler)
+reactor ── TcpConnectionPool ── HttpEngine (TcpConnectionHandler)
                                    │ per-slot Connection
                                    │   rx buf → HttpParser ─→ Router
                                    │   tx buf ← ResponseWriter ← handler / static source

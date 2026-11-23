@@ -5,6 +5,7 @@ statusbar_add_module(
   NAME
   http
   SOURCES
+  http_engine.cpp
   http_parser.cpp
   http_server.cpp
   http_sha1.cpp
@@ -20,7 +21,13 @@ statusbar_add_module(
   http_parser_test.cpp
   http_server_test.cpp
   http_static_test.cpp
-  http_ws_test.cpp)
+  http_ws_test.cpp
+  FUNCTIONAL_TESTS
+  http_alloc_gate_functional_test.cpp
+  http_handler_functional_test.cpp
+  http_server_functional_test.cpp
+  http_static_functional_test.cpp
+  http_ws_functional_test.cpp)
 
 add_executable(http_server_example http_server_example.cpp)
 target_link_libraries(http_server_example PRIVATE statusbar)
@@ -32,8 +39,10 @@ target_link_libraries(http_bench_tool PRIVATE statusbar)
 set_target_properties(http_bench_tool PROPERTIES OUTPUT_NAME
                                                  statusbar-http-bench)
 
-# Regression gate: enforced in optimized builds, reports SKIP otherwise.
+# Regression gate: enforced in optimized builds, reports SKIP otherwise. It
+# measures the server over real loopback sockets, so it is a functional test.
 add_test(NAME statusbar_http_bench_check COMMAND http_bench_tool --check)
+set_tests_properties(statusbar_http_bench_check PROPERTIES LABELS functional)
 
 # Runnable target for invoking the benchmark from the Makefile.
 add_custom_target(

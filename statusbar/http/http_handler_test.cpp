@@ -3,11 +3,9 @@
 
 #include "statusbar/http/http_handler.hpp"
 
-#include "statusbar/http/http_server.hpp"
+#include "statusbar/http/http_engine.hpp"
+#include "statusbar/http/http_test_support.hpp"
 #include "statusbar/test/test.hpp"
-
-#include <poll.h>
-#include <unistd.h>
 
 #include <array>
 #include <memory>
@@ -15,99 +13,15 @@
 #include <string_view>
 #include <vector>
 
-#include <sys/socket.h>
-
 using namespace statusbar;
 using namespace statusbar::http;
+using namespace statusbar::http::test_support;
 
 namespace {
 
-struct Client
-{
-    int fd{-1};
-
-    explicit Client(net::SocketAddress const& to)
-    {
-        fd = ::socket(to.family(), SOCK_STREAM, 0);
-        if (fd >= 0 && ::connect(fd, to.sockaddr(), to.length()) < 0) {
-            ::close(fd);
-            fd = -1;
-        }
-    }
-    ~Client()
-    {
-        if (fd >= 0) {
-            ::close(fd);
-        }
-    }
-    Client(Client const&) = delete;
-    auto operator=(Client const&) -> Client& = delete;
-
-    void send_all(std::string_view text) const
-    {
-        auto const n = ::send(fd, text.data(), text.size(), 0);
-        (void)n;
-    }
-
-    [[nodiscard]] auto recv_for(int budget_ms) const -> std::string
-    {
-        std::string out;
-        std::array<char, 65536> buf{};
-        for (int spent = 0; spent < budget_ms; spent += 10) {
-            struct pollfd pfd{.fd = fd, .events = POLLIN, .revents = 0};
-            if (::poll(&pfd, 1, 10) <= 0) {
-                continue;
-            }
-            auto const n = ::recv(fd, buf.data(), buf.size(), 0);
-            if (n <= 0) {
-                break;
-            }
-            out.append(buf.data(), size_t(n));
-        }
-        return out;
-    }
-
-    [[nodiscard]] auto at_eof() const -> bool
-    {
-        std::array<char, 16> buf{};
-        struct pollfd pfd{.fd = fd, .events = POLLIN, .revents = 0};
-        if (::poll(&pfd, 1, 50) <= 0) {
-            return false;
-        }
-        return ::recv(fd, buf.data(), buf.size(), 0) == 0;
-    }
-};
-
-void pump(HttpServer& server, int rounds = 20, int64_t now0 = 1)
-{
-    for (int i = 0; i < rounds; ++i) {
-        struct pollfd pfd{.fd = server.fd(), .events = POLLIN, .revents = 0};
-        (void)::poll(&pfd, 1, 5);
-        server.on_ready(now0 + i);
-        server.tick(now0 + i);
-    }
-}
-
-[[nodiscard]] auto status_line(std::string const& response) -> std::string
-{
-    return response.substr(0, response.find('\r'));
-}
-
-[[nodiscard]] auto header_value(std::string const& response, std::string_view name) -> std::string
-{
-    auto const at = response.find(std::string(name) + ": ");
-    if (at == std::string::npos) {
-        return {};
-    }
-    auto const start = at + name.size() + 2;
-    return response.substr(start, response.find('\r', start) - start);
-}
-
-[[nodiscard]] auto body_of(std::string const& response) -> std::string
-{
-    auto const at = response.find("\r\n\r\n");
-    return at == std::string::npos ? std::string{} : response.substr(at + 4);
-}
+// The engine runs here on a made-up wire (http_test_support.hpp): each test
+// says what the peer sends, turns the reactor by hand on a clock it makes up,
+// and reads back exactly what the engine wrote. No socket, and nothing waits.
 
 /// Buffered echo: replies with the body it received, plus a custom header.
 class EchoHandler : public HttpHandler
@@ -236,20 +150,24 @@ class OverflowHandler : public HttpHandler
 
 struct Fixture
 {
-    HttpLimits limits;
-    std::unique_ptr<HttpServer> server;
-    net::SocketAddress addr{};
+    ToldSite<> site;
+    HttpEngine* server{&site.engine};
 
     explicit Fixture(size_t max_body = 64, size_t max_response_head = 4096, int64_t keep_alive_idle_ns = 30'000'000'000)
+        : site{limits_for(max_body, max_response_head, keep_alive_idle_ns)}
+    {}
+
+    static auto limits_for(size_t max_body, size_t max_response_head, int64_t keep_alive_idle_ns) -> HttpLimits
     {
+        HttpLimits limits;
         limits.max_connections = 2;
         limits.max_body = max_body;
         limits.max_response_head = max_response_head;
         limits.keep_alive_idle_ns = keep_alive_idle_ns;
-        server = std::make_unique<HttpServer>(net::SocketAddress::ipv4_loopback(0), limits);
-        EXPECT_TRUE(server->valid());
-        addr = *server->local_addr();
+        return limits;
     }
+
+    auto pump(int rounds = 20, int64_t now0 = 1) -> size_t { return site.pump(rounds, now0); }
 };
 
 }  // namespace
@@ -260,10 +178,10 @@ TEST(http_handler, buffered_echo_round_trip)
     EchoHandler echo;
     EXPECT_TRUE(fx.server->add_route(HttpMethod::post, "/echo", echo));
 
-    Client c{fx.addr};
+    ToldClient c{fx.site.wire};
     c.send_all("POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 11\r\n\r\nhello world");
-    pump(*fx.server);
-    auto const response = c.recv_for(150);
+    fx.pump();
+    auto const response = c.received();
     EXPECT_TRUE(status_line(response) == "HTTP/1.1 200 OK");
     EXPECT_TRUE(header_value(response, "X-Echo-Path") == "/echo");
     EXPECT_TRUE(header_value(response, "Content-Length") == "11");
@@ -271,10 +189,10 @@ TEST(http_handler, buffered_echo_round_trip)
 
     // Keep-alive: a second echo on the same socket, body split mid-write.
     c.send_all("POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 6\r\n\r\nabc");
-    pump(*fx.server, 5);
+    fx.pump(5);
     c.send_all("def");
-    pump(*fx.server);
-    EXPECT_TRUE(body_of(c.recv_for(150)) == "abcdef");
+    fx.pump();
+    EXPECT_TRUE(body_of(c.received()) == "abcdef");
 }
 
 TEST(http_handler, streaming_accepts_beyond_max_body)
@@ -284,10 +202,10 @@ TEST(http_handler, streaming_accepts_beyond_max_body)
     EXPECT_TRUE(fx.server->add_route(HttpMethod::put, "/count", counter));
 
     std::string const body(50000, 'x');
-    Client c{fx.addr};
+    ToldClient c{fx.site.wire};
     c.send_all("PUT /count HTTP/1.1\r\nHost: t\r\nContent-Length: 50000\r\n\r\n" + body);
-    pump(*fx.server, 60);
-    auto const response = c.recv_for(200);
+    fx.pump(60);
+    auto const response = c.received();
     EXPECT_TRUE(status_line(response) == "HTTP/1.1 200 OK");
     EXPECT_TRUE(body_of(response) == "count=50000");
     EXPECT_TRUE(counter.chunks > 1U);  // genuinely chunked, not buffered
@@ -297,8 +215,8 @@ TEST(http_handler, streaming_accepts_beyond_max_body)
     EchoHandler echo;
     EXPECT_TRUE(fx.server->add_route(HttpMethod::put, "/buffered", echo));
     c.send_all("PUT /buffered HTTP/1.1\r\nHost: t\r\nContent-Length: 50000\r\n\r\n" + body);
-    pump(*fx.server);
-    auto const refused = c.recv_for(200);
+    fx.pump();
+    auto const refused = c.received();
     EXPECT_TRUE(status_line(refused) == "HTTP/1.1 413 Content Too Large");
     EXPECT_TRUE(header_value(refused, "Connection") == "close");
     EXPECT_TRUE(c.at_eof());
@@ -312,15 +230,15 @@ TEST(http_handler, reject_consumes_body_and_keeps_alive)
     EchoHandler echo;
     EXPECT_TRUE(fx.server->add_route(HttpMethod::post, "/echo", echo));
 
-    Client c{fx.addr};
+    ToldClient c{fx.site.wire};
     c.send_all("POST /brew HTTP/1.1\r\nHost: t\r\nContent-Length: 8\r\n\r\ncoffee!!");
-    pump(*fx.server);
-    EXPECT_TRUE(status_line(c.recv_for(150)) == "HTTP/1.1 418 I'm a teapot");
+    fx.pump();
+    EXPECT_TRUE(status_line(c.received()) == "HTTP/1.1 418 I'm a teapot");
 
     // Framing survived the rejected body: the next request works.
     c.send_all("POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\n\r\nok");
-    pump(*fx.server);
-    EXPECT_TRUE(body_of(c.recv_for(150)) == "ok");
+    fx.pump();
+    EXPECT_TRUE(body_of(c.received()) == "ok");
 }
 
 TEST(http_handler, method_mismatch_answers_405_with_allow)
@@ -333,17 +251,17 @@ TEST(http_handler, method_mismatch_answers_405_with_allow)
     EXPECT_FALSE(fx.server->add_route(HttpMethod::post, "/thing", echo));
     EXPECT_FALSE(fx.server->add_route(HttpMethod::get, "no-slash", echo));
 
-    Client c{fx.addr};
+    ToldClient c{fx.site.wire};
     c.send_all("GET /thing HTTP/1.1\r\nHost: t\r\n\r\n");
-    pump(*fx.server);
-    auto const response = c.recv_for(150);
+    fx.pump();
+    auto const response = c.received();
     EXPECT_TRUE(status_line(response) == "HTTP/1.1 405 Method Not Allowed");
     EXPECT_TRUE(header_value(response, "Allow") == "POST, PUT");
 
     // Unregistered paths still fall through to 404.
     c.send_all("GET /elsewhere HTTP/1.1\r\nHost: t\r\n\r\n");
-    pump(*fx.server);
-    EXPECT_TRUE(status_line(c.recv_for(150)) == "HTTP/1.1 404 Not Found");
+    fx.pump();
+    EXPECT_TRUE(status_line(c.received()) == "HTTP/1.1 404 Not Found");
 }
 
 TEST(http_handler, async_completion_holds_the_slot)
@@ -352,11 +270,11 @@ TEST(http_handler, async_completion_holds_the_slot)
     AsyncHandler async;
     EXPECT_TRUE(fx.server->add_route(HttpMethod::get, "/later", async));
 
-    Client c{fx.addr};
+    ToldClient c{fx.site.wire};
     c.send_all("GET /later HTTP/1.1\r\nHost: t\r\n\r\n");
-    pump(*fx.server);
+    fx.pump();
     EXPECT_TRUE(async.held_slot >= 0);
-    EXPECT_TRUE(c.recv_for(80).empty());  // held: nothing sent yet
+    EXPECT_TRUE(c.received().empty());  // held: nothing sent yet
 
     // Complete from "elsewhere" (still the reactor thread).
     auto writer = fx.server->respond(size_t(async.held_slot));
@@ -364,8 +282,8 @@ TEST(http_handler, async_completion_holds_the_slot)
     std::string_view const done{"finally"};
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
     EXPECT_TRUE(writer->send(200, "text/plain", {reinterpret_cast<uint8_t const*>(done.data()), done.size()}));
-    pump(*fx.server, 5);
-    auto const response = c.recv_for(150);
+    fx.pump(5);
+    auto const response = c.received();
     EXPECT_TRUE(status_line(response) == "HTTP/1.1 200 OK");
     EXPECT_TRUE(body_of(response) == "finally");
 
@@ -374,13 +292,13 @@ TEST(http_handler, async_completion_holds_the_slot)
 
     // Keep-alive: the connection still serves.
     c.send_all("GET /later HTTP/1.1\r\nHost: t\r\n\r\n");
-    pump(*fx.server);
+    fx.pump();
     EXPECT_TRUE(async.held_slot >= 0);
     auto writer2 = fx.server->respond(size_t(async.held_slot));
     EXPECT_TRUE(writer2.has_value());
     writer2->send_status(204);
-    pump(*fx.server, 5);
-    EXPECT_TRUE(status_line(c.recv_for(150)) == "HTTP/1.1 204 No Content");
+    fx.pump(5);
+    EXPECT_TRUE(status_line(c.received()) == "HTTP/1.1 204 No Content");
 }
 
 TEST(http_handler, handlers_take_precedence_and_head_suppresses_body)
@@ -390,10 +308,10 @@ TEST(http_handler, handlers_take_precedence_and_head_suppresses_body)
     EXPECT_TRUE(fx.server->add_route(HttpMethod::get, "/info", counter));
     EXPECT_TRUE(fx.server->add_route(HttpMethod::head, "/info", counter));
 
-    Client c{fx.addr};
+    ToldClient c{fx.site.wire};
     c.send_all("HEAD /info HTTP/1.1\r\nHost: t\r\n\r\n");
-    pump(*fx.server);
-    auto const head = c.recv_for(150);
+    fx.pump();
+    auto const head = c.received();
     EXPECT_TRUE(status_line(head) == "HTTP/1.1 200 OK");
     EXPECT_TRUE(header_value(head, "Content-Length") == "7");  // "count=0"
     EXPECT_TRUE(head.ends_with("\r\n\r\n"));                   // no body bytes
@@ -408,10 +326,10 @@ TEST(http_handler, reject_of_an_oversize_body_answers_and_closes)
     // The declared body exceeds max_body and never arrives: the rejection
     // must not wait to drain it (that would be an unbounded read of
     // attacker-sized junk); it answers at once and closes.
-    Client c{fx.addr};
+    ToldClient c{fx.site.wire};
     c.send_all("POST /brew HTTP/1.1\r\nHost: t\r\nContent-Length: 100000\r\n\r\n");
-    pump(*fx.server);
-    auto const response = c.recv_for(150);
+    fx.pump();
+    auto const response = c.received();
     EXPECT_TRUE(status_line(response) == "HTTP/1.1 418 I'm a teapot");
     EXPECT_TRUE(header_value(response, "Connection") == "close");
     EXPECT_TRUE(c.at_eof());
@@ -427,19 +345,19 @@ TEST(http_handler, handler_responses_keep_the_idle_clock_current)
     // Two requests, well apart on the injected clock. The idle timer must
     // run from the SECOND response — a send that used a stale "now" would
     // leave the connection looking idle since the first.
-    Client c{fx.addr};
+    ToldClient c{fx.site.wire};
     c.send_all("GET /ping HTTP/1.1\r\nHost: t\r\n\r\n");
-    pump(*fx.server, 3, 100);
-    EXPECT_TRUE(status_line(c.recv_for(100)) == "HTTP/1.1 200 OK");
+    fx.pump(3, 100);
+    EXPECT_TRUE(status_line(c.received()) == "HTTP/1.1 200 OK");
     c.send_all("GET /ping HTTP/1.1\r\nHost: t\r\n\r\n");
-    pump(*fx.server, 3, 3000);
-    EXPECT_TRUE(status_line(c.recv_for(100)) == "HTTP/1.1 200 OK");
+    fx.pump(3, 3000);
+    EXPECT_TRUE(status_line(c.received()) == "HTTP/1.1 200 OK");
 
     fx.server->tick(7000);  // 4000 since the second response: still alive
     EXPECT_EQ(fx.server->active_connections(), 1U);
     c.send_all("GET /ping HTTP/1.1\r\nHost: t\r\n\r\n");
-    pump(*fx.server, 3, 7001);
-    EXPECT_TRUE(status_line(c.recv_for(100)) == "HTTP/1.1 200 OK");
+    fx.pump(3, 7001);
+    EXPECT_TRUE(status_line(c.received()) == "HTTP/1.1 200 OK");
 
     fx.server->tick(7001 + 5001);  // and now it really is idle
     EXPECT_TRUE(c.at_eof());
@@ -452,21 +370,21 @@ TEST(http_handler, send_from_on_headers_is_refused)
     EagerHandler eager;
     EXPECT_TRUE(fx.server->add_route(HttpMethod::post, "/eager", eager));
 
-    Client c{fx.addr};
+    ToldClient c{fx.site.wire};
     c.send_all("POST /eager HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\n\r\nabc");
-    pump(*fx.server);
+    fx.pump();
     EXPECT_FALSE(eager.early_sent);
     EXPECT_FALSE(eager.early_marked);
     EXPECT_TRUE(eager.late_sent);
-    auto const response = c.recv_for(150);
+    auto const response = c.received();
     EXPECT_TRUE(status_line(response) == "HTTP/1.1 200 OK");
     EXPECT_TRUE(body_of(response) == "late");
     EXPECT_TRUE(response.find("HTTP/1.1", 1) == std::string::npos);  // exactly one response
 
     // The connection is intact for the next request.
     c.send_all("POST /eager HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n");
-    pump(*fx.server);
-    EXPECT_TRUE(body_of(c.recv_for(150)) == "late");
+    fx.pump();
+    EXPECT_TRUE(body_of(c.received()) == "late");
 }
 
 TEST(http_handler, unbuildable_responses_become_a_fixed_500)
@@ -476,14 +394,14 @@ TEST(http_handler, unbuildable_responses_become_a_fixed_500)
         OverflowHandler overflow{long_header};
         EXPECT_TRUE(fx.server->add_route(HttpMethod::get, "/big", overflow));
 
-        Client c{fx.addr};
+        ToldClient c{fx.site.wire};
         c.send_all("GET /big HTTP/1.1\r\nHost: t\r\n\r\n");
-        pump(*fx.server);
+        fx.pump();
         EXPECT_EQ(overflow.header_added, long_header);  // queued fine; the head is what overflows
         EXPECT_FALSE(overflow.first_sent);
         EXPECT_TRUE(overflow.marked);        // the 500 IS the response
         EXPECT_FALSE(overflow.second_sent);  // single-shot still holds
-        auto const response = c.recv_for(150);
+        auto const response = c.received();
         EXPECT_TRUE(status_line(response) == "HTTP/1.1 500 Internal Server Error");
         EXPECT_TRUE(header_value(response, "Content-Length") == "0");
         EXPECT_TRUE(header_value(response, "Connection") == "close");
@@ -501,23 +419,21 @@ TEST(http_handler, extra_header_space_and_body_chunk_come_from_limits)
     limits.max_body = 64;
     limits.max_extra_headers = 256;  // OverflowHandler's X-Long line is 310 bytes
     limits.body_chunk = 1000;
-    HttpServer server{net::SocketAddress::ipv4_loopback(0), limits};
-    EXPECT_TRUE(server.valid());
-    auto const addr = *server.local_addr();
+    ToldSite<> site{limits};
 
     OverflowHandler overflow{true};
     CountHandler counter;
-    EXPECT_TRUE(server.add_route(HttpMethod::get, "/big", overflow));
-    EXPECT_TRUE(server.add_route(HttpMethod::put, "/count", counter));
+    EXPECT_TRUE(site.engine.add_route(HttpMethod::get, "/big", overflow));
+    EXPECT_TRUE(site.engine.add_route(HttpMethod::put, "/count", counter));
 
     // The queued header no longer fits; the response itself (4-byte body,
     // default tx buffer) is unaffected.
-    Client c{addr};
+    ToldClient c{site.wire};
     c.send_all("GET /big HTTP/1.1\r\nHost: t\r\n\r\n");
-    pump(server);
+    site.pump();
     EXPECT_FALSE(overflow.header_added);
     EXPECT_TRUE(overflow.first_sent);
-    auto const response = c.recv_for(150);
+    auto const response = c.received();
     EXPECT_TRUE(status_line(response) == "HTTP/1.1 200 OK");
     EXPECT_TRUE(response.find("X-Long") == std::string::npos);
 
@@ -528,8 +444,8 @@ TEST(http_handler, extra_header_space_and_body_chunk_come_from_limits)
     size_t const min_chunks = 1 + ((50000 - rx_capacity + limits.body_chunk - 1) / limits.body_chunk);
     std::string const body(50000, 'x');
     c.send_all("PUT /count HTTP/1.1\r\nHost: t\r\nContent-Length: 50000\r\n\r\n" + body);
-    pump(server, 80);
-    EXPECT_TRUE(body_of(c.recv_for(200)) == "count=50000");
+    site.pump(80);
+    EXPECT_TRUE(body_of(c.received()) == "count=50000");
     EXPECT_TRUE(counter.chunks >= min_chunks);
 }
 
@@ -542,29 +458,29 @@ TEST(http_handler, expect_continue_gets_an_interim_100_before_the_body)
     EXPECT_TRUE(fx.server->add_route(HttpMethod::put, "/count", counter));
 
     // Buffered: the client holds the body back until the 100 arrives.
-    Client c{fx.addr};
+    ToldClient c{fx.site.wire};
     c.send_all("POST /echo HTTP/1.1\r\nHost: t\r\nExpect: 100-Continue\r\nContent-Length: 5\r\n\r\n");
-    pump(*fx.server);
-    EXPECT_TRUE(c.recv_for(100) == "HTTP/1.1 100 Continue\r\n\r\n");
+    fx.pump();
+    EXPECT_TRUE(c.received() == "HTTP/1.1 100 Continue\r\n\r\n");
     c.send_all("hello");
-    pump(*fx.server);
-    auto const echoed = c.recv_for(150);
+    fx.pump();
+    auto const echoed = c.received();
     EXPECT_TRUE(status_line(echoed) == "HTTP/1.1 200 OK");
     EXPECT_TRUE(body_of(echoed) == "hello");
 
     // Streamed, same connection: the 100 sits alone, then the body.
     c.send_all("PUT /count HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 7\r\n\r\n");
-    pump(*fx.server);
-    EXPECT_TRUE(c.recv_for(100) == "HTTP/1.1 100 Continue\r\n\r\n");
+    fx.pump();
+    EXPECT_TRUE(c.received() == "HTTP/1.1 100 Continue\r\n\r\n");
     c.send_all("1234567");
-    pump(*fx.server);
-    EXPECT_TRUE(body_of(c.recv_for(150)) == "count=7");
+    fx.pump();
+    EXPECT_TRUE(body_of(c.received()) == "count=7");
 
     // Body already riding with the head: no interim, the client was not
     // waiting for one.
     c.send_all("POST /echo HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nok");
-    pump(*fx.server);
-    auto const direct = c.recv_for(150);
+    fx.pump();
+    auto const direct = c.received();
     EXPECT_TRUE(status_line(direct) == "HTTP/1.1 200 OK");
     EXPECT_TRUE(body_of(direct) == "ok");
     EXPECT_FALSE(c.at_eof());
@@ -580,60 +496,44 @@ TEST(http_handler, expect_continue_on_a_refused_body_is_the_final_status_and_clo
 
     // Rejected from on_headers: no 100, the status right away, closed.
     {
-        Client c{fx.addr};
+        ToldClient c{fx.site.wire};
         c.send_all("POST /brew HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 8\r\n\r\n");
-        pump(*fx.server);
-        auto const resp = c.recv_for(150);
+        fx.pump();
+        auto const resp = c.received();
         EXPECT_TRUE(status_line(resp) == "HTTP/1.1 418 I'm a teapot");
         EXPECT_TRUE(header_value(resp, "Connection") == "close");
         EXPECT_TRUE(c.at_eof());
     }
     // Buffered but over max_body: 413 without waiting for the upload.
     {
-        Client c{fx.addr};
+        ToldClient c{fx.site.wire};
         c.send_all("POST /echo HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 65\r\n\r\n");
-        pump(*fx.server);
-        auto const resp = c.recv_for(150);
+        fx.pump();
+        auto const resp = c.received();
         EXPECT_TRUE(status_line(resp) == "HTTP/1.1 413 Content Too Large");
         EXPECT_TRUE(header_value(resp, "Connection") == "close");
         EXPECT_TRUE(c.at_eof());
     }
     // No route: the 404 without draining a body nobody wants.
     {
-        Client c{fx.addr};
+        ToldClient c{fx.site.wire};
         c.send_all("POST /nowhere HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 8\r\n\r\n");
-        pump(*fx.server);
-        auto const resp = c.recv_for(150);
+        fx.pump();
+        auto const resp = c.received();
         EXPECT_TRUE(status_line(resp) == "HTTP/1.1 404 Not Found");
         EXPECT_TRUE(header_value(resp, "Connection") == "close");
         EXPECT_TRUE(c.at_eof());
     }
     // HTTP/1.0 never gets a 1xx: the engine reads the body as usual.
     {
-        Client c{fx.addr};
+        ToldClient c{fx.site.wire};
         c.send_all("POST /echo HTTP/1.0\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n");
-        pump(*fx.server);
-        EXPECT_TRUE(c.recv_for(100).empty());
+        fx.pump();
+        EXPECT_TRUE(c.received().empty());
         c.send_all("ok");
-        pump(*fx.server);
-        EXPECT_TRUE(body_of(c.recv_for(150)) == "ok");
+        fx.pump();
+        EXPECT_TRUE(body_of(c.received()) == "ok");
     }
-}
-
-/// Polls the server's fd like the reactor would and counts the rounds on
-/// which it reported readiness.
-[[nodiscard]] auto ready_rounds(HttpServer& server, int rounds, int64_t now0) -> int
-{
-    int ready = 0;
-    for (int i = 0; i < rounds; ++i) {
-        struct pollfd pfd{.fd = server.fd(), .events = POLLIN, .revents = 0};
-        if (::poll(&pfd, 1, 5) > 0) {
-            ++ready;
-        }
-        server.on_ready(now0 + i);
-        server.tick(now0 + i);
-    }
-    return ready;
 }
 
 TEST(http_handler, bytes_behind_a_held_request_do_not_spin_the_reactor)
@@ -642,19 +542,21 @@ TEST(http_handler, bytes_behind_a_held_request_do_not_spin_the_reactor)
     AsyncHandler async;
     EXPECT_TRUE(fx.server->add_route(HttpMethod::get, "/later", async));
 
-    Client c{fx.addr};
+    ToldClient c{fx.site.wire};
     c.send_all("GET /later HTTP/1.1\r\nHost: t\r\n\r\n");
-    pump(*fx.server);
+    fx.pump();
     EXPECT_TRUE(async.held_slot >= 0);
 
-    // A pipelined request lands while the first is held. Its bytes stay in
-    // the socket until the response goes out; level-triggered, they are
-    // "readable" on every poll unless the server has turned the slot's
+    // A pipelined request lands while the first is held. Its bytes stay on
+    // the wire until the response goes out; level-triggered, they are
+    // "readable" on every poll unless the engine has turned the slot's
     // read interest off, and the reactor would spin for as long as the
-    // handler takes.
+    // handler takes. Thirty turns of the reactor raise nothing at all.
     c.send_all("GET /later HTTP/1.1\r\nHost: t\r\n\r\n");
-    EXPECT_TRUE(ready_rounds(*fx.server, 30, 100) <= 1);
-    EXPECT_TRUE(c.recv_for(30).empty());  // and nothing was answered early
+    EXPECT_FALSE(fx.site.wire.read_interest(c.slot()));
+    EXPECT_EQ(fx.pump(30, 100), size_t{0});
+    EXPECT_EQ(fx.site.wire.unread(c.slot()), std::string_view{"GET /later HTTP/1.1\r\nHost: t\r\n\r\n"}.size());
+    EXPECT_TRUE(c.received().empty());  // and nothing was answered early
 
     // Completing the held request lets the waiting one through to the
     // handler, which holds it in turn (synchronously, as the response
@@ -663,14 +565,14 @@ TEST(http_handler, bytes_behind_a_held_request_do_not_spin_the_reactor)
     EXPECT_TRUE(writer.has_value());
     async.held_slot = -1;
     writer->send_status(204);
-    pump(*fx.server);
-    EXPECT_TRUE(status_line(c.recv_for(150)) == "HTTP/1.1 204 No Content");
+    fx.pump();
+    EXPECT_TRUE(status_line(c.received()) == "HTTP/1.1 204 No Content");
     EXPECT_TRUE(async.held_slot >= 0);
     auto writer2 = fx.server->respond(size_t(async.held_slot));
     EXPECT_TRUE(writer2.has_value());
     writer2->send_status(204);
-    pump(*fx.server, 5);
-    EXPECT_TRUE(status_line(c.recv_for(150)) == "HTTP/1.1 204 No Content");
+    fx.pump(5);
+    EXPECT_TRUE(status_line(c.received()) == "HTTP/1.1 204 No Content");
 }
 
 TEST_MAIN(statusbar_http, http_handler_test)
