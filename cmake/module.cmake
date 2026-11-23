@@ -9,7 +9,8 @@
 # public statusbar-* deps [PRIVATE_DEPS   <target>...]             #
 # private-only deps [INTERFACE]                              # header-only
 # module [TESTS          <file>...]               # unit test .cpp files
-# [FUNCTIONAL_TESTS <file>...])                    # functional test .cpp files
+# [FUNCTIONAL_TESTS <file>...]                     # functional test .cpp files
+# [FUNCTIONAL_TEST_DATA <file>...])                # data files those tests read
 #
 # TESTS are unit tests: they test logic, told its inputs and its time. They open
 # no socket, sleep for nothing and assert nothing about how long anything took.
@@ -17,6 +18,13 @@
 # kernel, real waits); they build into their own binary and carry the ctest
 # label "functional", so `ctest -LE functional` runs the unit tests alone and
 # `ctest -L functional` the rest.
+#
+# The functional test binary is installed with the development files, as
+# <package>-functional-test, so the tests can be run on a target, where real
+# sockets and a real kernel are the point. FUNCTIONAL_TEST_DATA names the files
+# those tests read from beside their sources (paths relative to the module's
+# directory): they are installed too, and a test finds them on either machine
+# with statusbar::test::functional_test_data() (statusbar/test/test_data.hpp).
 #
 # Always registers the created target into the global STATUSBAR_INSTALL_TARGETS
 # property and sets its EXPORT_NAME to the module-name (so the exported alias
@@ -54,7 +62,8 @@ endif()
 
 function(statusbar_add_module)
   cmake_parse_arguments(
-    ARG "INTERFACE" "NAME" "SOURCES;DEPS;PRIVATE_DEPS;TESTS;FUNCTIONAL_TESTS"
+    ARG "INTERFACE" "NAME"
+    "SOURCES;DEPS;PRIVATE_DEPS;TESTS;FUNCTIONAL_TESTS;FUNCTIONAL_TEST_DATA"
     ${ARGN})
 
   if(NOT ARG_NAME)
@@ -65,7 +74,7 @@ function(statusbar_add_module)
       FATAL_ERROR
         "statusbar_add_module(${ARG_NAME}): unknown keyword(s): "
         "${ARG_UNPARSED_ARGUMENTS}. "
-        "Valid keywords are NAME, SOURCES, DEPS, PRIVATE_DEPS, INTERFACE, TESTS, FUNCTIONAL_TESTS."
+        "Valid keywords are NAME, SOURCES, DEPS, PRIVATE_DEPS, INTERFACE, TESTS, FUNCTIONAL_TESTS, FUNCTIONAL_TEST_DATA."
     )
   endif()
 
@@ -126,6 +135,21 @@ function(statusbar_add_module)
     endforeach()
     set_property(GLOBAL APPEND PROPERTY STATUSBAR_FUNCTIONAL_TEST_FILES
                                         ${_abs_tests})
+  endif()
+  # The data files the functional tests read, installed where the installed test
+  # binary looks for them: <datadir>/<package>/functional-test-data/, then the
+  # module's directory name and the file's own relative path, which is how the
+  # file lies beside the test's source.
+  if(ARG_FUNCTIONAL_TEST_DATA AND NOT STATUSBAR_AGGREGATE_BUILD)
+    get_filename_component(_module_dir "${CMAKE_CURRENT_LIST_DIR}" NAME)
+    foreach(_f ${ARG_FUNCTIONAL_TEST_DATA})
+      get_filename_component(_f_dir "${_f}" DIRECTORY)
+      install(
+        FILES "${CMAKE_CURRENT_LIST_DIR}/${_f}"
+        DESTINATION
+          "${CMAKE_INSTALL_DATADIR}/${PROJECT_NAME}/functional-test-data/${_module_dir}/${_f_dir}"
+        COMPONENT devel)
+    endforeach()
   endif()
 endfunction()
 
@@ -316,6 +340,21 @@ function(statusbar_package_functional_test_binary)
     add_test(NAME ${_name} COMMAND statusbar_functional_test ${_name})
     set_tests_properties(${_name} PROPERTIES LABELS functional)
   endforeach()
+  # Packaged with the development files, to be run on a target:
+  # `<package>-functional-test -A` for all of them, or one test's ctest name
+  # (statusbar/<module>/<file without .cpp>) for one file. The binary knows
+  # where its data files are installed; the environment variable of the same
+  # name points it somewhere else.
+  set_target_properties(
+    statusbar_functional_test PROPERTIES OUTPUT_NAME
+                                         "${PROJECT_NAME}-functional-test")
+  target_compile_definitions(
+    statusbar_functional_test
+    PRIVATE
+      STATUSBAR_FUNCTIONAL_TEST_DATA_DIR="${CMAKE_INSTALL_FULL_DATADIR}/${PROJECT_NAME}/functional-test-data"
+  )
+  install(TARGETS statusbar_functional_test
+          RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT devel)
 endfunction()
 
 # Give every installed executable a statusbar- prefixed on-disk name, so the

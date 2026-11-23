@@ -111,6 +111,8 @@ assertion to pass.
   is what test files `#include`.
 - `statusbar/test/test_util.hpp` — optional `do_not_optimize` and
   `hex_to_bytes` helpers; include on demand.
+- `statusbar/test/test_data.hpp` — `functional_test_data()`: where a
+  functional test finds a data file, on the build machine or a target.
 
 ## Dependencies
 
@@ -135,6 +137,25 @@ assertion to pass.
   it out (as `http::HttpEngine` is split from `HttpServer`, and
   `realtime::TimerSchedule` from `Timer`) and unit-test the logic on a
   told stand-in such as `net::ToldConnectionTransport`.
+- **Who runs which.** A build (`local-build.sh`, the test presets, CI)
+  builds everything, the functional tests among it, and runs the unit
+  tests: `ctest -LE functional`. The functional tests run when
+  committing: the pre-commit hook calls core's `run-functional-tests.sh`,
+  which builds the repo's configured build directory and runs
+  `ctest -L functional` when the staged change touches C++ or CMake.
+  Without a configured build directory it says so and lets the commit
+  through; `STATUSBAR_SKIP_FUNCTIONAL_TESTS=1` skips it for one commit;
+  `sh run-functional-tests.sh --always` runs it by hand.
+- **Functional tests on a target.** Each package's development package
+  (`statusbar-<pkg>-dev`) installs its functional tests as
+  `statusbar-<pkg>-functional-test`: `-A` runs all of them, a ctest name
+  (`statusbar/<module>/<file without .cpp>`) one file. A test that reads
+  a data file from beside its source names it in its module's
+  `FUNCTIONAL_TEST_DATA` and finds it with
+  `statusbar::test::functional_test_data(__FILE__, "testdata/x.bin")`
+  (`statusbar/test/test_data.hpp`): beside the source where there is a
+  source tree, else under the installed data directory, which the
+  environment variable `STATUSBAR_FUNCTIONAL_TEST_DATA_DIR` overrides.
 - **This is the test framework every other statusbar module uses.** It
   has no `*_test.cpp` of its own — exercising the framework is what the
   rest of the codebase does. Treat changes here as cross-cutting: a
