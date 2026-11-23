@@ -67,6 +67,7 @@ error reporting stays allocation-free (raw `errno` + static
 - `UtcClock` / `TaiClock`, `to_tai()` / `to_utc()`, `TAI_MINUS_UTC` — the system clock's timescale and the constant 37 s to TAI. What disciplines the system clock is a `ClockQuality::time_source`, not a type.
 - `read_utc()` / `read_system_clock_error()` — the system clock as a `UtcClock` time, and what the operating system says of its synchronization (`synchronized`, `max_error`, `estimated_error`).
 - `UtcClockQualityTracker` — the system clock's `ClockQuality`. It takes the operating system's worst-case error at each update by the time daemon as the bound and grows it at the deployment's own drift figure, so the clock coasts through a lost time server where the system's 500 ppm growth would write it off in seconds. `observe(raw, utc, reported)` is the told form, `sample()` the asking one. A step of the system clock is a new `epoch`.
+- `AccuracyLimit` — one user's limit on one clock. `judge(quality, now)` returns an `AccuracyVerdict` (`usable`, `timeline_changed`, `accuracy`) and keeps an `AccuracyRecord` of excursions, time spent outside the limit and changes of timeline. Told the time, integers only, `constexpr`. This is what a user of a clock writes in place of an `is_synchronized()` check.
 - `DEFAULT_HOLDOVER_DRIFT_PPB` — 15 ppm, the drift a source assumes while it coasts when its deployment has configured nothing.
 - `MonotonicRawLine` / `MonotonicRawRateOffset` — the RAW<->MONOTONIC line: one writer samples both clocks and publishes `rate`/`offset_ns` through a seqlock; any sleeper reads it wait-free to convert a RAW deadline into a coarse MONOTONIC one. `quality()` says how well the line is known: the fit's worst residual plus half the read bracket, growing while it is not sampled.
 - `TimerConfig` — period, compensation, CPU, SCHED_FIFO priority, busy-wait threshold, stack-prefault size, resync interval, per-tick histograms.
@@ -113,6 +114,7 @@ int main()
 - `realtime_clock.hpp` — `Clock<Tag>`, concrete clock aliases, `Nanoseconds`, the `ClockType` concept, the declarations of the clock reads and the sleep, `ClockQuality`, `BoundedTime`, `ClockSource`, `ClockAdapter`, `MonotonicRawClockAdapter`, `ClockAdapterType`. No operating-system includes.
 - `realtime_clock.cpp` — the platform's clock reads and sleep; the one file to port.
 - `realtime_utc_clock.hpp` — `UtcClockQualityTracker`.
+- `realtime_accuracy_limit.hpp` — `AccuracyLimit`, `AccuracyVerdict`, `AccuracyRecord`.
 - `realtime_monotonic_raw_line.hpp` — `MonotonicRawLine`, `MonotonicRawRateOffset`, `MonotonicRawTracker` (told one typed reading of each clock per sample).
 - `realtime_timer_schedule.hpp` — `TimerSchedule<ClockAdapterT>`, `WaitResult`, `wait_result()`, the cycle-number helpers.
 - `realtime_timer.hpp` (+ `_base.hpp` / `_config.hpp` / `_event.hpp`) — `Timer<ClockAdapterT>`, `TimerBase`, `TimerConfig`, `TimerEvent<ClockT>`, `TimerCallback<ClockT>`.
@@ -144,6 +146,7 @@ int main()
 - **Every timer waits on RAW.** There is no `CLOCK_MONOTONIC`-scheduled timer: `CLOCK_MONOTONIC` appears only inside the wait, as the clock the coarse sleep is made on.
 - **Coasting, not a health flag.** A source that has lost its master keeps its rate and offset, and its `ClockQuality` grows from the last sync at its drift bound. A timer waits for the first sync only; after that it keeps its schedule and tells each wake the accuracy. The user of the time compares the accuracy with its own limit. Two things stay hard events: a source that never synchronized is unbounded, and a new timeline changes the `epoch`.
 - **Tests run on made-up time.** The timer's arithmetic is `TimerSchedule`, the wait's is `TimerBase::wake_target()` / `early_wake()` / `wait_outcome()`, and each tracker has a told form. Their tests tell them instants and never wait. A test that sleeps, or that asserts how long something took, fails on a loaded build host for no fault of the code.
+- **The limit belongs to the user of the time.** A source never says it is good enough. Each user holds an `AccuracyLimit` set from its own configuration and asks it at the instants it cares about. A latency meter stops measuring at a tenth of a millisecond; a media clock follows the system clock up to ten. A user that built something on the clock (an offset, a filter) starts it over when the verdict says `timeline_changed`.
 - **Accuracy is a worst case.** Bounds add through conversions, are rounded up, and saturate to `UNBOUNDED_ACCURACY`. A negative or unbounded input is never made to look bounded.
 
 ## Further reading

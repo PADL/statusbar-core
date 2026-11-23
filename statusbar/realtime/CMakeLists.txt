@@ -20,6 +20,7 @@ statusbar_add_module(
   statusbar-itc
   statusbar-safe_arith
   TESTS
+  realtime_accuracy_limit_test.cpp
   realtime_base_test.cpp
   realtime_clock_test.cpp
   realtime_monotonic_raw_line_test.cpp

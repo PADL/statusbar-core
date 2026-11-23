@@ -6,6 +6,7 @@
 // Realtime Utilities Module
 // Provides utilities for realtime programming: memory locking, scheduling, timing statistics
 
+#include "statusbar/realtime/realtime_accuracy_limit.hpp"
 #include "statusbar/realtime/realtime_anytimer.hpp"
 #include "statusbar/realtime/realtime_base.hpp"
 #include "statusbar/realtime/realtime_clock.hpp"
