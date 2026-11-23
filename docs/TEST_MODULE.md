@@ -137,12 +137,19 @@ assertion to pass.
   it out (as `http::HttpEngine` is split from `HttpServer`, and
   `realtime::TimerSchedule` from `Timer`) and unit-test the logic on a
   told stand-in such as `net::ToldConnectionTransport`.
-- **Who runs which.** A build (`local-build.sh`, the test presets, CI)
-  builds everything, the functional tests among it, and runs the unit
-  tests: `ctest -LE functional`. The functional tests run when
-  committing: the pre-commit hook calls core's `run-functional-tests.sh`,
-  which builds the repo's configured build directory and runs
-  `ctest -L functional` when the staged change touches C++ or CMake.
+- **Who runs which.** A build (`local-build.sh`, and so CI) builds
+  everything and makes two test runs, kept apart: the unit tests,
+  `ctest -LE functional`, then the functional tests,
+  `ctest -L functional`. Both count: a failure in either fails the build.
+  `STATUSBAR_SKIP_FUNCTIONAL_TESTS=1` leaves the functional run out, for
+  a host that cannot run them, and the unit tests still run. The
+  umbrella's test presets come in pairs for the same reason: `default`
+  is the unit tests and `default-functional` the functional ones.
+- **Before a commit, if you want it.** The pre-commit hook checks
+  formatting and the block rule. `install-hooks.sh --functional` adds a
+  third step, core's `run-functional-tests.sh`, which builds the repo's
+  configured build directory and runs `ctest -L functional` when the
+  staged change touches C++ or CMake. It is off unless asked for.
   Without a configured build directory it says so and lets the commit
   through; `STATUSBAR_SKIP_FUNCTIONAL_TESTS=1` skips it for one commit;
   `sh run-functional-tests.sh --always` runs it by hand.

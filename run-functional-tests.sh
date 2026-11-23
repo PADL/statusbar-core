@@ -2,18 +2,19 @@
 # Copyright 2026 Jeff Koftinoff <jeff.koftinoff@statusbar.com>
 # SPDX-License-Identifier: MIT
 
-# Run a repository's functional tests. What the pre-commit hook runs.
+# Run a repository's functional tests before a commit. What the pre-commit
+# hook runs when it was installed with `install-hooks.sh --functional`.
 #
 #   default:    build, then run the functional tests, when the staged change
 #               touches C++ or CMake
 #   --always:   the same whatever is staged (a run by hand)
 #
-# Unit tests test logic: they open no socket and wait for nothing, so they
-# pass or fail the same on any host, and CI runs them. Functional tests
-# exercise the real thing end to end (real sockets, a real kernel, real
-# waits). CI builds them, so they always compile, and does not run them: a
-# loaded build host is the wrong judge of them. They run here instead, on the
-# machine of whoever is committing.
+# Unit tests test logic: they open no socket and wait for nothing. Functional
+# tests exercise the real thing end to end (real sockets, a real kernel, real
+# waits). A build runs both, the unit tests first (local-build.sh, and so CI),
+# and a failure of either fails it. This script is for whoever wants the
+# functional tests run on their own machine as well, before the commit is
+# made: the hook step is optional and off unless asked for.
 #
 # They are the tests a module lists as FUNCTIONAL_TESTS, plus any ctest entry
 # labelled "functional": this runs `ctest -L functional`.
