@@ -64,6 +64,7 @@ statusbar_add_module(
   net_tcam_classifier_test.cpp
   net_tcp_server_test.cpp
   net_test.cpp
+  net_told_connection_transport_test.cpp
   net_vlan_link_test.cpp
   net_xdp_abi_test.cpp
   net_xdp_launch_time_test.cpp

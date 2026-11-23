@@ -8,7 +8,15 @@
 # .cpp files; omit for INTERFACE [DEPS           <target>...]             #
 # public statusbar-* deps [PRIVATE_DEPS   <target>...]             #
 # private-only deps [INTERFACE]                              # header-only
-# module [TESTS          <file>...])              # test .cpp files
+# module [TESTS          <file>...]               # unit test .cpp files
+# [FUNCTIONAL_TESTS <file>...])                    # functional test .cpp files
+#
+# TESTS are unit tests: they test logic, told its inputs and its time. They open
+# no socket, sleep for nothing and assert nothing about how long anything took.
+# FUNCTIONAL_TESTS exercise the real thing end to end (real sockets, a real
+# kernel, real waits); they build into their own binary and carry the ctest
+# label "functional", so `ctest -LE functional` runs the unit tests alone and
+# `ctest -L functional` the rest.
 #
 # Always registers the created target into the global STATUSBAR_INSTALL_TARGETS
 # property and sets its EXPORT_NAME to the module-name (so the exported alias
@@ -45,8 +53,9 @@ if(NOT COMMAND statusbar_register_fuzz_targets)
 endif()
 
 function(statusbar_add_module)
-  cmake_parse_arguments(ARG "INTERFACE" "NAME"
-                        "SOURCES;DEPS;PRIVATE_DEPS;TESTS" ${ARGN})
+  cmake_parse_arguments(
+    ARG "INTERFACE" "NAME" "SOURCES;DEPS;PRIVATE_DEPS;TESTS;FUNCTIONAL_TESTS"
+    ${ARGN})
 
   if(NOT ARG_NAME)
     message(FATAL_ERROR "statusbar_add_module: NAME is required")
@@ -56,7 +65,7 @@ function(statusbar_add_module)
       FATAL_ERROR
         "statusbar_add_module(${ARG_NAME}): unknown keyword(s): "
         "${ARG_UNPARSED_ARGUMENTS}. "
-        "Valid keywords are NAME, SOURCES, DEPS, PRIVATE_DEPS, INTERFACE, TESTS."
+        "Valid keywords are NAME, SOURCES, DEPS, PRIVATE_DEPS, INTERFACE, TESTS, FUNCTIONAL_TESTS."
     )
   endif()
 
@@ -105,6 +114,18 @@ function(statusbar_add_module)
       endif()
     endforeach()
     set_property(GLOBAL APPEND PROPERTY STATUSBAR_TEST_FILES ${_abs_tests})
+  endif()
+  if(ARG_FUNCTIONAL_TESTS)
+    set(_abs_tests "")
+    foreach(_t ${ARG_FUNCTIONAL_TESTS})
+      if(IS_ABSOLUTE "${_t}")
+        list(APPEND _abs_tests "${_t}")
+      else()
+        list(APPEND _abs_tests "${CMAKE_CURRENT_LIST_DIR}/${_t}")
+      endif()
+    endforeach()
+    set_property(GLOBAL APPEND PROPERTY STATUSBAR_FUNCTIONAL_TEST_FILES
+                                        ${_abs_tests})
   endif()
 endfunction()
 
@@ -189,6 +210,11 @@ function(statusbar_package_module_init)
     FULL_DOCS "accumulated test sources")
   define_property(
     GLOBAL
+    PROPERTY STATUSBAR_FUNCTIONAL_TEST_FILES
+    BRIEF_DOCS "functional test sources"
+    FULL_DOCS "accumulated functional test sources")
+  define_property(
+    GLOBAL
     PROPERTY STATUSBAR_INSTALL_TARGETS
     BRIEF_DOCS "install targets"
     FULL_DOCS "accumulated install targets")
@@ -209,6 +235,7 @@ function(statusbar_package_module_init)
   # every aggregated package.
   if(NOT STATUSBAR_AGGREGATE_BUILD)
     set_property(GLOBAL PROPERTY STATUSBAR_TEST_FILES "")
+    set_property(GLOBAL PROPERTY STATUSBAR_FUNCTIONAL_TEST_FILES "")
     set_property(GLOBAL PROPERTY STATUSBAR_INSTALL_TARGETS "")
   endif()
 endfunction()
@@ -221,6 +248,7 @@ function(statusbar_package_test_binary)
   if(STATUSBAR_AGGREGATE_BUILD)
     return()
   endif()
+  statusbar_package_functional_test_binary()
   get_property(STATUSBAR_TEST_FILES_ABS GLOBAL PROPERTY STATUSBAR_TEST_FILES)
   set(STATUSBAR_TEST_FILES "")
   foreach(TEST_FILE_ABS ${STATUSBAR_TEST_FILES_ABS})
@@ -260,6 +288,34 @@ function(statusbar_package_test_binary)
     PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL: " PASS_REGULAR_EXPRESSION
                "All tests finished\\.")
   statusbar_register_coverage_targets(statusbar_test)
+endfunction()
+
+# The package's functional tests, in a binary of their own: every file given to
+# a module as FUNCTIONAL_TESTS. Each is one ctest entry labelled "functional".
+# Called by statusbar_package_test_binary().
+function(statusbar_package_functional_test_binary)
+  get_property(_abs GLOBAL PROPERTY STATUSBAR_FUNCTIONAL_TEST_FILES)
+  if(NOT _abs OR ENABLE_NO_EXCEPTIONS)
+    return()
+  endif()
+  set(_rel "")
+  foreach(_file ${_abs})
+    file(RELATIVE_PATH _file_rel "${PROJECT_SOURCE_DIR}" "${_file}")
+    list(APPEND _rel "${_file_rel}")
+  endforeach()
+  list(SORT _rel)
+  create_test_sourcelist(_sources statusbar_functional_test.cpp ${_rel})
+  add_executable(
+    statusbar_functional_test
+    ${CMAKE_CURRENT_BINARY_DIR}/statusbar_functional_test.cpp ${_abs})
+  target_include_directories(statusbar_functional_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(statusbar_functional_test PRIVATE statusbar)
+  foreach(_file ${_rel})
+    string(REPLACE ".cpp" "" _name "${_file}")
+    add_test(NAME ${_name} COMMAND statusbar_functional_test ${_name})
+    set_tests_properties(${_name} PROPERTIES LABELS functional)
+  endforeach()
 endfunction()
 
 # Give every installed executable a statusbar- prefixed on-disk name, so the
