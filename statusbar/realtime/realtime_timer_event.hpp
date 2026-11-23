@@ -35,6 +35,14 @@ struct TimerEvent
     /// "not told".
     MonotonicRawClock::time_point wake_raw{};
 
+    /// The worst-case accuracy of this wake's schedule: how far the
+    /// schedule's clock, as the timer's adapter maps it, may be from true at
+    /// the scheduled instant. It grows while the adapter's source coasts
+    /// without its master, so a callback can decide whether the time it is
+    /// told is still good enough. UNBOUNDED_ACCURACY when the adapter
+    /// reports no quality, and for an event built by hand.
+    Nanoseconds accuracy{UNBOUNDED_ACCURACY};
+
     /// Get scheduled time as raw nanoseconds (for backward compatibility)
     [[nodiscard]] constexpr auto scheduled_time_ns() const noexcept -> int64_t { return scheduled_time.time_since_epoch().count(); }
 

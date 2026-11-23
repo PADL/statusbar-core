@@ -217,6 +217,17 @@ struct MonotonicOnlySource
 
 using MockGptpAdapter = ClockAdapter<GptpClock0, MockClockSource>;
 
+/// Whether an adapter accepts a value in a conversion, asked in a way that
+/// answers no where a plain call would be a compile error.
+template <typename A, typename T>
+concept ConvertsToRaw = requires(A const& a, T t) { a.to_raw(t); };
+
+template <typename A, typename T>
+concept ConvertsFromRaw = requires(A const& a, T t) { a.from_raw(t); };
+
+template <typename A>
+concept ReportsQuality = requires(A const& a) { a.quality(); };
+
 }  // namespace
 
 TEST(clock_source, a_source_maps_its_domain_to_and_from_raw)
@@ -254,10 +265,12 @@ TEST(clock_adapter, conversions_name_the_clock_on_both_sides)
     EXPECT_EQ(GptpClock0::to_ns(gptp), int64_t{1'100'000'000LL});
 
     // A RAW instant is not accepted as the adapter's own domain, or the
-    // other way about.
-    static_assert(!std::is_invocable_v<decltype(&MockGptpAdapter::to_raw), MockGptpAdapter const&, MonotonicRawClock::time_point>);
-    static_assert(!std::is_invocable_v<decltype(&MockGptpAdapter::from_raw), MockGptpAdapter const&, GptpClock0::time_point>);
-    static_assert(!std::is_invocable_v<decltype(&MockGptpAdapter::to_raw), MockGptpAdapter const&, int64_t>);
+    // other way about, and neither is a bare count.
+    static_assert(ConvertsToRaw<MockGptpAdapter, GptpClock0::time_point>);
+    static_assert(ConvertsFromRaw<MockGptpAdapter, MonotonicRawClock::time_point>);
+    static_assert(!ConvertsToRaw<MockGptpAdapter, MonotonicRawClock::time_point>);
+    static_assert(!ConvertsFromRaw<MockGptpAdapter, GptpClock0::time_point>);
+    static_assert(!ConvertsToRaw<MockGptpAdapter, int64_t>);
 }
 
 TEST(clock_adapter, health_is_the_sources)
@@ -291,6 +304,268 @@ TEST(clock_adapter, the_same_source_can_be_bound_to_any_clock)
     static_assert(ClockAdapterType<ClockAdapter<GptpClock<1>, MockClockSource>>);
     static_assert(ClockAdapterType<ClockAdapter<TaiClock, MockClockSource>>);
     static_assert(std::is_same_v<ClockAdapter<TaiClock, MockClockSource>::clock_type, TaiClock>);
+}
+
+//
+// ClockQuality Tests
+//
+
+namespace {
+
+constexpr auto raw_s(int64_t seconds) -> MonotonicRawClock::time_point
+{
+    return MonotonicRawClock::from_ns(seconds * 1'000'000'000);
+}
+
+/// Synchronized at RAW second 100 to within 2 us, wandering at most 1 ppm since.
+constexpr ClockQuality SYNCED{
+    .synced_at = raw_s(100),
+    .bound_at_sync = Nanoseconds{2'000},
+    .epoch = 7,
+    .drift_bound_ppb = 1'000,
+    .time_source = TimeSource::ptp,
+};
+
+}  // namespace
+
+TEST(clock_quality, a_default_quality_has_never_synchronized_and_bounds_nothing)
+{
+    constexpr ClockQuality never{};
+    static_assert(!never.is_bounded());
+    static_assert(never.uncertainty(raw_s(0)) == UNBOUNDED_ACCURACY);
+    static_assert(never.uncertainty(raw_s(1'000'000)) == UNBOUNDED_ACCURACY);
+    static_assert(!never.within(UNBOUNDED_ACCURACY, raw_s(5)));
+    static_assert(never.time_source == TimeSource::internal_oscillator);
+}
+
+TEST(clock_quality, at_the_sync_the_uncertainty_is_the_bound_at_sync)
+{
+    static_assert(SYNCED.is_bounded());
+    static_assert(SYNCED.age(raw_s(100)) == Nanoseconds::zero());
+    static_assert(SYNCED.uncertainty(raw_s(100)) == Nanoseconds{2'000});
+}
+
+TEST(clock_quality, coasting_grows_the_uncertainty_by_the_drift_bound)
+{
+    // Three missed Syncs at 8 per second: 375 ms of age costs 375 ns at 1 ppm.
+    constexpr auto three_syncs_later = raw_s(100) + std::chrono::milliseconds{375};
+    static_assert(SYNCED.age(three_syncs_later) == std::chrono::milliseconds{375});
+    static_assert(SYNCED.uncertainty(three_syncs_later) == Nanoseconds{2'375});
+
+    // Thirty seconds without the master: 30 us more. Still inside 100 us.
+    static_assert(SYNCED.uncertainty(raw_s(130)) == Nanoseconds{32'000});
+    static_assert(SYNCED.within(std::chrono::microseconds{100}, raw_s(130)));
+    // A hundred seconds: just past it.
+    static_assert(SYNCED.uncertainty(raw_s(200)) == Nanoseconds{102'000});
+    static_assert(!SYNCED.within(std::chrono::microseconds{100}, raw_s(200)));
+}
+
+TEST(clock_quality, an_instant_before_the_sync_has_age_zero)
+{
+    // Stamps taken on two threads can be a little out of order.
+    static_assert(SYNCED.age(raw_s(99)) == Nanoseconds::zero());
+    static_assert(SYNCED.uncertainty(raw_s(99)) == Nanoseconds{2'000});
+}
+
+TEST(clock_quality, a_bound_that_is_not_a_bound_claims_nothing)
+{
+    constexpr ClockQuality negative{.synced_at = raw_s(1), .bound_at_sync = Nanoseconds{-1}};
+    static_assert(!negative.is_bounded());
+    static_assert(negative.uncertainty(raw_s(2)) == UNBOUNDED_ACCURACY);
+}
+
+TEST(clock_quality, growth_saturates_and_never_wraps)
+{
+    constexpr ClockQuality fast{.synced_at = raw_s(0), .bound_at_sync = Nanoseconds{1}, .drift_bound_ppb = 0xFFFF'FFFFU};
+    static_assert(fast.is_bounded());
+    static_assert(fast.uncertainty(MonotonicRawClock::time_point::max()) == UNBOUNDED_ACCURACY);
+
+    constexpr ClockQuality nearly{
+        .synced_at = raw_s(0), .bound_at_sync = UNBOUNDED_ACCURACY - Nanoseconds{10}, .drift_bound_ppb = 1};
+    static_assert(nearly.uncertainty(raw_s(5)) == UNBOUNDED_ACCURACY - Nanoseconds{5});
+    static_assert(nearly.uncertainty(raw_s(60)) == UNBOUNDED_ACCURACY);
+}
+
+TEST(clock_quality, the_reference_read_as_itself_is_exact)
+{
+    static_assert(ClockQuality::exact().is_bounded());
+    static_assert(ClockQuality::exact().uncertainty(raw_s(1'000'000)) == Nanoseconds::zero());
+}
+
+TEST(clock_quality, a_further_step_widens_the_bound)
+{
+    constexpr auto wider = SYNCED.widened_by(Nanoseconds{500});
+    static_assert(wider.bound_at_sync == Nanoseconds{2'500});
+    static_assert(wider.uncertainty(raw_s(130)) == Nanoseconds{32'500});
+    static_assert(wider.epoch == SYNCED.epoch && wider.synced_at == SYNCED.synced_at);
+    // A step cannot make a clock better, or give a bound to one that has none.
+    static_assert(SYNCED.widened_by(Nanoseconds{-500}) == SYNCED);
+    static_assert(!ClockQuality{}.widened_by(Nanoseconds{500}).is_bounded());
+}
+
+TEST(clock_quality, is_plain_integers)
+{
+    static_assert(std::is_trivially_copyable_v<ClockQuality>);
+    static_assert(std::is_trivially_copyable_v<BoundedTime<GptpClock0>>);
+    static_assert(sizeof(ClockQuality) <= 32);
+    static_assert(sizeof(BoundedTime<GptpClock0>) == 16);
+    static_assert(static_cast<uint8_t>(TimeSource::gnss) == 0x20);
+    static_assert(static_cast<uint8_t>(TimeSource::internal_oscillator) == 0xA0);
+
+    // The same arithmetic at run time, where a compiler could not have
+    // folded it: a quality read from somewhere, an instant read from a clock.
+    ClockQuality quality = SYNCED;
+    quality.synced_at = read_monotonic_raw();
+    auto const later = quality.synced_at + std::chrono::seconds{30};
+    EXPECT_EQ(quality.uncertainty(later).count(), int64_t{32'000});
+    EXPECT_TRUE(quality.within(std::chrono::microseconds{100}, later));
+}
+
+//
+// BoundedTime Tests
+//
+
+TEST(bounded_time, a_default_bounded_time_claims_no_accuracy)
+{
+    constexpr BoundedTime<GptpClock0> unknown{};
+    static_assert(!unknown.is_bounded());
+    static_assert(!unknown.within(UNBOUNDED_ACCURACY));
+
+    constexpr BoundedTime<GptpClock0> good{.time = GptpClock0::from_ns(5), .accuracy = Nanoseconds{40}};
+    static_assert(good.is_bounded());
+    static_assert(good.within(Nanoseconds{40}));
+    static_assert(!good.within(Nanoseconds{39}));
+    static_assert(!std::is_same_v<BoundedTime<GptpClock0>, BoundedTime<MonotonicRawClock>>);
+}
+
+//
+// Adapters, with the Worst-Case Accuracy
+//
+
+namespace {
+
+/// A source that reports its quality: a fixed offset ahead of RAW, synced
+/// at a RAW instant the test sets.
+struct QualifiedSource
+{
+    static constexpr int64_t OFFSET_NS = 100'000'000;
+    ClockQuality reported{};
+    int64_t current_time_ns{0};
+
+    [[nodiscard]] auto now_ns() const noexcept -> int64_t { return current_time_ns; }
+    [[nodiscard]] auto to_raw_ns(int64_t domain_ns) const noexcept -> int64_t { return domain_ns - OFFSET_NS; }
+    [[nodiscard]] auto from_raw_ns(int64_t raw_ns) const noexcept -> int64_t { return raw_ns + OFFSET_NS; }
+    [[nodiscard]] auto is_healthy() const noexcept -> bool { return reported.is_bounded(); }
+    [[nodiscard]] auto quality() const noexcept -> ClockQuality { return reported; }
+};
+
+using QualifiedAdapter = ClockAdapter<GptpClock0, QualifiedSource>;
+
+}  // namespace
+
+TEST(bounded_adapter, a_source_may_report_its_quality_or_not)
+{
+    static_assert(QualifiedClockSource<QualifiedSource>);
+    static_assert(ClockSource<MockClockSource>);
+    static_assert(!QualifiedClockSource<MockClockSource>);
+
+    static_assert(QualifiedClockAdapter<QualifiedAdapter>);
+    static_assert(ClockAdapterType<MockGptpAdapter>);
+    static_assert(!QualifiedClockAdapter<MockGptpAdapter>);
+    static_assert(QualifiedClockAdapter<MonotonicRawClockAdapter>);
+}
+
+TEST(bounded_adapter, now_bounded_is_the_time_with_the_accuracy_at_that_instant)
+{
+    QualifiedSource source;
+    source.reported = SYNCED;  // synced at RAW second 100
+    source.current_time_ns =
+        GptpClock0::to_ns(GptpClock0::from_ns(QualifiedSource::OFFSET_NS)) + 130'000'000'000;  // RAW second 130
+    QualifiedAdapter const adapter{source};
+
+    auto const now = adapter.now_bounded();
+    static_assert(std::is_same_v<decltype(now), BoundedTime<GptpClock0> const>);
+    EXPECT_TRUE(now.time == adapter.now());
+    EXPECT_EQ(now.accuracy.count(), int64_t{32'000});
+    EXPECT_TRUE(adapter.quality() == SYNCED);
+    EXPECT_EQ(adapter.accuracy_at(raw_s(100)).count(), int64_t{2'000});
+}
+
+TEST(bounded_adapter, a_conversion_adds_its_own_accuracy_to_the_one_it_is_given)
+{
+    QualifiedSource source;
+    source.reported = SYNCED;
+    QualifiedAdapter const adapter{source};
+
+    // A gPTP time known to 300 ns, which is RAW second 130: 2 us at sync,
+    // 30 us of coasting, and the 300 ns it came with.
+    BoundedTime<GptpClock0> const gptp{
+        .time = GptpClock0::from_ns(130'000'000'000 + QualifiedSource::OFFSET_NS), .accuracy = Nanoseconds{300}};
+    auto const raw = adapter.to_raw(gptp);
+    static_assert(std::is_same_v<decltype(raw), BoundedTime<MonotonicRawClock> const>);
+    EXPECT_TRUE(raw.time == raw_s(130));
+    EXPECT_EQ(raw.accuracy.count(), int64_t{32'300});
+
+    // And back: the mapping's error is counted again, because it is used again.
+    auto const back = adapter.from_raw(raw);
+    static_assert(std::is_same_v<decltype(back), BoundedTime<GptpClock0> const>);
+    EXPECT_TRUE(back.time == gptp.time);
+    EXPECT_EQ(back.accuracy.count(), int64_t{64'300});
+
+    // The plain forms are untouched: a time in, a time out.
+    static_assert(std::is_same_v<decltype(adapter.to_raw(gptp.time)), MonotonicRawClock::time_point>);
+}
+
+TEST(bounded_adapter, a_time_of_unknown_accuracy_stays_unknown)
+{
+    QualifiedSource source;
+    source.reported = SYNCED;
+    QualifiedAdapter const adapter{source};
+
+    BoundedTime<GptpClock0> const unknown{.time = GptpClock0::from_ns(QualifiedSource::OFFSET_NS)};
+    EXPECT_FALSE(adapter.to_raw(unknown).is_bounded());
+    BoundedTime<GptpClock0> const nonsense{.time = GptpClock0::from_ns(QualifiedSource::OFFSET_NS), .accuracy = Nanoseconds{-1}};
+    EXPECT_FALSE(adapter.to_raw(nonsense).is_bounded());
+}
+
+TEST(bounded_adapter, a_source_that_reports_no_quality_claims_no_accuracy)
+{
+    MockClockSource const source;
+    MockGptpAdapter const adapter{source};
+
+    EXPECT_FALSE(adapter.now_bounded().is_bounded());
+    EXPECT_TRUE(adapter.accuracy_at(raw_s(1)) == UNBOUNDED_ACCURACY);
+    BoundedTime<GptpClock0> const exact_in{.time = GptpClock0::from_ns(1'100'000'000LL), .accuracy = Nanoseconds::zero()};
+    auto const raw = adapter.to_raw(exact_in);
+    EXPECT_EQ(MonotonicRawClock::to_ns(raw.time), int64_t{1'000'000'000LL});
+    EXPECT_FALSE(raw.is_bounded());
+    // quality() itself is only there when the source has one.
+    static_assert(!ReportsQuality<MockGptpAdapter>);
+    static_assert(ReportsQuality<QualifiedAdapter>);
+}
+
+TEST(bounded_adapter, a_source_that_never_synchronized_is_unbounded_until_it_does)
+{
+    QualifiedSource source;  // reported{} : never synchronized
+    QualifiedAdapter const adapter{source};
+    EXPECT_FALSE(adapter.now_bounded().is_bounded());
+
+    source.reported = SYNCED;
+    EXPECT_TRUE(adapter.now_bounded().is_bounded());
+}
+
+TEST(bounded_adapter, the_raw_adapter_is_exact)
+{
+    static_assert(MonotonicRawClockAdapter::quality() == ClockQuality::exact());
+    static_assert(MonotonicRawClockAdapter::accuracy_at(raw_s(5)) == Nanoseconds::zero());
+    constexpr BoundedTime<MonotonicRawClock> in{.time = raw_s(5), .accuracy = Nanoseconds{17}};
+    static_assert(MonotonicRawClockAdapter::to_raw(in) == in);
+    static_assert(MonotonicRawClockAdapter::from_raw(in) == in);
+
+    auto const before = read_monotonic_raw();
+    auto const now = MonotonicRawClockAdapter::now_bounded();
+    EXPECT_TRUE(now.time >= before);
+    EXPECT_EQ(now.accuracy.count(), int64_t{0});
 }
 
 //

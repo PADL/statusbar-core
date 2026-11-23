@@ -77,12 +77,39 @@ class Timer : public TimerBase
         MonotonicRawClock::time_point raw_deadline;
     };
 
-    /// Block until the clock adapter reports healthy (for clocks like gPTP
-    /// that need to synchronise before producing valid timestamps).
+    /// Whether the adapter's clock has synchronized, so that a schedule can
+    /// be laid on it. An adapter that reports quality is ready once it
+    /// claims a bound, and stays ready while it coasts; any other adapter
+    /// is ready while it says it is healthy.
+    [[nodiscard]] auto adapter_is_ready() const -> bool
+    {
+        if constexpr (QualifiedClockAdapter<ClockAdapterT>) {
+            return adapter_.quality().is_bounded();
+        } else {
+            return adapter_.is_healthy();
+        }
+    }
+
+    /// The worst-case accuracy of the schedule at a CLOCK_MONOTONIC_RAW
+    /// deadline, for the event. No clock is read: the deadline is the
+    /// instant, and the adapter's quality grows from its last sync to it.
+    [[nodiscard]] auto schedule_accuracy(MonotonicRawClock::time_point raw_deadline) const -> Nanoseconds
+    {
+        if constexpr (QualifiedClockAdapter<ClockAdapterT>) {
+            return adapter_.quality().uncertainty(raw_deadline);
+        } else {
+            return UNBOUNDED_ACCURACY;
+        }
+    }
+
+    /// Block until the adapter's clock is ready (for clocks like gPTP that
+    /// need to synchronise before producing valid timestamps). The timer
+    /// only waits here, once: after it has started it keeps its schedule
+    /// through a loss of sync and reports the accuracy in every event.
     /// Returns false if shutdown was requested before the adapter became ready.
     [[nodiscard]] auto wait_until_ready() -> bool override
     {
-        while (should_run() && !adapter_.is_healthy()) {
+        while (should_run() && !adapter_is_ready()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         return should_run();
@@ -133,17 +160,19 @@ class Timer : public TimerBase
     /// stats update for this tick and is caught in TimerBase::start()'s
     /// thread lambda, which lets the thread exit while the tripwire machinery
     /// drives shutdown from the monitor/main threads.
-    auto invoke_callback(time_point scheduled, int64_t wake_count, WaitResult const& wait) -> void
+    auto invoke_callback(Deadline const& deadline, int64_t wake_count, WaitResult const& wait) -> void
     {
         Nanoseconds callback_duration{0};
         if (callback_) {
+            Nanoseconds const accuracy = schedule_accuracy(deadline.raw_deadline);
             auto const callback_start = read_monotonic_raw();
             event_type const event{
-                .scheduled_time = scheduled,
+                .scheduled_time = deadline.scheduled,
                 .error = wait.error,
                 .wake_count = wake_count,
                 .skipped_counts = wait.skipped_counts,
                 .wake_raw = callback_start,
+                .accuracy = accuracy,
             };
 
             callback_(event, stats_.snapshot());
@@ -167,7 +196,7 @@ class Timer : public TimerBase
 
         while (should_run()) {
             WaitResult const wait = wait_until_raw_deadline(deadline.raw_deadline);
-            invoke_callback(deadline.scheduled, next_wake_count, wait);
+            invoke_callback(deadline, next_wake_count, wait);
 
             advance_schedule(wait, next_wake_count, deadline);
             deadline = maybe_resync_deadline(next_wake_count, deadline);

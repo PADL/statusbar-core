@@ -15,7 +15,7 @@ types they name live in core's [`realtime`](REALTIME_MODULE.md),
 | `CLOCK_MONOTONIC` | `realtime::MonotonicClock` | **Sleeping only.** The kernel can only sleep on this clock, so a sleep to a RAW deadline goes through `realtime::MonotonicRawLine` (`monotonic = rate * raw + offset`), wakes early by a guard, then spins on RAW to the exact deadline. Never time anything with it. |
 | `std::chrono::steady_clock` | `sm::Clock` / `sm::TimePoint` | **The control plane.** Protocol state machines (ADP, ACMP, AECP, MRP, gPTP port state) and the `net::MessageReactor` that drives them. Timers here are hundreds of milliseconds, so slew is harmless. It is `CLOCK_MONOTONIC` on Linux and stays that way on purpose: do not "fix" it to RAW. |
 | gPTP / PHC | `realtime::GptpClock<N>`, PHC nanoseconds | The network's media time: AVTP presentation times, CRF, launch times. Reached from RAW through a bridge (`gptp::GptpTimeBridge`, `ptpclient::PtpTimeBridge`), never read directly on a hot path. |
-| GPS, TAI | `realtime::GpsClock`, `realtime::TaiClock` | Media-clock rate tracking and TAI arithmetic. |
+| UTC, TAI | `realtime::UtcClock`, `realtime::TaiClock` | The system clock's timescale and TAI, a constant 37 s apart (`realtime::to_tai()`). Media-clock rate tracking and TAI arithmetic. What disciplines the system clock (a local GPS receiver, a distant NTP server) is not part of the type: how well the time is known is a `realtime::ClockQuality`. |
 | `CLOCK_REALTIME` | plain `int64_t` | Wall-clock output only (log lines, LTC, scene stamps). Never compared with the clocks above. |
 
 The first two rows mean the same thing on macOS as on Linux: both are read

@@ -18,6 +18,7 @@ statusbar_add_module(
   statusbar-container
   statusbar-stats
   statusbar-itc
+  statusbar-safe_arith
   TESTS
   realtime_base_test.cpp
   realtime_clock_test.cpp

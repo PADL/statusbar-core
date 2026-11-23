@@ -22,9 +22,18 @@
 /// Clock::to_ns(). A ClockAdapter binds a clock type to a ClockSource and
 /// is the one place a source's bare nanoseconds are given their domain.
 ///
-/// This header includes no operating-system header. The clock reads and
+/// How well a domain is known is a ClockQuality: a worst-case accuracy
+/// that grows from the last synchronization, so that a follower which has
+/// lost its master can keep its rate and offset and coast, and whoever
+/// uses the time decides whether it is still good enough. A time carried
+/// with that accuracy is a BoundedTime. All of it is integer arithmetic.
+///
+/// This header includes no operating-system header (the standard library
+/// and the header-only overflow checks are all it needs). The clock reads and
 /// the sleep it declares are implemented in realtime_clock.cpp, which is
 /// the one place the platform is named.
+
+#include "statusbar/safe_arith/safe_arith.hpp"
 
 #include <chrono>
 #include <concepts>
@@ -221,19 +230,26 @@ inline auto sleep_until_monotonic(MonotonicClock::time_point const deadline) noe
 namespace detail {
 
 /// `seconds * ppb + part` in nanoseconds, or the largest count when that
-/// would not fit. All three are non-negative and @p ppb is not zero.
-[[nodiscard]] constexpr auto saturating_drift_ns(int64_t const seconds, int64_t const ppb, int64_t const part) noexcept -> int64_t
+/// would not fit. The overflow is detected on the product itself, so there
+/// is no division here.
+[[nodiscard]] constexpr auto saturating_drift_ns(uint64_t const seconds, uint64_t const ppb, uint64_t const part) noexcept
+    -> int64_t
 {
-    constexpr int64_t LIMIT = Nanoseconds::max().count();
-    return seconds > (LIMIT - part) / ppb ? LIMIT : (seconds * ppb) + part;
+    constexpr auto LIMIT = static_cast<uint64_t>(Nanoseconds::max().count());
+    if (!can_multiply(seconds, ppb)) {
+        return static_cast<int64_t>(LIMIT);
+    }
+    uint64_t const whole = seconds * ppb;
+    return static_cast<int64_t>(whole > LIMIT - part ? LIMIT : whole + part);
 }
 
 }  // namespace detail
 
 /// How far a clock running @p ppb parts per billion off can move in
-/// @p elapsed: `elapsed * ppb / 1e9`, rounded up, in integers only. A
-/// result that would not fit saturates to Nanoseconds::max(). A span that
-/// is not positive drifts nothing.
+/// @p elapsed: `elapsed * ppb / 1e9`, rounded up, in integers only: two
+/// divisions by a constant and two multiplies. A result that would not fit
+/// saturates to Nanoseconds::max(). A span that is not positive drifts
+/// nothing.
 /// @param elapsed The span the drift accumulates over
 /// @param ppb The rate error, in nanoseconds per second
 [[nodiscard]] constexpr auto accumulated_drift(Nanoseconds const elapsed, uint32_t const ppb) noexcept -> Nanoseconds
@@ -247,8 +263,171 @@ namespace detail {
     // remainder_ns is below 1e9 and ppb below 2^32: the product is under
     // 4.3e18 and fits, with room for the rounding term.
     int64_t const part = ((remainder_ns * int64_t{ppb}) + (BILLION - 1)) / BILLION;
-    return Nanoseconds{detail::saturating_drift_ns(seconds, int64_t{ppb}, part)};
+    return Nanoseconds{detail::saturating_drift_ns(static_cast<uint64_t>(seconds), uint64_t{ppb}, static_cast<uint64_t>(part))};
 }
+
+//
+// Clock Quality
+//
+
+/// Where a clock's time ultimately comes from: the IEEE 1588 timeSource
+/// enumeration, so a gPTP source can fill it from the Announce it received.
+enum class TimeSource : uint8_t
+{
+    atomic_clock = 0x10,
+    gnss = 0x20,  ///< GPS or another satellite system
+    terrestrial_radio = 0x30,
+    serial_time_code = 0x39,
+    ptp = 0x40,
+    ntp = 0x50,
+    hand_set = 0x60,
+    other = 0x90,
+    internal_oscillator = 0xA0,  ///< free running
+};
+
+/// An accuracy that claims nothing: never synchronized, or not reported.
+inline constexpr Nanoseconds UNBOUNDED_ACCURACY = Nanoseconds::max();
+
+namespace detail {
+
+/// The sum of two accuracies, or UNBOUNDED_ACCURACY when either is
+/// unbounded, either is negative (not an accuracy at all), or the sum
+/// would not fit.
+[[nodiscard]] constexpr auto add_accuracy(Nanoseconds const a, Nanoseconds const b) noexcept -> Nanoseconds
+{
+    if (a < Nanoseconds::zero() || b < Nanoseconds::zero()) {
+        return UNBOUNDED_ACCURACY;
+    }
+    return a > UNBOUNDED_ACCURACY - b ? UNBOUNDED_ACCURACY : a + b;
+}
+
+}  // namespace detail
+
+/// How well a clock domain is known, as a worst-case bound that grows from
+/// the last synchronization.
+///
+/// A source that is following its master refreshes this on every sync. A
+/// source that has lost its master changes nothing: it keeps converting
+/// with the rate and offset it had, and uncertainty() grows with the time
+/// since synced_at. Nothing here says "unhealthy"; the user of the time
+/// compares uncertainty() with what its own application can tolerate.
+///
+/// A default ClockQuality has never been synchronized and bounds nothing.
+/// Trivially copyable, integers only, usable in a constant expression.
+struct ClockQuality
+{
+    /// The CLOCK_MONOTONIC_RAW instant of the last synchronization event.
+    MonotonicRawClock::time_point synced_at{};
+
+    /// The worst-case error at that instant. Negative, or
+    /// UNBOUNDED_ACCURACY, means no bound is claimed.
+    Nanoseconds bound_at_sync{UNBOUNDED_ACCURACY};
+
+    /// Changes when the timeline itself changes (a new grandmaster, a
+    /// step): time before and after is not the same clock, however small
+    /// the uncertainty.
+    uint64_t epoch{0};
+
+    /// The worst-case rate at which the error grows after synced_at, in
+    /// parts per billion (nanoseconds per second): how far the held rate
+    /// may wander, not how far the oscillator is from nominal.
+    uint32_t drift_bound_ppb{0};
+
+    /// Where the time comes from. Only a user that makes a claim about the
+    /// source needs it; most compare the accuracy and nothing else.
+    TimeSource time_source{TimeSource::internal_oscillator};
+
+    /// A clock that is exact by definition: the reference read as itself.
+    [[nodiscard]] static constexpr auto exact() noexcept -> ClockQuality
+    {
+        return {
+            .synced_at = {},
+            .bound_at_sync = Nanoseconds::zero(),
+            .epoch = 0,
+            .drift_bound_ppb = 0,
+            .time_source = TimeSource::internal_oscillator};
+    }
+
+    /// Whether any bound is claimed at all (the clock has synchronized).
+    [[nodiscard]] constexpr auto is_bounded() const noexcept -> bool
+    {
+        return bound_at_sync >= Nanoseconds::zero() && bound_at_sync != UNBOUNDED_ACCURACY;
+    }
+
+    /// The time since the last synchronization event, never negative:
+    /// an instant before synced_at has age zero.
+    /// @param now The CLOCK_MONOTONIC_RAW instant to measure to
+    [[nodiscard]] constexpr auto age(MonotonicRawClock::time_point const now) const noexcept -> Nanoseconds
+    {
+        return now > synced_at ? now - synced_at : Nanoseconds::zero();
+    }
+
+    /// The worst-case error at @p now: the bound at the last sync plus the
+    /// drift accumulated since, rounded up. UNBOUNDED_ACCURACY when no
+    /// bound is claimed or the sum does not fit. Told the time, so it reads
+    /// no clock, and it is integer arithmetic only.
+    /// @param now The CLOCK_MONOTONIC_RAW instant the error is wanted at
+    [[nodiscard]] constexpr auto uncertainty(MonotonicRawClock::time_point const now) const noexcept -> Nanoseconds
+    {
+        if (!is_bounded()) {
+            return UNBOUNDED_ACCURACY;
+        }
+        return detail::add_accuracy(bound_at_sync, accumulated_drift(age(now), drift_bound_ppb));
+    }
+
+    /// Whether the worst-case error at @p now is within @p limit.
+    /// @param limit The largest error the caller can tolerate
+    /// @param now The CLOCK_MONOTONIC_RAW instant the error is wanted at
+    [[nodiscard]] constexpr auto within(Nanoseconds const limit, MonotonicRawClock::time_point const now) const noexcept -> bool
+    {
+        return is_bounded() && uncertainty(now) <= limit;
+    }
+
+    /// This quality with @p extra added to its bound: what a further step
+    /// with an error of its own (a read bracket, a fit residual) leaves.
+    /// An @p extra that is negative adds nothing.
+    /// @param extra The worst-case error of the further step
+    [[nodiscard]] constexpr auto widened_by(Nanoseconds const extra) const noexcept -> ClockQuality
+    {
+        ClockQuality wider = *this;
+        if (is_bounded() && extra > Nanoseconds::zero()) {
+            wider.bound_at_sync = detail::add_accuracy(bound_at_sync, extra);
+        }
+        return wider;
+    }
+
+    auto operator==(ClockQuality const&) const noexcept -> bool = default;
+};
+
+/// A time together with its worst-case accuracy: the true time is within
+/// `time` plus or minus `accuracy`. What the bounded forms of the clock
+/// functions return, and what they take to carry a bound through a
+/// conversion.
+///
+/// @tparam ClockT The clock the time is on
+template <ClockType ClockT>
+struct BoundedTime
+{
+    using clock_type = ClockT;
+
+    typename ClockT::time_point time{};
+    Nanoseconds accuracy{UNBOUNDED_ACCURACY};
+
+    /// Whether any accuracy is claimed at all
+    [[nodiscard]] constexpr auto is_bounded() const noexcept -> bool
+    {
+        return accuracy >= Nanoseconds::zero() && accuracy != UNBOUNDED_ACCURACY;
+    }
+
+    /// Whether the worst-case error is within @p limit.
+    /// @param limit The largest error the caller can tolerate
+    [[nodiscard]] constexpr auto within(Nanoseconds const limit) const noexcept -> bool
+    {
+        return is_bounded() && accuracy <= limit;
+    }
+
+    auto operator==(BoundedTime const&) const noexcept -> bool = default;
+};
 
 //
 // Clock Source Concept
@@ -269,6 +448,14 @@ concept ClockSource = requires(T const& t, int64_t ns) {
     { t.to_raw_ns(ns) } -> std::convertible_to<int64_t>;
     { t.from_raw_ns(ns) } -> std::convertible_to<int64_t>;
     { t.is_healthy() } -> std::convertible_to<bool>;
+};
+
+/// A ClockSource that also reports how well its domain is known. A source
+/// without quality() is still a source: it claims no accuracy, and what is
+/// built on it behaves as it did before accuracy existed.
+template <typename T>
+concept QualifiedClockSource = ClockSource<T> && requires(T const& t) {
+    { t.quality() } -> std::convertible_to<ClockQuality>;
 };
 
 //
@@ -318,6 +505,54 @@ class ClockAdapter
     /// Whether the source's mapping is currently valid
     [[nodiscard]] auto is_healthy() const noexcept -> bool { return source_->is_healthy(); }
 
+    // With the worst-case accuracy (see ClockQuality)
+
+    /// How well the source's domain is known. Only when the source reports it.
+    [[nodiscard]] auto quality() const -> ClockQuality
+        requires QualifiedClockSource<Source>
+    {
+        return source_->quality();
+    }
+
+    /// The worst-case error of this adapter's mapping at a
+    /// CLOCK_MONOTONIC_RAW instant: UNBOUNDED_ACCURACY when the source
+    /// reports no quality. The instant is told, so no clock is read.
+    /// @param raw The instant the mapping is used at
+    [[nodiscard]] auto accuracy_at(MonotonicRawClock::time_point raw) const -> Nanoseconds
+    {
+        if constexpr (QualifiedClockSource<Source>) {
+            return source_->quality().uncertainty(raw);
+        } else {
+            return UNBOUNDED_ACCURACY;
+        }
+    }
+
+    /// Current time in this clock's domain, with its worst-case accuracy
+    [[nodiscard]] auto now_bounded() const -> BoundedTime<ClockT>
+    {
+        time_point const time = now();
+        return {.time = time, .accuracy = accuracy_at(to_raw(time))};
+    }
+
+    /// The CLOCK_MONOTONIC_RAW instant of a bounded time in this clock's
+    /// domain. The result's accuracy is the input's plus this mapping's
+    /// at the converted instant.
+    /// @param bounded Time point in this clock's domain, with its accuracy
+    [[nodiscard]] auto to_raw(BoundedTime<ClockT> bounded) const -> BoundedTime<MonotonicRawClock>
+    {
+        auto const raw = to_raw(bounded.time);
+        return {.time = raw, .accuracy = detail::add_accuracy(bounded.accuracy, accuracy_at(raw))};
+    }
+
+    /// The time in this clock's domain of a bounded CLOCK_MONOTONIC_RAW
+    /// instant. The result's accuracy is the input's plus this mapping's
+    /// at that instant.
+    /// @param bounded Time point on CLOCK_MONOTONIC_RAW, with its accuracy
+    [[nodiscard]] auto from_raw(BoundedTime<MonotonicRawClock> bounded) const -> BoundedTime<ClockT>
+    {
+        return {.time = from_raw(bounded.time), .accuracy = detail::add_accuracy(bounded.accuracy, accuracy_at(bounded.time))};
+    }
+
   private:
     Source const* source_;
 };
@@ -345,6 +580,30 @@ struct MonotonicRawClockAdapter
     [[nodiscard]] static constexpr auto from_raw(time_point raw) noexcept -> time_point { return raw; }
 
     [[nodiscard]] static constexpr auto is_healthy() noexcept -> bool { return true; }
+
+    /// The reference clock read as itself is exact.
+    [[nodiscard]] static constexpr auto quality() noexcept -> ClockQuality { return ClockQuality::exact(); }
+
+    /// The identity adds no error.
+    [[nodiscard]] static constexpr auto accuracy_at(time_point) noexcept -> Nanoseconds { return Nanoseconds::zero(); }
+
+    /// Current CLOCK_MONOTONIC_RAW time, exact
+    [[nodiscard]] static auto now_bounded() noexcept -> BoundedTime<MonotonicRawClock>
+    {
+        return {.time = read_monotonic_raw(), .accuracy = Nanoseconds::zero()};
+    }
+
+    /// Already on CLOCK_MONOTONIC_RAW (identity, the accuracy is unchanged)
+    [[nodiscard]] static constexpr auto to_raw(BoundedTime<MonotonicRawClock> bounded) noexcept -> BoundedTime<MonotonicRawClock>
+    {
+        return bounded;
+    }
+
+    /// Already on CLOCK_MONOTONIC_RAW (identity, the accuracy is unchanged)
+    [[nodiscard]] static constexpr auto from_raw(BoundedTime<MonotonicRawClock> bounded) noexcept -> BoundedTime<MonotonicRawClock>
+    {
+        return bounded;
+    }
 };
 
 //
@@ -359,6 +618,14 @@ concept ClockAdapterType = ClockType<typename T::clock_type> && requires(T const
     { t.now() } -> std::same_as<typename T::clock_type::time_point>;
     { t.to_raw(tp) } -> std::same_as<MonotonicRawClock::time_point>;
     { t.is_healthy() } -> std::convertible_to<bool>;
+};
+
+/// An adapter that also reports how well its clock is known. A Timer on one
+/// tells every wake the accuracy of its schedule; on any other adapter the
+/// wake claims none.
+template <typename T>
+concept QualifiedClockAdapter = ClockAdapterType<T> && requires(T const& t) {
+    { t.quality() } -> std::convertible_to<ClockQuality>;
 };
 
 }  // namespace statusbar::realtime

@@ -330,6 +330,8 @@ TEST(realtime_timer_event, an_event_built_by_hand_was_not_told_its_raw_entry)
     };
     static_assert(std::is_same_v<TimerEvent<>, TimerEvent<MonotonicRawClock>>);
     EXPECT_EQ(by_hand.wake_raw_ns(), int64_t{0});
+    // Nor an accuracy.
+    EXPECT_TRUE(by_hand.accuracy == UNBOUNDED_ACCURACY);
 }
 
 TEST(realtime_timer_event, the_nanosecond_accessors_read_the_typed_fields)
@@ -1199,6 +1201,143 @@ TEST(realtime_timer_domain, a_timer_on_a_gptp_adapter_schedules_in_gptp_and_meas
     int64_t const entered_late_ns = last_wake_raw_ns.load() - scheduled_raw_ns;
     EXPECT_TRUE(entered_late_ns >= last_error_ns.load());
     EXPECT_TRUE(entered_late_ns - last_error_ns.load() < 10'000'000);
+}
+
+//
+// The accuracy a timer tells with every wake
+//
+
+namespace {
+
+/// A source that reports its quality and can lose its master: while
+/// `synced` is false it keeps its mapping and stops refreshing its quality.
+struct CoastingSource
+{
+    static constexpr int64_t OFFSET_NS = 1'780'000'000'000'000'000;
+    static constexpr int64_t BOUND_AT_SYNC_NS = 500;
+    static constexpr uint32_t DRIFT_PPB = 20'000;  // 20 ppm: fast enough to see in a test
+
+    std::atomic<int64_t> synced_at_raw_ns{0};  // 0: never synchronized
+
+    auto sync_now() noexcept -> void { synced_at_raw_ns.store(read_monotonic_raw_ns(), std::memory_order_release); }
+
+    [[nodiscard]] auto now_ns() const noexcept -> int64_t { return read_monotonic_raw_ns() + OFFSET_NS; }
+    [[nodiscard]] auto to_raw_ns(int64_t domain_ns) const noexcept -> int64_t { return domain_ns - OFFSET_NS; }
+    [[nodiscard]] auto from_raw_ns(int64_t raw_ns) const noexcept -> int64_t { return raw_ns + OFFSET_NS; }
+    [[nodiscard]] auto is_healthy() const noexcept -> bool { return false; }  // a timer on a quality-reporting source does not ask
+    [[nodiscard]] auto quality() const noexcept -> ClockQuality
+    {
+        int64_t const at = synced_at_raw_ns.load(std::memory_order_acquire);
+        if (at == 0) {
+            return ClockQuality{};
+        }
+        return {
+            .synced_at = MonotonicRawClock::from_ns(at),
+            .bound_at_sync = Nanoseconds{BOUND_AT_SYNC_NS},
+            .epoch = 1,
+            .drift_bound_ppb = DRIFT_PPB,
+            .time_source = TimeSource::ptp};
+    }
+};
+
+}  // namespace
+
+TEST(realtime_timer_accuracy, a_timer_on_the_raw_clock_tells_an_exact_schedule)
+{
+    TimerConfig const config{.period_ns = RAW_PERIOD_NS, .cpu = -1, .stack_prefault_bytes = 0};
+    std::atomic<int> wakes{0};
+    std::atomic<int64_t> worst_accuracy_ns{-1};
+    Timer<> timer(config, [&](TimerEvent<MonotonicRawClock> const& event, AtomicWakeStats::Snapshot const&) {
+        worst_accuracy_ns.store(std::max(worst_accuracy_ns.load(), event.accuracy.count()));
+        wakes.fetch_add(1, std::memory_order_release);
+    });
+    timer.start();
+    for (int i = 0; i < 500 && wakes.load(std::memory_order_acquire) < 5; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    timer.stop();
+
+    EXPECT_TRUE(wakes.load() >= 5);
+    EXPECT_EQ(worst_accuracy_ns.load(), int64_t{0});
+}
+
+TEST(realtime_timer_accuracy, a_timer_on_a_source_without_quality_claims_no_accuracy)
+{
+    using Adapter = ClockAdapter<GptpClock0, OffsetSource>;
+    static_assert(!QualifiedClockAdapter<Adapter>);
+
+    OffsetSource const source;
+    TimerConfig const config{.period_ns = RAW_PERIOD_NS, .cpu = -1, .stack_prefault_bytes = 0};
+    std::atomic<int> wakes{0};
+    std::atomic<bool> every_wake_unbounded{true};
+    Timer<Adapter> timer(
+        config,
+        [&](TimerEvent<GptpClock0> const& event, AtomicWakeStats::Snapshot const&) {
+            if (event.accuracy != UNBOUNDED_ACCURACY) {
+                every_wake_unbounded.store(false);
+            }
+            wakes.fetch_add(1, std::memory_order_release);
+        },
+        Adapter{source});
+    timer.start();
+    for (int i = 0; i < 500 && wakes.load(std::memory_order_acquire) < 5; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    timer.stop();
+
+    EXPECT_TRUE(wakes.load() >= 5);
+    EXPECT_TRUE(every_wake_unbounded.load());
+}
+
+TEST(realtime_timer_accuracy, a_timer_waits_for_the_first_sync_then_coasts_and_tells_the_growing_accuracy)
+{
+    using Adapter = ClockAdapter<GptpClock0, CoastingSource>;
+    static_assert(QualifiedClockAdapter<Adapter>);
+
+    CoastingSource source;  // never synchronized yet
+    TimerConfig const config{.period_ns = RAW_PERIOD_NS, .cpu = -1, .stack_prefault_bytes = 0};
+    std::atomic<int> wakes{0};
+    std::atomic<int64_t> first_accuracy_ns{0};
+    std::atomic<int64_t> last_accuracy_ns{0};
+    std::atomic<bool> grew_every_wake{true};
+    Timer<Adapter> timer(
+        config,
+        [&](TimerEvent<GptpClock0> const& event, AtomicWakeStats::Snapshot const&) {
+            int64_t const accuracy_ns = event.accuracy.count();
+            if (wakes.load(std::memory_order_relaxed) == 0) {
+                first_accuracy_ns.store(accuracy_ns);
+            } else if (accuracy_ns <= last_accuracy_ns.load()) {
+                grew_every_wake.store(false);
+            }
+            last_accuracy_ns.store(accuracy_ns);
+            wakes.fetch_add(1, std::memory_order_release);
+        },
+        Adapter{source});
+    timer.start();
+
+    // Not synchronized: the timer thread waits and no callback runs.
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    EXPECT_EQ(wakes.load(), 0);
+
+    // One sync, and then the master is gone for good. The timer starts
+    // and keeps its schedule; nothing ever tells it to stop.
+    source.sync_now();
+    for (int i = 0; i < 1000 && wakes.load(std::memory_order_acquire) < 20; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    timer.stop();
+
+    int const count = wakes.load();
+    EXPECT_TRUE(count >= 20);
+    // Each wake is told an accuracy: the bound at the sync, plus the drift
+    // over the time since, which only grows while the source coasts.
+    EXPECT_TRUE(first_accuracy_ns.load() > CoastingSource::BOUND_AT_SYNC_NS);
+    EXPECT_TRUE(grew_every_wake.load());
+    // Nineteen periods later at 20 ppm: at least 19 * 2 ms * 20e-6 = 760 ns more.
+    int64_t const growth_ns = last_accuracy_ns.load() - first_accuracy_ns.load();
+    EXPECT_TRUE(growth_ns >= int64_t{count - 1} * RAW_PERIOD_NS * CoastingSource::DRIFT_PPB / 1'000'000'000);
+    // And no more than the whole test could account for (two seconds).
+    EXPECT_TRUE(last_accuracy_ns.load() < CoastingSource::BOUND_AT_SYNC_NS + 40'000 + 1);
 }
 
 //
