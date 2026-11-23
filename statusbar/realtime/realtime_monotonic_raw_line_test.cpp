@@ -3,13 +3,16 @@
 
 // MonotonicRawLine and MonotonicRawTracker: the RAW->MONOTONIC line a
 // sleeper converts its deadline through. The tracker tests are told their
-// samples, so they pin the fit exactly; only the last test reads clocks.
+// samples, so they pin the fit exactly and no clock is read here. The
+// asking form (sample()) is tried on the real clocks in
+// realtime_functional_test.cpp.
 
 #include "statusbar/realtime/realtime_monotonic_raw_line.hpp"
 
 #include "statusbar/realtime/realtime_base.hpp"
 #include "statusbar/test/test.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <type_traits>
@@ -172,6 +175,38 @@ TEST(monotonic_raw_line, a_line_nobody_has_fitted_claims_no_accuracy)
     EXPECT_FALSE(line.quality().is_bounded());
 }
 
+TEST(monotonic_raw_line, a_sleeper_allows_for_the_misfit_of_the_line_and_for_the_time_since_it_was_sampled)
+{
+    MonotonicRawLine line;
+    auto const now = MonotonicRawClock::from_ns(LONG_UPTIME_NS);
+    constexpr Nanoseconds AHEAD{5'000'000};
+
+    // Never sampled: nothing to count from but now. 100 ppm of 5 ms.
+    EXPECT_EQ(line.sleep_margin(now + AHEAD, now).count(), int64_t{500});
+
+    // Sampled 80 ms ago and good to 300 ns then: the margin runs from the
+    // sample to the target, 85 ms at 100 ppm, on top of the misfit.
+    line.publish_quality(
+        {.synced_at = now - Nanoseconds{80'000'000},
+         .bound_at_sync = Nanoseconds{300},
+         .epoch = 0,
+         .drift_bound_ppb = MonotonicRawTracker::DEFAULT_DRIFT_BOUND_PPB,
+         .time_source = TimeSource::internal_oscillator});
+    EXPECT_EQ(line.sleep_margin(now + AHEAD, now).count(), int64_t{300 + 8'500});
+
+    // A line 50 ppm off rate one could be slewed back by as much: 150 ppm.
+    line.publish_fixed({.slope_numerator = 1'000'050'000, .offset_ns = 0});
+    EXPECT_EQ(line.sleep_margin(now + AHEAD, now).count(), int64_t{300 + 12'750});
+
+    // Left unsampled for ten seconds the margin has grown past a
+    // millisecond: a sleeper then spins rather than trust the line.
+    auto const later = now + std::chrono::seconds{10};
+    EXPECT_EQ(line.sleep_margin(later + AHEAD, later).count(), int64_t{300 + 1'512'750});
+
+    // A target the sample is already past still owes the misfit.
+    EXPECT_EQ(line.sleep_margin(now - std::chrono::seconds{1}, now).count(), int64_t{300});
+}
+
 TEST(monotonic_raw_tracker, an_exact_fit_is_bounded_by_half_the_read_bracket)
 {
     MonotonicRawLine line;
@@ -220,8 +255,10 @@ TEST(monotonic_raw_tracker, a_rate_that_moved_within_the_window_raises_the_drift
         EXPECT_TRUE(push(tracker, raw, mono));
         mono += 100'000'000LL + (i >= 7 ? 200'000 : 0);
     }
-    EXPECT_TRUE(line.quality().drift_bound_ppb > MonotonicRawTracker::DEFAULT_DRIFT_BOUND_PPB);
-    EXPECT_TRUE(line.quality().drift_bound_ppb <= uint32_t{2'100'000});
+    // The halves differ by 2000 ppm and the fit itself sits between them,
+    // off rate one: both come on top of the frequency correction's range.
+    EXPECT_TRUE(line.quality().drift_bound_ppb >= MonotonicRawTracker::DEFAULT_DRIFT_BOUND_PPB + uint32_t{1'900'000});
+    EXPECT_TRUE(line.quality().drift_bound_ppb <= MonotonicRawTracker::DEFAULT_DRIFT_BOUND_PPB + uint32_t{4'200'000});
 }
 
 TEST(monotonic_raw_tracker, a_line_far_from_rate_one_may_move_by_as_much_as_it_is_off)
@@ -234,24 +271,9 @@ TEST(monotonic_raw_tracker, a_line_far_from_rate_one_may_move_by_as_much_as_it_i
         int64_t const raw = LONG_UPTIME_NS + (i * 100'000'000LL);
         EXPECT_TRUE(push(tracker, raw, LONG_UPTIME_NS + (i * 105'000'000LL)));
     }
-    EXPECT_TRUE(line.quality().drift_bound_ppb >= uint32_t{49'900'000});
-    EXPECT_TRUE(line.quality().drift_bound_ppb <= uint32_t{50'100'000});
-}
-
-TEST(monotonic_raw_tracker, sampling_the_clocks_gives_a_line_near_the_live_offset)
-{
-    MonotonicRawLine line;
-    MonotonicRawTracker tracker{line};
-    int64_t const bracket = tracker.sample().count();
-    EXPECT_TRUE(bracket >= 0);
-    // Right after one sample the line maps now to now, give or take the
-    // bracket and the time these reads took.
-    int64_t const raw_now = read_monotonic_raw_ns();
-    int64_t const mono_now = read_monotonic_ns();
-    EXPECT_TRUE(within(line.to_monotonic_ns(raw_now), mono_now, bracket + 1'000'000));
-    // And the line says how good it is: half the bracket it was read in.
-    EXPECT_TRUE(line.quality().is_bounded());
-    EXPECT_EQ(line.quality().bound_at_sync.count(), (bracket + 1) / 2);
+    // On top of the 500 ppm the frequency correction could add either way.
+    EXPECT_TRUE(line.quality().drift_bound_ppb >= uint32_t{50'400'000});
+    EXPECT_TRUE(line.quality().drift_bound_ppb <= uint32_t{50'600'000});
 }
 
 TEST(monotonic_raw_tracker, a_negative_bracket_takes_nothing_off_the_bound)

@@ -140,11 +140,13 @@ using GptpClock0 = GptpClock<0>;
 /// nothing at all, and how well it is known is a ClockQuality, not a type.
 using UtcClock = Clock<UtcClockTag>;
 
-/// TAI clock - International Atomic Time. A constant offset from UTC: no
-/// further leap seconds are to be applied to UTC, so the offset is fixed.
+/// TAI clock - International Atomic Time. This code takes its offset from
+/// UTC as a constant (TAI_MINUS_UTC).
 using TaiClock = Clock<TaiClockTag>;
 
-/// TAI - UTC, in force since 2017-01-01 and fixed from here on.
+/// TAI - UTC, in force since 2017-01-01. Taken as fixed: a leap second
+/// applied to UTC after that date would need this constant changed and
+/// everything built again.
 inline constexpr Nanoseconds TAI_MINUS_UTC{37'000'000'000LL};
 
 /// The TAI instant of a UTC one (exact: a constant offset)

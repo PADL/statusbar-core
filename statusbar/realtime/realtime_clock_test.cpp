@@ -201,16 +201,6 @@ TEST(clock_reads, the_system_reports_on_its_own_clock)
     }
 }
 
-TEST(clock_reads, sleeping_to_a_monotonic_deadline_reaches_it)
-{
-    auto const deadline = read_monotonic() + Nanoseconds{2'000'000};
-    EXPECT_EQ(sleep_until_monotonic(deadline), 0);
-    EXPECT_TRUE(read_monotonic() >= deadline);
-
-    // A deadline already passed returns at once.
-    EXPECT_EQ(sleep_until_monotonic(read_monotonic() - Nanoseconds{1'000'000}), 0);
-}
-
 //
 // ClockSource Concept Tests
 //

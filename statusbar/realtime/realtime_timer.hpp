@@ -38,6 +38,12 @@ namespace statusbar::realtime {
 /// accuracy told with each wake) is TimerSchedule, which is told the time and reads no
 /// clock; this class is the thread around it.
 ///
+/// When the adapter's clock moves to another timeline (a new grandmaster, a step) the
+/// wakes go on at the old grid's pace, each telling UNBOUNDED_ACCURACY, until the new
+/// timeline claims a bound; the grid is then laid again on it and TimerEvent::timeline
+/// changes. stop() returns within WAIT_SLICE of being called whatever the period; a stop
+/// asked for more than a slice before a wake leaves without that wake's callback.
+///
 /// @tparam ClockAdapterT The clock adapter type (e.g., MonotonicRawClockAdapter, ClockAdapter<GptpClock<0>, PtpTimeBridge>)
 template <ClockAdapterType ClockAdapterT = MonotonicRawClockAdapter>
 class Timer : public TimerBase
@@ -113,14 +119,22 @@ class Timer : public TimerBase
         stats_.update_with_duration(wait.error.count(), callback_duration.count(), wait.skipped_counts);
     }
 
+    /// The loop. A deadline further off than WAIT_SLICE is waited for in
+    /// slices, and between slices the thread looks at whether it should
+    /// still run and whether its clock has moved to another timeline: so
+    /// stop() never waits on a far deadline, and a grid left behind by a
+    /// timeline change is laid again however far off its next wake was.
     auto run_loop() -> void override
     {
         prime_raw_line();
         schedule_.begin(schedule_.adapter().now());
         while (should_run()) {
-            WaitResult const wait = wait_until_raw_deadline(schedule_.deadline().raw_deadline);
-            invoke_callback(wait);
-            schedule_.advance(wait);
+            if (auto const wait = wait_slice(schedule_.deadline().raw_deadline)) {
+                invoke_callback(*wait);
+                schedule_.advance(*wait);
+            } else {
+                (void)schedule_.follow_timeline(read_monotonic_raw());
+            }
         }
     }
 

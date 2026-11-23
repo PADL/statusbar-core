@@ -9,7 +9,8 @@
 /// wait ended. It reads no clock and never blocks. The whole of a timer's
 /// arithmetic lives here (the grid of period boundaries, each deadline on
 /// two clocks, the periodic resync, whether the clock is ready, the
-/// accuracy told with each wake), so all of it can be run on made-up time.
+/// accuracy told with each wake, what happens when the clock moves to
+/// another timeline), so all of it can be run on made-up time.
 /// Timer is this schedule plus a thread that waits for its deadlines.
 
 #include "statusbar/realtime/realtime_clock.hpp"
@@ -127,11 +128,39 @@ class TimerSchedule
 
     /// Lay the grid, told the adapter's time now: the first wake is
     /// start_offset_cycles past the cycle that contains @p now, far enough
-    /// ahead that thread setup cannot leave it in the past.
-    auto begin(time_point now) -> void
+    /// ahead that thread setup cannot leave it in the past. The grid
+    /// belongs to the timeline the adapter is on as this is called.
+    auto begin(time_point now) -> void { lay(adapter_timeline(), now); }
+
+    /// The timeline the grid is laid on: the adapter's ClockQuality::epoch
+    /// as begin() found it, 0 for an adapter that reports no quality.
+    [[nodiscard]] auto timeline() const noexcept -> uint64_t { return timeline_; }
+
+    /// Whether the adapter's clock has left the timeline the grid is laid
+    /// on (a new grandmaster, a step). The grid's instants are then times
+    /// of a clock that no longer exists: each wake tells
+    /// UNBOUNDED_ACCURACY and nothing is converted until
+    /// follow_timeline() has laid the grid again.
+    [[nodiscard]] auto timeline_changed() const -> bool { return adapter_timeline() != timeline_; }
+
+    /// Lay the grid again on the timeline the adapter is on now, told the
+    /// RAW instant it is. Nothing happens while the grid's timeline is
+    /// still the adapter's, or while the new one claims no bound yet: the
+    /// schedule coasts on its old grid until there is a clock to lay a new
+    /// one on. The cycle numbers of the new grid are the new timeline's,
+    /// so wake_count can jump either way.
+    /// @param raw_now The CLOCK_MONOTONIC_RAW instant it is now
+    /// @return true when the grid was laid again
+    auto follow_timeline(MonotonicRawClock::time_point raw_now) -> bool
     {
-        wake_count_ = cycle_number(now, config_.period) + config_.start_offset_cycles;
-        deadline_ = fresh_deadline();
+        if (!timeline_changed() || !is_ready()) {
+            return false;
+        }
+        // The timeline is noted before the instant is converted on it: had
+        // it changed again in between, the next look finds that out.
+        uint64_t const timeline = adapter_timeline();
+        lay(timeline, adapter_.from_raw(raw_now));
+        return true;
     }
 
     /// The deadline to wait for next.
@@ -142,11 +171,13 @@ class TimerSchedule
 
     /// The worst-case accuracy of the schedule at the deadline. No clock is
     /// read: the deadline is the instant, and the adapter's quality grows
-    /// from its last sync to it.
+    /// from its last sync to it. A quality of another timeline than the
+    /// grid's says nothing about the grid: UNBOUNDED_ACCURACY.
     [[nodiscard]] auto accuracy() const -> Nanoseconds
     {
         if constexpr (QualifiedClockAdapter<ClockAdapterT>) {
-            return adapter_.quality().uncertainty(deadline_.raw_deadline);
+            ClockQuality const quality = adapter_.quality();
+            return quality.epoch == timeline_ ? quality.uncertainty(deadline_.raw_deadline) : UNBOUNDED_ACCURACY;
         } else {
             return UNBOUNDED_ACCURACY;
         }
@@ -163,6 +194,7 @@ class TimerSchedule
             .wake_count = wake_count_,
             .skipped_counts = wait.skipped_counts,
             .accuracy = accuracy(),
+            .timeline = timeline_,
         };
     }
 
@@ -173,19 +205,51 @@ class TimerSchedule
     /// fresh conversion cancels what has accumulated. At 1000 cycles of a
     /// 125 us period and 11 ppm of skew that caps the error near 1.4 us; it
     /// scales with the period, so a slow timer wants a smaller interval.
+    ///
+    /// When the adapter's clock has moved to another timeline the grid is
+    /// laid again from the instant this wake ended (follow_timeline), and
+    /// until that can be done nothing is converted: a grid of the old
+    /// timeline put through the new one's mapping could land anywhere.
     auto advance(WaitResult const& wait) -> void
     {
-        int64_t const periods = wait.skipped_counts + 1;
-        Nanoseconds const step = config_.period * periods;
-        wake_count_ += periods;
-        deadline_.scheduled += step;
-        deadline_.raw_deadline += step;
-        if (config_.resync_interval_cycles > 0 && (wake_count_ % config_.resync_interval_cycles) == 0) {
+        // wait.error is measured from the uncompensated RAW deadline.
+        auto const woke = deadline_.raw_deadline + wait.error;
+        step(wait.skipped_counts + 1);
+        if (timeline_changed()) {
+            (void)follow_timeline(woke);
+        } else if (config_.resync_interval_cycles > 0 && (wake_count_ % config_.resync_interval_cycles) == 0) {
             deadline_ = fresh_deadline();
         }
     }
 
   private:
+    /// Lay the grid on @p timeline from @p now, a time of that timeline.
+    auto lay(uint64_t timeline, time_point now) -> void
+    {
+        timeline_ = timeline;
+        wake_count_ = cycle_number(now, config_.period) + config_.start_offset_cycles;
+        deadline_ = fresh_deadline();
+    }
+
+    /// Move both instants on by @p periods.
+    auto step(int64_t periods) noexcept -> void
+    {
+        Nanoseconds const span = config_.period * periods;
+        wake_count_ += periods;
+        deadline_.scheduled += span;
+        deadline_.raw_deadline += span;
+    }
+
+    /// The timeline the adapter's clock is on now.
+    [[nodiscard]] auto adapter_timeline() const -> uint64_t
+    {
+        if constexpr (QualifiedClockAdapter<ClockAdapterT>) {
+            return adapter_.quality().epoch;
+        } else {
+            return 0;
+        }
+    }
+
     /// Both instants of the current cycle, converted afresh.
     [[nodiscard]] auto fresh_deadline() const -> Deadline
     {
@@ -197,6 +261,7 @@ class TimerSchedule
     Config config_;
     int64_t wake_count_{0};
     Deadline deadline_{};
+    uint64_t timeline_{0};
 };
 
 }  // namespace statusbar::realtime

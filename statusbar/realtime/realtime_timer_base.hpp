@@ -89,6 +89,10 @@ class TimerBase
     /// the affinity could not be set.
     [[nodiscard]] auto prepare_cpu() -> bool;
 
+    /// The longest a timer thread sleeps toward one deadline before it looks
+    /// again at whether it should still run.
+    static constexpr Nanoseconds WAIT_SLICE{100'000'000};
+
     /// Sleep until an absolute CLOCK_MONOTONIC deadline: the coarse sleep
     /// under every RAW wait.
     /// @return wake error (positive = late)
@@ -111,9 +115,9 @@ class TimerBase
 
     /// Where on CLOCK_MONOTONIC the coarse sleep toward @p target_raw should
     /// end, told that RAW now reads @p raw_now: the target through the
-    /// timer's line, less the spin guard and the slew the line says the
-    /// sleep could accrue. Empty when that is already here and the whole
-    /// wait is a spin.
+    /// timer's line, less the spin guard and what the line says its own
+    /// conversion could be late by (MonotonicRawLine::sleep_margin). Empty
+    /// when that is already here and the whole wait is a spin.
     [[nodiscard]] auto early_wake(MonotonicRawClock::time_point target_raw, MonotonicRawClock::time_point raw_now) const noexcept
         -> std::optional<MonotonicClock::time_point>;
 
@@ -129,12 +133,24 @@ class TimerBase
     /// convert the (compensated) deadline to CLOCK_MONOTONIC through the
     /// timer's own line, sleep until a guard before it, then spin on RAW to
     /// the exact instant. The guard is config_.raw_spin_guard_ns (or
-    /// busy_wait_threshold_ns in busy_wait mode) plus the slew the line says
-    /// the sleep could accrue, so the sleep never overshoots. Error and
+    /// busy_wait_threshold_ns in busy_wait mode) plus the line's own margin
+    /// (its last misfit and the slew it could have accrued since it was
+    /// sampled), so the sleep never overshoots. Error and
     /// skipped-cycle counts are measured on RAW against the uncompensated
     /// @p raw_deadline, so statistics remain comparable across compensation
-    /// settings. Re-samples the line when it is due.
+    /// settings. Re-samples the line when it is due. Does not return before
+    /// the deadline, however far off it is: a loop that must stay
+    /// stoppable uses wait_slice.
     auto wait_until_raw_deadline(MonotonicRawClock::time_point raw_deadline) noexcept -> WaitResult;
+
+    /// One slice of that wait. When the early wake is within @p slice of
+    /// now this is the whole wait and its result is returned. Otherwise the
+    /// thread sleeps for the slice and empty is returned, the deadline
+    /// still ahead: the caller decides whether to go on waiting for it.
+    /// @param raw_deadline The CLOCK_MONOTONIC_RAW deadline (uncompensated)
+    /// @param slice The longest to sleep in this call
+    [[nodiscard]] auto wait_slice(MonotonicRawClock::time_point raw_deadline, Nanoseconds slice = WAIT_SLICE) noexcept
+        -> std::optional<WaitResult>;
 
     /// Give the line a rate before the schedule is seeded: two samples a
     /// millisecond apart. A run loop calls this first, so the millisecond
@@ -152,6 +168,11 @@ class TimerBase
     /// Prime the line if it never was, else re-sample it once
     /// raw_line_sample_interval_ns has passed.
     auto track_raw_line(MonotonicRawClock::time_point raw_now) noexcept -> void;
+
+    /// The coarse part of a RAW wait, for at most @p slice.
+    /// @return true when it ended at the early wake (or there was none to
+    ///         sleep to), false when the slice ran out first.
+    [[nodiscard]] auto sleep_toward(MonotonicRawClock::time_point target_raw, Nanoseconds slice) noexcept -> bool;
 
     /// The exact part of a RAW wait. @return the RAW time at which it ended.
     [[nodiscard]] static auto spin_until_raw(MonotonicRawClock::time_point target_raw) noexcept -> MonotonicRawClock::time_point;

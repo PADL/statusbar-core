@@ -13,11 +13,13 @@
 #include "statusbar/realtime/realtime_base.hpp"
 #include "statusbar/realtime/realtime_tripwire.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 
 namespace statusbar::realtime {
 
@@ -71,6 +73,11 @@ auto TimerBase::start(statusbar::itc::StopToken* shutdown_token) -> void
 {
     if (!try_start()) {
         return;  // Already running
+    }
+    // A thread that left on its own (see stop()) cleared the flag and is
+    // still joinable: assigning over it would terminate the process.
+    if (timer_thread_.joinable()) {
+        timer_thread_.join();
     }
     shutdown_token_ = shutdown_token;
     timer_thread_ = std::thread([this]() -> void {
@@ -170,12 +177,33 @@ auto TimerBase::wait_until_absolute(MonotonicClock::time_point const deadline) n
 
 auto TimerBase::wait_until_raw_deadline(MonotonicRawClock::time_point const raw_deadline) noexcept -> WaitResult
 {
+    for (;;) {
+        if (auto const result = wait_slice(raw_deadline)) {
+            return *result;
+        }
+    }
+}
+
+auto TimerBase::wait_slice(MonotonicRawClock::time_point const raw_deadline, Nanoseconds const slice) noexcept
+    -> std::optional<WaitResult>
+{
     auto const target_raw = wake_target(raw_deadline);
-    track_raw_line(read_monotonic_raw());
-    if (auto const wake = early_wake(target_raw, read_monotonic_raw())) {
-        (void)wait_until_absolute(*wake);
+    if (!sleep_toward(target_raw, slice)) {
+        return std::nullopt;
     }
     return wait_outcome(raw_deadline, spin_until_raw(target_raw));
+}
+
+auto TimerBase::sleep_toward(MonotonicRawClock::time_point const target_raw, Nanoseconds const slice) noexcept -> bool
+{
+    track_raw_line(read_monotonic_raw());
+    auto const wake = early_wake(target_raw, read_monotonic_raw());
+    if (!wake) {
+        return true;
+    }
+    auto const slice_end = read_monotonic() + slice;
+    (void)wait_until_absolute(std::min(*wake, slice_end));
+    return *wake <= slice_end;
 }
 
 auto TimerBase::prime_raw_line() noexcept -> void
@@ -207,13 +235,9 @@ auto TimerBase::track_raw_line(MonotonicRawClock::time_point const raw_now) noex
 auto TimerBase::early_wake(MonotonicRawClock::time_point const target_raw, MonotonicRawClock::time_point const raw_now)
     const noexcept -> std::optional<MonotonicClock::time_point>
 {
-    // The line's rate error after the 1 ms priming baseline, in parts per
-    // billion; added to the measured slew so the early wake stays early.
-    constexpr int64_t RATE_MARGIN_PPB = 100'000;
-    auto const slew_ppb = static_cast<uint32_t>(raw_line_.rate_deviation_ppb() + RATE_MARGIN_PPB);
     Nanoseconds const remaining = target_raw - raw_now;
     Nanoseconds const guard = Nanoseconds{config_.busy_wait ? config_.busy_wait_threshold_ns : config_.raw_spin_guard_ns} +
-        accumulated_drift(remaining, slew_ppb);
+        raw_line_.sleep_margin(target_raw, raw_now);
     if (remaining <= guard) {
         return std::nullopt;
     }

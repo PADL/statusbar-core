@@ -121,6 +121,15 @@ struct Sums
     return spread >= 4e9 ? UINT32_MAX : static_cast<uint32_t>(std::ceil(spread));
 }
 
+/// The line's drift bound: the range of the system clock's frequency
+/// correction, the line's own distance from rate one and the spread seen
+/// in the window, all three together. Saturates.
+[[nodiscard]] auto drift_bound_ppb(uint32_t const spread_ppb, int64_t const deviation_ppb) noexcept -> uint32_t
+{
+    int64_t const sum = int64_t{MonotonicRawTracker::DEFAULT_DRIFT_BOUND_PPB} + int64_t{spread_ppb} + deviation_ppb;
+    return sum >= int64_t{UINT32_MAX} ? UINT32_MAX : static_cast<uint32_t>(sum);
+}
+
 }  // namespace
 
 auto MonotonicRawLine::slope_numerator(double rate) noexcept -> int64_t
@@ -140,6 +149,17 @@ auto MonotonicRawLine::from_monotonic_ns(int64_t mono_ns) const noexcept -> int6
     return scale(mono_ns - line.offset_ns, SLOPE_DENOMINATOR, line.slope_numerator);
 }
 
+auto MonotonicRawLine::sleep_margin(
+    MonotonicRawClock::time_point const target_raw, MonotonicRawClock::time_point const raw_now) const noexcept -> Nanoseconds
+{
+    auto const slew_ppb = static_cast<uint32_t>(rate_deviation_ppb() + SLEEP_RATE_MARGIN_PPB);
+    ClockQuality const known = quality();
+    if (!known.is_bounded()) {
+        return accumulated_drift(target_raw - raw_now, slew_ppb);
+    }
+    return known.bound_at_sync + accumulated_drift(target_raw - known.synced_at, slew_ppb);
+}
+
 auto MonotonicRawTracker::push(
     MonotonicRawClock::time_point const raw, MonotonicClock::time_point const mono, Nanoseconds const bracket) noexcept -> bool
 {
@@ -156,8 +176,7 @@ auto MonotonicRawTracker::push(
          .bound_at_sync = worst_residual(window_, *line_) +
              (bracket > Nanoseconds::zero() ? (bracket + Nanoseconds{1}) / 2 : Nanoseconds::zero()),
          .epoch = 0,
-         .drift_bound_ppb =
-             std::max({DEFAULT_DRIFT_BOUND_PPB, rate_spread_ppb(window_), static_cast<uint32_t>(line_->rate_deviation_ppb())}),
+         .drift_bound_ppb = drift_bound_ppb(rate_spread_ppb(window_), line_->rate_deviation_ppb()),
          .time_source = TimeSource::internal_oscillator});
     return true;
 }

@@ -92,6 +92,24 @@ class MonotonicRawLine
         return deviation < 0 ? -deviation : deviation;
     }
 
+    /// The line's rate error after a 1 ms priming baseline, in parts per
+    /// billion: added to its distance from rate one in sleep_margin, so
+    /// that an early wake stays early.
+    static constexpr int64_t SLEEP_RATE_MARGIN_PPB = 100'000;
+
+    /// How much earlier than to_monotonic(@p target_raw) a sleeper has to
+    /// aim to be sure of waking before the target: the line's misfit when
+    /// it was last sampled (its fit residual and half the read bracket),
+    /// plus the slew it could have accrued from that sample to the target,
+    /// at the line's distance from rate one and SLEEP_RATE_MARGIN_PPB. The
+    /// longer the line goes unsampled the larger this is, and the more of
+    /// a wait is spent spinning. A line never sampled (the identity) has no
+    /// sample to count from: the slew is counted from @p raw_now.
+    /// @param target_raw The CLOCK_MONOTONIC_RAW instant to be awake before
+    /// @param raw_now The CLOCK_MONOTONIC_RAW instant it is now
+    [[nodiscard]] auto sleep_margin(MonotonicRawClock::time_point target_raw, MonotonicRawClock::time_point raw_now) const noexcept
+        -> Nanoseconds;
+
     /// Writer side: how well the line just published is known.
     void publish_quality(ClockQuality const& quality) noexcept { quality_.store(quality); }
 
@@ -147,10 +165,10 @@ class MonotonicRawTracker
 
     /// How fast CLOCK_MONOTONIC may move against RAW while the line is not
     /// being sampled: 500 ppm, the range of the system clock's frequency
-    /// correction. A line seen further from rate one than that is under a
-    /// tick adjustment and may move by as much as it is off; a rate seen
-    /// moving more within the window counts too. The largest of the three
-    /// is the line's drift bound.
+    /// correction. A line seen away from rate one may move back by as much
+    /// as it is off, and a rate seen moving within the window may move as
+    /// much again. The three can happen together, so the line's drift
+    /// bound is their sum.
     static constexpr uint32_t DEFAULT_DRIFT_BOUND_PPB = 500'000;
 
     explicit MonotonicRawTracker(MonotonicRawLine& line, size_t window = DEFAULT_WINDOW) noexcept

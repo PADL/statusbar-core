@@ -27,7 +27,9 @@ statusbar_add_module(
   realtime_stats_test.cpp
   realtime_timer_test.cpp
   realtime_tripwire_test.cpp
-  realtime_utc_clock_test.cpp)
+  realtime_utc_clock_test.cpp
+  FUNCTIONAL_TESTS
+  realtime_functional_test.cpp)
 
 add_executable(realtime_timer_example realtime_timer_example.cpp)
 target_link_libraries(realtime_timer_example PRIVATE statusbar)

@@ -43,6 +43,14 @@ struct TimerEvent
     /// reports no quality, and for an event built by hand.
     Nanoseconds accuracy{UNBOUNDED_ACCURACY};
 
+    /// The timeline of the adapter's clock the schedule is laid on: its
+    /// ClockQuality::epoch, 0 for an adapter that reports no quality and
+    /// for an event built by hand. When it differs from the wake before,
+    /// the clock moved to another timeline (a new grandmaster, a step) and
+    /// the grid was laid again: scheduled_time and wake_count are not
+    /// comparable with the earlier ones.
+    uint64_t timeline{0};
+
     /// Get scheduled time as raw nanoseconds (for backward compatibility)
     [[nodiscard]] constexpr auto scheduled_time_ns() const noexcept -> int64_t { return scheduled_time.time_since_epoch().count(); }
 
