@@ -302,6 +302,37 @@ TEST(http_ws, binary_echo_and_server_push)
     EXPECT_TRUE(frames[0].payload == push);
 }
 
+TEST(http_ws, a_send_too_large_to_copy_is_refused_and_the_connection_carries_on)
+{
+    Fixture fx;
+    ToldClient c{fx.site.wire};
+    (void)fx.upgrade(c);
+    size_t const slot = fx.echo.opens[0];
+    // What the tx buffer holds behind a four-byte frame header.
+    size_t const room = ws_limits().max_response_head - 4;
+
+    std::vector<uint8_t> const too_large(room + 1, uint8_t{0x55});
+    EXPECT_FALSE(fx.server->ws_send(slot, too_large, false));
+    fx.pump(5);
+    EXPECT_TRUE(c.received_bytes().empty());  // nothing of the refused frame went out
+
+    // The refusal left nothing staged: the largest frame that fits goes out next,
+    std::vector<uint8_t> const fits(room, uint8_t{0x33});
+    EXPECT_TRUE(fx.server->ws_send(slot, fits, false));
+    fx.pump(5);
+    auto frames = parse_server_frames(c.received_bytes());
+    EXPECT_EQ(frames.size(), 1U);
+    EXPECT_EQ(frames[0].payload.size(), room);
+
+    // and the engine still reads what the peer sends.
+    c.send_all(masked_frame(WsOpcode::text, true, "hello"));
+    fx.pump();
+    EXPECT_EQ(fx.echo.messages.size(), 1U);
+    frames = parse_server_frames(c.received_bytes());
+    EXPECT_EQ(frames.size(), 1U);
+    EXPECT_TRUE(frames[0].payload == "hello");
+}
+
 TEST(http_ws, close_handshake_and_protocol_errors)
 {
     Fixture fx;

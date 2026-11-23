@@ -1260,7 +1260,11 @@ auto HttpEngine::ws_stage_frame_bytes(Connection& c, WsOpcode opcode, std::span<
     -> bool
 {
     auto const header_len = ws_write_frame_header(c.tx, opcode, true, payload.size());
-    if (header_len == 0) {
+    // A copied payload goes behind the header in tx. One that does not fit
+    // is refused before anything is staged: a header left staged with no
+    // frame to follow would make the connection look busy for good, and it
+    // would neither send nor read again.
+    if (header_len == 0 || (!external && header_len + payload.size() > c.tx.size())) {
         return false;
     }
     c.stage_tx(header_len);

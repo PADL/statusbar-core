@@ -397,8 +397,9 @@ class HttpEngine : private net::TcpConnectionHandler
     [[nodiscard]] auto ws_deliver_message(size_t slot) -> bool;
     auto ws_stage_frame(size_t slot, WsOpcode opcode, std::span<uint8_t const> payload, bool external, int64_t now_ns) noexcept
         -> bool;
-    /// The frame's header and payload into tx and the body fields; false
-    /// when the header cannot be written or a copied payload does not fit.
+    /// The frame's header and payload into tx and the body fields; false,
+    /// with nothing staged, when the header cannot be written or a copied
+    /// payload does not fit.
     [[nodiscard]] static auto ws_stage_frame_bytes(
         Connection& c, WsOpcode opcode, std::span<uint8_t const> payload, bool external) noexcept -> bool;
     void ws_fail(size_t slot, uint16_t code, int64_t now_ns);
