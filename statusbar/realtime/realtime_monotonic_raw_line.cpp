@@ -3,6 +3,7 @@
 
 #include "statusbar/realtime/realtime_monotonic_raw_line.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <optional>
@@ -90,6 +91,36 @@ struct Sums
     return std::fabs(rate - 1.0) <= MonotonicRawTracker::MAX_RATE_PPM * 1e-6;
 }
 
+/// The furthest any sample of the window lies from the line, in whole
+/// nanoseconds rounded up: the fit's worst case over what it was fitted to.
+[[nodiscard]] auto worst_residual(Window const& window, MonotonicRawLine const& line) noexcept -> Nanoseconds
+{
+    int64_t worst = 0;
+    for (size_t i = 0; i < window.size(); ++i) {
+        int64_t const miss = MonotonicClock::to_ns(line.to_monotonic(window[i].raw)) - MonotonicClock::to_ns(window[i].mono);
+        worst = std::max(worst, miss < 0 ? -miss : miss);
+    }
+    return Nanoseconds{worst};
+}
+
+/// The spread of the slope over the window's two halves, in parts per
+/// billion: how far the rate the line now holds may be from the rate it
+/// would be given next. Zero until both halves span some time.
+[[nodiscard]] auto rate_spread_ppb(Window const& window) noexcept -> uint32_t
+{
+    size_t const half = window.size() / 2;
+    if (half < 2) {
+        return 0;
+    }
+    auto const slope_ppb = [&window](size_t const from, size_t const to) -> double {
+        auto const dx = static_cast<double>((window[to].raw - window[from].raw).count());
+        auto const dy = static_cast<double>((window[to].mono - window[from].mono).count());
+        return dx > 0.0 ? (dy / dx) * 1e9 : 1e9;
+    };
+    double const spread = std::fabs(slope_ppb(0, half - 1) - slope_ppb(half, window.size() - 1));
+    return spread >= 4e9 ? UINT32_MAX : static_cast<uint32_t>(std::ceil(spread));
+}
+
 }  // namespace
 
 auto MonotonicRawLine::slope_numerator(double rate) noexcept -> int64_t
@@ -109,7 +140,8 @@ auto MonotonicRawLine::from_monotonic_ns(int64_t mono_ns) const noexcept -> int6
     return scale(mono_ns - line.offset_ns, SLOPE_DENOMINATOR, line.slope_numerator);
 }
 
-auto MonotonicRawTracker::push(MonotonicRawClock::time_point const raw, MonotonicClock::time_point const mono) noexcept -> bool
+auto MonotonicRawTracker::push(
+    MonotonicRawClock::time_point const raw, MonotonicClock::time_point const mono, Nanoseconds const bracket) noexcept -> bool
 {
     window_.push({.raw = raw, .mono = mono});
     auto const fit = fit_window(window_);
@@ -117,6 +149,16 @@ auto MonotonicRawTracker::push(MonotonicRawClock::time_point const raw, Monotoni
         return false;
     }
     line_->publish(*fit);
+    // The quality of what was just published: fitted on the writer's side,
+    // so that a reader's uncertainty() stays integer arithmetic.
+    line_->publish_quality(
+        {.synced_at = raw,
+         .bound_at_sync =
+             worst_residual(window_, *line_) + (bracket > Nanoseconds::zero() ? (bracket + Nanoseconds{1}) / 2 : bracket),
+         .epoch = 0,
+         .drift_bound_ppb =
+             std::max({DEFAULT_DRIFT_BOUND_PPB, rate_spread_ppb(window_), static_cast<uint32_t>(line_->rate_deviation_ppb())}),
+         .time_source = TimeSource::internal_oscillator});
     return true;
 }
 
@@ -126,7 +168,7 @@ auto MonotonicRawTracker::sample() noexcept -> Nanoseconds
     auto const mono = read_monotonic();
     auto const raw_after = read_monotonic_raw();
     Nanoseconds const bracket = raw_after - raw_before;
-    (void)push(raw_before + (bracket / 2), mono);
+    (void)push(raw_before + (bracket / 2), mono, bracket);
     return bracket;
 }
 

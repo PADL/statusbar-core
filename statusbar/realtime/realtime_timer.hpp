@@ -7,6 +7,7 @@
 #include "statusbar/realtime/realtime_timer_base.hpp"
 #include "statusbar/realtime/realtime_timer_config.hpp"
 #include "statusbar/realtime/realtime_timer_event.hpp"
+#include "statusbar/realtime/realtime_timer_schedule.hpp"
 #include "statusbar/realtime/realtime_tripwire.hpp"
 #include "statusbar/stats/stats.hpp"
 
@@ -33,6 +34,10 @@ namespace statusbar::realtime {
 /// adapter, and the timer waits for that: it sleeps early on CLOCK_MONOTONIC and spins on
 /// RAW to the exact instant (TimerBase::wait_until_raw_deadline).
 ///
+/// The arithmetic of that (the grid, the two instants of each deadline, the resync, the
+/// accuracy told with each wake) is TimerSchedule, which is told the time and reads no
+/// clock; this class is the thread around it.
+///
 /// @tparam ClockAdapterT The clock adapter type (e.g., MonotonicRawClockAdapter, ClockAdapter<GptpClock<0>, PtpTimeBridge>)
 template <ClockAdapterType ClockAdapterT = MonotonicRawClockAdapter>
 class Timer : public TimerBase
@@ -55,7 +60,11 @@ class Timer : public TimerBase
     ///                represents a usable runtime state (e.g. MonotonicRawClockAdapter).
     Timer(TimerConfig const& config, callback_type callback, ClockAdapterT adapter = ClockAdapterT{})
         : TimerBase{config}
-        , adapter_{std::move(adapter)}
+        , schedule_{
+              std::move(adapter),
+              {.period = period(),
+               .start_offset_cycles = config.start_offset_cycles,
+               .resync_interval_cycles = config.resync_interval_cycles}}
         , callback_{std::move(callback)}
     {}
 
@@ -66,42 +75,11 @@ class Timer : public TimerBase
     Timer(Timer&&) = delete;
     auto operator=(Timer&&) -> Timer& = delete;
 
+    /// The schedule this timer's thread is working through. The thread
+    /// writes it; read it from another thread only while the timer is stopped.
+    [[nodiscard]] auto schedule() const noexcept -> TimerSchedule<ClockAdapterT> const& { return schedule_; }
+
   protected:
-    /// The two instants that drive each tick, one per clock: @p scheduled
-    /// is the canonical target in the adapter's clock domain (used for
-    /// event data and stats); @p raw_deadline is the same instant on
-    /// CLOCK_MONOTONIC_RAW, the clock the wait is made on.
-    struct Deadline
-    {
-        time_point scheduled;
-        MonotonicRawClock::time_point raw_deadline;
-    };
-
-    /// Whether the adapter's clock has synchronized, so that a schedule can
-    /// be laid on it. An adapter that reports quality is ready once it
-    /// claims a bound, and stays ready while it coasts; any other adapter
-    /// is ready while it says it is healthy.
-    [[nodiscard]] auto adapter_is_ready() const -> bool
-    {
-        if constexpr (QualifiedClockAdapter<ClockAdapterT>) {
-            return adapter_.quality().is_bounded();
-        } else {
-            return adapter_.is_healthy();
-        }
-    }
-
-    /// The worst-case accuracy of the schedule at a CLOCK_MONOTONIC_RAW
-    /// deadline, for the event. No clock is read: the deadline is the
-    /// instant, and the adapter's quality grows from its last sync to it.
-    [[nodiscard]] auto schedule_accuracy(MonotonicRawClock::time_point raw_deadline) const -> Nanoseconds
-    {
-        if constexpr (QualifiedClockAdapter<ClockAdapterT>) {
-            return adapter_.quality().uncertainty(raw_deadline);
-        } else {
-            return UNBOUNDED_ACCURACY;
-        }
-    }
-
     /// Block until the adapter's clock is ready (for clocks like gPTP that
     /// need to synchronise before producing valid timestamps). The timer
     /// only waits here, once: after it has started it keeps its schedule
@@ -109,74 +87,28 @@ class Timer : public TimerBase
     /// Returns false if shutdown was requested before the adapter became ready.
     [[nodiscard]] auto wait_until_ready() -> bool override
     {
-        while (should_run() && !adapter_is_ready()) {
+        while (should_run() && !schedule_.is_ready()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         return should_run();
     }
 
-    /// Compute both instants from @p next_wake_count as a fresh pair. Used
-    /// for the initial deadline setup in run_loop and (via
-    /// maybe_resync_deadline) for the periodic drift correction.
-    [[nodiscard]] auto resync_deadline(int64_t next_wake_count) const -> Deadline
-    {
-        time_point const scheduled = cycle_start<clock_type>(next_wake_count, period());
-        return {.scheduled = scheduled, .raw_deadline = adapter_.to_raw(scheduled)};
-    }
-
-    /// Periodic drift correction: every resync_interval_cycles wakes, return
-    /// a freshly-computed Deadline to cancel the slope error accumulated by
-    /// advancing the RAW deadline directly in advance_schedule. On
-    /// non-resync ticks this returns @p current unchanged. At the default
-    /// 1000-cycle cadence and ~11 ppm clock skew the resync caps residual
-    /// error at ~1.4µs; a resync_interval_cycles of 0 disables it.
-    [[nodiscard]] auto maybe_resync_deadline(int64_t next_wake_count, Deadline current) const -> Deadline
-    {
-        int64_t const interval = config_.resync_interval_cycles;
-        if (interval > 0 && (next_wake_count % interval) == 0) {
-            return resync_deadline(next_wake_count);
-        }
-        return current;
-    }
-
-    /// Advance the loop-carried wake state by (skipped_counts + 1) periods.
-    /// Both instants move by the same duration, although their clocks tick
-    /// at slightly different rates — this is the key optimisation that
-    /// avoids re-running the adapter's slope conversion every tick (the tiny
-    /// accumulated drift is fixed up by the periodic resync in run_loop).
-    auto advance_schedule(WaitResult const& wait, int64_t& next_wake_count, Deadline& deadline) const noexcept -> void
-    {
-        int64_t const periods_to_advance = wait.skipped_counts + 1;
-        Nanoseconds const advance = period() * periods_to_advance;
-        next_wake_count += periods_to_advance;
-        deadline.scheduled += advance;
-        deadline.raw_deadline += advance;
-    }
-
-    /// Construct the per-wake event, invoke the user callback, measure its
-    /// wall-clock duration, and feed the error / duration / skipped counts
-    /// into the wake stats. A TripwireFiredException thrown by the callback
-    /// (via ScopedTripwireObserver) is allowed to propagate — it aborts the
+    /// Build the event for the wake the schedule is at, stamp the RAW
+    /// instant of entry, invoke the user callback, measure its duration,
+    /// and feed the error / duration / skipped counts into the wake stats.
+    /// A TripwireFiredException thrown by the callback (via
+    /// ScopedTripwireObserver) is allowed to propagate — it aborts the
     /// stats update for this tick and is caught in TimerBase::start()'s
     /// thread lambda, which lets the thread exit while the tripwire machinery
     /// drives shutdown from the monitor/main threads.
-    auto invoke_callback(Deadline const& deadline, int64_t wake_count, WaitResult const& wait) -> void
+    auto invoke_callback(WaitResult const& wait) -> void
     {
         Nanoseconds callback_duration{0};
         if (callback_) {
-            Nanoseconds const accuracy = schedule_accuracy(deadline.raw_deadline);
-            auto const callback_start = read_monotonic_raw();
-            event_type const event{
-                .scheduled_time = deadline.scheduled,
-                .error = wait.error,
-                .wake_count = wake_count,
-                .skipped_counts = wait.skipped_counts,
-                .wake_raw = callback_start,
-                .accuracy = accuracy,
-            };
-
+            event_type event = schedule_.event(wait);
+            event.wake_raw = read_monotonic_raw();
             callback_(event, stats_.snapshot());
-            callback_duration = read_monotonic_raw() - callback_start;
+            callback_duration = read_monotonic_raw() - event.wake_raw;
         }
         stats_.update_with_duration(wait.error.count(), callback_duration.count(), wait.skipped_counts);
     }
@@ -184,27 +116,16 @@ class Timer : public TimerBase
     auto run_loop() -> void override
     {
         prime_raw_line();
-        // Calculate starting wake count based on current time in the adapter's clock domain.
-        // start_offset_cycles (default 2) schedules the first wake far enough in the future
-        // that thread setup latency can't leave us past the deadline before we even sleep.
-        int64_t next_wake_count = cycle_number(adapter_.now(), period()) + config_.start_offset_cycles;
-
-        // Seed both instants from next_wake_count. After this we advance
-        // the RAW deadline directly in advance_schedule — the slope
-        // error is cancelled periodically by maybe_resync_deadline.
-        Deadline deadline = resync_deadline(next_wake_count);
-
+        schedule_.begin(schedule_.adapter().now());
         while (should_run()) {
-            WaitResult const wait = wait_until_raw_deadline(deadline.raw_deadline);
-            invoke_callback(deadline, next_wake_count, wait);
-
-            advance_schedule(wait, next_wake_count, deadline);
-            deadline = maybe_resync_deadline(next_wake_count, deadline);
+            WaitResult const wait = wait_until_raw_deadline(schedule_.deadline().raw_deadline);
+            invoke_callback(wait);
+            schedule_.advance(wait);
         }
     }
 
   private:
-    ClockAdapterT adapter_;
+    TimerSchedule<ClockAdapterT> schedule_;
     callback_type callback_;
 };
 

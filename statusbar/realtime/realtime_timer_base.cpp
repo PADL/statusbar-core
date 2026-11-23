@@ -168,27 +168,20 @@ auto TimerBase::wait_until_absolute(MonotonicClock::time_point const deadline) n
     return read_monotonic() - deadline;
 }
 
-auto TimerBase::wait_result(Nanoseconds const error) const noexcept -> WaitResult
-{
-    // Guard against period_ns == 0 (CLI-settable via build_timer_arg_specs)
-    // so we never divide by zero in the hot path.
-    Nanoseconds const period = this->period();
-    int64_t const skipped_counts = (period > Nanoseconds::zero() && error > period) ? (error / period) : 0;
-    return {.error = error, .skipped_counts = skipped_counts};
-}
-
 auto TimerBase::wait_until_raw_deadline(MonotonicRawClock::time_point const raw_deadline) noexcept -> WaitResult
 {
-    auto const target_raw = raw_deadline + compensation();
+    auto const target_raw = wake_target(raw_deadline);
     track_raw_line(read_monotonic_raw());
-    sleep_early_for_raw(target_raw);
-    return wait_result(spin_until_raw(target_raw) - raw_deadline);
+    if (auto const wake = early_wake(target_raw, read_monotonic_raw())) {
+        (void)wait_until_absolute(*wake);
+    }
+    return wait_outcome(raw_deadline, spin_until_raw(target_raw));
 }
 
 auto TimerBase::prime_raw_line() noexcept -> void
 {
     // Two samples a millisecond apart give a rate good to ~100 ppm, which
-    // the slew margin in sleep_early_for_raw covers; one sample alone would
+    // the slew margin in early_wake covers; one sample alone would
     // leave the first sleep trusting rate 1.0 against a clock phc2sys may be
     // railing at 10%.
     (void)raw_tracker_.sample();
@@ -211,18 +204,20 @@ auto TimerBase::track_raw_line(MonotonicRawClock::time_point const raw_now) noex
     raw_line_sampled_ = raw_now;
 }
 
-auto TimerBase::sleep_early_for_raw(MonotonicRawClock::time_point const target_raw) noexcept -> void
+auto TimerBase::early_wake(MonotonicRawClock::time_point const target_raw, MonotonicRawClock::time_point const raw_now)
+    const noexcept -> std::optional<MonotonicClock::time_point>
 {
     // The line's rate error after the 1 ms priming baseline, in parts per
     // billion; added to the measured slew so the early wake stays early.
     constexpr int64_t RATE_MARGIN_PPB = 100'000;
     auto const slew_ppb = static_cast<uint32_t>(raw_line_.rate_deviation_ppb() + RATE_MARGIN_PPB);
-    Nanoseconds const remaining = target_raw - read_monotonic_raw();
-    Nanoseconds const base_guard{config_.busy_wait ? config_.busy_wait_threshold_ns : config_.raw_spin_guard_ns};
-    Nanoseconds const slew_guard = accumulated_drift(remaining, slew_ppb);
-    if (remaining > base_guard + slew_guard) {
-        (void)wait_until_absolute(raw_line_.to_monotonic(target_raw) - base_guard - slew_guard);
+    Nanoseconds const remaining = target_raw - raw_now;
+    Nanoseconds const guard = Nanoseconds{config_.busy_wait ? config_.busy_wait_threshold_ns : config_.raw_spin_guard_ns} +
+        accumulated_drift(remaining, slew_ppb);
+    if (remaining <= guard) {
+        return std::nullopt;
     }
+    return raw_line_.to_monotonic(target_raw) - guard;
 }
 
 auto TimerBase::spin_until_raw(MonotonicRawClock::time_point const target_raw) noexcept -> MonotonicRawClock::time_point

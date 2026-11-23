@@ -15,5 +15,7 @@
 #include "statusbar/realtime/realtime_timer_config.hpp"
 #include "statusbar/realtime/realtime_timer_event.hpp"
 #include "statusbar/realtime/realtime_timer_event_tripwire.hpp"
+#include "statusbar/realtime/realtime_timer_schedule.hpp"
 #include "statusbar/realtime/realtime_timing_sample_window.hpp"
 #include "statusbar/realtime/realtime_tripwire.hpp"
+#include "statusbar/realtime/realtime_utc_clock.hpp"

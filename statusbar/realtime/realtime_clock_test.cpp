@@ -177,6 +177,30 @@ TEST(clock_reads, the_monotonic_read_is_the_monotonic_clock)
     EXPECT_TRUE(MonotonicClock::to_ns(now) <= after);
 }
 
+TEST(clock_reads, the_utc_read_is_the_system_clock)
+{
+    auto const now = read_utc();
+    static_assert(std::is_same_v<decltype(now), UtcClock::time_point const>);
+
+    // The same clock std::chrono reads: within a minute of it, whatever a
+    // time daemon does to the clock between the two reads.
+    auto const chrono_now = std::chrono::duration_cast<Nanoseconds>(std::chrono::system_clock::now().time_since_epoch());
+    Nanoseconds const apart = now.time_since_epoch() - chrono_now;
+    EXPECT_TRUE(apart > -std::chrono::minutes{1} && apart < std::chrono::minutes{1});
+    // TAI is 37 s ahead, exactly.
+    EXPECT_EQ((to_tai(now).time_since_epoch() - now.time_since_epoch()).count(), int64_t{37'000'000'000});
+}
+
+TEST(clock_reads, the_system_reports_on_its_own_clock)
+{
+    auto const system = read_system_clock_error();
+    // A synchronized system has a bound; an unsynchronized one may say anything.
+    if (system.synchronized) {
+        EXPECT_TRUE(system.max_error >= Nanoseconds::zero());
+        EXPECT_TRUE(system.estimated_error >= Nanoseconds::zero());
+    }
+}
+
 TEST(clock_reads, sleeping_to_a_monotonic_deadline_reaches_it)
 {
     auto const deadline = read_monotonic() + Nanoseconds{2'000'000};

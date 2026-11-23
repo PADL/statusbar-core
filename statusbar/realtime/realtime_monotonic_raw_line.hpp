@@ -92,6 +92,15 @@ class MonotonicRawLine
         return deviation < 0 ? -deviation : deviation;
     }
 
+    /// Writer side: how well the line just published is known.
+    void publish_quality(ClockQuality const& quality) noexcept { quality_.store(quality); }
+
+    /// Reader side (any thread): how well CLOCK_MONOTONIC is known through
+    /// this line. Unbounded until a tracker has published one; while no
+    /// new sample arrives it grows from the last one, so a sleeper can
+    /// tell how far the line may have gone stale.
+    [[nodiscard]] auto quality() const noexcept -> ClockQuality { return quality_.load(); }
+
     /// CLOCK_MONOTONIC instant for a CLOCK_MONOTONIC_RAW one.
     [[nodiscard]] auto to_monotonic_ns(int64_t raw_ns) const noexcept -> int64_t;
 
@@ -113,6 +122,7 @@ class MonotonicRawLine
 
   private:
     itc::SeqlockValue<FixedLine> line_{FixedLine{}};
+    itc::SeqlockValue<ClockQuality> quality_{ClockQuality{}};
 };
 
 /// The writer side of a line: takes paired readings of the two clocks,
@@ -135,6 +145,14 @@ class MonotonicRawTracker
     /// at +/-10%, and the line must follow it or the early wake is late.
     static constexpr double MAX_RATE_PPM = 200'000.0;
 
+    /// How fast CLOCK_MONOTONIC may move against RAW while the line is not
+    /// being sampled: 500 ppm, the range of the system clock's frequency
+    /// correction. A line seen further from rate one than that is under a
+    /// tick adjustment and may move by as much as it is off; a rate seen
+    /// moving more within the window counts too. The largest of the three
+    /// is the line's drift bound.
+    static constexpr uint32_t DEFAULT_DRIFT_BOUND_PPB = 500'000;
+
     explicit MonotonicRawTracker(MonotonicRawLine& line, size_t window = DEFAULT_WINDOW) noexcept
         : line_{&line}
         , window_{window}
@@ -144,9 +162,13 @@ class MonotonicRawTracker
     /// and publishes. One sample publishes an offset-only line.
     /// @param raw The CLOCK_MONOTONIC_RAW reading
     /// @param mono The CLOCK_MONOTONIC reading of the same instant
+    /// @param bracket How long the paired read took: half of it is the
+    ///        uncertainty of the pairing. Zero when the caller cannot say.
     /// @return false when the fit was rejected (rate out of range); the
     ///         previous line stands.
-    auto push(MonotonicRawClock::time_point raw, MonotonicClock::time_point mono) noexcept -> bool;
+    auto push(
+        MonotonicRawClock::time_point raw, MonotonicClock::time_point mono, Nanoseconds bracket = Nanoseconds::zero()) noexcept
+        -> bool;
 
     /// Asking form, for the tick owner: reads RAW, MONOTONIC, RAW and pushes
     /// the pair at the RAW midpoint of the bracket.

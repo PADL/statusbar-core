@@ -126,3 +126,8 @@ The surface a told function presents:
    wake early, spin on RAW.
 6. Test it by telling it a time. If the test needs to mock a clock, the
    function is asking.
+7. A unit test never sleeps and never asserts how long something took. On a
+   loaded build host a sleep lasts as long as it likes. If a test seems to
+   need a thread to run for a while, split the arithmetic from the thread
+   (as `TimerSchedule` is split from `Timer`) and tell the arithmetic its
+   instants.

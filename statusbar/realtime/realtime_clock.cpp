@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <ctime>
 
+#include <sys/timex.h>
+
 #if defined(__APPLE__)
 #    include <mach/mach_time.h>
 #endif
@@ -71,6 +73,36 @@ auto sleep_until_monotonic_ns(int64_t const deadline_ns) noexcept -> int
     return 0;
 #else
 #    error "Unsupported platform: port the clock reads and the sleep in this file"
+#endif
+}
+
+auto read_utc_ns() noexcept -> int64_t
+{
+    return read_clock_ns(CLOCK_REALTIME);
+}
+
+auto read_system_clock_error() noexcept -> SystemClockError
+{
+    constexpr int64_t NS_PER_MICROSECOND = 1'000;
+#if defined(__linux__)
+    // modes == 0 reads the kernel's NTP state and changes nothing; it needs
+    // no privilege.
+    struct timex state{};
+    int const result = ::adjtimex(&state);
+    bool const synchronized = result != -1 && result != TIME_ERROR && (state.status & STA_UNSYNC) == 0;
+    return {
+        .synchronized = synchronized,
+        .max_error = Nanoseconds{static_cast<int64_t>(state.maxerror) * NS_PER_MICROSECOND},
+        .estimated_error = Nanoseconds{static_cast<int64_t>(state.esterror) * NS_PER_MICROSECOND}};
+#elif defined(__APPLE__)
+    struct ntptimeval state{};
+    int const result = ::ntp_gettime(&state);
+    return {
+        .synchronized = result != -1 && result != TIME_ERROR,
+        .max_error = Nanoseconds{static_cast<int64_t>(state.maxerror) * NS_PER_MICROSECOND},
+        .estimated_error = Nanoseconds{static_cast<int64_t>(state.esterror) * NS_PER_MICROSECOND}};
+#else
+#    error "Unsupported platform: port the system clock's synchronization state in this file"
 #endif
 }
 

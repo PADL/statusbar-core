@@ -288,6 +288,12 @@ enum class TimeSource : uint8_t
 /// An accuracy that claims nothing: never synchronized, or not reported.
 inline constexpr Nanoseconds UNBOUNDED_ACCURACY = Nanoseconds::max();
 
+/// The drift a source assumes while it coasts when its deployment has told
+/// it nothing better: 15 ppm, the frequency tolerance NTP assumes of any
+/// clock when it grows its own dispersion. A deployment that knows its
+/// oscillator and its temperature range configures its own figure.
+inline constexpr uint32_t DEFAULT_HOLDOVER_DRIFT_PPB = 15'000;
+
 namespace detail {
 
 /// The sum of two accuracies, or UNBOUNDED_ACCURACY when either is
@@ -428,6 +434,46 @@ struct BoundedTime
 
     auto operator==(BoundedTime const&) const noexcept -> bool = default;
 };
+
+//
+// The System Clock (UTC)
+//
+// Declared here, implemented per platform in realtime_clock.cpp.
+//
+
+/// The system clock (CLOCK_REALTIME on POSIX) in nanoseconds since
+/// 1970-01-01 UTC. It is stepped and slewed by whatever disciplines it, so
+/// it is never a timing reference: it is how absolute time is learned.
+auto read_utc_ns() noexcept -> int64_t;
+
+/// The system clock now, as a UtcClock time.
+[[nodiscard]] inline auto read_utc() noexcept -> UtcClock::time_point
+{
+    return UtcClock::from_ns(read_utc_ns());
+}
+
+/// What the operating system says about how well its clock is
+/// synchronized: the figures its time daemon (NTP, chrony) maintains.
+struct SystemClockError
+{
+    /// False while the system reports its clock unsynchronized, and where
+    /// the platform cannot say.
+    bool synchronized{false};
+
+    /// The system's own worst-case error, which the daemon sets from its
+    /// source at each update and the system grows between updates.
+    Nanoseconds max_error{UNBOUNDED_ACCURACY};
+
+    /// The system's estimate of the typical error.
+    Nanoseconds estimated_error{UNBOUNDED_ACCURACY};
+
+    auto operator==(SystemClockError const&) const noexcept -> bool = default;
+};
+
+/// Ask the operating system for its clock's synchronization state. One
+/// system call: for a tick owner to make at its sampling rate, not on a
+/// fast path.
+[[nodiscard]] auto read_system_clock_error() noexcept -> SystemClockError;
 
 //
 // Clock Source Concept

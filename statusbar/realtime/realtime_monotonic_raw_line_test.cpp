@@ -28,6 +28,10 @@ constexpr int64_t LONG_UPTIME_NS = 400LL * 24 * 3600 * 1'000'000'000LL;
     return std::llabs(a - b) <= tolerance;
 }
 
+/// Whether the tracker accepts a pair of readings of these types.
+template <typename Raw, typename Mono>
+concept TrackerTakes = requires(MonotonicRawTracker& tracker, Raw raw, Mono mono) { tracker.push(raw, mono); };
+
 /// A told sample: the same instant as a count on each clock.
 [[nodiscard]] auto push(MonotonicRawTracker& tracker, int64_t raw_ns, int64_t mono_ns) -> bool
 {
@@ -99,17 +103,9 @@ TEST(monotonic_raw_line, typed_conversions_change_the_clock_tag)
 TEST(monotonic_raw_tracker, a_sample_names_the_clock_of_each_reading)
 {
     // The two readings cannot be passed the wrong way round.
-    static_assert(std::is_invocable_v<
-                  decltype(&MonotonicRawTracker::push),
-                  MonotonicRawTracker&,
-                  MonotonicRawClock::time_point,
-                  MonotonicClock::time_point>);
-    static_assert(!std::is_invocable_v<
-                  decltype(&MonotonicRawTracker::push),
-                  MonotonicRawTracker&,
-                  MonotonicClock::time_point,
-                  MonotonicRawClock::time_point>);
-    static_assert(!std::is_invocable_v<decltype(&MonotonicRawTracker::push), MonotonicRawTracker&, int64_t, int64_t>);
+    static_assert(TrackerTakes<MonotonicRawClock::time_point, MonotonicClock::time_point>);
+    static_assert(!TrackerTakes<MonotonicClock::time_point, MonotonicRawClock::time_point>);
+    static_assert(!TrackerTakes<int64_t, int64_t>);
 }
 
 TEST(monotonic_raw_tracker, one_sample_publishes_the_offset_at_rate_one)
@@ -167,6 +163,81 @@ TEST(monotonic_raw_tracker, the_window_forgets_old_samples)
     EXPECT_EQ(tracker.size(), size_t{4});
 }
 
+TEST(monotonic_raw_line, a_line_nobody_has_fitted_claims_no_accuracy)
+{
+    MonotonicRawLine line;
+    EXPECT_FALSE(line.quality().is_bounded());
+    // Publishing a line by hand says nothing of how good it is either.
+    line.publish({.rate = 1.0, .offset_ns = 5});
+    EXPECT_FALSE(line.quality().is_bounded());
+}
+
+TEST(monotonic_raw_tracker, an_exact_fit_is_bounded_by_half_the_read_bracket)
+{
+    MonotonicRawLine line;
+    MonotonicRawTracker tracker{line};
+    // mono = raw + 7 s exactly, every 100 ms, each pair read in 400 ns.
+    constexpr int64_t OFFSET_NS = 7'000'000'000LL;
+    for (int i = 0; i < 8; ++i) {
+        int64_t const raw = LONG_UPTIME_NS + (i * 100'000'000LL);
+        EXPECT_TRUE(tracker.push(MonotonicRawClock::from_ns(raw), MonotonicClock::from_ns(raw + OFFSET_NS), Nanoseconds{400}));
+    }
+    auto const last = MonotonicRawClock::from_ns(LONG_UPTIME_NS + 700'000'000LL);
+    auto const quality = line.quality();
+    EXPECT_TRUE(quality.is_bounded());
+    EXPECT_TRUE(quality.synced_at == last);
+    EXPECT_EQ(quality.bound_at_sync.count(), int64_t{200});
+    EXPECT_EQ(quality.drift_bound_ppb, MonotonicRawTracker::DEFAULT_DRIFT_BOUND_PPB);
+    // Unsampled for a second, CLOCK_MONOTONIC may have been slewed 500 us away.
+    EXPECT_EQ(quality.uncertainty(last + std::chrono::seconds{1}).count(), int64_t{200 + 500'000});
+}
+
+TEST(monotonic_raw_tracker, samples_that_miss_the_line_widen_its_bound)
+{
+    MonotonicRawLine line;
+    MonotonicRawTracker tracker{line};
+    // The same line, with every other reading 3 us late.
+    for (int i = 0; i < 16; ++i) {
+        int64_t const raw = LONG_UPTIME_NS + (i * 100'000'000LL);
+        int64_t const mono = raw + 7'000'000'000LL + ((i % 2) * 3'000);
+        EXPECT_TRUE(push(tracker, raw, mono));
+    }
+    auto const quality = line.quality();
+    EXPECT_TRUE(quality.is_bounded());
+    // The fit runs between the two populations: each is about 1.5 us off it.
+    EXPECT_TRUE(quality.bound_at_sync >= Nanoseconds{1'400});
+    EXPECT_TRUE(quality.bound_at_sync <= Nanoseconds{3'000});
+}
+
+TEST(monotonic_raw_tracker, a_rate_that_moved_within_the_window_raises_the_drift_bound)
+{
+    MonotonicRawLine line;
+    MonotonicRawTracker tracker{line, 16};
+    // Eight samples at rate 1, then eight while the clock is slewed 2000 ppm.
+    int64_t mono = LONG_UPTIME_NS;
+    for (int i = 0; i < 16; ++i) {
+        int64_t const raw = LONG_UPTIME_NS + (i * 100'000'000LL);
+        EXPECT_TRUE(push(tracker, raw, mono));
+        mono += 100'000'000LL + (i >= 7 ? 200'000 : 0);
+    }
+    EXPECT_TRUE(line.quality().drift_bound_ppb > MonotonicRawTracker::DEFAULT_DRIFT_BOUND_PPB);
+    EXPECT_TRUE(line.quality().drift_bound_ppb <= uint32_t{2'100'000});
+}
+
+TEST(monotonic_raw_tracker, a_line_far_from_rate_one_may_move_by_as_much_as_it_is_off)
+{
+    MonotonicRawLine line;
+    MonotonicRawTracker tracker{line};
+    // CLOCK_MONOTONIC railed 5% fast and steady: beyond any frequency
+    // correction, so a tick adjustment that could be taken away again.
+    for (int i = 0; i < 16; ++i) {
+        int64_t const raw = LONG_UPTIME_NS + (i * 100'000'000LL);
+        EXPECT_TRUE(push(tracker, raw, LONG_UPTIME_NS + (i * 105'000'000LL)));
+    }
+    EXPECT_TRUE(line.quality().drift_bound_ppb >= uint32_t{49'900'000});
+    EXPECT_TRUE(line.quality().drift_bound_ppb <= uint32_t{50'100'000});
+}
+
 TEST(monotonic_raw_tracker, sampling_the_clocks_gives_a_line_near_the_live_offset)
 {
     MonotonicRawLine line;
@@ -178,6 +249,9 @@ TEST(monotonic_raw_tracker, sampling_the_clocks_gives_a_line_near_the_live_offse
     int64_t const raw_now = read_monotonic_raw_ns();
     int64_t const mono_now = read_monotonic_ns();
     EXPECT_TRUE(within(line.to_monotonic_ns(raw_now), mono_now, bracket + 1'000'000));
+    // And the line says how good it is: half the bracket it was read in.
+    EXPECT_TRUE(line.quality().is_bounded());
+    EXPECT_EQ(line.quality().bound_at_sync.count(), (bracket + 1) / 2);
 }
 
 TEST_MAIN(statusbar_realtime, realtime_monotonic_raw_line_test)
