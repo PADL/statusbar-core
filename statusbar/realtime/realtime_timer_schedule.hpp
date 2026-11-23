@@ -22,7 +22,7 @@
 namespace statusbar::realtime {
 
 /// Return the cycle number that contains @p time_ns for a timer of period
-/// @p period_ns (floor division). A "cycle number" here is the integer index
+/// @p period_ns (the quotient, truncated toward zero). A "cycle number" here is the integer index
 /// of the period-sized slot the time falls within, counted from the clock's
 /// zero epoch.
 ///
@@ -60,7 +60,7 @@ template <ClockType ClockT>
 }
 
 /// How a wait for a deadline ended: the wake error (positive = late) and the
-/// number of full periods the wake is past the deadline (0 when on time).
+/// number of periods skipped by a late wake (0 while the wake is no more than one period late).
 struct WaitResult
 {
     Nanoseconds error;
@@ -170,8 +170,9 @@ class TimerSchedule
     /// skipped. Both instants move by the same duration although their
     /// clocks tick at slightly different rates: that avoids the adapter's
     /// conversion on every tick, and every resync_interval_cycles wakes a
-    /// fresh conversion cancels what has accumulated. At the default 1000
-    /// cycles and 11 ppm of skew that caps the error near 1.4 us.
+    /// fresh conversion cancels what has accumulated. At 1000 cycles of a
+    /// 125 us period and 11 ppm of skew that caps the error near 1.4 us; it
+    /// scales with the period, so a slow timer wants a smaller interval.
     auto advance(WaitResult const& wait) -> void
     {
         int64_t const periods = wait.skipped_counts + 1;

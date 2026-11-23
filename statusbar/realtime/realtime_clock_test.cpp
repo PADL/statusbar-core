@@ -408,6 +408,11 @@ TEST(clock_quality, growth_saturates_and_never_wraps)
         .synced_at = raw_s(0), .bound_at_sync = UNBOUNDED_ACCURACY - Nanoseconds{10}, .drift_bound_ppb = 1};
     static_assert(nearly.uncertainty(raw_s(5)) == UNBOUNDED_ACCURACY - Nanoseconds{5});
     static_assert(nearly.uncertainty(raw_s(60)) == UNBOUNDED_ACCURACY);
+
+    // Grown to the ceiling, it is inside no limit, not even the widest one.
+    static_assert(nearly.within(UNBOUNDED_ACCURACY, raw_s(5)));
+    static_assert(!nearly.within(UNBOUNDED_ACCURACY, raw_s(60)));
+    static_assert(!fast.within(UNBOUNDED_ACCURACY, MonotonicRawClock::time_point::max()));
 }
 
 TEST(clock_quality, the_reference_read_as_itself_is_exact)

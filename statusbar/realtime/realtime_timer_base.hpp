@@ -53,7 +53,7 @@ class TimerBase
     [[nodiscard]] auto is_busy_wait() const noexcept -> bool { return config_.busy_wait; }
 
     /// The RAW->MONOTONIC line this timer's thread keeps for its own sleeps
-    /// (see wait_until_raw_deadline). Identity until the thread's first wait.
+    /// (see wait_until_raw_deadline). Identity until the thread primes it at the top of its loop.
     [[nodiscard]] auto raw_line() const noexcept -> MonotonicRawLine const& { return raw_line_; }
 
   protected:

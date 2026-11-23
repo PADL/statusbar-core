@@ -31,13 +31,13 @@ struct TimerConfig
     /// and locks ranges of them itself sets this false and locks once, at
     /// startup, with lock_memory() or prepare_realtime_system().
     bool lock_memory{true};
-    int64_t start_offset_cycles{2};        ///< Cycles ahead of now to schedule the first wake (>=2 avoids a startup race)
-    int64_t resync_interval_cycles{1000};  ///< Wakes between mono-deadline resyncs that correct accumulated slope drift (0 = never)
-    /// Raw-reference timers only (see MonotonicRawClockAdapter): how early,
-    /// in ns, to wake on CLOCK_MONOTONIC before spinning on CLOCK_MONOTONIC_RAW
+    int64_t start_offset_cycles{2};  ///< Cycles ahead of now to schedule the first wake (>=2 avoids a startup race)
+    int64_t resync_interval_cycles{
+        1000};  ///< Wakes between fresh conversions of the RAW deadline from the adapter's time (0 = never)
+    /// How early, in ns, to wake on CLOCK_MONOTONIC before spinning on CLOCK_MONOTONIC_RAW
     /// to the deadline. busy_wait timers use busy_wait_threshold_ns instead.
     int64_t raw_spin_guard_ns{50'000};
-    /// Raw-reference timers only: how often, in ns of RAW time, the timer
+    /// How often, in ns of RAW time, the timer
     /// thread re-samples its RAW->MONOTONIC line (0 = only once, at the start).
     int64_t raw_line_sample_interval_ns{100'000'000};
 

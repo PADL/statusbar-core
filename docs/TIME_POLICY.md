@@ -16,19 +16,22 @@ types they name live in core's [`realtime`](REALTIME_MODULE.md),
 | `std::chrono::steady_clock` | `sm::Clock` / `sm::TimePoint` | **The control plane.** Protocol state machines (ADP, ACMP, AECP, MRP, gPTP port state) and the `net::MessageReactor` that drives them. Timers here are hundreds of milliseconds, so slew is harmless. It is `CLOCK_MONOTONIC` on Linux and stays that way on purpose: do not "fix" it to RAW. |
 | gPTP / PHC | `realtime::GptpClock<N>`, PHC nanoseconds | The network's media time: AVTP presentation times, CRF, launch times. Reached from RAW through a bridge (`gptp::GptpTimeBridge`, `ptpclient::PtpTimeBridge`), never read directly on a hot path. |
 | UTC, TAI | `realtime::UtcClock`, `realtime::TaiClock` | The system clock's timescale and TAI, a constant 37 s apart (`realtime::to_tai()`). Media-clock rate tracking and TAI arithmetic. What disciplines the system clock (a local GPS receiver, a distant NTP server) is not part of the type: how well the time is known is a `realtime::ClockQuality`. |
-| `CLOCK_REALTIME` | plain `int64_t` | Wall-clock output only (log lines, LTC, scene stamps). Never compared with the clocks above. |
+| `CLOCK_REALTIME` as a bare count | plain `int64_t` | Wall-clock output only (log lines, LTC, scene stamps). It is the same clock as `UtcClock` in the row above; a bare count of it is never compared with another clock. Code that relates it to RAW reads it as `UtcClock` and carries its `ClockQuality` (`realtime::UtcClockQualityTracker`). |
 
 The first two rows mean the same thing on macOS as on Linux: both are read
-with `clock_gettime`, both keep counting through a system sleep, and only
-`CLOCK_MONOTONIC` is slewed. The one platform difference is the sleep
-primitive, and it lives in a single place, `realtime::sleep_until_monotonic_ns()`:
+with `clock_gettime`, the two stop or run together through a system sleep
+(on macOS both keep counting; on Linux neither does, only `CLOCK_BOOTTIME`),
+and only `CLOCK_MONOTONIC` is slewed. The one platform difference is the sleep
+primitive, and it lives in a single place, `realtime::sleep_until_monotonic()`
+(`sleep_until_monotonic_ns()` for a bare count):
 `clock_nanosleep(TIMER_ABSTIME)` on Linux, a relative `mach_wait_until` on
 macOS, because Mach's own counter (`mach_absolute_time`, which is
 `CLOCK_UPTIME_RAW`) stops while the machine sleeps and must never carry an
 absolute deadline. `std::chrono::steady_clock` is `CLOCK_MONOTONIC_RAW` on
 macOS libc++, so it is not a `CLOCK_MONOTONIC` value there either: a
-"monotonic" nanosecond count for a sleep or a line comes from
-`realtime::read_monotonic_ns()`, never from `steady_clock`.
+"monotonic" instant for a sleep or a line comes from
+`realtime::read_monotonic()` (`read_monotonic_ns()` for a bare count), never
+from `steady_clock`.
 
 Each domain is a distinct `Clock<Tag>` with its own `time_point`, so mixing
 two domains is a compile error. Crossing a domain is an explicit conversion
@@ -72,8 +75,8 @@ The surface a told function presents:
   stream, mac, now)`, `on_talker_listener(id, ready, now)`,
   `AemCommandResult::at` all carry the receive or tick that caused them.
 - **A wake is told on every clock its consumer needs.** A timer reports
-  its wake as `TimerWakeInfo{actual_time_ns (gPTP), actual_raw
-  (MonotonicRawClock::time_point)}`; the media tick tells gPTP to the
+  its wake as `TimerWakeInfo{actual_time (GptpClock0::time_point), actual_raw
+  (MonotonicRawClock::time_point)}`, with `actual_time_ns()` for the bare count; the media tick tells gPTP to the
   talkers and RAW to the transmit gate and the RX drain, and nothing under
   it reads a clock.
 - **Control-plane adapters take the reactor's count.** `net::Pollable`
@@ -94,15 +97,16 @@ The surface a told function presents:
   `PtpTimeBridge::sleep_until_ptp` plan a sleep as a RAW deadline, convert it
   to a coarse `CLOCK_MONOTONIC` target through the `MonotonicRawLine`, sleep
   early, and spin on RAW to the deadline.
-- **The gPTP time bridge is told its anchor.** `GptpTimeBridge::update_from_anchor(sync_rx_app_ns,
-  tx_master_ns, rate_ratio)` takes the Sync's arrival on the app clock (read
+- **The gPTP time bridge is told its anchor.** `GptpTimeBridge::update_from_anchor(sync_rx_raw,
+  tx_master)` takes the Sync's arrival as a RAW instant (read
   once in the receive path, carried with the Sync to its FollowUp) and the
-  master time the FollowUp carried. Reading the app clock at the call would
+  master time the FollowUp carried, as a gPTP instant. Reading RAW at the call would
   pair the Sync's master time with the FollowUp's processing time. The
   conversions (`to_gptp`, `from_gptp_rated`) are told an instant and read
   nothing; udptun's wire timeline is RAW straight through them.
-- **The gPTP slave's bridge clock is RAW.** `--bridge-clock=monotonic_raw`
-  is the policy value and udptun refuses any other.
+- **The gPTP slave's bridge clock is RAW.** The bridge is kept against
+  `CLOCK_MONOTONIC_RAW` and nothing else; there is no option to choose
+  another clock (`statusbar-gptp-slave --no-bridge` turns the bridge off).
 
 ## Known outliers
 

@@ -25,7 +25,7 @@ struct TimerEvent
 
     time_point scheduled_time;  ///< The scheduled wake time (uncompensated)
     duration error;             ///< Wake error (positive = late, negative = early)
-    int64_t wake_count;         ///< The wake number (starting from 1)
+    int64_t wake_count;         ///< The cycle number of this wake: the adapter's time over the period, not a count from 1
     int64_t skipped_counts;     ///< Number of missed wakes (0 = no misses)
 
     /// The CLOCK_MONOTONIC_RAW instant the timer entered the callback: the
@@ -68,7 +68,7 @@ struct TimerEvent
 
 /// Callback signature for timer wakes
 /// @param event The timer event with timing data for this wake
-/// @param stats Snapshot of cumulative statistics (includes this wake's data)
+/// @param stats Snapshot of the statistics up to the wake before this one (this wake is added after the callback)
 template <ClockType ClockT = MonotonicRawClock>
 using TimerCallback =
     statusbar::sg14::inplace_function<void(TimerEvent<ClockT> const&, stats::AtomicWakeStats::Snapshot const&), 64>;

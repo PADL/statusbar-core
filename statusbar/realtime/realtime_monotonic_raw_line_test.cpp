@@ -254,4 +254,23 @@ TEST(monotonic_raw_tracker, sampling_the_clocks_gives_a_line_near_the_live_offse
     EXPECT_EQ(line.quality().bound_at_sync.count(), (bracket + 1) / 2);
 }
 
+TEST(monotonic_raw_tracker, a_negative_bracket_takes_nothing_off_the_bound)
+{
+    // A bracket is how long the pair took to read. One below zero is a
+    // caller's mistake; it must not make the line look better known.
+    MonotonicRawLine told_wrong;
+    MonotonicRawTracker wrong{told_wrong};
+    MonotonicRawLine told_none;
+    MonotonicRawTracker none{told_none};
+    for (int i = 0; i < 16; ++i) {
+        auto const raw = MonotonicRawClock::from_ns(1'000'000'000LL + (i * 100'000'000LL));
+        auto const mono = MonotonicClock::from_ns(5'000'000'000LL + (i * 100'000'000LL) + ((i % 2) * 40));
+        (void)wrong.push(raw, mono, Nanoseconds{-1000});
+        (void)none.push(raw, mono, Nanoseconds::zero());
+    }
+    EXPECT_TRUE(told_wrong.quality().is_bounded());
+    EXPECT_TRUE(told_wrong.quality().bound_at_sync >= Nanoseconds::zero());
+    EXPECT_TRUE(told_wrong.quality().bound_at_sync == told_none.quality().bound_at_sync);
+}
+
 TEST_MAIN(statusbar_realtime, realtime_monotonic_raw_line_test)

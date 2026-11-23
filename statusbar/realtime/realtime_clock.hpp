@@ -188,8 +188,8 @@ concept ClockType = detail::is_clock<T>;
 /// early on CLOCK_MONOTONIC through a MonotonicRawLine and spinning here.
 auto read_monotonic_raw_ns() noexcept -> int64_t;
 
-/// CLOCK_MONOTONIC in nanoseconds (it keeps counting through a system
-/// sleep, and NTP slews its rate). This is the clock the kernel sleeps on:
+/// CLOCK_MONOTONIC in nanoseconds (NTP slews its rate; through a system
+/// sleep it keeps counting on macOS and stops on Linux, as RAW does on each). This is the clock the kernel sleeps on:
 /// use it for sleeping, not for timing. Timing, stamps and deadlines take
 /// read_monotonic_raw_ns().
 auto read_monotonic_ns() noexcept -> int64_t;
@@ -386,7 +386,9 @@ struct ClockQuality
     /// @param now The CLOCK_MONOTONIC_RAW instant the error is wanted at
     [[nodiscard]] constexpr auto within(Nanoseconds const limit, MonotonicRawClock::time_point const now) const noexcept -> bool
     {
-        return is_bounded() && uncertainty(now) <= limit;
+        // An uncertainty that has grown to the ceiling is no bound, whatever the limit.
+        Nanoseconds const grown = uncertainty(now);
+        return is_bounded() && grown != UNBOUNDED_ACCURACY && grown <= limit;
     }
 
     /// This quality with @p extra added to its bound: what a further step

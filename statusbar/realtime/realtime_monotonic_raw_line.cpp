@@ -153,8 +153,8 @@ auto MonotonicRawTracker::push(
     // so that a reader's uncertainty() stays integer arithmetic.
     line_->publish_quality(
         {.synced_at = raw,
-         .bound_at_sync =
-             worst_residual(window_, *line_) + (bracket > Nanoseconds::zero() ? (bracket + Nanoseconds{1}) / 2 : bracket),
+         .bound_at_sync = worst_residual(window_, *line_) +
+             (bracket > Nanoseconds::zero() ? (bracket + Nanoseconds{1}) / 2 : Nanoseconds::zero()),
          .epoch = 0,
          .drift_bound_ppb =
              std::max({DEFAULT_DRIFT_BOUND_PPB, rate_spread_ppb(window_), static_cast<uint32_t>(line_->rate_deviation_ppb())}),
