@@ -115,7 +115,9 @@ statusbar_add_module(
   DEPS    <target>...               # public deps (PUBLIC link, propagated)
   PRIVATE_DEPS <target>...          # private deps (PRIVATE link, not propagated)
   INTERFACE                         # header-only flag — INTERFACE library
-  TESTS   <file>...                 # test .cpp files; pushed onto a global property
+  TESTS   <file>...                 # unit test .cpp files (logic only: no socket, no sleep)
+  FUNCTIONAL_TESTS <file>...        # functional test .cpp files (real sockets, a real kernel, real waits)
+  FUNCTIONAL_TEST_DATA <file>...    # data files those tests read, relative to the module directory
 )
 ```
 
@@ -142,6 +144,15 @@ and feeds it to `create_test_sourcelist`, producing the single
 `statusbar/<module>/<file>_test`) plus a `statusbar_all_test` entry
 that runs them all. Under an aggregate build, an outer project reads
 the accumulated property after every package has populated it.
+
+`FUNCTIONAL_TESTS` go the same way into the global property
+`STATUSBAR_FUNCTIONAL_TEST_FILES` and a second executable (CMake target
+`statusbar_functional_test`, file `<package>-functional-test`), with one
+ctest entry per file, each labelled `functional`: `ctest -LE functional`
+is the unit tests and `ctest -L functional` the rest. The binary and the
+`FUNCTIONAL_TEST_DATA` files install with the development component.
+The functional binary is not built under `ENABLE_NO_EXCEPTIONS`. See
+[TEST_MODULE.md](TEST_MODULE.md).
 
 `STATUSBAR_INSTALL_TARGETS` is appended to unconditionally; the
 package-level CMakeLists reads it for its install set. Under an
@@ -284,6 +295,11 @@ The contract is small:
   `statusbar_add_module(... TESTS ...)`) — the outer project reads it,
   feeds it to `create_test_sourcelist`, and builds one `statusbar_test`
   executable with one `ctest` entry per file.
+- **`STATUSBAR_FUNCTIONAL_TEST_FILES`** (GLOBAL property, populated by
+  `statusbar_add_module(... FUNCTIONAL_TESTS ...)`) — the outer project
+  builds its own functional test executable from it and labels the
+  entries `functional`; the per-package binary and its data install are
+  skipped.
 - **`STATUSBAR_INSTALL_TARGETS`** (GLOBAL property, populated by every
   `statusbar_add_module()` call) — the outer project reads it to
   construct the unified install set for `cmake --install`.

@@ -2,7 +2,7 @@
 
 Foundational C++23 utilities — error handling, zero-copy buffers, IEEE and networking primitives, state machines, inter-thread communication, real-time scheduling, and terminal UI.
 
-Version 1.3.0.
+Version 3.0.0. The release summaries are in [`docs/`](docs/README.md).
 
 > Portions of this repository were developed with assistance from Claude,
 > an AI model by Anthropic. All reference material used in this process
@@ -37,8 +37,11 @@ toolchain with `-Werror`, sanitizers, coverage, and clang-tidy wired in.
 ## Quick start
 
 ```bash
-# Local build + unit tests (Clang+libc++ toolchain is mandatory; applied automatically)
-./local-build.sh && ctest --test-dir build
+# Local build, then the unit tests, then the functional tests
+# (Clang+libc++ toolchain is mandatory; applied automatically)
+./local-build.sh
+# The same without the functional tests, for a host that cannot run them
+STATUSBAR_SKIP_FUNCTIONAL_TESTS=1 ./local-build.sh
 
 # Reproducible Debian .deb in ../deb-output/ (no dependencies)
 ./container-build.sh
@@ -96,8 +99,11 @@ Per-module overviews and topic guides live under [docs/](docs/README.md).
 
 This package has no statusbar dependencies — it builds on its own.
 
-**Quick path:** run `./local-build.sh`. It configures, builds, and runs
-ctest; extra arguments are forwarded to cmake configure
+**Quick path:** run `./local-build.sh`. It configures, builds, runs the
+unit tests (`ctest -LE functional`) and then the functional tests
+(`ctest -L functional`: real sockets, a real kernel). A failure in
+either run fails the script; `STATUSBAR_SKIP_FUNCTIONAL_TESTS=1` leaves
+the second run out. Extra arguments are forwarded to cmake configure
 (`./local-build.sh -DENABLE_ASAN=ON`). The script echoes its final cmake
 invocation via `set -x` so users configuring an IDE can copy the exact
 flags into their CMake settings.
@@ -108,7 +114,9 @@ toolchain file (Clang + libc++, C++23, `-Werror`):
 ```
 cmake -S . -B build -G Ninja --toolchain cmake/toolchain-clang.cmake
 cmake --build build
-ctest --test-dir build
+ctest --test-dir build                  # every test
+ctest --test-dir build -LE functional   # unit tests only
+ctest --test-dir build -L functional    # functional tests only
 ```
 
 ## Benchmarks
@@ -237,7 +245,7 @@ Run `cpack` from the build directory:
 cd build && cpack
 ```
 
-This produces `statusbar-core` (runtime: tools) and `statusbar-core-dev` / `-devel` (headers, static libraries, CMake config).
+This produces `statusbar-core` (runtime: tools) and `statusbar-core-dev` / `-devel` (headers, static libraries, CMake config, and `statusbar-core-functional-test`: the functional tests built to run on a target, with their data files).
 
 ### Reproducible Debian packages
 

@@ -77,7 +77,7 @@ int main() {
 
 ## Headers
 
-- `statusbar/net/net.hpp` — module header; pulls in everything below (with `net_linux_*.hpp` gated on `__linux__`). Consumers should `#include` this.
+- `statusbar/net/net.hpp` — module header; pulls in the socket, reactor, Ethernet-port, classifier and netlink-framing headers below (with `net_linux_*.hpp` gated on `__linux__`). Include these by name: `net_tcp_server.hpp`, `net_connection_transport.hpp`, `net_told_connection_transport.hpp`, `net_dpll.hpp`, `net_phc.hpp`, `net_rx_flow.hpp`.
 - `statusbar/net/net_message_reactor.hpp` — `Pollable`, `MessageReactor`, `ClockFn`, `monotonic_ns`.
 - `statusbar/net/net_address.hpp` — `SocketAddress` plus `create_udp_socket` / `create_tcp_socket` / `create_tcp_listener`.
 - `statusbar/net/net_socket.hpp` — `FileDescriptor`, `set_nonblocking`, `set_reuse_addr`, `set_dscp`, `set_tos`, `would_block`; the IPv4 endpoint pair `ipv4_sockaddr_in(address, port)` / `ipv4_endpoint(sockaddr_in)` (`IPv4Endpoint`); `set_multicast_all(fd, on)` (Linux's IP_MULTICAST_ALL; a receiver turns it off so it hears only the groups it joined; Darwin and the BSDs filter per socket and have no such option); `set_receive_pktinfo(fd)`, `pktinfo_of(msghdr)` and `destined_for(msghdr, address, ifindex)`, which checks the IP_PKTINFO control message says the datagram was sent to that address on that interface (0: any).

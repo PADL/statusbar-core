@@ -130,8 +130,9 @@ assertion to pass.
   sleep for nothing and assert nothing about how long anything took, so a
   loaded build host cannot fail them. A module's `FUNCTIONAL_TESTS`
   exercise the real thing end to end (real sockets, a real kernel, real
-  waits). They build into a binary of their own,
-  `statusbar_functional_test`, and each carries the ctest label
+  waits). They build into a binary of their own (CMake target
+  `statusbar_functional_test`, file `statusbar-<pkg>-functional-test`),
+  and each carries the ctest label
   `functional`: `ctest -LE functional` runs the unit tests alone,
   `ctest -L functional` the rest. When logic is tangled with I/O, split
   it out (as `http::HttpEngine` is split from `HttpServer`, and
@@ -146,17 +147,25 @@ assertion to pass.
   umbrella's test presets come in pairs for the same reason: `default`
   is the unit tests and `default-functional` the functional ones.
 - **Before a commit, if you want it.** The pre-commit hook checks
-  formatting and the block rule. `install-hooks.sh --functional` adds a
+  formatting and the block rule. The umbrella's
+  `install-hooks.sh --functional` adds a
   third step, core's `run-functional-tests.sh`, which builds the repo's
   configured build directory and runs `ctest -L functional` when the
   staged change touches C++ or CMake. It is off unless asked for.
   Without a configured build directory it says so and lets the commit
   through; `STATUSBAR_SKIP_FUNCTIONAL_TESTS=1` skips it for one commit;
-  `sh run-functional-tests.sh --always` runs it by hand.
+  `sh run-functional-tests.sh --always` runs it by hand, which is also
+  the way in a core checkout on its own (it has no hook installer). The
+  script reads `STATUSBAR_BUILD_DIR` (the build directory),
+  `STATUSBAR_FUNCTIONAL_TESTS_TIMEOUT` (seconds per test, 300) and
+  `STATUSBAR_FUNCTIONAL_TESTS_STRICT`.
 - **Functional tests on a target.** Each package's development package
   (`statusbar-<pkg>-dev`) installs its functional tests as
   `statusbar-<pkg>-functional-test`: `-A` runs all of them, a ctest name
-  (`statusbar/<module>/<file without .cpp>`) one file. A test that reads
+  (`statusbar/<module>/<file without .cpp>`) one file. An `-A` run exits
+  0 whatever the tests did, so judge it by its output (no `FAIL: ` line,
+  and `All tests finished.` at the end); a single named file exits
+  non-zero when it fails. A test that reads
   a data file from beside its source names it in its module's
   `FUNCTIONAL_TEST_DATA` and finds it with
   `statusbar::test::functional_test_data(__FILE__, "testdata/x.bin")`

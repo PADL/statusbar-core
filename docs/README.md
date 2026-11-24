@@ -18,6 +18,7 @@ two-minute orientation, then dive into its headers under
 | config       | Cascades TOML files with CLI overrides into typed argument bindings.                | [CONFIG_MODULE.md](CONFIG_MODULE.md)       |
 | container    | Generic bounded, zero-heap containers used across protocol state machines.          | [CONTAINER_MODULE.md](CONTAINER_MODULE.md) |
 | csv          | RFC 4180 CSV output primitives; generic, with no domain knowledge.                  | [CSV_MODULE.md](CSV_MODULE.md)             |
+| http         | Embedded HTTP/1.1 and WebSocket server: `HttpEngine` (the logic) on a `ConnectionTransport`, `HttpServer` (the engine on sockets). | [HTTP_PLAN.md](HTTP_PLAN.md) |
 | ieee         | Network byte-order integer wrappers and IEEE 802 wire-format structs and constants. | [IEEE_MODULE.md](IEEE_MODULE.md)           |
 | ip           | Wire-format structs and protocol constants for IPv4, IPv6, UDP, ARP, ICMP, IGMP.    | [IP_MODULE.md](IP_MODULE.md)               |
 | itc          | Inter-thread primitives: typed sync, triple buffer, MessagePipe, stop signal.       | [ITC_MODULE.md](ITC_MODULE.md)             |

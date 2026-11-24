@@ -45,7 +45,8 @@ struct MonotonicRawFixedLine
     int64_t offset_ns{0};
 };
 
-/// The shared line. Reads are wait-free and consistent (seqlock); the
+/// The shared line. Reads take no lock and are consistent (a seqlock: a
+/// reader retries while the writer is mid-update); the
 /// conversions are exact to the nanosecond for any uptime, so a deadline
 /// hours away converts the same way a deadline microseconds away does.
 class MonotonicRawLine

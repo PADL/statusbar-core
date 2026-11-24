@@ -6,7 +6,9 @@ Mac (Release): ~210 ns per parsed request head, ~25k req/s sequential
 keep-alive on loopback (syscall-bound, client and server sharing one
 thread), ~140k req/s pipelined ×8; `statusbar-http-bench --check` gates
 regressions in CI-shaped optimized builds, and
-`http_alloc_gate_test.cpp` proves the zero-allocation steady state.
+`http_alloc_gate_test.cpp` (the engine on a told wire) and
+`http_alloc_gate_functional_test.cpp` (the engine on real sockets) prove
+the zero-allocation steady state.
 
 The logic and the sockets are separate. `HttpEngine` is the whole of the
 server's logic and names no socket: it is told its connections' events
@@ -63,13 +65,13 @@ base64, which is a nonce transform, not security — a self-contained
 ~60-line implementation lives inside this module, commented as
 handshake-only (§6.1).
 
-### Proposed layout
+### Layout
 
 ```
 statusbar/http/
   http_limits.hpp            init-time capacity/limit set
   http_parser.{hpp,cpp}      incremental request parser
-  http_router.{hpp,cpp}      manifest table + registered handlers
+  http_handler.hpp           HttpHandler, Disposition: the dynamic-handler interface
   http_static.{hpp,cpp}      manifest load, file sources, conditional GET
   http_engine.{hpp,cpp}      HttpEngine: the logic, on any ConnectionTransport
   http_server.{hpp,cpp}      HttpServer: the engine on a TcpConnectionPool
@@ -77,6 +79,7 @@ statusbar/http/
   http_sha1.{hpp,cpp}        handshake-only SHA-1 + base64
   http_server_example.cpp    manifest site + echo WS endpoint
   http_test_support.hpp      ToldSite / ToldClient: an engine on a made-up wire
+  http_alloc_gate_counting_new.hpp  counting operator new for the two allocation-gate tests (test only, one translation unit per binary)
   *_test.cpp                 unit tests: logic only, no socket, no waiting
   *_functional_test.cpp      the same engine end to end on real sockets
 ```
@@ -143,7 +146,7 @@ stateDiagram-v2
     reading_body --> awaiting_response : body done, handler deferred
     reading_body --> reading_head : body done, fast completion\n(response drained synchronously)
 
-    awaiting_response --> sending : HttpServer::respond() + send
+    awaiting_response --> sending : HttpEngine::respond() + send
     awaiting_response --> reading_head : respond() drained synchronously
 
     sending --> sending : EAGAIN; on_writable continues
