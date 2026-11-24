@@ -600,4 +600,22 @@ TEST(dpll_client, a_closed_client_answers_nothing)
 
 #endif  // __linux__
 
+TEST(dpll_pin, a_pin_may_report_a_frequency_its_own_ranges_do_not_hold)
+{
+    // Seen on a real card: a recovered-clock mux pin and a SyncE port pin
+    // report the frequency they run at and list no range at all, and an
+    // output that is off reports 0 Hz beside a range of 1 Hz to 25 MHz. The
+    // kernel refuses to set such a pin to the frequency it already has
+    // (EINVAL, before it looks at anything else), so a caller asks
+    // supports_frequency() and does not assume the reported one is settable.
+    Pin const recovered_clock{.id = 149, .frequency_hz = uint64_t{1'953'125}};
+    EXPECT_TRUE(recovered_clock.frequencies_supported.empty());
+    EXPECT_FALSE(recovered_clock.supports_frequency(*recovered_clock.frequency_hz));
+
+    Pin const idle_output{
+        .id = 162, .frequency_hz = uint64_t{0}, .frequencies_supported = {FrequencyRange{.min = 1, .max = 25'000'000}}};
+    EXPECT_FALSE(idle_output.supports_frequency(*idle_output.frequency_hz));
+    EXPECT_TRUE(idle_output.supports_frequency(FREQUENCY_10_MHZ));
+}
+
 TEST_MAIN(statusbar_net, net_dpll_test)

@@ -164,6 +164,27 @@ TEST(dpll_client, the_kernels_devices_are_listed_and_read_back)
     }
 }
 
+namespace {
+
+/// Set a pin to the frequency it reports, which changes nothing on the
+/// device, and check the answer against the order the kernel decides in
+/// (dpll_pin_freq_set): a frequency outside the pin's own supported ranges is
+/// refused with EINVAL before anything else is looked at, and a pin may well
+/// report one (a mux or SyncE pin with no ranges at all, an output at 0 Hz);
+/// then a pin whose driver cannot set a frequency is refused with EOPNOTSUPP;
+/// only then is the unchanged frequency acknowledged.
+auto expect_own_frequency_answered_as_the_kernel_does(DpllClient& client, Pin const& pin) -> void
+{
+    auto const answer = client.set_frequency(pin.id, *pin.frequency_hz);
+    if (!pin.supports_frequency(*pin.frequency_hz)) {
+        EXPECT_TRUE(!answer && answer.error() == std::errc::invalid_argument);
+        return;
+    }
+    EXPECT_TRUE(answer.has_value() || answer.error() == std::errc::operation_not_supported);
+}
+
+}  // namespace
+
 TEST(dpll_client, the_kernels_pins_are_listed_and_read_back)
 {
     DpllClient client;
@@ -191,9 +212,8 @@ TEST(dpll_client, the_kernels_pins_are_listed_and_read_back)
         for (auto const& on : pin.on_devices) {
             EXPECT_TRUE(client.device(on.device_id).has_value());
         }
-        // Asking for what it already has changes nothing and is acknowledged.
         if (pin.frequency_hz) {
-            EXPECT_TRUE(client.set_frequency(pin.id, *pin.frequency_hz).has_value());
+            expect_own_frequency_answered_as_the_kernel_does(client, pin);
         }
     }
     auto const missing = client.pin(0x7fff'fff0);
