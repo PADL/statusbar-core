@@ -299,6 +299,112 @@ TEST(mem_mapped_file, a_move_hands_the_mapping_over_and_the_source_is_empty)
     EXPECT_EQ(assigned.bytes()[511], TempFile::byte_at(511));
 }
 
+TEST(mem_mapped_file, a_region_maps_at_its_offset)
+{
+    size_t const page = MappedFile::page_size();
+    TempFile const file{(page * 3) + 9};
+    auto mapped = MappedFile::map(file.fd(), {.offset = page, .length = page});
+    EXPECT_TRUE(mapped.has_value());
+    EXPECT_EQ(mapped->size(), page);
+    EXPECT_EQ(mapped->bytes()[0], TempFile::byte_at(page));
+    EXPECT_EQ(mapped->bytes()[page - 1], TempFile::byte_at((page * 2) - 1));
+
+    auto tail = MappedFile::map(file.fd(), {.offset = page * 2});  // no length: to the end
+    EXPECT_TRUE(tail.has_value());
+    EXPECT_EQ(tail->size(), page + 9);
+    EXPECT_EQ(tail->bytes()[page + 8], TempFile::byte_at((page * 3) + 8));
+}
+
+TEST(mem_mapped_file, a_regions_ranges_count_from_its_own_start)
+{
+    size_t const page = MappedFile::page_size();
+    TempFile const file{(page * 4) + 9};
+    auto mapped = MappedFile::map(file.fd(), {.offset = page * 2});
+    EXPECT_TRUE(mapped.has_value());
+    auto const all = mapped->bytes();
+    auto const span = mapped->page_span(page + 10, 5);  // the region's second page, the file's fourth
+    EXPECT_EQ(span.data(), all.data() + page);
+    EXPECT_EQ(span.size(), page);
+    EXPECT_EQ(mapped->page_span(page * 2, 100).size(), size_t{9});  // clipped to the region, not the file
+#if defined(__linux__)
+    if (statusbar::test::under_address_sanitizer) {
+        SKIP("AddressSanitizer reports mlock success without locking anything");
+    }
+    long const before = vm_lck_kb();
+    auto const locked = mapped->lock_range(page, page * 2);  // the region's second page and its 9-byte tail
+    if (!locked) {
+        SKIP("mlock is not permitted here (RLIMIT_MEMLOCK / CAP_IPC_LOCK)");
+    }
+    EXPECT_EQ(vm_lck_kb() - before, static_cast<long>(2 * page / 1024));
+    EXPECT_EQ(mapped_pages(mapped->page_span(page, page * 2)), 2L);
+    EXPECT_EQ(all[page + 1], TempFile::byte_at((page * 3) + 1));
+    EXPECT_TRUE(mapped->unlock_range(page, page * 2).has_value());
+    EXPECT_EQ(vm_lck_kb(), before);
+#endif
+}
+
+TEST(mem_mapped_file, a_zero_length_region_is_a_valid_empty_mapping)
+{
+    size_t const page = MappedFile::page_size();
+    TempFile const file{page * 2};
+    auto mapped = MappedFile::map(file.fd(), {.offset = page, .length = 0});
+    EXPECT_TRUE(mapped.has_value());
+    EXPECT_TRUE(mapped->valid());
+    EXPECT_TRUE(mapped->bytes().empty());
+    EXPECT_TRUE(mapped->page_span(0, 1).empty());
+    EXPECT_TRUE(mapped->lock_range(0, page).has_value());  // nothing to lock
+}
+
+TEST(mem_mapped_file, an_unaligned_offset_is_refused)
+{
+    TempFile const file{MappedFile::page_size() * 2};
+    auto mapped = MappedFile::map(file.fd(), {.offset = 1, .length = 16});
+    EXPECT_FALSE(mapped.has_value());
+    EXPECT_EQ(mapped.error(), std::make_error_code(std::errc::invalid_argument));
+}
+
+TEST(mem_mapped_file, a_region_past_the_end_is_refused)
+{
+    size_t const page = MappedFile::page_size();
+    TempFile const file{page + 10};
+    auto too_long = MappedFile::map(file.fd(), {.offset = page, .length = 11});
+    EXPECT_FALSE(too_long.has_value());
+    EXPECT_EQ(too_long.error(), std::make_error_code(std::errc::invalid_argument));
+    auto too_far = MappedFile::map(file.fd(), {.offset = page * 2});
+    EXPECT_FALSE(too_far.has_value());
+    EXPECT_EQ(too_far.error(), std::make_error_code(std::errc::invalid_argument));
+    auto exact = MappedFile::map(file.fd(), {.offset = page, .length = 10});
+    EXPECT_TRUE(exact.has_value());
+}
+
+TEST(mem_mapped_file, an_offset_past_off_t_is_refused)
+{
+    int const fd = ::open("/dev/zero", O_RDONLY | O_CLOEXEC);
+    EXPECT_TRUE(fd >= 0);
+    uint64_t const page = MappedFile::page_size();
+    auto mapped = MappedFile::map(fd, {.offset = (UINT64_MAX / page) * page, .length = MappedFile::page_size()});
+    (void)::close(fd);
+    EXPECT_FALSE(mapped.has_value());
+    EXPECT_EQ(mapped.error(), std::make_error_code(std::errc::invalid_argument));
+}
+
+#if defined(__linux__)
+// /dev/zero maps shared on Linux; other systems refuse it (ENODEV).
+TEST(mem_mapped_file, a_file_that_is_not_regular_needs_a_length)
+{
+    int const fd = ::open("/dev/zero", O_RDONLY | O_CLOEXEC);
+    EXPECT_TRUE(fd >= 0);
+    auto no_length = MappedFile::map(fd);
+    EXPECT_FALSE(no_length.has_value());
+    EXPECT_EQ(no_length.error(), std::make_error_code(std::errc::invalid_argument));
+    auto with_length = MappedFile::map(fd, {.length = MappedFile::page_size()});
+    (void)::close(fd);
+    EXPECT_TRUE(with_length.has_value());
+    EXPECT_EQ(with_length->size(), MappedFile::page_size());
+    EXPECT_EQ(with_length->bytes()[0], uint8_t{0});
+}
+#endif
+
 //
 // Test Runner
 //

@@ -10,7 +10,10 @@
 #include <array>
 #include <cerrno>
 #include <climits>
+#include <cstdint>
 #include <cstring>
+#include <limits>
+#include <optional>
 #include <system_error>
 
 #include <sys/mman.h>
@@ -62,17 +65,49 @@ namespace {
 }
 #endif
 
-/// The size of a regular file open on fd, or the errno.
-[[nodiscard]] auto file_size(int const fd) noexcept -> StatusValue<size_t>
+/// The size of the file open on fd, or nullopt when it is not a regular file; the errno on failure.
+[[nodiscard]] auto file_size(int const fd) noexcept -> StatusValue<std::optional<uint64_t>>
 {
     struct stat st{};
     if (::fstat(fd, &st) != 0) {
         return errno_status();
     }
     if (!S_ISREG(st.st_mode)) {
+        return std::optional<uint64_t>{};
+    }
+    return std::optional{static_cast<uint64_t>(st.st_size)};
+}
+
+/// The length of `options`' region of a regular file of `size` bytes: within the file, and within size_t.
+[[nodiscard]] auto regular_region(MapOptions const& options, uint64_t const size) noexcept -> StatusValue<size_t>
+{
+    uint64_t const left = options.offset <= size ? size - options.offset : 0;
+    uint64_t const length = options.length ? uint64_t{*options.length} : left;
+    bool const fits = options.offset <= size && length <= left && static_cast<size_t>(length) == length;  // 32-bit size_t
+    return fits ? StatusValue<size_t>{static_cast<size_t>(length)} : failure(std::errc::invalid_argument);
+}
+
+/// The region's length: `options` checked against the page size and off_t and, for a regular file, its `size`.
+[[nodiscard]] auto region_length(MapOptions const& options, std::optional<uint64_t> const size, size_t const page) noexcept
+    -> StatusValue<size_t>
+{
+    if (options.offset % page != 0 || options.offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
         return failure(std::errc::invalid_argument);
     }
-    return static_cast<size_t>(st.st_size);
+    if (!size) {
+        return options.length ? StatusValue<size_t>{*options.length} : failure(std::errc::invalid_argument);
+    }
+    return regular_region(options, *size);
+}
+
+/// The shared read-only mapping of `length` bytes of fd at `options`' offset; the errno on failure.
+[[nodiscard]] auto mmap_region(int const fd, size_t const length, MapOptions const& options) noexcept -> StatusValue<void*>
+{
+    void* const base = ::mmap(nullptr, length, PROT_READ, MAP_SHARED, fd, static_cast<off_t>(options.offset));
+    if (base == MAP_FAILED) {
+        return errno_status();
+    }
+    return base;
 }
 
 /// A close that keeps the errno of the call before it.
@@ -85,20 +120,17 @@ void close_keeping_errno(int const fd) noexcept
 
 }  // namespace
 
-auto MappedFile::map(int const fd) -> StatusValue<MappedFile>
+auto MappedFile::map(int const fd, MapOptions const& options) -> StatusValue<MappedFile>
 {
-    auto const size = file_size(fd);
-    if (!size) {
-        return failure(size.error());
+    auto const length =
+        file_size(fd).and_then([&](std::optional<uint64_t> const size) { return region_length(options, size, page_size()); });
+    if (!length) {
+        return failure(length.error());
     }
-    if (*size == 0) {
-        return MappedFile{nullptr, 0};  // mmap refuses a zero length; the empty file is valid all the same
+    if (*length == 0) {
+        return MappedFile{nullptr, 0};  // mmap refuses a zero length; the empty region is valid
     }
-    void* const base = ::mmap(nullptr, *size, PROT_READ, MAP_SHARED, fd, 0);
-    if (base == MAP_FAILED) {
-        return errno_status();
-    }
-    return MappedFile{base, *size};
+    return mmap_region(fd, *length, options).transform([&](void* const base) { return MappedFile{base, *length}; });
 }
 
 namespace {
