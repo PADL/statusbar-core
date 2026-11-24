@@ -100,14 +100,33 @@ namespace {
     return regular_region(options, *size);
 }
 
-/// The shared read-only mapping of `length` bytes of fd at `options`' offset; the errno on failure.
+/// The shared mapping of `length` bytes of fd at `options`' offset, read-write when it asks; the errno on failure.
 [[nodiscard]] auto mmap_region(int const fd, size_t const length, MapOptions const& options) noexcept -> StatusValue<void*>
 {
-    void* const base = ::mmap(nullptr, length, PROT_READ, MAP_SHARED, fd, static_cast<off_t>(options.offset));
+    int const protection = options.writable ? PROT_READ | PROT_WRITE : PROT_READ;
+    void* const base = ::mmap(nullptr, length, protection, MAP_SHARED, fd, static_cast<off_t>(options.offset));
     if (base == MAP_FAILED) {
         return errno_status();
     }
     return base;
+}
+
+/// Whether fd's access mode allows the mapping, as mmap(2) checks it: readable (O_RDONLY or O_RDWR), and O_RDWR
+/// when writable, else EACCES; an O_PATH descriptor is EBADF.
+[[nodiscard]] auto access_allows(int const fd, bool const writable) noexcept -> Status
+{
+    int const flags = ::fcntl(fd, F_GETFL);
+    if (flags < 0) {
+        return errno_status();
+    }
+#if defined(O_PATH)
+    if ((flags & O_PATH) != 0) {
+        return failure(std::error_code{EBADF, std::system_category()});
+    }
+#endif
+    int const mode = flags & O_ACCMODE;
+    bool const allowed = writable ? mode == O_RDWR : mode != O_WRONLY;
+    return allowed ? Status{success()} : failure(std::error_code{EACCES, std::system_category()});
 }
 
 /// A close that keeps the errno of the call before it.
@@ -120,6 +139,11 @@ void close_keeping_errno(int const fd) noexcept
 
 }  // namespace
 
+auto MappedFile::empty_region(int const fd, MapOptions const& options) noexcept -> StatusValue<MappedFile>
+{
+    return access_allows(fd, options.writable).transform([&] { return MappedFile{nullptr, 0, options.writable}; });
+}
+
 auto MappedFile::map(int const fd, MapOptions const& options) -> StatusValue<MappedFile>
 {
     auto const length =
@@ -128,9 +152,11 @@ auto MappedFile::map(int const fd, MapOptions const& options) -> StatusValue<Map
         return failure(length.error());
     }
     if (*length == 0) {
-        return MappedFile{nullptr, 0};  // mmap refuses a zero length; the empty region is valid
+        return empty_region(fd, options);  // mmap refuses a zero length; the empty region is valid
     }
-    return mmap_region(fd, *length, options).transform([&](void* const base) { return MappedFile{base, *length}; });
+    return mmap_region(fd, *length, options).transform([&](void* const base) {
+        return MappedFile{base, *length, options.writable};
+    });
 }
 
 namespace {
@@ -170,6 +196,7 @@ auto MappedFile::operator=(MappedFile&& other) noexcept -> MappedFile&
         base_ = other.base_;
         size_ = other.size_;
         valid_ = other.valid_;
+        writable_ = other.writable_;
         other.forget();
     }
     return *this;
