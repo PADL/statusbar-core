@@ -230,15 +230,6 @@ TEST(net_rx_flow, clearing_stops_at_a_nic_without_a_classifier)
 
 // The real NIC, where the only answer anyone can count on is a refusal
 
-TEST(net_rx_flow, loopback_has_no_classifier)
-{
-    auto const rule = rx_flow_rule("lo", 0);
-    EXPECT_FALSE(rule.has_value());
-    if (!rule) {
-        EXPECT_TRUE(rule.error() == std::errc::operation_not_supported);
-    }
-}
-
 TEST(net_rx_flow, an_unknown_interface_is_told_apart_from_no_classifier)
 {
 #if !defined(__linux__)

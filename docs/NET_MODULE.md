@@ -81,11 +81,14 @@ int main() {
 
 ## Headers
 
-- `statusbar/net/net.hpp` — module header; pulls in everything below (with `net_linux_*.hpp` gated on `__linux__`). Consumers should `#include` this.
+- `statusbar/net/net.hpp` — module header; pulls in the socket, reactor, Ethernet-port, classifier and netlink-framing headers below (with `net_linux_*.hpp` gated on `__linux__`). Include these by name: `net_tcp_server.hpp`, `net_connection_transport.hpp`, `net_told_connection_transport.hpp`, `net_dpll.hpp`, `net_phc.hpp`, `net_rx_flow.hpp`.
 - `statusbar/net/net_message_reactor.hpp` — `Pollable`, `MessageReactor`, `ClockFn`, `monotonic_ns`.
 - `statusbar/net/net_address.hpp` — `SocketAddress` plus `create_udp_socket` / `create_tcp_socket` / `create_tcp_listener`.
 - `statusbar/net/net_socket.hpp` — `FileDescriptor`, `set_nonblocking`, `set_reuse_addr`, `set_dscp`, `set_tos`, `would_block`; the IPv4 endpoint pair `ipv4_sockaddr_in(address, port)` / `ipv4_endpoint(sockaddr_in)` (`IPv4Endpoint`); `set_multicast_all(fd, on)` (Linux's IP_MULTICAST_ALL; a receiver turns it off so it hears only the groups it joined; Darwin and the BSDs filter per socket and have no such option); `set_receive_pktinfo(fd)`, `pktinfo_of(msghdr)` and `destined_for(msghdr, address, ifindex)`, which checks the IP_PKTINFO control message says the datagram was sent to that address on that interface (0: any).
 - `statusbar/net/net_server_config.hpp`, `net_notify.hpp`, `net_error.hpp` — `ServerConfig`, `NotificationPipe`, `NetError`.
+- `statusbar/net/net_connection_transport.hpp` — `TcpConnectionHandler` and `ConnectionTransport`: the seam between a slot-indexed connection engine and what carries its bytes.
+- `statusbar/net/net_tcp_server.hpp` — `TcpConnectionPool`, the transport made of real sockets.
+- `statusbar/net/net_told_connection_transport.hpp` — `ToldConnectionTransport`, the transport made of memory: told what its peers do, turned by hand with `poll(now_ns)`, for unit-testing an engine's logic with no socket and no clock.
 - `statusbar/net/net_rawnet.hpp`, `net_ethernet_port.hpp` — `RawnetContext` and the `EthernetPort` concept + slot/guard types.
 - `statusbar/net/net_rawnet_port.hpp`, `net_any_ethernet_port.hpp` — `RawnetPort`, and `AnyEthernetPort` with `EthernetBackend` / `parse_ethernet_backend`.
 - `statusbar/net/net_dpll.hpp`, `net_phc.hpp` — `dpll::DpllClient` / `dpll::DpllWatch` (the kernel's DPLLs and their lock status), `phc::PhcDevice` (a PTP hardware clock's pins and periodic outputs).

@@ -43,6 +43,19 @@ TEST(realtime_timer_config, default_values)
     EXPECT_EQ(config.resync_interval_cycles, 1000);
 }
 
+TEST(realtime_timer_config, the_lines_figures_reach_the_timers_line)
+{
+    TimerConfig config;
+    EXPECT_EQ(config.raw_line_drift_bound_ppb, MonotonicRawLineConfig{}.drift_bound_ppb);
+    EXPECT_EQ(config.raw_line_sleep_rate_margin_ppb, MonotonicRawLineConfig{}.sleep_rate_margin_ppb);
+
+    config.raw_line_drift_bound_ppb = 50'000;
+    config.raw_line_sleep_rate_margin_ppb = 20'000;
+    Timer<> const timer{config, [](TimerEvent<> const&, statusbar::stats::AtomicWakeStats::Snapshot const&) {}};
+    EXPECT_EQ(timer.raw_line().config().drift_bound_ppb, uint32_t{50'000});
+    EXPECT_EQ(timer.raw_line().config().sleep_rate_margin_ppb, uint32_t{20'000});
+}
+
 TEST(realtime_timer_config, default_error_histogram)
 {
     TimerConfig config;
@@ -198,7 +211,7 @@ TEST(realtime_cycle_number_to_ns, is_constexpr)
 }
 
 //
-// Tests: Timer construction (default MonotonicClockAdapter)
+// Tests: Timer construction (default MonotonicRawClockAdapter)
 //
 
 TEST(realtime_timer_construct, valid_config)
@@ -206,7 +219,7 @@ TEST(realtime_timer_construct, valid_config)
     TimerConfig config;
     config.period_ns = 1'000'000;  // 1 ms
 
-    Timer<> timer(config, [](TimerEvent<MonotonicClock> const&, AtomicWakeStats::Snapshot const&) {});
+    Timer<> timer(config, [](TimerEvent<MonotonicRawClock> const&, AtomicWakeStats::Snapshot const&) {});
 
     EXPECT_FALSE(timer.is_running());
     EXPECT_EQ(timer.period_ns(), 1'000'000);
@@ -221,7 +234,7 @@ TEST(realtime_timer_construct, custom_compensation)
     config.period_ns = 500'000;
     config.compensation_ns = -25'000;
 
-    Timer<> timer(config, [](TimerEvent<MonotonicClock> const&, AtomicWakeStats::Snapshot const&) {});
+    Timer<> timer(config, [](TimerEvent<MonotonicRawClock> const&, AtomicWakeStats::Snapshot const&) {});
 
     EXPECT_EQ(timer.compensation_ns(), -25'000);
     EXPECT_EQ(timer.compensation().count(), -25'000);
@@ -233,7 +246,7 @@ TEST(realtime_timer_construct, busy_wait_mode)
     config.period_ns = 125'000;
     config.busy_wait = true;
 
-    Timer<> timer(config, [](TimerEvent<MonotonicClock> const&, AtomicWakeStats::Snapshot const&) {});
+    Timer<> timer(config, [](TimerEvent<MonotonicRawClock> const&, AtomicWakeStats::Snapshot const&) {});
 
     EXPECT_TRUE(timer.is_busy_wait());
 }
@@ -243,7 +256,7 @@ TEST(realtime_timer_construct, period_as_duration)
     TimerConfig config;
     config.period_ns = 250'000;
 
-    Timer<> timer(config, [](TimerEvent<MonotonicClock> const&, AtomicWakeStats::Snapshot const&) {});
+    Timer<> timer(config, [](TimerEvent<MonotonicRawClock> const&, AtomicWakeStats::Snapshot const&) {});
 
     EXPECT_EQ(timer.period().count(), 250'000);
 }
@@ -256,7 +269,7 @@ TEST(realtime_timer_construct, config_accessor)
     config.cpu = 2;
     config.priority = 80;
 
-    Timer<> timer(config, [](TimerEvent<MonotonicClock> const&, AtomicWakeStats::Snapshot const&) {});
+    Timer<> timer(config, [](TimerEvent<MonotonicRawClock> const&, AtomicWakeStats::Snapshot const&) {});
 
     auto const& cfg = timer.config();
     EXPECT_EQ(cfg.name, "test_timer");
@@ -270,7 +283,7 @@ TEST(realtime_timer_construct, initial_stats_empty)
     TimerConfig config;
     config.period_ns = 1'000'000;
 
-    Timer<> timer(config, [](TimerEvent<MonotonicClock> const&, AtomicWakeStats::Snapshot const&) {});
+    Timer<> timer(config, [](TimerEvent<MonotonicRawClock> const&, AtomicWakeStats::Snapshot const&) {});
 
     auto snapshot = timer.stats();
     EXPECT_EQ(snapshot.error.count, 0);
@@ -281,41 +294,73 @@ TEST(realtime_timer_construct, initial_stats_empty)
 // Tests: TimerEvent
 //
 
-TEST(realtime_timer_event, scheduled_time_ns)
+TEST(realtime_timer_event, the_scheduled_time_is_on_the_events_clock)
 {
-    TimerEvent<MonotonicClock> event{
-        .scheduled_time = MonotonicClock::from_ns(1'000'000'000),
-        .error = MonotonicClock::duration{500},
+    TimerEvent<GptpClock0> event{
+        .scheduled_time = GptpClock0::from_ns(1'000'000'000),
+        .error = Nanoseconds{500},
         .wake_count = 1,
         .skipped_counts = 0,
     };
 
-    EXPECT_EQ(event.scheduled_time_ns(), 1'000'000'000);
+    static_assert(std::is_same_v<decltype(event.scheduled_time), GptpClock0::time_point>);
+    static_assert(std::is_same_v<decltype(event.error), Nanoseconds>);
+    EXPECT_EQ(GptpClock0::to_ns(event.scheduled_time), int64_t{1'000'000'000});
 }
 
-TEST(realtime_timer_event, error_ns)
+TEST(realtime_timer_event, the_error_is_a_signed_duration)
 {
-    TimerEvent<MonotonicClock> event{
-        .scheduled_time = MonotonicClock::from_ns(0),
-        .error = MonotonicClock::duration{-250},
+    TimerEvent<MonotonicRawClock> event{
+        .scheduled_time = MonotonicRawClock::from_ns(0),
+        .error = Nanoseconds{-250},
         .wake_count = 1,
         .skipped_counts = 0,
     };
 
-    EXPECT_EQ(event.error_ns(), -250);
+    EXPECT_EQ(event.error.count(), int64_t{-250});
 }
 
 TEST(realtime_timer_event, fields_accessible)
 {
-    TimerEvent<MonotonicClock> event{
-        .scheduled_time = MonotonicClock::from_ns(5000),
-        .error = MonotonicClock::duration{100},
+    TimerEvent<MonotonicRawClock> event{
+        .scheduled_time = MonotonicRawClock::from_ns(5000),
+        .error = Nanoseconds{100},
         .wake_count = 42,
         .skipped_counts = 3,
     };
 
     EXPECT_EQ(event.wake_count, 42);
     EXPECT_EQ(event.skipped_counts, 3);
+}
+
+TEST(realtime_timer_event, an_event_built_by_hand_was_not_told_its_raw_entry)
+{
+    TimerEvent<> const by_hand{
+        .scheduled_time = MonotonicRawClock::from_ns(5000),
+        .error = Nanoseconds{0},
+        .wake_count = 1,
+        .skipped_counts = 0,
+    };
+    static_assert(std::is_same_v<TimerEvent<>, TimerEvent<MonotonicRawClock>>);
+    EXPECT_EQ(by_hand.wake_raw_ns(), int64_t{0});
+    // Nor an accuracy.
+    EXPECT_TRUE(by_hand.accuracy == UNBOUNDED_ACCURACY);
+}
+
+TEST(realtime_timer_event, the_nanosecond_accessors_read_the_typed_fields)
+{
+    // Kept for callbacks written against them.
+    TimerEvent<GptpClock0> const event{
+        .scheduled_time = GptpClock0::from_ns(1'000'000'000),
+        .error = Nanoseconds{-250},
+        .wake_count = 1,
+        .skipped_counts = 0,
+        .wake_raw = MonotonicRawClock::from_ns(77),
+    };
+
+    EXPECT_EQ(event.scheduled_time_ns(), int64_t{1'000'000'000});
+    EXPECT_EQ(event.error_ns(), int64_t{-250});
+    EXPECT_EQ(event.wake_raw_ns(), int64_t{77});
 }
 
 //
@@ -334,7 +379,7 @@ TEST(realtime_timer_any, create_monotonic)
     TimerConfig config;
     config.period_ns = 1'000'000;
 
-    auto timer = AnyTimer::create(config, [](TimerEvent<MonotonicClock> const&, AtomicWakeStats::Snapshot const&) {});
+    auto timer = AnyTimer::create(config, [](TimerEvent<MonotonicRawClock> const&, AtomicWakeStats::Snapshot const&) {});
 
     EXPECT_TRUE(static_cast<bool>(timer));
     EXPECT_FALSE(timer.is_running());
@@ -346,7 +391,7 @@ TEST(realtime_timer_any, config_accessor)
     config.period_ns = 2'000'000;
     config.name = "any_test";
 
-    auto timer = AnyTimer::create(config, [](TimerEvent<MonotonicClock> const&, AtomicWakeStats::Snapshot const&) {});
+    auto timer = AnyTimer::create(config, [](TimerEvent<MonotonicRawClock> const&, AtomicWakeStats::Snapshot const&) {});
 
     EXPECT_EQ(timer.config().period_ns, 2'000'000);
     EXPECT_EQ(timer.config().name, "any_test");
@@ -378,7 +423,7 @@ TEST(realtime_timer_any, move_construct)
     config.period_ns = 1'000'000;
     config.name = "movable";
 
-    auto timer1 = AnyTimer::create(config, [](TimerEvent<MonotonicClock> const&, AtomicWakeStats::Snapshot const&) {});
+    auto timer1 = AnyTimer::create(config, [](TimerEvent<MonotonicRawClock> const&, AtomicWakeStats::Snapshot const&) {});
     AnyTimer timer2{std::move(timer1)};
 
     EXPECT_TRUE(static_cast<bool>(timer2));
@@ -441,7 +486,7 @@ TEST(realtime_timer_base, stop_idempotent)
 {
     TimerConfig config;
     config.period_ns = 1'000'000;
-    Timer<> timer(config, [](TimerEvent<MonotonicClock> const&, AtomicWakeStats::Snapshot const&) {});
+    Timer<> timer(config, [](TimerEvent<MonotonicRawClock> const&, AtomicWakeStats::Snapshot const&) {});
     timer.stop();
     EXPECT_FALSE(timer.is_running());
 }
@@ -461,13 +506,16 @@ class TestTimerBase : public TimerBase
     using TimerBase::TimerBase;
 
     // Expose protected members for direct testing
+    using TimerBase::early_wake;
     using TimerBase::is_running_atomic;
     using TimerBase::set_running;
     using TimerBase::should_run;
     using TimerBase::try_start;
     using TimerBase::try_stop;
+    using TimerBase::wait_outcome;
     using TimerBase::wait_until_absolute;
-    using TimerBase::wait_until_busy;
+    using TimerBase::wait_until_raw_deadline;
+    using TimerBase::wake_target;
 
     // Call the real (non-overridden) prepare_thread directly, bypassing our lightweight override
     auto call_real_prepare_thread() -> bool { return TimerBase::prepare_thread(); }
@@ -651,67 +699,96 @@ TEST(realtime_timer_base_prepare, small_prefault_completes_on_worker_thread)
 }
 
 //
-// wait_until_absolute / wait_until_busy
+// wait_until_absolute. The waits that really wait (a sleep to a deadline
+// ahead, a RAW wait, a running timer) are in realtime_functional_test.cpp.
 //
 
 TEST(realtime_timer_base_wait, absolute_past_deadline_returns_immediately)
 {
-    int64_t const deadline = read_monotonic_ns() - 1'000'000;  // 1 ms in the past
-    int64_t const start = read_monotonic_ns();
-    int64_t const err = TestTimerBase::wait_until_absolute(deadline);
-    int64_t const elapsed = read_monotonic_ns() - start;
+    auto const deadline = read_monotonic() - Nanoseconds{1'000'000};  // 1 ms in the past
+    auto const start = read_monotonic();
+    Nanoseconds const err = TestTimerBase::wait_until_absolute(deadline);
+    Nanoseconds const elapsed = read_monotonic() - start;
 
-    // Error should be positive (we're late) and elapsed time should be very short.
-    EXPECT_TRUE(err > 0);
-    EXPECT_TRUE(elapsed < 5'000'000);  // under 5 ms even on a busy system
+    // The error is positive (we're late) by at least the millisecond the
+    // deadline was already past; how long the call took is the host's affair.
+    EXPECT_TRUE(err >= Nanoseconds{1'000'000});
+    EXPECT_TRUE(elapsed >= Nanoseconds::zero());
 }
 
-TEST(realtime_timer_base_wait, absolute_future_deadline_sleeps_until_reached)
-{
-    int64_t const target_wait_ns = 2'000'000;  // 2 ms
-    int64_t const deadline = read_monotonic_ns() + target_wait_ns;
-    int64_t const start = read_monotonic_ns();
-    (void)TestTimerBase::wait_until_absolute(deadline);
-    int64_t const actual = read_monotonic_ns();
+//
+// The arithmetic of a RAW wait, told the time: no clock is read here.
+//
 
-    // We must have slept at least until the deadline.
-    EXPECT_TRUE(actual >= deadline);
-    // And not dramatically overshot (give 20ms slack for slow CI / shared hosts).
-    EXPECT_TRUE((actual - start) < (target_wait_ns + 20'000'000));
+TEST(realtime_timer_base_wait, a_wake_past_the_deadline_counts_the_periods_it_missed)
+{
+    TestTimerBase const base{TimerConfig{.period_ns = 1'000'000, .cpu = -1}};
+    auto const deadline = MonotonicRawClock::from_ns(50'000'000'000);
+
+    auto const on_time = base.wait_outcome(deadline, deadline + Nanoseconds{300});
+    EXPECT_EQ(on_time.error.count(), int64_t{300});
+    EXPECT_EQ(on_time.skipped_counts, int64_t{0});
+
+    // Five and a half periods late: five whole periods were missed.
+    auto const late = base.wait_outcome(deadline, deadline + Nanoseconds{5'500'000});
+    EXPECT_EQ(late.error.count(), int64_t{5'500'000});
+    EXPECT_EQ(late.skipped_counts, int64_t{5});
+
+    // Exactly one period late is still this wake, not a missed one.
+    EXPECT_EQ(base.wait_outcome(deadline, deadline + Nanoseconds{1'000'000}).skipped_counts, int64_t{0});
+    // A period of zero divides nothing.
+    EXPECT_EQ(wait_result(Nanoseconds{5'500'000}, Nanoseconds::zero()).skipped_counts, int64_t{0});
 }
 
-TEST(realtime_timer_base_wait, busy_past_deadline_returns_immediately)
+TEST(realtime_timer_base_wait, the_wait_aims_at_the_compensated_deadline_and_measures_against_the_uncompensated_one)
 {
-    int64_t const deadline = read_monotonic_ns() - 500'000;
-    int64_t const start = read_monotonic_ns();
-    int64_t const err = TestTimerBase::wait_until_busy(deadline);
-    int64_t const elapsed = read_monotonic_ns() - start;
+    // Compensation moves the wake, not the instant the error is measured from.
+    Nanoseconds const early{20'000'000};
+    TestTimerBase const base{TimerConfig{.period_ns = 1'000'000'000, .compensation_ns = -early.count(), .cpu = -1}};
+    auto const deadline = MonotonicRawClock::from_ns(50'000'000'000);
 
-    EXPECT_TRUE(err > 0);
-    EXPECT_TRUE(elapsed < 5'000'000);
+    auto const target = base.wake_target(deadline);
+    EXPECT_TRUE(target == deadline - early);
+    // Woken 150 ns after the target: early by the compensation less that.
+    auto const outcome = base.wait_outcome(deadline, target + Nanoseconds{150});
+    EXPECT_EQ(outcome.error.count(), -early.count() + 150);
+    EXPECT_EQ(outcome.skipped_counts, int64_t{0});
 }
 
-TEST(realtime_timer_base_wait, busy_future_deadline_honors_deadline)
+TEST(realtime_timer_base_wait, the_coarse_sleep_ends_a_guard_before_the_target)
 {
-    int64_t const target_wait_ns = 500'000;  // 500 us — short enough to stay in busy-wait
-    int64_t const deadline = read_monotonic_ns() + target_wait_ns;
-    (void)TestTimerBase::wait_until_busy(deadline, 1'000'000);  // threshold > period: pure busy-wait
-    int64_t const actual = read_monotonic_ns();
+    // A timer that has not waited yet holds the identity line, so here a
+    // CLOCK_MONOTONIC instant reads the same as the RAW one. The guard is
+    // raw_spin_guard_ns plus the slew the sleep could accrue: 100 ppm of
+    // margin on a line at rate one.
+    TestTimerBase const base{TimerConfig{.period_ns = 1'000'000'000, .cpu = -1, .raw_spin_guard_ns = 50'000}};
+    auto const now = MonotonicRawClock::from_ns(50'000'000'000);
 
-    EXPECT_TRUE(actual >= deadline);
+    // 5 ms to go: sleep to 50 us and 500 ns before the target.
+    auto const wake = base.early_wake(now + Nanoseconds{5'000'000}, now);
+    EXPECT_TRUE(wake.has_value());
+    EXPECT_EQ(
+        MonotonicClock::to_ns(wake.value_or(MonotonicClock::time_point{})), int64_t{50'000'000'000 + 5'000'000 - 50'000 - 500});
+
+    // Inside the guard, at the target, or past it: no sleep, the wait is a spin.
+    EXPECT_FALSE(base.early_wake(now + Nanoseconds{50'004}, now).has_value());
+    EXPECT_FALSE(base.early_wake(now, now).has_value());
+    EXPECT_FALSE(base.early_wake(now - Nanoseconds{5'500'000}, now).has_value());
 }
 
-TEST(realtime_timer_base_wait, busy_sleeps_then_spins_when_threshold_small)
+TEST(realtime_timer_base_wait, a_busy_wait_timer_spins_the_whole_of_a_short_wait)
 {
-    int64_t const target_wait_ns = 3'000'000;  // 3 ms total
-    int64_t const threshold_ns = 200'000;      // sleep until deadline - 200us, spin remainder
-    int64_t const deadline = read_monotonic_ns() + target_wait_ns;
-    int64_t const start = read_monotonic_ns();
-    (void)TestTimerBase::wait_until_busy(deadline, threshold_ns);
-    int64_t const actual = read_monotonic_ns();
+    // busy_wait: the guard is busy_wait_threshold_ns.
+    TestTimerBase const base{
+        TimerConfig{.period_ns = 1'000'000'000, .busy_wait_threshold_ns = 10'000'000, .cpu = -1, .busy_wait = true}};
+    auto const now = MonotonicRawClock::from_ns(50'000'000'000);
 
-    EXPECT_TRUE(actual >= deadline);
-    EXPECT_TRUE((actual - start) < (target_wait_ns + 20'000'000));
+    EXPECT_FALSE(base.early_wake(now + Nanoseconds{500'000}, now).has_value());
+    // A long one still sleeps first: to 10 ms and 5 us before the target.
+    auto const wake = base.early_wake(now + Nanoseconds{50'000'000}, now);
+    EXPECT_EQ(
+        MonotonicClock::to_ns(wake.value_or(MonotonicClock::time_point{})),
+        int64_t{50'000'000'000 + 50'000'000 - 10'000'000 - 5'000});
 }
 
 //
@@ -901,7 +978,7 @@ TEST(realtime_timer_vector, print_configs_no_crash)
     TimerConfig cfg;
     cfg.period_ns = 1'000'000;
     cfg.name = "cfg_test";
-    timers.push_back(AnyTimer::create(cfg, [](TimerEvent<MonotonicClock> const&, AtomicWakeStats::Snapshot const&) {}));
+    timers.push_back(AnyTimer::create(cfg, [](TimerEvent<MonotonicRawClock> const&, AtomicWakeStats::Snapshot const&) {}));
     print_timer_configs(timers);
     EXPECT_TRUE(true);
 }
@@ -912,7 +989,7 @@ TEST(realtime_timer_vector, print_stats_no_crash)
     TimerConfig cfg;
     cfg.period_ns = 1'000'000;
     cfg.name = "stat_test";
-    timers.push_back(AnyTimer::create(cfg, [](TimerEvent<MonotonicClock> const&, AtomicWakeStats::Snapshot const&) {}));
+    timers.push_back(AnyTimer::create(cfg, [](TimerEvent<MonotonicRawClock> const&, AtomicWakeStats::Snapshot const&) {}));
     print_timer_stats(timers);
     EXPECT_TRUE(true);
 }
@@ -1014,70 +1091,347 @@ TEST(realtime_monotonic, is_monotonic)
 //
 
 //
-// Raw-reference timer: schedules and measures on CLOCK_MONOTONIC_RAW
+// The schedule a timer keeps (TimerSchedule), told the time: every instant
+// below is made up, nothing waits and no clock is read.
 //
 
 namespace {
 
-constexpr int64_t RAW_PERIOD_NS = 2'000'000;
+constexpr Nanoseconds SCHEDULE_PERIOD{2'000'000};
 
-/// What the timer thread reported, read back once it has stopped.
-struct RawRun
+/// A made-up domain a fixed distance ahead of RAW, far enough that a value
+/// on one clock could never be mistaken for a value on the other, and
+/// running `ppm` fast of it.
+struct ToldSource
 {
-    std::atomic<int> wakes{0};
-    std::atomic<int64_t> first_scheduled_ns{0};
-    std::atomic<int64_t> last_scheduled_ns{0};
-    std::atomic<int64_t> worst_error_ns{0};
+    static constexpr int64_t OFFSET_NS = 1'780'000'000'000'000'000;
 
-    auto observe(TimerEvent<MonotonicRawClock> const& event) -> void
+    int64_t ppm{0};
+    bool healthy{true};
+
+    [[nodiscard]] auto now_ns() const noexcept -> int64_t { return OFFSET_NS; }  // a schedule is told, it does not ask
+    [[nodiscard]] auto to_raw_ns(int64_t domain_ns) const noexcept -> int64_t
     {
-        if (wakes.fetch_add(1, std::memory_order_relaxed) == 0) {
-            first_scheduled_ns.store(event.scheduled_time_ns(), std::memory_order_relaxed);
-        }
-        last_scheduled_ns.store(event.scheduled_time_ns(), std::memory_order_relaxed);
-        worst_error_ns.store(std::max(worst_error_ns.load(std::memory_order_relaxed), event.error_ns()), std::memory_order_relaxed);
+        int64_t const elapsed = domain_ns - OFFSET_NS;
+        return elapsed - ((elapsed * ppm) / 1'000'000);
     }
+    [[nodiscard]] auto from_raw_ns(int64_t raw_ns) const noexcept -> int64_t
+    {
+        return OFFSET_NS + raw_ns + ((raw_ns * ppm) / 1'000'000);
+    }
+    [[nodiscard]] auto is_healthy() const noexcept -> bool { return healthy; }
 };
 
-/// Run a raw-reference timer until it has woken @p wanted times (or 500 ms
-/// have passed) and hand back the line its thread fitted.
-auto run_raw_timer(RawRun& run, int wanted) -> MonotonicRawLine::RateOffset
+/// The same domain from a source that reports its quality: whatever the
+/// test last set, as a follower's would be whatever its last sync left.
+struct ToldQualifiedSource : ToldSource
 {
-    TimerConfig const config{.period_ns = RAW_PERIOD_NS, .cpu = -1, .stack_prefault_bytes = 0};
-    Timer<MonotonicRawClockAdapter> timer(config, [&run](auto const& event, auto const&) { run.observe(event); });
-    timer.start();
-    for (int i = 0; i < 500 && run.wakes.load(std::memory_order_relaxed) < wanted; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    timer.stop();
-    return timer.raw_line().consume();
+    ClockQuality reported{};
+
+    [[nodiscard]] auto quality() const noexcept -> ClockQuality { return reported; }
+};
+
+/// A domain the test can move to another timeline: `offset_ns` ahead of RAW
+/// at rate one, known as well as `reported` says.
+struct SteppingSource
+{
+    int64_t offset_ns{ToldSource::OFFSET_NS};
+    ClockQuality reported{};
+
+    [[nodiscard]] auto now_ns() const noexcept -> int64_t { return offset_ns; }
+    [[nodiscard]] auto to_raw_ns(int64_t domain_ns) const noexcept -> int64_t { return domain_ns - offset_ns; }
+    [[nodiscard]] auto from_raw_ns(int64_t raw_ns) const noexcept -> int64_t { return raw_ns + offset_ns; }
+    [[nodiscard]] auto is_healthy() const noexcept -> bool { return true; }
+    [[nodiscard]] auto quality() const noexcept -> ClockQuality { return reported; }
+};
+
+using RawSchedule = TimerSchedule<MonotonicRawClockAdapter>;
+using GptpAdapter = ClockAdapter<GptpClock0, ToldSource>;
+using QualifiedGptpAdapter = ClockAdapter<GptpClock0, ToldQualifiedSource>;
+using SteppingAdapter = ClockAdapter<GptpClock0, SteppingSource>;
+
+/// A timeline synchronized at RAW @p synced_ns to within @p bound_ns,
+/// drifting no faster than 20 ppm.
+constexpr auto timeline_quality(uint64_t epoch, int64_t synced_ns, int64_t bound_ns) -> ClockQuality
+{
+    return {
+        .synced_at = MonotonicRawClock::from_ns(synced_ns),
+        .bound_at_sync = Nanoseconds{bound_ns},
+        .epoch = epoch,
+        .drift_bound_ppb = 20'000,
+        .time_source = TimeSource::ptp};
+}
+
+/// A wait that ended @p error late having missed @p skipped whole periods.
+constexpr auto waited(int64_t error_ns = 0, int64_t skipped = 0) -> WaitResult
+{
+    return {.error = Nanoseconds{error_ns}, .skipped_counts = skipped};
 }
 
 }  // namespace
 
-TEST(realtime_timer_raw, the_adapter_decides_which_wait_the_timer_takes)
+TEST(realtime_timer_raw, a_timer_given_no_adapter_runs_on_the_raw_clock)
 {
-    static_assert(Timer<MonotonicRawClockAdapter>::raw_reference);
-    static_assert(!Timer<>::raw_reference);
-    static_assert(std::is_same_v<Timer<MonotonicRawClockAdapter>::time_point, MonotonicRawClock::time_point>);
+    static_assert(std::is_same_v<Timer<>, Timer<MonotonicRawClockAdapter>>);
+    static_assert(std::is_same_v<Timer<>::clock_type, MonotonicRawClock>);
+    static_assert(std::is_same_v<Timer<>::time_point, MonotonicRawClock::time_point>);
+    static_assert(std::is_same_v<Timer<>::event_type, TimerEvent<MonotonicRawClock>>);
 }
 
-TEST(realtime_timer_raw, a_raw_reference_timer_wakes_on_period_boundaries_of_the_raw_clock)
+TEST(realtime_timer_schedule, the_grid_starts_on_a_period_boundary_past_the_time_it_is_told)
 {
-    RawRun run;
-    auto const line = run_raw_timer(run, 10);
-    int const wakes = run.wakes.load(std::memory_order_relaxed);
-    EXPECT_TRUE(wakes >= 10);
-    // Scheduled times are RAW instants on period boundaries, advancing a
-    // period per wake.
-    EXPECT_EQ(run.last_scheduled_ns.load(std::memory_order_relaxed) % RAW_PERIOD_NS, int64_t{0});
-    EXPECT_TRUE(run.last_scheduled_ns.load() - run.first_scheduled_ns.load() >= (wakes - 1) * RAW_PERIOD_NS);
-    // The thread primed its RAW->MONOTONIC line before the first deadline.
-    EXPECT_TRUE(line.rate > 0.8 && line.rate < 1.2);
-    EXPECT_NE(line.offset_ns, int64_t{0});
-    // The wake error is measured on RAW. This runs without SCHED_FIFO on a
-    // shared box, so only a gross bound is asserted.
-    EXPECT_TRUE(run.worst_error_ns.load(std::memory_order_relaxed) < 50'000'000);
+    RawSchedule schedule{{}, {.period = SCHEDULE_PERIOD, .start_offset_cycles = 2}};
+    EXPECT_TRUE(schedule.is_ready());
+
+    // Told a time 700 us into cycle 10: the first wake is cycle 12.
+    schedule.begin(MonotonicRawClock::from_ns((10 * SCHEDULE_PERIOD.count()) + 700'000));
+    EXPECT_EQ(schedule.wake_count(), int64_t{12});
+    EXPECT_EQ(MonotonicRawClock::to_ns(schedule.deadline().scheduled), 12 * SCHEDULE_PERIOD.count());
+    // On the RAW clock the schedule and the wait are the same instant.
+    EXPECT_TRUE(schedule.deadline().raw_deadline == schedule.deadline().scheduled);
+}
+
+TEST(realtime_timer_schedule, each_wake_moves_one_period_and_a_late_one_skips_what_it_missed)
+{
+    RawSchedule schedule{{}, {.period = SCHEDULE_PERIOD}};
+    schedule.begin(MonotonicRawClock::from_ns(10 * SCHEDULE_PERIOD.count()));
+
+    schedule.advance(waited(100));
+    EXPECT_EQ(schedule.wake_count(), int64_t{13});
+    EXPECT_EQ(MonotonicRawClock::to_ns(schedule.deadline().scheduled), 13 * SCHEDULE_PERIOD.count());
+
+    // Five and a half periods late: the five boundaries that passed are
+    // skipped, not run late one after the other.
+    schedule.advance(waited(11'000'000, 5));
+    EXPECT_EQ(schedule.wake_count(), int64_t{19});
+    EXPECT_EQ(MonotonicRawClock::to_ns(schedule.deadline().scheduled), 19 * SCHEDULE_PERIOD.count());
+    EXPECT_EQ(MonotonicRawClock::to_ns(schedule.deadline().raw_deadline), 19 * SCHEDULE_PERIOD.count());
+}
+
+TEST(realtime_timer_schedule, the_event_tells_the_schedule_and_how_the_wait_ended)
+{
+    RawSchedule schedule{{}, {.period = SCHEDULE_PERIOD}};
+    schedule.begin(MonotonicRawClock::from_ns(10 * SCHEDULE_PERIOD.count()));
+
+    auto const event = schedule.event(waited(4'000'300, 2));
+    EXPECT_TRUE(event.scheduled_time == schedule.deadline().scheduled);
+    EXPECT_EQ(event.error.count(), int64_t{4'000'300});
+    EXPECT_EQ(event.wake_count, int64_t{12});
+    EXPECT_EQ(event.skipped_counts, int64_t{2});
+    // The RAW clock is its own reference: the schedule is exact.
+    EXPECT_EQ(event.accuracy.count(), int64_t{0});
+    // When the callback is entered is the thread's to stamp, not the schedule's.
+    EXPECT_TRUE(event.wake_raw == MonotonicRawClock::time_point{});
+}
+
+TEST(realtime_timer_schedule, a_schedule_on_a_gptp_adapter_is_laid_in_gptp_and_waited_for_on_raw)
+{
+    static_assert(std::is_same_v<Timer<GptpAdapter>::event_type, TimerEvent<GptpClock0>>);
+    static_assert(std::is_same_v<TimerSchedule<GptpAdapter>::event_type, TimerEvent<GptpClock0>>);
+
+    ToldSource const source;
+    TimerSchedule<GptpAdapter> schedule{GptpAdapter{source}, {.period = SCHEDULE_PERIOD}};
+    // Told the gPTP time 700 us into its cycle that RAW would call cycle 10.
+    schedule.begin(GptpClock0::from_ns(ToldSource::OFFSET_NS + (10 * SCHEDULE_PERIOD.count()) + 700'000));
+
+    // The schedule is a period boundary of the gPTP domain...
+    int64_t const scheduled_gptp_ns = GptpClock0::to_ns(schedule.deadline().scheduled);
+    EXPECT_EQ(scheduled_gptp_ns % SCHEDULE_PERIOD.count(), int64_t{0});
+    EXPECT_EQ(scheduled_gptp_ns, ToldSource::OFFSET_NS + (12 * SCHEDULE_PERIOD.count()));
+    // ...and the wait is for the same instant on RAW.
+    EXPECT_EQ(MonotonicRawClock::to_ns(schedule.deadline().raw_deadline), 12 * SCHEDULE_PERIOD.count());
+    EXPECT_TRUE(schedule.event(waited()).scheduled_time == schedule.deadline().scheduled);
+}
+
+TEST(realtime_timer_schedule, both_instants_move_by_the_period_until_a_resync_converts_afresh)
+{
+    // A domain 100 ppm fast of RAW: one of its milliseconds is 999'900 ns of RAW.
+    ToldSource const source{.ppm = 100};
+    constexpr Nanoseconds PERIOD{1'000'000};
+    TimerSchedule<GptpAdapter> schedule{
+        GptpAdapter{source}, {.period = PERIOD, .start_offset_cycles = 2, .resync_interval_cycles = 4}};
+    schedule.begin(GptpClock0::from_ns(ToldSource::OFFSET_NS));
+
+    // Cycle 2 of the domain since its offset, converted: 2 ms less 200 ns.
+    EXPECT_EQ(MonotonicRawClock::to_ns(schedule.deadline().raw_deadline), int64_t{1'999'800});
+    // Cycle 3: moved by the period on both clocks, 100 ns late on RAW.
+    schedule.advance(waited());
+    EXPECT_EQ(MonotonicRawClock::to_ns(schedule.deadline().raw_deadline), int64_t{2'999'800});
+    // Cycle 4 is a multiple of the resync interval: converted afresh.
+    schedule.advance(waited());
+    EXPECT_EQ(schedule.wake_count() % 4, int64_t{0});
+    EXPECT_EQ(MonotonicRawClock::to_ns(schedule.deadline().raw_deadline), int64_t{3'999'600});
+    EXPECT_EQ(GptpClock0::to_ns(schedule.deadline().scheduled), ToldSource::OFFSET_NS + 4'000'000);
+
+    // With the resync turned off the two drift apart for good.
+    TimerSchedule<GptpAdapter> never{
+        GptpAdapter{source}, {.period = PERIOD, .start_offset_cycles = 2, .resync_interval_cycles = 0}};
+    never.begin(GptpClock0::from_ns(ToldSource::OFFSET_NS));
+    never.advance(waited());
+    never.advance(waited());
+    EXPECT_EQ(MonotonicRawClock::to_ns(never.deadline().raw_deadline), int64_t{3'999'800});
+}
+
+//
+// The accuracy a timer tells with every wake
+//
+
+TEST(realtime_timer_accuracy, a_source_without_quality_is_ready_while_healthy_and_claims_no_accuracy)
+{
+    static_assert(!QualifiedClockAdapter<GptpAdapter>);
+
+    ToldSource source{.healthy = false};
+    TimerSchedule<GptpAdapter> schedule{GptpAdapter{source}, {.period = SCHEDULE_PERIOD}};
+    EXPECT_FALSE(schedule.is_ready());
+    source.healthy = true;
+    EXPECT_TRUE(schedule.is_ready());
+
+    schedule.begin(GptpClock0::from_ns(ToldSource::OFFSET_NS));
+    EXPECT_TRUE(schedule.accuracy() == UNBOUNDED_ACCURACY);
+    EXPECT_TRUE(schedule.event(waited()).accuracy == UNBOUNDED_ACCURACY);
+}
+
+TEST(realtime_timer_accuracy, a_schedule_waits_for_the_first_sync_then_coasts_and_tells_the_growing_accuracy)
+{
+    static_assert(QualifiedClockAdapter<QualifiedGptpAdapter>);
+
+    ToldQualifiedSource source;  // never synchronized, and it says it is not healthy either
+    source.healthy = false;
+    TimerSchedule<QualifiedGptpAdapter> schedule{QualifiedGptpAdapter{source}, {.period = SCHEDULE_PERIOD}};
+    EXPECT_FALSE(schedule.is_ready());
+
+    // One sync at RAW 1 s, good to 500 ns, drifting no faster than 20 ppm.
+    // Then the master is gone for good: this quality is never refreshed.
+    source.reported = {
+        .synced_at = MonotonicRawClock::from_ns(1'000'000'000),
+        .bound_at_sync = Nanoseconds{500},
+        .epoch = 1,
+        .drift_bound_ppb = 20'000,
+        .time_source = TimeSource::ptp};
+    // Ready on the bound alone: a source that reports quality is not asked for its health.
+    EXPECT_TRUE(schedule.is_ready());
+
+    // Started 300 us after the sync: the first wake is 4 ms after it.
+    schedule.begin(GptpClock0::from_ns(ToldSource::OFFSET_NS + 1'000'300'000));
+    EXPECT_EQ(MonotonicRawClock::to_ns(schedule.deadline().raw_deadline), int64_t{1'004'000'000});
+    EXPECT_EQ(schedule.event(waited()).accuracy.count(), int64_t{500 + 80});  // 4 ms at 20 ppm
+    schedule.advance(waited());
+    EXPECT_EQ(schedule.event(waited()).accuracy.count(), int64_t{500 + 120});  // 6 ms
+
+    // Thirty seconds on (told as one long skip), still coasting, still on its grid.
+    schedule.advance(waited(0, 14'999));
+    EXPECT_TRUE(schedule.is_ready());
+    EXPECT_EQ(MonotonicRawClock::to_ns(schedule.deadline().raw_deadline), int64_t{31'006'000'000});
+    EXPECT_EQ(schedule.event(waited()).accuracy.count(), int64_t{500 + 600'120});  // 30.006 s
+
+    // A new timeline with nothing known of it yet: the schedule goes on,
+    // and each wake says that it can vouch for nothing.
+    source.reported = ClockQuality{.epoch = 2};
+    schedule.advance(waited());
+    EXPECT_EQ(MonotonicRawClock::to_ns(schedule.deadline().raw_deadline), int64_t{31'008'000'000});
+    EXPECT_TRUE(schedule.event(waited()).accuracy == UNBOUNDED_ACCURACY);
+}
+
+//
+// A clock that moves to another timeline under a running schedule
+//
+
+TEST(realtime_timer_timeline, a_schedule_tells_the_timeline_its_grid_is_on)
+{
+    // An adapter that reports no quality has one timeline, number 0.
+    RawSchedule raw{{}, {.period = SCHEDULE_PERIOD}};
+    raw.begin(MonotonicRawClock::from_ns(10 * SCHEDULE_PERIOD.count()));
+    EXPECT_EQ(raw.timeline(), uint64_t{0});
+    EXPECT_FALSE(raw.timeline_changed());
+    EXPECT_FALSE(raw.follow_timeline(MonotonicRawClock::from_ns(11 * SCHEDULE_PERIOD.count())));
+    EXPECT_EQ(raw.event(waited()).timeline, uint64_t{0});
+
+    SteppingSource source{.reported = timeline_quality(7, 1'000'000'000, 500)};
+    TimerSchedule<SteppingAdapter> schedule{SteppingAdapter{source}, {.period = SCHEDULE_PERIOD}};
+    schedule.begin(GptpClock0::from_ns(source.offset_ns + 1'000'300'000));
+    EXPECT_EQ(schedule.timeline(), uint64_t{7});
+    EXPECT_EQ(schedule.event(waited()).timeline, uint64_t{7});
+    EXPECT_FALSE(schedule.timeline_changed());
+    // Nothing to follow while the clock stays on the grid's timeline.
+    EXPECT_FALSE(schedule.follow_timeline(MonotonicRawClock::from_ns(1'000'400'000)));
+}
+
+TEST(realtime_timer_timeline, a_grid_left_behind_coasts_unconverted_until_the_new_timeline_claims_a_bound)
+{
+    SteppingSource source{.reported = timeline_quality(1, 1'000'000'000, 500)};
+    TimerSchedule<SteppingAdapter> schedule{
+        SteppingAdapter{source}, {.period = SCHEDULE_PERIOD, .start_offset_cycles = 2, .resync_interval_cycles = 2}};
+    schedule.begin(GptpClock0::from_ns(source.offset_ns + 1'000'300'000));
+    EXPECT_EQ(MonotonicRawClock::to_ns(schedule.deadline().raw_deadline), int64_t{1'004'000'000});
+    int64_t const old_wake_count = schedule.wake_count();
+
+    // A new grandmaster an hour behind the old one, nothing known of it yet.
+    constexpr int64_t HOUR_NS = 3'600'000'000'000;
+    source.offset_ns -= HOUR_NS;
+    source.reported = ClockQuality{.epoch = 2};
+    EXPECT_TRUE(schedule.timeline_changed());
+    EXPECT_TRUE(schedule.event(waited()).accuracy == UNBOUNDED_ACCURACY);
+    EXPECT_EQ(schedule.event(waited()).timeline, uint64_t{1});
+
+    // Five wakes on, through two resync points: the grid keeps its pace on
+    // RAW. Had it been put through the new mapping, the next wake would be
+    // an hour away.
+    for (int i = 1; i <= 5; ++i) {
+        schedule.advance(waited(300));
+        EXPECT_EQ(MonotonicRawClock::to_ns(schedule.deadline().raw_deadline), 1'004'000'000 + (i * SCHEDULE_PERIOD.count()));
+        EXPECT_TRUE(schedule.event(waited()).accuracy == UNBOUNDED_ACCURACY);
+    }
+    EXPECT_EQ(schedule.wake_count(), old_wake_count + 5);
+
+    // The new timeline synchronizes. The wake that ends 300 ns after RAW
+    // 1.014 s lays the grid again from there: two cycles past the one that
+    // instant is in, on the new timeline.
+    source.reported = timeline_quality(2, 1'015'000'000, 800);
+    schedule.advance(waited(300));
+    EXPECT_FALSE(schedule.timeline_changed());
+    EXPECT_EQ(schedule.timeline(), uint64_t{2});
+    EXPECT_EQ(MonotonicRawClock::to_ns(schedule.deadline().raw_deadline), int64_t{1'018'000'000});
+    EXPECT_EQ(GptpClock0::to_ns(schedule.deadline().scheduled), source.offset_ns + 1'018'000'000);
+    // The cycle numbers are the new timeline's: an hour of them fewer.
+    EXPECT_EQ(schedule.wake_count(), old_wake_count + 7 - (HOUR_NS / SCHEDULE_PERIOD.count()));
+    auto const event = schedule.event(waited());
+    EXPECT_EQ(event.timeline, uint64_t{2});
+    EXPECT_EQ(event.accuracy.count(), int64_t{800 + 60});  // 3 ms past the sync at 20 ppm
+}
+
+TEST(realtime_timer_timeline, a_thread_between_slices_of_a_long_wait_can_have_the_grid_laid_again)
+{
+    // A slow timer: its next wake is most of a second off when the clock steps.
+    constexpr Nanoseconds SLOW{1'000'000'000};
+    SteppingSource source{.reported = timeline_quality(1, 1'000'000'000, 500)};
+    TimerSchedule<SteppingAdapter> schedule{SteppingAdapter{source}, {.period = SLOW}};
+    schedule.begin(GptpClock0::from_ns(source.offset_ns + 1'000'300'000));
+    EXPECT_EQ(MonotonicRawClock::to_ns(schedule.deadline().raw_deadline), int64_t{3'000'000'000});
+
+    // The clock steps 400 ms forward and is known at once.
+    source.offset_ns += 400'000'000;
+    source.reported = timeline_quality(2, 1'200'000'000, 900);
+    EXPECT_TRUE(schedule.follow_timeline(MonotonicRawClock::from_ns(1'300'000'000)));
+    // RAW 1.3 s is 1.7 s into the new timeline's count from the old zero:
+    // the grid is its whole seconds, the first wake two past this one.
+    EXPECT_EQ(GptpClock0::to_ns(schedule.deadline().scheduled), ToldSource::OFFSET_NS + 3'000'000'000);
+    EXPECT_EQ(MonotonicRawClock::to_ns(schedule.deadline().raw_deadline), int64_t{2'600'000'000});
+    EXPECT_EQ(schedule.timeline(), uint64_t{2});
+    // Followed once: there is nothing more to follow.
+    EXPECT_FALSE(schedule.follow_timeline(MonotonicRawClock::from_ns(1'400'000'000)));
+}
+
+TEST(realtime_timer_accuracy, a_timer_is_ready_when_its_schedule_is)
+{
+    // A timer that is built and never started: no thread, no clock.
+    ToldQualifiedSource source;
+    TimerConfig const config{.period_ns = SCHEDULE_PERIOD.count(), .cpu = -1, .stack_prefault_bytes = 0};
+    Timer<QualifiedGptpAdapter> const timer(
+        config, [](TimerEvent<GptpClock0> const&, AtomicWakeStats::Snapshot const&) {}, QualifiedGptpAdapter{source});
+    EXPECT_FALSE(timer.schedule().is_ready());
+
+    source.reported = {.synced_at = MonotonicRawClock::from_ns(1'000'000'000), .bound_at_sync = Nanoseconds{500}};
+    EXPECT_TRUE(timer.schedule().is_ready());
 }
 
 //
@@ -1106,13 +1460,14 @@ TEST(realtime_timer_stop, joins_a_thread_that_left_on_its_own)
 {
     TimerConfig config;
     config.period_ns = 1'000'000;
-    SelfExitingTimer timer(config, [](TimerEvent<MonotonicClock> const&, AtomicWakeStats::Snapshot const&) {});
+    SelfExitingTimer timer(config, [](TimerEvent<MonotonicRawClock> const&, AtomicWakeStats::Snapshot const&) {});
 
     timer.start();
     // The thread clears the running flag itself as it leaves; the
-    // std::thread stays joinable until somebody joins it.
-    for (int i = 0; i < 1000 && timer.is_running(); ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    // std::thread stays joinable until somebody joins it. Wait for that
+    // to have happened, however long the host takes to run the thread.
+    while (timer.is_running()) {
+        std::this_thread::yield();
     }
     EXPECT_FALSE(timer.is_running());
     EXPECT_TRUE(timer.thread_joinable());
@@ -1124,29 +1479,27 @@ TEST(realtime_timer_stop, joins_a_thread_that_left_on_its_own)
     EXPECT_FALSE(timer.is_running());
 }
 
-TEST(realtime_timer_event, a_running_timer_tells_the_raw_instant_it_entered_the_callback)
+TEST(realtime_timer_stop, a_timer_whose_thread_left_on_its_own_starts_again)
 {
     TimerConfig config;
-    config.period_ns = 1'000'000;  // 1 ms
+    config.period_ns = 1'000'000;
+    SelfExitingTimer timer(config, [](TimerEvent<MonotonicRawClock> const&, AtomicWakeStats::Snapshot const&) {});
 
-    std::atomic<int64_t> told_raw{0};
-    std::atomic<int64_t> read_raw{0};
-    Timer<> timer(config, [&](TimerEvent<MonotonicClock> const& event, AtomicWakeStats::Snapshot const&) {
-        if (told_raw.load() == 0) {
-            told_raw.store(event.wake_raw_ns());
-            read_raw.store(read_monotonic_raw_ns());
-        }
-    });
     timer.start();
-    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
-    while (told_raw.load() == 0 && std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    while (timer.is_running()) {
+        std::this_thread::yield();
+    }
+    EXPECT_TRUE(timer.thread_joinable());
+
+    // The first thread is gone and not yet joined. Starting again joins it
+    // first; before, the new thread was assigned over it and the process
+    // terminated.
+    timer.start();
+    while (timer.is_running()) {
+        std::this_thread::yield();
     }
     timer.stop();
-
-    EXPECT_NE(told_raw.load(), 0);
-    EXPECT_TRUE(read_raw.load() >= told_raw.load());
-    EXPECT_TRUE(read_raw.load() - told_raw.load() < 100'000'000);  // the same callback, not another clock
+    EXPECT_FALSE(timer.thread_joinable());
 }
 
 TEST_MAIN(statusbar_realtime, realtime_timer_test)

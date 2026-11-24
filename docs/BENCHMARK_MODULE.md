@@ -47,7 +47,9 @@ module via `using` declarations.
   more reordering).
 - `Timer` — `steady_clock`-backed stopwatch. `start()`, `elapsed()`,
   `elapsed_ns()` / `elapsed_us()` / `elapsed_ms()` / `elapsed_s()`,
-  `reset()`.
+  `reset()`. It is `BasicTimer<std::chrono::steady_clock>`;
+  `BasicTimer<ClockT>` takes any clock with a static `now()`, so a test
+  can drive it.
 - `HardwareTimer` — CPU-counter-backed stopwatch with the same shape as
   `Timer` plus `elapsed_ticks()`, `start_tick()`, `ticks_per_second()`,
   and `ticks_to_ns()` for callers doing their own batch conversion.

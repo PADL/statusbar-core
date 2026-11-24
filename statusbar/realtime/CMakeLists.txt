@@ -7,6 +7,7 @@ statusbar_add_module(
   SOURCES
   realtime_base.cpp
   realtime_base_impl.cpp
+  realtime_clock.cpp
   realtime_cpu_idle.cpp
   realtime_monotonic_raw_line.cpp
   realtime_timer_base.cpp
@@ -18,15 +19,19 @@ statusbar_add_module(
   statusbar-container
   statusbar-stats
   statusbar-itc
-  statusbar-tsn
+  statusbar-safe_arith
   TESTS
+  realtime_accuracy_limit_test.cpp
   realtime_base_test.cpp
   realtime_clock_test.cpp
   realtime_cpu_idle_test.cpp
   realtime_monotonic_raw_line_test.cpp
   realtime_stats_test.cpp
   realtime_timer_test.cpp
-  realtime_tripwire_test.cpp)
+  realtime_tripwire_test.cpp
+  realtime_utc_clock_test.cpp
+  FUNCTIONAL_TESTS
+  realtime_functional_test.cpp)
 
 add_executable(realtime_timer_example realtime_timer_example.cpp)
 target_link_libraries(realtime_timer_example PRIVATE statusbar)

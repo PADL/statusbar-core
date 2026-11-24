@@ -4,45 +4,62 @@
 // SPDX-License-Identifier: MIT
 
 /// Realtime Clock Types Module
-/// Provides type-safe clock definitions for different time domains:
-/// - MonotonicRawClock: CLOCK_MONOTONIC_RAW, the timing reference clock
-///   (raw hardware counter, immune to NTP/phc2sys frequency slew)
-/// - MonotonicClock: Native system monotonic clock (CLOCK_MONOTONIC), the
-///   clock the kernel sleeps on; its rate is slewed, so it is for sleeping,
-///   not for timing
-/// - GptpClock<N>: gPTP clock domains (epochless, rate may differ from monotonic)
-/// - GpsClock: GPS time domain
-/// - TaiClock: TAI time domain
 ///
-/// Each clock type produces distinct time_point types that cannot be accidentally
-/// mixed at compile time. Conversion between clock domains requires explicit
-/// use of a ClockAdapter with the appropriate time mapping.
+/// One type per time domain, so a time on one clock cannot be passed where
+/// a time on another is expected:
+/// - MonotonicRawClock: CLOCK_MONOTONIC_RAW, the reference clock (raw
+///   hardware counter, immune to NTP/phc2sys frequency slew). Stamps,
+///   deadlines and measurements live here, and every other domain is
+///   mapped to and from it.
+/// - MonotonicClock: CLOCK_MONOTONIC, the clock the kernel sleeps on; its
+///   rate is slewed, so it is for sleeping, not for timing.
+/// - GptpClock<N>: gPTP clock domains (rate may differ from the local
+///   oscillator, and the time steps when the grandmaster changes).
+/// - UtcClock: UTC as the system clock keeps it, whatever disciplines it.
+/// - TaiClock: International Atomic Time, a constant offset from UTC.
+///
+/// Integers enter and leave a domain only through Clock::from_ns() and
+/// Clock::to_ns(). A ClockAdapter binds a clock type to a ClockSource and
+/// is the one place a source's bare nanoseconds are given their domain.
+///
+/// How well a domain is known is a ClockQuality: a worst-case accuracy
+/// that grows from the last synchronization, so that a follower which has
+/// lost its master can keep its rate and offset and coast, and whoever
+/// uses the time decides whether it is still good enough. A time carried
+/// with that accuracy is a BoundedTime. All of it is integer arithmetic.
+///
+/// This header includes no operating-system header (the standard library
+/// and the header-only overflow checks are all it needs). The clock reads and
+/// the sleep it declares are implemented in realtime_clock.cpp, which is
+/// the one place the platform is named.
 
-#include "statusbar/realtime/realtime_base.hpp"
-#include "statusbar/status/throw_or_abort.hpp"
-#include "statusbar/tsn/tsn.hpp"
+#include "statusbar/safe_arith/safe_arith.hpp"
 
 #include <chrono>
 #include <concepts>
 #include <cstdint>
-#include <optional>
 #include <ratio>
-#include <stdexcept>
-#include <type_traits>
 
 namespace statusbar::realtime {
+
+/// The duration every clock here counts in. It is one type for all
+/// domains on purpose: a period added to a gPTP schedule and to a RAW
+/// deadline is the same value, even though the two clocks tick at rates a
+/// few ppm apart.
+using Nanoseconds = std::chrono::duration<int64_t, std::nano>;
 
 //
 // Clock Type Tags
 //
 
-/// Tag type for monotonic clock (the reference clock for all conversions)
-struct MonotonicClockTag
+/// Tag type for the raw monotonic clock (CLOCK_MONOTONIC_RAW), the
+/// reference clock: stamps, deadlines and measurements live here.
+struct MonotonicRawClockTag
 {};
 
-/// Tag type for the raw monotonic clock (CLOCK_MONOTONIC_RAW), the timing
-/// reference: stamps, deadlines and measurements live here.
-struct MonotonicRawClockTag
+/// Tag type for the monotonic clock (CLOCK_MONOTONIC), the clock the
+/// kernel sleeps on.
+struct MonotonicClockTag
 {};
 
 /// Tag type for gPTP clock domains (parameterized by domain ID)
@@ -52,8 +69,8 @@ struct GptpClockTag
     static constexpr int domain_id = DomainId;
 };
 
-/// Tag type for GPS clock
-struct GpsClockTag
+/// Tag type for UTC as the system clock keeps it
+struct UtcClockTag
 {};
 
 /// Tag type for TAI clock
@@ -61,12 +78,14 @@ struct TaiClockTag
 {};
 
 //
-// Base Clock Template
+// Clock Template
 //
 
-/// Base clock type that provides std::chrono-compatible type aliases.
-/// This is not a TrivialClock (no static now()) because these clocks
-/// require runtime state (mapping parameters) to read time.
+/// A time domain: std::chrono-compatible aliases whose time_point is
+/// distinct for each Tag. There is no now(): most of these clocks need
+/// runtime state (a bridge) to be read, and the two that do not are read
+/// with read_monotonic_raw() and read_monotonic() so that every clock
+/// read in the code has a name that can be searched for.
 ///
 /// @tparam Tag A unique tag type that distinguishes this clock from others
 template <typename Tag>
@@ -74,322 +93,431 @@ struct Clock
 {
     using tag_type = Tag;
     using rep = int64_t;
-    using period = std::ratio<1, 1'000'000'000>;  // nanoseconds
-    using duration = std::chrono::duration<rep, period>;
+    using period = std::nano;
+    using duration = Nanoseconds;
     using time_point = std::chrono::time_point<Clock<Tag>, duration>;
 
-    /// This clock is not steady - the rate relative to real time may change
-    /// (e.g., due to oscillator drift or temperature changes)
-    static constexpr bool is_steady = false;
-
-    /// Create a time_point from a raw nanosecond value
+    /// Give a bare nanosecond count this clock's domain
     /// @param ns Time value in nanoseconds
     [[nodiscard]] static constexpr auto from_ns(int64_t ns) noexcept -> time_point { return time_point{duration{ns}}; }
 
-    /// Extract raw nanosecond value from a time_point
+    /// Take a time_point out of its domain, as a bare nanosecond count
     /// @param tp The time_point to convert
-    [[nodiscard]] static constexpr auto to_ns(time_point tp) noexcept { return tp.time_since_epoch().count(); }
+    [[nodiscard]] static constexpr auto to_ns(time_point tp) noexcept -> int64_t { return tp.time_since_epoch().count(); }
 };
 
 //
 // Concrete Clock Types
 //
 
-/// Monotonic clock - the native reference clock for the timer system.
-/// Maps directly to CLOCK_MONOTONIC on Linux and on macOS (clock_gettime).
-/// This is the only clock that can be read without a time bridge.
-using MonotonicClock = Clock<MonotonicClockTag>;
-
-/// Raw monotonic clock - CLOCK_MONOTONIC_RAW, read with read_monotonic_raw_ns().
+/// Raw monotonic clock - CLOCK_MONOTONIC_RAW, read with read_monotonic_raw().
 /// The raw hardware counter: NTP and phc2sys slew CLOCK_MONOTONIC's rate but
 /// never this one, so timing, stamps and deadlines use it. The kernel cannot
 /// sleep on it; a deadline here is reached by sleeping early on
 /// CLOCK_MONOTONIC through a MonotonicRawLine and spinning the last stretch.
 using MonotonicRawClock = Clock<MonotonicRawClockTag>;
 
+/// Monotonic clock - CLOCK_MONOTONIC, read with read_monotonic(). The only
+/// clock the kernel sleeps on, and that is all it is used for.
+using MonotonicClock = Clock<MonotonicClockTag>;
+
 /// gPTP clock for a specific domain.
 /// gPTP clocks are epochless (start at 0 when the grandmaster boots) and
 /// may run at a different rate than the local oscillator (up to ±50 ppm).
-/// Converting to/from MonotonicClock requires a PtpTimeBridge or similar.
+/// Converting to or from MonotonicRawClock takes a ClockAdapter on a bridge.
 ///
 /// @tparam DomainId The gPTP domain number (typically 0, but complex AVB
 ///         systems may have multiple domains on different network ports)
 template <int DomainId = 0>
 using GptpClock = Clock<GptpClockTag<DomainId>>;
 
-/// GPS clock - time from GPS receivers.
-/// GPS time has a fixed epoch (January 6, 1980) and does not include leap seconds.
-/// Converting to/from MonotonicClock requires a GPS time bridge.
-using GpsClock = Clock<GpsClockTag>;
-
-/// TAI clock - International Atomic Time.
-/// TAI has a fixed epoch and a known offset from UTC (currently 37 seconds).
-/// Converting to/from MonotonicClock requires a TAI time bridge.
-using TaiClock = Clock<TaiClockTag>;
-
-//
-// Common Type Aliases for Convenience
-//
-
 /// Default gPTP clock (domain 0)
 using GptpClock0 = GptpClock<0>;
 
-/// gPTP clock domain 1 (for multi-port AVB systems)
-using GptpClock1 = GptpClock<1>;
+/// UTC clock - the system clock (CLOCK_REALTIME on POSIX), counted from
+/// 1970-01-01 UTC. The type names the timescale only: the clock may be
+/// disciplined by a local GPS receiver, by a distant NTP server, or by
+/// nothing at all, and how well it is known is a ClockQuality, not a type.
+using UtcClock = Clock<UtcClockTag>;
+
+/// TAI clock - International Atomic Time. This code takes its offset from
+/// UTC as a constant (TAI_MINUS_UTC).
+using TaiClock = Clock<TaiClockTag>;
+
+/// TAI - UTC, in force since 2017-01-01, and taken as fixed. No further
+/// leap second is expected: the General Conference on Weights and Measures
+/// resolved in 2022 to stop inserting them, from 2035 at the latest. Should
+/// one still be applied before then, this constant changes and everything
+/// is built again.
+inline constexpr Nanoseconds TAI_MINUS_UTC{37'000'000'000LL};
+
+/// The TAI instant of a UTC one (exact: a constant offset)
+[[nodiscard]] constexpr auto to_tai(UtcClock::time_point utc) noexcept -> TaiClock::time_point
+{
+    return TaiClock::from_ns(UtcClock::to_ns(utc)) + TAI_MINUS_UTC;
+}
+
+/// The UTC instant of a TAI one (exact: a constant offset)
+[[nodiscard]] constexpr auto to_utc(TaiClock::time_point tai) noexcept -> UtcClock::time_point
+{
+    return UtcClock::from_ns(TaiClock::to_ns(tai)) - TAI_MINUS_UTC;
+}
 
 //
-// Clock Traits
+// Concept for Clock Types
 //
 
-/// Check if a type is a Clock instantiation
+namespace detail {
+
 template <typename T>
-struct is_clock : std::false_type
-{};
+inline constexpr bool is_clock = false;
 
 template <typename Tag>
-struct is_clock<Clock<Tag>> : std::true_type
-{};
+inline constexpr bool is_clock<Clock<Tag>> = true;
 
+}  // namespace detail
+
+/// Any clock type in this system (an instantiation of Clock)
 template <typename T>
-inline constexpr bool is_clock_v = is_clock<T>::value;
+concept ClockType = detail::is_clock<T>;
 
-/// Check if a type is a gPTP clock
-template <typename T>
-struct is_gptp_clock : std::false_type
-{};
+//
+// Reading the Two Clocks That Need No Bridge
+//
+// Declared here, implemented per platform in realtime_clock.cpp.
+//
 
-template <int DomainId>
-struct is_gptp_clock<Clock<GptpClockTag<DomainId>>> : std::true_type
-{};
+/// CLOCK_MONOTONIC_RAW in nanoseconds: the reference clock, immune to
+/// frequency slew. Not sleepable; a deadline on it is reached by sleeping
+/// early on CLOCK_MONOTONIC through a MonotonicRawLine and spinning here.
+auto read_monotonic_raw_ns() noexcept -> int64_t;
 
-template <typename T>
-inline constexpr bool is_gptp_clock_v = is_gptp_clock<T>::value;
+/// CLOCK_MONOTONIC in nanoseconds (NTP slews its rate; through a system
+/// sleep it keeps counting on macOS and stops on Linux, as RAW does on each). This is the clock the kernel sleeps on:
+/// use it for sleeping, not for timing. Timing, stamps and deadlines take
+/// read_monotonic_raw_ns().
+auto read_monotonic_ns() noexcept -> int64_t;
 
-/// Check if a type is the monotonic clock
-template <typename T>
-struct is_monotonic_clock : std::false_type
-{};
+/// Sleep until an absolute CLOCK_MONOTONIC deadline, the one kernel sleep
+/// primitive every sleeper goes through. Returns 0 when the deadline has
+/// passed (a missed or non-positive deadline returns at once rather than
+/// failing), EINTR when a signal cut the sleep short, or the errno of a
+/// failed sleep. Where the platform has no absolute sleep the wait is
+/// relative, over the remaining time as read on entry.
+/// @param deadline_ns The CLOCK_MONOTONIC instant to sleep to, in nanoseconds
+auto sleep_until_monotonic_ns(int64_t deadline_ns) noexcept -> int;
 
-template <>
-struct is_monotonic_clock<MonotonicClock> : std::true_type
-{};
-
-template <typename T>
-inline constexpr bool is_monotonic_clock_v = is_monotonic_clock<T>::value;
-
-/// Check if a type is the raw monotonic clock
-template <typename T>
-struct is_monotonic_raw_clock : std::false_type
-{};
-
-template <>
-struct is_monotonic_raw_clock<MonotonicRawClock> : std::true_type
-{};
-
-template <typename T>
-inline constexpr bool is_monotonic_raw_clock_v = is_monotonic_raw_clock<T>::value;
-
-/// Whether a clock source or adapter says its reference clock is
-/// CLOCK_MONOTONIC_RAW (a `static constexpr bool reference_is_raw`). A type
-/// that says nothing maps to CLOCK_MONOTONIC, as the originals did.
-template <typename T>
-struct reference_is_raw : std::false_type
-{};
-
-template <typename T>
-    requires requires {
-        { T::reference_is_raw } -> std::convertible_to<bool>;
-    }
-struct reference_is_raw<T> : std::bool_constant<T::reference_is_raw>
-{};
-
-template <typename T>
-inline constexpr bool reference_is_raw_v = reference_is_raw<T>::value;
-
-/// Get the domain ID from a gPTP clock type (compile-time)
-template <typename T>
-struct gptp_domain_id;
-
-template <int DomainId>
-struct gptp_domain_id<Clock<GptpClockTag<DomainId>>>
+/// CLOCK_MONOTONIC_RAW now: the reference clock, read once and passed on.
+[[nodiscard]] inline auto read_monotonic_raw() noexcept -> MonotonicRawClock::time_point
 {
-    static constexpr int value = DomainId;
+    return MonotonicRawClock::from_ns(read_monotonic_raw_ns());
+}
+
+/// CLOCK_MONOTONIC now: for sleeping, not for timing.
+[[nodiscard]] inline auto read_monotonic() noexcept -> MonotonicClock::time_point
+{
+    return MonotonicClock::from_ns(read_monotonic_ns());
+}
+
+/// Sleep until an absolute CLOCK_MONOTONIC deadline; see
+/// sleep_until_monotonic_ns() for what it returns.
+/// @param deadline The CLOCK_MONOTONIC instant to sleep to
+inline auto sleep_until_monotonic(MonotonicClock::time_point const deadline) noexcept -> int
+{
+    return sleep_until_monotonic_ns(MonotonicClock::to_ns(deadline));
+}
+
+//
+// Drift Over a Span
+//
+
+namespace detail {
+
+/// `seconds * ppb + part` in nanoseconds, or the largest count when that
+/// would not fit. The overflow is detected on the product itself, so there
+/// is no division here.
+[[nodiscard]] constexpr auto saturating_drift_ns(uint64_t const seconds, uint64_t const ppb, uint64_t const part) noexcept
+    -> int64_t
+{
+    constexpr auto LIMIT = static_cast<uint64_t>(Nanoseconds::max().count());
+    if (!can_multiply(seconds, ppb)) {
+        return static_cast<int64_t>(LIMIT);
+    }
+    uint64_t const whole = seconds * ppb;
+    return static_cast<int64_t>(whole > LIMIT - part ? LIMIT : whole + part);
+}
+
+}  // namespace detail
+
+/// How far a clock running @p ppb parts per billion off can move in
+/// @p elapsed: `elapsed * ppb / 1e9`, rounded up, in integers only: two
+/// divisions by a constant and two multiplies. A result that would not fit
+/// saturates to Nanoseconds::max(). A span that is not positive drifts
+/// nothing.
+/// @param elapsed The span the drift accumulates over
+/// @param ppb The rate error, in nanoseconds per second
+[[nodiscard]] constexpr auto accumulated_drift(Nanoseconds const elapsed, uint32_t const ppb) noexcept -> Nanoseconds
+{
+    constexpr int64_t BILLION = 1'000'000'000;
+    if (elapsed <= Nanoseconds::zero() || ppb == 0) {
+        return Nanoseconds::zero();
+    }
+    int64_t const seconds = elapsed.count() / BILLION;
+    int64_t const remainder_ns = elapsed.count() % BILLION;
+    // remainder_ns is below 1e9 and ppb below 2^32: the product is under
+    // 4.3e18 and fits, with room for the rounding term.
+    int64_t const part = ((remainder_ns * int64_t{ppb}) + (BILLION - 1)) / BILLION;
+    return Nanoseconds{detail::saturating_drift_ns(static_cast<uint64_t>(seconds), uint64_t{ppb}, static_cast<uint64_t>(part))};
+}
+
+//
+// Clock Quality
+//
+
+/// Where a clock's time ultimately comes from: the IEEE 1588 timeSource
+/// enumeration, so a gPTP source can fill it from the Announce it received.
+enum class TimeSource : uint8_t
+{
+    atomic_clock = 0x10,
+    gnss = 0x20,  ///< GPS or another satellite system
+    terrestrial_radio = 0x30,
+    serial_time_code = 0x39,
+    ptp = 0x40,
+    ntp = 0x50,
+    hand_set = 0x60,
+    other = 0x90,
+    internal_oscillator = 0xA0,  ///< free running
 };
 
-template <typename T>
-    requires is_gptp_clock_v<T>
-inline constexpr int gptp_domain_id_v = gptp_domain_id<T>::value;
+/// An accuracy that claims nothing: never synchronized, or not reported.
+inline constexpr Nanoseconds UNBOUNDED_ACCURACY = Nanoseconds::max();
 
-//
-// Concepts for Clock Types
-//
+/// The drift a source assumes while it coasts when its deployment has told
+/// it nothing better: 15 ppm, the frequency tolerance NTP assumes of any
+/// clock when it grows its own dispersion. A deployment that knows its
+/// oscillator and its temperature range configures its own figure.
+inline constexpr uint32_t DEFAULT_HOLDOVER_DRIFT_PPB = 15'000;
 
-/// Concept for any clock type in this system
-template <typename T>
-concept ClockType = is_clock_v<T>;
+namespace detail {
 
-/// Concept for gPTP clock types
-template <typename T>
-concept GptpClockType = is_gptp_clock_v<T>;
+/// The sum of two accuracies, or UNBOUNDED_ACCURACY when either is
+/// unbounded, either is negative (not an accuracy at all), or the sum
+/// would not fit.
+[[nodiscard]] constexpr auto add_accuracy(Nanoseconds const a, Nanoseconds const b) noexcept -> Nanoseconds
+{
+    if (a < Nanoseconds::zero() || b < Nanoseconds::zero()) {
+        return UNBOUNDED_ACCURACY;
+    }
+    return a > UNBOUNDED_ACCURACY - b ? UNBOUNDED_ACCURACY : a + b;
+}
 
-/// Concept for the monotonic clock
-template <typename T>
-concept MonotonicClockType = is_monotonic_clock_v<T>;
+}  // namespace detail
 
-/// Concept for the raw monotonic clock
-template <typename T>
-concept MonotonicRawClockType = is_monotonic_raw_clock_v<T>;
-
-//
-// Time Point Conversion Result
-//
-
-/// Result of a time conversion operation.
-/// Includes the converted time and metadata about the conversion's validity.
+/// How well a clock domain is known, as a worst-case bound that grows from
+/// the last synchronization.
 ///
-/// @tparam Clock The target clock type for the converted time_point
-template <ClockType Clock>
-struct TimeConversion
+/// A source that is following its master refreshes this on every sync. A
+/// source that has lost its master changes nothing: it keeps converting
+/// with the rate and offset it had, and uncertainty() grows with the time
+/// since synced_at. Nothing here says "unhealthy"; the user of the time
+/// compares uncertainty() with what its own application can tolerate.
+///
+/// A default ClockQuality has never been synchronized and bounds nothing.
+/// Trivially copyable, integers only, usable in a constant expression.
+struct ClockQuality
 {
-    using time_point = Clock::time_point;
+    /// The CLOCK_MONOTONIC_RAW instant of the last synchronization event.
+    MonotonicRawClock::time_point synced_at{};
 
-    time_point time{};    ///< The converted time
-    uint64_t epoch{0};    ///< Epoch counter at time of conversion
-    bool healthy{false};  ///< Whether the time bridge was healthy
+    /// The worst-case error at that instant. Negative, or
+    /// UNBOUNDED_ACCURACY, means no bound is claimed.
+    Nanoseconds bound_at_sync{UNBOUNDED_ACCURACY};
 
-    /// Check if conversion is valid (bridge was healthy)
-    [[nodiscard]] constexpr explicit operator bool() const noexcept { return healthy; }
+    /// Changes when the timeline itself changes (a new grandmaster, a
+    /// step): time before and after is not the same clock, however small
+    /// the uncertainty.
+    uint64_t epoch{0};
 
-    /// Get the time value, throwing if unhealthy
-    [[nodiscard]] constexpr auto value() const -> time_point
+    /// The worst-case rate at which the error grows after synced_at, in
+    /// parts per billion (nanoseconds per second): how far the held rate
+    /// may wander, not how far the oscillator is from nominal.
+    uint32_t drift_bound_ppb{0};
+
+    /// Where the time comes from. Only a user that makes a claim about the
+    /// source needs it; most compare the accuracy and nothing else.
+    TimeSource time_source{TimeSource::internal_oscillator};
+
+    /// A clock that is exact by definition: the reference read as itself.
+    [[nodiscard]] static constexpr auto exact() noexcept -> ClockQuality
     {
-        if (!healthy) {
-            throw_or_abort(std::errc::state_not_recoverable, "TimeConversion: bridge not healthy");
+        return {
+            .synced_at = {},
+            .bound_at_sync = Nanoseconds::zero(),
+            .epoch = 0,
+            .drift_bound_ppb = 0,
+            .time_source = TimeSource::internal_oscillator};
+    }
+
+    /// Whether any bound is claimed at all (the clock has synchronized).
+    [[nodiscard]] constexpr auto is_bounded() const noexcept -> bool
+    {
+        return bound_at_sync >= Nanoseconds::zero() && bound_at_sync != UNBOUNDED_ACCURACY;
+    }
+
+    /// The time since the last synchronization event, never negative:
+    /// an instant before synced_at has age zero.
+    /// @param now The CLOCK_MONOTONIC_RAW instant to measure to
+    [[nodiscard]] constexpr auto age(MonotonicRawClock::time_point const now) const noexcept -> Nanoseconds
+    {
+        return now > synced_at ? now - synced_at : Nanoseconds::zero();
+    }
+
+    /// The worst-case error at @p now: the bound at the last sync plus the
+    /// drift accumulated since, rounded up. UNBOUNDED_ACCURACY when no
+    /// bound is claimed or the sum does not fit. Told the time, so it reads
+    /// no clock, and it is integer arithmetic only.
+    /// @param now The CLOCK_MONOTONIC_RAW instant the error is wanted at
+    [[nodiscard]] constexpr auto uncertainty(MonotonicRawClock::time_point const now) const noexcept -> Nanoseconds
+    {
+        if (!is_bounded()) {
+            return UNBOUNDED_ACCURACY;
         }
-        return time;
+        return detail::add_accuracy(bound_at_sync, accumulated_drift(age(now), drift_bound_ppb));
     }
 
-    /// Get the time value or a default if unhealthy
-    /// @param default_value Value to return if the conversion is unhealthy
-    [[nodiscard]] constexpr auto value_or(time_point default_value) const noexcept -> time_point
+    /// Whether the worst-case error at @p now is within @p limit.
+    /// @param limit The largest error the caller can tolerate
+    /// @param now The CLOCK_MONOTONIC_RAW instant the error is wanted at
+    [[nodiscard]] constexpr auto within(Nanoseconds const limit, MonotonicRawClock::time_point const now) const noexcept -> bool
     {
-        return healthy ? time : default_value;
+        // An uncertainty that has grown to the ceiling is no bound, whatever the limit.
+        Nanoseconds const grown = uncertainty(now);
+        return is_bounded() && grown != UNBOUNDED_ACCURACY && grown <= limit;
     }
+
+    /// This quality with @p extra added to its bound: what a further step
+    /// with an error of its own (a read bracket, a fit residual) leaves.
+    /// An @p extra that is negative adds nothing.
+    /// @param extra The worst-case error of the further step
+    [[nodiscard]] constexpr auto widened_by(Nanoseconds const extra) const noexcept -> ClockQuality
+    {
+        ClockQuality wider = *this;
+        if (is_bounded() && extra > Nanoseconds::zero()) {
+            wider.bound_at_sync = detail::add_accuracy(bound_at_sync, extra);
+        }
+        return wider;
+    }
+
+    auto operator==(ClockQuality const&) const noexcept -> bool = default;
 };
+
+/// A time together with its worst-case accuracy: the true time is within
+/// `time` plus or minus `accuracy`. What the bounded forms of the clock
+/// functions return, and what they take to carry a bound through a
+/// conversion.
+///
+/// @tparam ClockT The clock the time is on
+template <ClockType ClockT>
+struct BoundedTime
+{
+    using clock_type = ClockT;
+
+    typename ClockT::time_point time{};
+    Nanoseconds accuracy{UNBOUNDED_ACCURACY};
+
+    /// Whether any accuracy is claimed at all
+    [[nodiscard]] constexpr auto is_bounded() const noexcept -> bool
+    {
+        return accuracy >= Nanoseconds::zero() && accuracy != UNBOUNDED_ACCURACY;
+    }
+
+    /// Whether the worst-case error is within @p limit.
+    /// @param limit The largest error the caller can tolerate
+    [[nodiscard]] constexpr auto within(Nanoseconds const limit) const noexcept -> bool
+    {
+        return is_bounded() && accuracy <= limit;
+    }
+
+    auto operator==(BoundedTime const&) const noexcept -> bool = default;
+};
+
+//
+// The System Clock (UTC)
+//
+// Declared here, implemented per platform in realtime_clock.cpp.
+//
+
+/// The system clock (CLOCK_REALTIME on POSIX) in nanoseconds since
+/// 1970-01-01 UTC. It is stepped and slewed by whatever disciplines it, so
+/// it is never a timing reference: it is how absolute time is learned.
+auto read_utc_ns() noexcept -> int64_t;
+
+/// The system clock now, as a UtcClock time.
+[[nodiscard]] inline auto read_utc() noexcept -> UtcClock::time_point
+{
+    return UtcClock::from_ns(read_utc_ns());
+}
+
+/// What the operating system says about how well its clock is
+/// synchronized: the figures its time daemon (NTP, chrony) maintains.
+struct SystemClockError
+{
+    /// False while the system reports its clock unsynchronized, and where
+    /// the platform cannot say.
+    bool synchronized{false};
+
+    /// The system's own worst-case error, which the daemon sets from its
+    /// source at each update and the system grows between updates.
+    Nanoseconds max_error{UNBOUNDED_ACCURACY};
+
+    /// The system's estimate of the typical error.
+    Nanoseconds estimated_error{UNBOUNDED_ACCURACY};
+
+    auto operator==(SystemClockError const&) const noexcept -> bool = default;
+};
+
+/// Ask the operating system for its clock's synchronization state. One
+/// system call: for a tick owner to make at its sampling rate, not on a
+/// fast path.
+[[nodiscard]] auto read_system_clock_error() noexcept -> SystemClockError;
 
 //
 // Clock Source Concept
 //
 
-/// Concept for a clock source that provides time mapping between a foreign
-/// clock domain and the monotonic clock.
+/// A time domain mapped onto CLOCK_MONOTONIC_RAW, in bare nanoseconds. A
+/// source (a PTP bridge, a gPTP slave) does not know which Clock type its
+/// domain is; a ClockAdapter says so.
 ///
 /// A ClockSource must provide:
-/// - now_ns(): Current time in the foreign clock domain (nanoseconds)
-/// - to_monotonic_ns(): Convert foreign clock ns to monotonic ns
-/// - from_monotonic_ns(): Convert monotonic ns to foreign clock ns
-/// - is_healthy(): Whether the time mapping is currently valid
-/// - epoch(): Counter that increments on time discontinuities
+/// - now_ns(): Current time in the source's domain
+/// - to_raw_ns(): Convert the source's domain to CLOCK_MONOTONIC_RAW
+/// - from_raw_ns(): Convert CLOCK_MONOTONIC_RAW to the source's domain
+/// - is_healthy(): Whether the mapping is currently valid
 template <typename T>
 concept ClockSource = requires(T const& t, int64_t ns) {
     { t.now_ns() } -> std::convertible_to<int64_t>;
-    { t.to_monotonic_ns(ns) } -> std::convertible_to<int64_t>;
-    { t.from_monotonic_ns(ns) } -> std::convertible_to<int64_t>;
-    { t.is_healthy() } -> std::convertible_to<bool>;
-    { t.epoch() } -> std::convertible_to<uint64_t>;
-};
-
-/// A ClockSource whose reference clock is CLOCK_MONOTONIC_RAW: it declares
-/// `reference_is_raw` and maps its domain to and from RAW nanoseconds. A
-/// Timer driven by such a source sleeps early on CLOCK_MONOTONIC and spins
-/// on RAW to the exact deadline (see MonotonicRawLine) instead of trusting
-/// the slewed clock.
-template <typename T>
-concept RawReferenceClockSource = ClockSource<T> && reference_is_raw_v<T> && requires(T const& t, int64_t ns) {
     { t.to_raw_ns(ns) } -> std::convertible_to<int64_t>;
     { t.from_raw_ns(ns) } -> std::convertible_to<int64_t>;
+    { t.is_healthy() } -> std::convertible_to<bool>;
 };
 
-//
-// gPTP Domain Information
-//
-
-/// Runtime information about a gPTP clock domain.
-/// This includes the current grandmaster identity and clock quality parameters.
-/// The grandmaster can change during operation due to BMCA (Best Master Clock Algorithm).
-struct GptpDomainInfo
-{
-    /// Current grandmaster clock identity (EUI-64)
-    tsn::ClockIdentity grandmaster_id{};
-
-    /// GM priority1 (lower = better, per IEEE 802.1AS)
-    uint8_t priority1{255};
-
-    /// GM priority2 (lower = better, tie-breaker)
-    uint8_t priority2{255};
-
-    /// GM clock class (per IEEE 802.1AS Table 6-4)
-    /// 6 = GPS/atomic primary reference, 7 = GPS/atomic primary reference holdover
-    /// 248 = default, 255 = slave-only
-    uint8_t clock_class{255};
-
-    /// GM clock accuracy (per IEEE 802.1AS Table 6-5)
-    /// 0x20 = 25ns, 0x21 = 100ns, 0x22 = 250ns, etc.
-    /// 0xFE = unknown, 0xFF = reserved
-    uint8_t clock_accuracy{0xFE};
-
-    /// GM offset scaled log variance (per IEEE 802.1AS)
-    /// Represents the stability of the clock oscillator
-    uint16_t offset_scaled_log_variance{0xFFFF};
-
-    /// Number of communication paths (hops) from the grandmaster
-    /// 0 = we are the grandmaster
-    uint16_t steps_removed{0};
-
-    /// True if this device is the current grandmaster
-    bool is_grandmaster{false};
-
-    /// Monotonic timestamp of the last successful sync from grandmaster
-    /// Used to detect stale time mappings
-    int64_t last_sync_mono_ns{0};
-
-    /// Check if we have a valid grandmaster (non-zero ID)
-    [[nodiscard]] constexpr auto has_grandmaster() const noexcept -> bool { return grandmaster_id.is_set(); }
-
-    /// Check if the sync is stale (older than threshold)
-    /// @param current_mono_ns Current monotonic time in nanoseconds
-    /// @param threshold_ns Staleness threshold in nanoseconds
-    [[nodiscard]] constexpr auto is_stale(int64_t current_mono_ns, int64_t threshold_ns) const noexcept -> bool
-    {
-        if (last_sync_mono_ns == 0) {
-            return true;  // Never synced
-        }
-        return (current_mono_ns - last_sync_mono_ns) > threshold_ns;
-    }
-
-    /// Default comparison (for detecting changes)
-    auto operator==(GptpDomainInfo const&) const noexcept -> bool = default;
-};
-
-/// Default staleness threshold: 1 second without sync = stale
-inline constexpr int64_t default_staleness_threshold_ns = 1'000'000'000LL;
-
-/// Extended concept for gPTP clock sources that provide domain information.
-/// A GptpClockSource extends ClockSource with:
-/// - domain_info(): Returns optional<GptpDomainInfo> - nullopt until first sync
-/// - staleness_threshold_ns(): Returns the configured staleness threshold
+/// A ClockSource that also reports how well its domain is known. A source
+/// without quality() is still a source: it claims no accuracy, and what is
+/// built on it behaves as it did before accuracy existed.
 template <typename T>
-concept GptpClockSource = ClockSource<T> && requires(T const& t) {
-    { t.domain_info() } -> std::convertible_to<std::optional<GptpDomainInfo>>;
-    { t.staleness_threshold_ns() } -> std::convertible_to<int64_t>;
+concept QualifiedClockSource = ClockSource<T> && requires(T const& t) {
+    { t.quality() } -> std::convertible_to<ClockQuality>;
 };
 
 //
 // Clock Adapter
 //
 
-/// Adapter that binds a ClockSource to a specific Clock type, providing
-/// type-safe time_point conversions.
+/// Binds a ClockSource to a Clock type: the source's bare nanoseconds go
+/// in and come out as that clock's time_point, and conversions name the
+/// clock on both sides. Holds a pointer to the source, which must outlive
+/// the adapter and every copy of it.
 ///
 /// @tparam ClockT The clock type (e.g., GptpClock<0>)
 /// @tparam Source The clock source type (e.g., PtpTimeBridge)
@@ -400,315 +528,156 @@ class ClockAdapter
     using clock_type = ClockT;
     using time_point = ClockT::time_point;
     using duration = ClockT::duration;
-    using monotonic_time_point = MonotonicClock::time_point;
 
-    /// Construct adapter with reference to a clock source
-    /// @param source The clock source providing time mapping between clock domains
-    explicit ClockAdapter(Source& source) noexcept
+    /// @param source The clock source this adapter reads and converts through
+    explicit ClockAdapter(Source const& source) noexcept
         : source_{&source}
     {}
 
-    ~ClockAdapter() = default;
+    /// A temporary source would be gone before the adapter is used.
+    explicit ClockAdapter(Source const&&) = delete;
 
-    // Non-copyable but movable
-    ClockAdapter(ClockAdapter const&) = delete;
-    auto operator=(ClockAdapter const&) -> ClockAdapter& = delete;
-    ClockAdapter(ClockAdapter&&) noexcept = default;
-    auto operator=(ClockAdapter&&) noexcept -> ClockAdapter& = default;
+    /// Current time in this clock's domain
+    [[nodiscard]] auto now() const noexcept -> time_point { return ClockT::from_ns(source_->now_ns()); }
 
-    /// Get current time in this clock's domain
-    [[nodiscard]] auto now() const -> TimeConversion<ClockT>
+    /// The CLOCK_MONOTONIC_RAW instant of a time in this clock's domain
+    /// @param tp Time point in this clock's domain
+    [[nodiscard]] auto to_raw(time_point tp) const noexcept -> MonotonicRawClock::time_point
     {
-        return TimeConversion<ClockT>{
-            .time = time_point{duration{source_->now_ns()}}, .epoch = source_->epoch(), .healthy = source_->is_healthy()};
+        return MonotonicRawClock::from_ns(source_->to_raw_ns(ClockT::to_ns(tp)));
     }
 
-    /// Convert a time_point from this clock to monotonic clock
-    /// @param tp Time point in this clock's domain to convert
-    [[nodiscard]] auto to_monotonic(time_point tp) const -> TimeConversion<MonotonicClock>
+    /// The time in this clock's domain of a CLOCK_MONOTONIC_RAW instant
+    /// @param raw Time point on CLOCK_MONOTONIC_RAW
+    [[nodiscard]] auto from_raw(MonotonicRawClock::time_point raw) const noexcept -> time_point
     {
-        auto mono_ns = source_->to_monotonic_ns(tp.time_since_epoch().count());
-        return TimeConversion<MonotonicClock>{
-            .time = monotonic_time_point{MonotonicClock::duration{mono_ns}},
-            .epoch = source_->epoch(),
-            .healthy = source_->is_healthy()};
+        return ClockT::from_ns(source_->from_raw_ns(MonotonicRawClock::to_ns(raw)));
     }
 
-    /// Convert a time_point from monotonic clock to this clock
-    /// @param tp Monotonic time point to convert to this clock's domain
-    [[nodiscard]] auto from_monotonic(monotonic_time_point tp) const -> TimeConversion<ClockT>
-    {
-        auto clock_ns = source_->from_monotonic_ns(tp.time_since_epoch().count());
-        return TimeConversion<ClockT>{
-            .time = time_point{duration{clock_ns}}, .epoch = source_->epoch(), .healthy = source_->is_healthy()};
-    }
-
-    /// Check if the clock source is healthy
+    /// Whether the source's mapping is currently valid
     [[nodiscard]] auto is_healthy() const noexcept -> bool { return source_->is_healthy(); }
 
-    /// Get the current epoch (increments on time discontinuities)
-    [[nodiscard]] auto epoch() const noexcept -> uint64_t { return source_->epoch(); }
+    // With the worst-case accuracy (see ClockQuality)
 
-    /// Get raw nanoseconds for timer integration
-    [[nodiscard]] auto now_ns() const noexcept { return source_->now_ns(); }
-
-    /// Convert to monotonic nanoseconds for timer integration
-    /// @param clock_ns Time in this clock's domain in nanoseconds
-    [[nodiscard]] auto to_monotonic_ns(int64_t clock_ns) const noexcept { return source_->to_monotonic_ns(clock_ns); }
-
-    /// Convert from monotonic nanoseconds for timer integration
-    /// @param mono_ns Monotonic time in nanoseconds
-    [[nodiscard]] auto from_monotonic_ns(int64_t mono_ns) const noexcept { return source_->from_monotonic_ns(mono_ns); }
-
-    // Raw reference (only when Source is a RawReferenceClockSource)
-
-    /// Whether the source maps to CLOCK_MONOTONIC_RAW; a Timer on this
-    /// adapter then takes the RAW-authoritative wait.
-    static constexpr bool reference_is_raw = RawReferenceClockSource<Source>;
-
-    /// Convert this clock's nanoseconds to CLOCK_MONOTONIC_RAW nanoseconds
-    /// @param clock_ns Time in this clock's domain in nanoseconds
-    [[nodiscard]] auto to_raw_ns(int64_t clock_ns) const noexcept -> int64_t
-        requires RawReferenceClockSource<Source>
+    /// How well the source's domain is known. Only when the source reports it.
+    [[nodiscard]] auto quality() const -> ClockQuality
+        requires QualifiedClockSource<Source>
     {
-        return source_->to_raw_ns(clock_ns);
+        return source_->quality();
     }
 
-    /// Convert CLOCK_MONOTONIC_RAW nanoseconds to this clock's nanoseconds
-    /// @param raw_ns Raw monotonic time in nanoseconds
-    [[nodiscard]] auto from_raw_ns(int64_t raw_ns) const noexcept -> int64_t
-        requires RawReferenceClockSource<Source>
+    /// The worst-case error of this adapter's mapping at a
+    /// CLOCK_MONOTONIC_RAW instant: UNBOUNDED_ACCURACY when the source
+    /// reports no quality. The instant is told, so no clock is read.
+    /// @param raw The instant the mapping is used at
+    [[nodiscard]] auto accuracy_at(MonotonicRawClock::time_point raw) const -> Nanoseconds
     {
-        return source_->from_raw_ns(raw_ns);
-    }
-
-    // gPTP Domain Information (only available when Source is GptpClockSource)
-
-    /// Get gPTP domain information (grandmaster ID, quality, etc.)
-    /// Returns nullopt if the clock has not yet synchronized with a grandmaster.
-    /// Only available when the underlying source provides domain info.
-    [[nodiscard]] auto domain_info() const -> std::optional<GptpDomainInfo>
-        requires GptpClockSource<Source>
-    {
-        return source_->domain_info();
-    }
-
-    /// Get the current grandmaster clock identity.
-    /// Returns nullopt if not yet synchronized.
-    /// Only available when the underlying source provides domain info.
-    [[nodiscard]] auto grandmaster_id() const -> std::optional<tsn::ClockIdentity>
-        requires GptpClockSource<Source>
-    {
-        auto const info = source_->domain_info();
-        if (!info) {
-            return std::nullopt;
+        if constexpr (QualifiedClockSource<Source>) {
+            return source_->quality().uncertainty(raw);
+        } else {
+            return UNBOUNDED_ACCURACY;
         }
-        return info->grandmaster_id;
     }
 
-    /// Check if synchronized with a grandmaster.
-    /// Returns true only if domain_info() has a value.
-    /// Only available when the underlying source provides domain info.
-    [[nodiscard]] auto is_synchronized() const -> bool
-        requires GptpClockSource<Source>
+    /// Current time in this clock's domain, with its worst-case accuracy
+    [[nodiscard]] auto now_bounded() const -> BoundedTime<ClockT>
     {
-        return source_->domain_info().has_value();
+        time_point const time = now();
+        return {.time = time, .accuracy = accuracy_at(to_raw(time))};
     }
 
-    /// Check if the sync data is stale (no recent sync from grandmaster).
-    /// Returns true if not synchronized OR if last sync is older than threshold.
-    /// Only available when the underlying source provides domain info.
-    [[nodiscard]] auto is_stale() const -> bool
-        requires GptpClockSource<Source>
+    /// The CLOCK_MONOTONIC_RAW instant of a bounded time in this clock's
+    /// domain. The result's accuracy is the input's plus this mapping's
+    /// at the converted instant.
+    /// @param bounded Time point in this clock's domain, with its accuracy
+    [[nodiscard]] auto to_raw(BoundedTime<ClockT> bounded) const -> BoundedTime<MonotonicRawClock>
     {
-        auto const info = source_->domain_info();
-        if (!info) {
-            return true;  // Not synchronized = stale
-        }
-        auto const threshold = source_->staleness_threshold_ns();
-        return info->is_stale(read_monotonic_ns(), threshold);
+        auto const raw = to_raw(bounded.time);
+        return {.time = raw, .accuracy = detail::add_accuracy(bounded.accuracy, accuracy_at(raw))};
     }
 
-    /// Get the staleness threshold in nanoseconds.
-    /// Only available when the underlying source provides domain info.
-    [[nodiscard]] auto staleness_threshold_ns() const -> int64_t
-        requires GptpClockSource<Source>
+    /// The time in this clock's domain of a bounded CLOCK_MONOTONIC_RAW
+    /// instant. The result's accuracy is the input's plus this mapping's
+    /// at that instant.
+    /// @param bounded Time point on CLOCK_MONOTONIC_RAW, with its accuracy
+    [[nodiscard]] auto from_raw(BoundedTime<MonotonicRawClock> bounded) const -> BoundedTime<ClockT>
     {
-        return source_->staleness_threshold_ns();
+        return {.time = from_raw(bounded.time), .accuracy = detail::add_accuracy(bounded.accuracy, accuracy_at(bounded.time))};
     }
 
   private:
-    Source* source_;
+    Source const* source_;
 };
 
 //
-// Monotonic Clock Adapter (Special Case - No Conversion Needed)
+// Raw Monotonic Clock Adapter (the reference clock, no source needed)
 //
 
-/// Specialized adapter for MonotonicClock that requires no time bridge.
-/// This is the native clock - reading time is direct with no conversion.
-class MonotonicClockAdapter
+/// Adapter for MonotonicRawClock: reads CLOCK_MONOTONIC_RAW directly and is
+/// always healthy. The adapter a Timer uses unless it is given another: it
+/// schedules and measures on the slew-immune clock.
+struct MonotonicRawClockAdapter
 {
-  public:
-    using clock_type = MonotonicClock;
-    using time_point = MonotonicClock::time_point;
-    using duration = MonotonicClock::duration;
-
-    MonotonicClockAdapter() noexcept = default;
-
-    /// Get current monotonic time (direct read, always healthy)
-    [[nodiscard]] auto now() const -> TimeConversion<MonotonicClock>;
-
-    /// Convert to monotonic (identity operation)
-    /// @param tp Monotonic time point (returned as-is)
-    [[nodiscard]] auto to_monotonic(time_point tp) const noexcept -> TimeConversion<MonotonicClock>
-    {
-        return TimeConversion<MonotonicClock>{.time = tp, .epoch = 0, .healthy = true};
-    }
-
-    /// Convert from monotonic (identity operation)
-    /// @param tp Monotonic time point (returned as-is)
-    [[nodiscard]] auto from_monotonic(time_point tp) const noexcept -> TimeConversion<MonotonicClock>
-    {
-        return TimeConversion<MonotonicClock>{.time = tp, .epoch = 0, .healthy = true};
-    }
-
-    /// Monotonic clock is always healthy
-    [[nodiscard]] static constexpr auto is_healthy() noexcept -> bool { return true; }
-
-    /// Monotonic clock epoch is always 0 (no discontinuities)
-    [[nodiscard]] static constexpr auto epoch() noexcept -> uint64_t { return 0; }
-
-    /// Get raw nanoseconds for timer integration
-    [[nodiscard]] auto now_ns() const noexcept -> int64_t;
-
-    /// Convert to monotonic nanoseconds (identity)
-    /// @param ns Time in nanoseconds (returned as-is)
-    [[nodiscard]] static constexpr auto to_monotonic_ns(int64_t ns) noexcept { return ns; }
-
-    /// Convert from monotonic nanoseconds (identity)
-    /// @param ns Time in nanoseconds (returned as-is)
-    [[nodiscard]] static constexpr auto from_monotonic_ns(int64_t ns) noexcept { return ns; }
-};
-
-//
-// Raw Monotonic Clock Adapter (the timing reference, no bridge needed)
-//
-
-class MonotonicRawLine;
-
-/// Adapter for MonotonicRawClock: reads CLOCK_MONOTONIC_RAW directly, always
-/// healthy. The adapter new timers should default to: a Timer on it schedules
-/// and measures on the slew-immune clock, sleeping early on CLOCK_MONOTONIC
-/// and spinning on RAW to each deadline.
-///
-/// to_monotonic_ns()/from_monotonic_ns() convert through the MonotonicRawLine
-/// given at construction. Without one they apply the offset between the two
-/// clocks at the moment of the call, which ignores any slew over the span
-/// converted: good enough for a one-off conversion, not for a schedule. The
-/// Timer never uses them on this adapter; its TimerBase keeps its own line.
-class MonotonicRawClockAdapter
-{
-  public:
     using clock_type = MonotonicRawClock;
     using time_point = MonotonicRawClock::time_point;
     using duration = MonotonicRawClock::duration;
 
-    static constexpr bool reference_is_raw = true;
+    /// Current CLOCK_MONOTONIC_RAW time (direct read)
+    [[nodiscard]] static auto now() noexcept -> time_point { return read_monotonic_raw(); }
 
-    explicit MonotonicRawClockAdapter(MonotonicRawLine const* line = nullptr) noexcept
-        : line_{line}
-    {}
+    /// Already on CLOCK_MONOTONIC_RAW (identity)
+    [[nodiscard]] static constexpr auto to_raw(time_point tp) noexcept -> time_point { return tp; }
 
-    /// Get current raw monotonic time (direct read, always healthy)
-    [[nodiscard]] auto now() const noexcept -> TimeConversion<MonotonicRawClock>;
-
-    /// Convert to monotonic through the line (see class note)
-    /// @param tp Raw monotonic time point
-    [[nodiscard]] auto to_monotonic(time_point tp) const noexcept -> TimeConversion<MonotonicClock>
-    {
-        return TimeConversion<MonotonicClock>{
-            .time = MonotonicClock::from_ns(to_monotonic_ns(MonotonicRawClock::to_ns(tp))), .epoch = 0, .healthy = true};
-    }
-
-    /// Convert from monotonic through the line (see class note)
-    /// @param tp Monotonic time point
-    [[nodiscard]] auto from_monotonic(MonotonicClock::time_point tp) const noexcept -> TimeConversion<MonotonicRawClock>
-    {
-        return TimeConversion<MonotonicRawClock>{
-            .time = MonotonicRawClock::from_ns(from_monotonic_ns(MonotonicClock::to_ns(tp))), .epoch = 0, .healthy = true};
-    }
+    /// Already on CLOCK_MONOTONIC_RAW (identity)
+    [[nodiscard]] static constexpr auto from_raw(time_point raw) noexcept -> time_point { return raw; }
 
     [[nodiscard]] static constexpr auto is_healthy() noexcept -> bool { return true; }
-    [[nodiscard]] static constexpr auto epoch() noexcept -> uint64_t { return 0; }
 
-    /// Get raw nanoseconds for timer integration (CLOCK_MONOTONIC_RAW)
-    [[nodiscard]] auto now_ns() const noexcept -> int64_t;
+    /// The reference clock read as itself is exact.
+    [[nodiscard]] static constexpr auto quality() noexcept -> ClockQuality { return ClockQuality::exact(); }
 
-    /// Convert to CLOCK_MONOTONIC nanoseconds (see class note)
-    [[nodiscard]] auto to_monotonic_ns(int64_t raw_ns) const noexcept -> int64_t;
+    /// The identity adds no error.
+    [[nodiscard]] static constexpr auto accuracy_at(time_point) noexcept -> Nanoseconds { return Nanoseconds::zero(); }
 
-    /// Convert from CLOCK_MONOTONIC nanoseconds (see class note)
-    [[nodiscard]] auto from_monotonic_ns(int64_t mono_ns) const noexcept -> int64_t;
+    /// Current CLOCK_MONOTONIC_RAW time, exact
+    [[nodiscard]] static auto now_bounded() noexcept -> BoundedTime<MonotonicRawClock>
+    {
+        return {.time = read_monotonic_raw(), .accuracy = Nanoseconds::zero()};
+    }
 
-    /// Convert to CLOCK_MONOTONIC_RAW nanoseconds (identity)
-    [[nodiscard]] static constexpr auto to_raw_ns(int64_t ns) noexcept { return ns; }
+    /// Already on CLOCK_MONOTONIC_RAW (identity, the accuracy is unchanged)
+    [[nodiscard]] static constexpr auto to_raw(BoundedTime<MonotonicRawClock> bounded) noexcept -> BoundedTime<MonotonicRawClock>
+    {
+        return bounded;
+    }
 
-    /// Convert from CLOCK_MONOTONIC_RAW nanoseconds (identity)
-    [[nodiscard]] static constexpr auto from_raw_ns(int64_t ns) noexcept { return ns; }
-
-  private:
-    MonotonicRawLine const* line_;
+    /// Already on CLOCK_MONOTONIC_RAW (identity, the accuracy is unchanged)
+    [[nodiscard]] static constexpr auto from_raw(BoundedTime<MonotonicRawClock> bounded) noexcept -> BoundedTime<MonotonicRawClock>
+    {
+        return bounded;
+    }
 };
 
 //
 // Concept for Clock Adapters
 //
 
-/// Concept for any clock adapter (type-safe or monotonic)
+/// What a Timer needs of its clock: the domain it schedules in, the time
+/// there now, the CLOCK_MONOTONIC_RAW instant to wait for, and whether the
+/// mapping can be trusted yet.
 template <typename T>
-concept ClockAdapterType = requires(T const& t, int64_t ns) {
-    typename T::clock_type;
-    typename T::time_point;
-    typename T::duration;
-    { t.now() } -> std::same_as<TimeConversion<typename T::clock_type>>;
+concept ClockAdapterType = ClockType<typename T::clock_type> && requires(T const& t, typename T::clock_type::time_point tp) {
+    { t.now() } -> std::same_as<typename T::clock_type::time_point>;
+    { t.to_raw(tp) } -> std::same_as<MonotonicRawClock::time_point>;
     { t.is_healthy() } -> std::convertible_to<bool>;
-    { t.epoch() } -> std::convertible_to<uint64_t>;
-    { t.now_ns() } -> std::convertible_to<int64_t>;
-    { t.to_monotonic_ns(ns) } -> std::convertible_to<int64_t>;
-    { t.from_monotonic_ns(ns) } -> std::convertible_to<int64_t>;
 };
 
-//
-// MonotonicClockAdapter Implementation
-//
-
-inline auto MonotonicClockAdapter::now() const -> TimeConversion<MonotonicClock>
-{
-    return TimeConversion<MonotonicClock>{.time = time_point{duration{read_monotonic_ns()}}, .epoch = 0, .healthy = true};
-}
-
-inline auto MonotonicClockAdapter::now_ns() const noexcept -> int64_t
-{
-    return read_monotonic_ns();
-}
-
-//
-// MonotonicRawClockAdapter Implementation
-//
-
-inline auto MonotonicRawClockAdapter::now() const noexcept -> TimeConversion<MonotonicRawClock>
-{
-    return TimeConversion<MonotonicRawClock>{
-        .time = MonotonicRawClock::from_ns(read_monotonic_raw_ns()), .epoch = 0, .healthy = true};
-}
-
-inline auto MonotonicRawClockAdapter::now_ns() const noexcept -> int64_t
-{
-    return read_monotonic_raw_ns();
-}
-
-// to_monotonic_ns()/from_monotonic_ns() need the full MonotonicRawLine and
-// live in realtime_monotonic_raw_line.cpp.
+/// An adapter that also reports how well its clock is known. A Timer on one
+/// tells every wake the accuracy of its schedule; on any other adapter the
+/// wake claims none.
+template <typename T>
+concept QualifiedClockAdapter = ClockAdapterType<T> && requires(T const& t) {
+    { t.quality() } -> std::convertible_to<ClockQuality>;
+};
 
 }  // namespace statusbar::realtime

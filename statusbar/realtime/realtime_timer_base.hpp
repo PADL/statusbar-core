@@ -6,10 +6,13 @@
 #include "statusbar/itc/itc_stop_token.hpp"
 #include "statusbar/realtime/realtime_monotonic_raw_line.hpp"
 #include "statusbar/realtime/realtime_timer_config.hpp"
+#include "statusbar/realtime/realtime_timer_schedule.hpp"
 #include "statusbar/stats/stats.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <optional>
 #include <thread>
 
 namespace statusbar::realtime {
@@ -17,9 +20,10 @@ namespace statusbar::realtime {
 /// Non-template base class for Timer.
 ///
 /// Holds everything that does not depend on the clock adapter template: config,
-/// statistics, running flag, worker thread, and the thread prepare / sleep
-/// primitives. Derived Timer<ClockAdapterT> supplies the per-tick loop body
-/// via the pure virtual run_loop() hook.
+/// statistics, running flag, worker thread, and the thread prepare / wait
+/// primitives. Every timer waits on CLOCK_MONOTONIC_RAW, whatever domain its
+/// schedule is in, so the wait lives here. Derived Timer<ClockAdapterT>
+/// supplies the per-tick loop body via the pure virtual run_loop() hook.
 class TimerBase
 {
   public:
@@ -43,11 +47,13 @@ class TimerBase
     [[nodiscard]] auto config() const noexcept -> TimerConfig const& { return config_; }
     [[nodiscard]] auto period_ns() const noexcept -> int64_t { return config_.period_ns; }
     [[nodiscard]] auto compensation_ns() const noexcept -> int64_t { return config_.compensation_ns; }
+    [[nodiscard]] auto period() const noexcept -> Nanoseconds { return Nanoseconds{config_.period_ns}; }
+    [[nodiscard]] auto compensation() const noexcept -> Nanoseconds { return Nanoseconds{config_.compensation_ns}; }
     [[nodiscard]] auto cpu() const noexcept -> int { return config_.cpu; }
     [[nodiscard]] auto is_busy_wait() const noexcept -> bool { return config_.busy_wait; }
 
     /// The RAW->MONOTONIC line this timer's thread keeps for its own sleeps
-    /// (see wait_until_raw_deadline). Identity until the thread's first wait.
+    /// (see wait_until_raw_deadline). Identity until the thread primes it at the top of its loop.
     [[nodiscard]] auto raw_line() const noexcept -> MonotonicRawLine const& { return raw_line_; }
 
   protected:
@@ -83,45 +89,74 @@ class TimerBase
     /// the affinity could not be set.
     [[nodiscard]] auto prepare_cpu() -> bool;
 
-    /// Sleep-based wait until an absolute monotonic deadline.
-    /// @return wake error in ns (positive = late)
-    static auto wait_until_absolute(int64_t deadline_ns) noexcept -> int64_t;
+    /// The longest a timer thread sleeps toward one deadline before it looks
+    /// again at whether it should still run.
+    static constexpr Nanoseconds WAIT_SLICE{100'000'000};
 
-    /// Hybrid sleep/busy-wait until an absolute monotonic deadline for ultra-low latency.
-    /// @return wake error in ns (positive = late)
-    static auto wait_until_busy(int64_t deadline_ns, int64_t threshold_ns = 100'000) noexcept -> int64_t;
+    /// Sleep until an absolute CLOCK_MONOTONIC deadline: the coarse sleep
+    /// under every RAW wait.
+    /// @return wake error (positive = late)
+    static auto wait_until_absolute(MonotonicClock::time_point deadline) noexcept -> Nanoseconds;
 
-    /// Result of a deadline wait: wake error (positive = late) and the number
-    /// of full periods we are past the canonical deadline (0 when on time).
-    struct WaitResult
+    /// Result of a deadline wait (see realtime_timer_schedule.hpp).
+    using WaitResult = realtime::WaitResult;
+
+    //
+    // The arithmetic of a RAW wait, told the time. wait_until_raw_deadline
+    // is these three with the clock reads, the sleep and the spin between.
+    //
+
+    /// The RAW instant a wait for @p raw_deadline aims at: the deadline
+    /// with the configured compensation applied.
+    [[nodiscard]] auto wake_target(MonotonicRawClock::time_point raw_deadline) const noexcept -> MonotonicRawClock::time_point
     {
-        int64_t error_ns;
-        int64_t skipped_counts;
-    };
+        return raw_deadline + compensation();
+    }
 
-    /// Sleep until the canonical monotonic deadline, applying
-    /// config_.compensation_ns as a sleep-offset and dispatching to the
-    /// sleep-based or hybrid busy-wait primitive according to
-    /// config_.busy_wait. Error and skipped-cycle counts are measured against
-    /// the uncompensated @p mono_deadline_ns so statistics remain comparable
-    /// across compensation settings.
-    auto wait_until_deadline(int64_t mono_deadline_ns) noexcept -> WaitResult;
+    /// Where on CLOCK_MONOTONIC the coarse sleep toward @p target_raw should
+    /// end, told that RAW now reads @p raw_now: the target through the
+    /// timer's line, less the spin guard and what the line says its own
+    /// conversion could be late by (MonotonicRawLine::sleep_margin). Empty
+    /// when that is already here and the whole wait is a spin.
+    [[nodiscard]] auto early_wake(MonotonicRawClock::time_point target_raw, MonotonicRawClock::time_point raw_now) const noexcept
+        -> std::optional<MonotonicClock::time_point>;
+
+    /// How a wait for @p raw_deadline ended, told the RAW instant it ended
+    /// at. Measured against the uncompensated deadline.
+    [[nodiscard]] auto wait_outcome(MonotonicRawClock::time_point raw_deadline, MonotonicRawClock::time_point woke) const noexcept
+        -> WaitResult
+    {
+        return wait_result(woke - raw_deadline, period());
+    }
 
     /// Wait until a CLOCK_MONOTONIC_RAW deadline, the RAW-authoritative way:
     /// convert the (compensated) deadline to CLOCK_MONOTONIC through the
     /// timer's own line, sleep until a guard before it, then spin on RAW to
     /// the exact instant. The guard is config_.raw_spin_guard_ns (or
-    /// busy_wait_threshold_ns in busy_wait mode) plus the slew the line says
-    /// the sleep could accrue, so the sleep never overshoots. Error and
+    /// busy_wait_threshold_ns in busy_wait mode) plus the line's own margin
+    /// (its last misfit and the slew it could have accrued since it was
+    /// sampled), so the sleep never overshoots. Error and
     /// skipped-cycle counts are measured on RAW against the uncompensated
-    /// @p raw_deadline_ns. Re-samples the line when it is due.
-    auto wait_until_raw_deadline(int64_t raw_deadline_ns) noexcept -> WaitResult;
+    /// @p raw_deadline, so statistics remain comparable across compensation
+    /// settings. Re-samples the line when it is due. Does not return before
+    /// the deadline, however far off it is: a loop that must stay
+    /// stoppable uses wait_slice.
+    auto wait_until_raw_deadline(MonotonicRawClock::time_point raw_deadline) noexcept -> WaitResult;
+
+    /// One slice of that wait. When the early wake is within @p slice of
+    /// now this is the whole wait and its result is returned. Otherwise the
+    /// thread sleeps for the slice and empty is returned, the deadline
+    /// still ahead: the caller decides whether to go on waiting for it.
+    /// @param raw_deadline The CLOCK_MONOTONIC_RAW deadline (uncompensated)
+    /// @param slice The longest to sleep in this call
+    [[nodiscard]] auto wait_slice(MonotonicRawClock::time_point raw_deadline, Nanoseconds slice = WAIT_SLICE) noexcept
+        -> std::optional<WaitResult>;
 
     /// Give the line a rate before the schedule is seeded: two samples a
-    /// millisecond apart. A raw-reference run loop calls this first, so the
-    /// millisecond is spent before the first deadline exists rather than
-    /// inside the first wait. wait_until_raw_deadline primes on its own if
-    /// this was skipped.
+    /// millisecond apart. A run loop calls this first, so the millisecond
+    /// is spent before the first deadline exists rather than inside the
+    /// first wait. wait_until_raw_deadline primes on its own if this was
+    /// skipped.
     auto prime_raw_line() noexcept -> void;
 
     TimerConfig config_;
@@ -130,45 +165,23 @@ class TimerBase
     std::thread timer_thread_;
 
   private:
-    /// Error and skipped-period count for a wake @p error_ns past its deadline.
-    [[nodiscard]] auto wait_result(int64_t error_ns) const noexcept -> WaitResult;
-
     /// Prime the line if it never was, else re-sample it once
     /// raw_line_sample_interval_ns has passed.
-    auto track_raw_line(int64_t raw_now_ns) noexcept -> void;
+    auto track_raw_line(MonotonicRawClock::time_point raw_now) noexcept -> void;
 
-    /// The coarse part of a RAW wait: sleep on CLOCK_MONOTONIC until the
-    /// guard before @p target_raw_ns, or not at all if that is already here.
-    auto sleep_early_for_raw(int64_t target_raw_ns) noexcept -> void;
+    /// The coarse part of a RAW wait, for at most @p slice.
+    /// @return true when it ended at the early wake (or there was none to
+    ///         sleep to), false when the slice ran out first.
+    [[nodiscard]] auto sleep_toward(MonotonicRawClock::time_point target_raw, Nanoseconds slice) noexcept -> bool;
 
     /// The exact part of a RAW wait. @return the RAW time at which it ended.
-    [[nodiscard]] static auto spin_until_raw(int64_t target_raw_ns) noexcept -> int64_t;
+    [[nodiscard]] static auto spin_until_raw(MonotonicRawClock::time_point target_raw) noexcept -> MonotonicRawClock::time_point;
 
     std::atomic<bool> running_{false};
     MonotonicRawLine raw_line_;
     MonotonicRawTracker raw_tracker_{raw_line_};
-    int64_t raw_line_sampled_ns_{0};
+    /// When the line was last sampled; empty until it has been primed.
+    std::optional<MonotonicRawClock::time_point> raw_line_sampled_{};
 };
-
-/// Return the cycle number that contains @p time_ns for a timer of period
-/// @p period_ns (floor division). A "cycle number" here is the integer index
-/// of the period-sized slot the time falls within, counted from the clock's
-/// zero epoch.
-///
-/// Precondition: period_ns > 0.
-[[nodiscard]] constexpr auto cycle_number_from_ns(int64_t time_ns, int64_t period_ns) noexcept -> int64_t
-{
-    return time_ns / period_ns;
-}
-
-/// Return the ns time at the start of cycle @p cycle for a timer of period
-/// @p period_ns. Inverse of cycle_number_from_ns (exact: round-trip restores
-/// the cycle number, not necessarily the original ns value).
-///
-/// Also usable as "convert N cycles to a ns delta" since the math is symmetric.
-[[nodiscard]] constexpr auto cycle_number_to_ns(int64_t cycle, int64_t period_ns) noexcept -> int64_t
-{
-    return cycle * period_ns;
-}
 
 }  // namespace statusbar::realtime

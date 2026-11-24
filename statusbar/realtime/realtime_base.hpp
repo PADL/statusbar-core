@@ -27,6 +27,7 @@
 #endif
 
 #include "statusbar/itc/itc_stop_token.hpp"
+#include "statusbar/realtime/realtime_clock.hpp"
 
 #include <algorithm>
 #include <array>
@@ -79,18 +80,13 @@ inline void save_file(char const* src, std::string const& dst)
     ::close(fd);
 }
 
-/// CLOCK_MONOTONIC_RAW in nanoseconds: the raw hardware counter, immune to
-/// the NTP/phc2sys frequency slew on CLOCK_MONOTONIC. The timing reference
-/// clock; see read_monotonic_raw_ns() for the public spelling.
+/// CLOCK_MONOTONIC_RAW in nanoseconds. Kept for existing callers: the read
+/// itself is read_monotonic_raw_ns(), declared in realtime_clock.hpp and
+/// implemented with the rest of the platform's clock code in
+/// realtime_clock.cpp.
 inline auto now_monotonic_raw_ns() noexcept -> int64_t
 {
-    timespec ts{};
-#if defined(CLOCK_MONOTONIC_RAW)
-    ::clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-#else
-    ::clock_gettime(CLOCK_MONOTONIC, &ts);
-#endif
-    return (static_cast<int64_t>(ts.tv_sec) * 1000000000LL) + ts.tv_nsec;
+    return read_monotonic_raw_ns();
 }
 
 /// mlockall(2) for lock_memory(): 0 on success, else the errno.
@@ -583,63 +579,9 @@ inline void set_current_thread_name(std::string_view name) noexcept
     return (tv_sec * 1'000'000'000LL) + tv_nsec;
 }
 
-#if defined(__APPLE__)
-/// Nanoseconds to mach_absolute_time ticks, for the relative wait in
-/// sleep_until_monotonic_ns(). Mach's own counter stops while the machine
-/// sleeps (it is CLOCK_UPTIME_RAW), so it never carries an absolute deadline.
-inline auto ns_to_mach(uint64_t const ns) -> uint64_t
-{
-    mach_timebase_info_data_t tb;
-    mach_timebase_info(&tb);
-    return ns * tb.denom / tb.numer;
-}
-#endif
-
-/// CLOCK_MONOTONIC in nanoseconds, read with clock_gettime on every
-/// platform (macOS has had it since 10.12, with the same meaning as Linux:
-/// it keeps counting through a system sleep and NTP slews its rate). This
-/// is the clock the kernel sleeps on: use it for sleeping, not for timing.
-/// Timing, stamps and deadlines take read_monotonic_raw_ns().
-inline auto read_monotonic_ns() noexcept -> int64_t
-{
-    timespec ts{};
-    ::clock_gettime(CLOCK_MONOTONIC, &ts);
-    return timespec_to_ns(ts.tv_sec, ts.tv_nsec);
-}
-
-/// CLOCK_MONOTONIC_RAW in nanoseconds: the timing reference clock, immune
-/// to frequency slew. Not sleepable; a deadline on it is reached by sleeping
-/// early on CLOCK_MONOTONIC through a MonotonicRawLine and spinning here.
-inline auto read_monotonic_raw_ns() noexcept -> int64_t
-{
-    return detail::now_monotonic_raw_ns();
-}
-
-/// Sleep until an absolute CLOCK_MONOTONIC deadline, the one kernel sleep
-/// primitive every sleeper goes through. Returns 0 when the deadline has
-/// passed (a missed or non-positive deadline returns at once rather than
-/// failing with EINVAL), EINTR when a signal cut the sleep short on Linux,
-/// or the errno of a failed clock_nanosleep. On macOS there is no
-/// clock_nanosleep, so the wait is relative: the remaining nanoseconds are
-/// handed to mach_wait_until from mach_absolute_time, which is a different
-/// counter (it stops in system sleep) but the same rate over one wait.
-inline auto sleep_until_monotonic_ns(int64_t const deadline_ns) noexcept -> int
-{
-    int64_t const remaining_ns = deadline_ns - read_monotonic_ns();
-    if (remaining_ns <= 0) {
-        return 0;
-    }
-#if defined(__linux__)
-    timespec const deadline{
-        .tv_sec = static_cast<time_t>(deadline_ns / 1'000'000'000LL), .tv_nsec = static_cast<long>(deadline_ns % 1'000'000'000LL)};
-    return ::clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, nullptr);
-#elif defined(__APPLE__)
-    (void)::mach_wait_until(::mach_absolute_time() + ns_to_mach(static_cast<uint64_t>(remaining_ns)));
-    return 0;
-#else
-#    error "Unsupported platform"
-#endif
-}
+// read_monotonic_ns(), read_monotonic_raw_ns() and sleep_until_monotonic_ns()
+// are declared in realtime_clock.hpp (included above) and implemented in
+// realtime_clock.cpp, the one file that holds the platform's clock code.
 
 //
 // Diagnostic Output and Initialization

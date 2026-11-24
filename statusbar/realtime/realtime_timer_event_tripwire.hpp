@@ -81,7 +81,7 @@ inline auto observe_and_handle_tripwire(TripwireMonitor& monitor, TimerEvent<Clo
 ///   } catch (TripwireFiredException const&) {
 ///       return;  // Wake latency exceeded, abort
 ///   }
-template <ClockType ClockT = MonotonicClock>
+template <ClockType ClockT = MonotonicRawClock>
 class ScopedTripwireObserver
 {
   public:

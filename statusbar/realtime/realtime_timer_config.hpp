@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "statusbar/args/args.hpp"
+#include "statusbar/realtime/realtime_monotonic_raw_line.hpp"
 #include "statusbar/stats/stats.hpp"
 
 #include <cstddef>
@@ -19,10 +20,10 @@ struct TimerConfig
     std::string_view name{};                          ///< Timer name for logging/debugging
     int64_t period_ns{500'000'000};                   ///< Wake period in nanoseconds
     int64_t compensation_ns{0};                       ///< Compensation offset in nanoseconds
-    int64_t busy_wait_threshold_ns{200'000};          ///< Busy-wait threshold in ns (sleep if remaining > this)
+    int64_t busy_wait_threshold_ns{200'000};          ///< With busy_wait: how early, in ns, to wake and start spinning
     int cpu{3};                                       ///< CPU number for affinity (-1 to disable)
     int priority{49};                                 ///< SCHED_FIFO priority (1-99, default 49)
-    bool busy_wait{false};                            ///< Use busy-wait mode for ultra-low latency
+    bool busy_wait{false};                            ///< Widen the spin from raw_spin_guard_ns to busy_wait_threshold_ns
     bool strict_affinity{false};                      ///< Fail if CPU affinity cannot be set
     size_t stack_prefault_bytes{size_t{128} * 1024};  ///< Stack bytes to prefault before RT loop (0 = skip)
     /// Lock the process's memory (mlockall(MCL_CURRENT)) when the timer thread
@@ -31,15 +32,22 @@ struct TimerConfig
     /// and locks ranges of them itself sets this false and locks once, at
     /// startup, with lock_memory() or prepare_realtime_system().
     bool lock_memory{true};
-    int64_t start_offset_cycles{2};        ///< Cycles ahead of now to schedule the first wake (>=2 avoids a startup race)
-    int64_t resync_interval_cycles{1000};  ///< Wakes between mono-deadline resyncs that correct accumulated slope drift (0 = never)
-    /// Raw-reference timers only (see MonotonicRawClockAdapter): how early,
-    /// in ns, to wake on CLOCK_MONOTONIC before spinning on CLOCK_MONOTONIC_RAW
+    int64_t start_offset_cycles{2};  ///< Cycles ahead of now to schedule the first wake (>=2 avoids a startup race)
+    int64_t resync_interval_cycles{
+        1000};  ///< Wakes between fresh conversions of the RAW deadline from the adapter's time (0 = never)
+    /// How early, in ns, to wake on CLOCK_MONOTONIC before spinning on CLOCK_MONOTONIC_RAW
     /// to the deadline. busy_wait timers use busy_wait_threshold_ns instead.
     int64_t raw_spin_guard_ns{50'000};
-    /// Raw-reference timers only: how often, in ns of RAW time, the timer
+    /// How often, in ns of RAW time, the timer
     /// thread re-samples its RAW->MONOTONIC line (0 = only once, at the start).
     int64_t raw_line_sample_interval_ns{100'000'000};
+    /// How fast CLOCK_MONOTONIC may move against RAW while the timer's line
+    /// is not being sampled, in parts per billion: an operating-system
+    /// figure, Linux's by default (MonotonicRawLineConfig::drift_bound_ppb).
+    uint32_t raw_line_drift_bound_ppb{MonotonicRawLineConfig{}.drift_bound_ppb};
+    /// The rate error allowed for when the early wake is sized, in parts
+    /// per billion (MonotonicRawLineConfig::sleep_rate_margin_ppb).
+    uint32_t raw_line_sleep_rate_margin_ppb{MonotonicRawLineConfig{}.sleep_rate_margin_ppb};
 
     /// Histogram configuration for wake error distribution
     stats::AtomicHistogramConfig error_histogram{
@@ -89,7 +97,7 @@ inline auto print_timer_config(TimerConfig const& config) -> void
             config.period_ns,
             config.cpu,
             config.compensation_ns,
-            config.busy_wait ? "BUSY-WAIT" : "sleep-based");
+            config.busy_wait ? "wide spin" : "short spin");
     } else {
         std::print(
             "{}: period={}ns, cpu={}, compensation={}ns, mode={}\n",
@@ -97,7 +105,7 @@ inline auto print_timer_config(TimerConfig const& config) -> void
             config.period_ns,
             config.cpu,
             config.compensation_ns,
-            config.busy_wait ? "BUSY-WAIT" : "sleep-based");
+            config.busy_wait ? "wide spin" : "short spin");
     }
 }
 

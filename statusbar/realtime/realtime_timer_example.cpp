@@ -66,15 +66,14 @@ auto parse_config(int argc, char** argv) -> StatusValue<Config>
     return config;
 }
 
-}  // namespace
-
-auto main(int argc, char** argv) -> int
+/// Everything before the timer exists: the config, the signal handlers
+/// and the system's realtime preparation.
+auto prepare(int argc, char** argv) -> Config
 {
     // Ensure stdout is line-buffered so output appears promptly in terminals
     setvbuf(stdout, NULL, _IOLBF, 0);
 
     Config config = config::parse_config_or_exit(parse_config, argc, argv);
-
     realtime::setup_shutdown_signal_handlers();
 
     // Check realtime capabilities and prepare system
@@ -82,44 +81,52 @@ auto main(int argc, char** argv) -> int
 
     // Use timer CPU for trace CPU
     config.trace.cpu = config.timer.cpu;
+    return config;
+}
+
+/// Wait for the shutdown signal, then report as the config asks.
+auto wait_and_report(Config const& config, realtime::TimerBase const& timer) -> void
+{
+    while (!realtime::is_shutdown_requested()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (config.verbose) {
+        std::print("\n\nShutting down...\n");
+    }
+    if (config.dump_stats_on_exit) {
+        std::print("\n");
+        realtime::print_timer_stats(timer);
+    }
+}
+
+/// Run a timer until shutdown. Given no adapter, it is scheduled on the
+/// default clock, CLOCK_MONOTONIC_RAW.
+auto run_timer(Config const& config, realtime::TripwireMonitor& tripwire_monitor) -> void
+{
+    auto tripwire_monitor_start = realtime::TripwireMonitorStart{tripwire_monitor, &realtime::shutdown_token()};
+    realtime::Timer<> timer(config.timer, [&tripwire_monitor, &config](auto const& event, auto const& stats) {
+        // Observe tripwire (will trigger if error exceeds threshold)
+        realtime::observe_and_handle_tripwire(tripwire_monitor, event);
+        if (!config.quiet) {
+            event.print(stats);
+        }
+    });
+    if (config.verbose) {
+        realtime::print_timer_config(config.timer);
+        std::print("\n");
+    }
+    timer.start(&realtime::shutdown_token());
+    wait_and_report(config, timer);
+}
+
+}  // namespace
+
+auto main(int argc, char** argv) -> int
+{
+    Config const config = prepare(argc, argv);
 
     // Create TripwireMonitor (combines TraceController + Tripwire + monitor thread)
     realtime::TripwireMonitor tripwire_monitor(config.trace);
-
-    {
-        auto tripwiere_monitor_start = realtime::TripwireMonitorStart{tripwire_monitor, &realtime::shutdown_token()};
-
-        // Create timer with callback (using default MonotonicClock)
-        realtime::Timer<> timer(config.timer, [&tripwire_monitor, &config](auto const& event, auto const& stats) {
-            // Observe tripwire (will trigger if error exceeds threshold)
-            realtime::observe_and_handle_tripwire(tripwire_monitor, event);
-            if (!config.quiet) {
-                event.print(stats);
-            }
-        });
-
-        // Start the timer
-        if (config.verbose) {
-            realtime::print_timer_config(config.timer);
-            std::print("\n");
-        }
-        timer.start(&realtime::shutdown_token());
-
-        // Wait for shutdown signal
-        while (!realtime::is_shutdown_requested()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-
-        // Stop timer before printing stats
-        if (config.verbose) {
-            std::print("\n\nShutting down...\n");
-        }
-        // Print final statistics
-        if (config.dump_stats_on_exit) {
-            std::print("\n");
-            realtime::print_timer_stats(timer);
-        }
-    }
-
+    run_timer(config, tripwire_monitor);
     return EXIT_SUCCESS;
 }

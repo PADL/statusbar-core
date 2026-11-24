@@ -72,13 +72,32 @@ statusbar_add_module(
   net_tcam_classifier_test.cpp
   net_tcp_server_test.cpp
   net_test.cpp
+  net_told_connection_transport_test.cpp
   net_vlan_link_test.cpp
   net_vlan_link_veth_test.cpp
   net_xdp_abi_test.cpp
   net_xdp_launch_time_test.cpp
   net_xdp_avtp_rules_test.cpp
   net_xdp_equiv_test.cpp
-  net_xdp_object_test.cpp)
+  net_xdp_object_test.cpp
+  FUNCTIONAL_TESTS
+  net_any_ethernet_port_functional_test.cpp
+  net_dpll_functional_test.cpp
+  net_functional_test.cpp
+  net_group_membership_functional_test.cpp
+  net_interface_info_functional_test.cpp
+  net_linux_mmap_functional_test.cpp
+  net_linux_xdp_functional_test.cpp
+  net_netdev_features_functional_test.cpp
+  net_netlink_functional_test.cpp
+  net_phc_functional_test.cpp
+  net_rawnet_functional_test.cpp
+  net_rss_functional_test.cpp
+  net_rx_flow_functional_test.cpp
+  net_tc_qdisc_functional_test.cpp
+  net_tcp_server_functional_test.cpp
+  net_vlan_link_functional_test.cpp
+  net_xdp_launch_time_functional_test.cpp)
 
 # The netlink reply parsers read kernel replies at offsets the replies
 # themselves state; the fuzzers feed them arbitrary bytes. The tc and VLAN

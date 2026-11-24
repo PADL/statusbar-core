@@ -13,18 +13,21 @@
 #include "statusbar/realtime/realtime_base.hpp"
 #include "statusbar/realtime/realtime_tripwire.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 
 namespace statusbar::realtime {
 
 TimerBase::TimerBase(TimerConfig config) noexcept
     : config_{config}
     , stats_{config_.error_histogram, config_.duration_histogram}
+    , raw_line_{MonotonicRawLine::Config{
+          .drift_bound_ppb = config_.raw_line_drift_bound_ppb, .sleep_rate_margin_ppb = config_.raw_line_sleep_rate_margin_ppb}}
 {}
 
 TimerBase::~TimerBase() noexcept
@@ -72,6 +75,11 @@ auto TimerBase::start(statusbar::itc::StopToken* shutdown_token) -> void
 {
     if (!try_start()) {
         return;  // Already running
+    }
+    // A thread that left on its own (see stop()) cleared the flag and is
+    // still joinable: assigning over it would terminate the process.
+    if (timer_thread_.joinable()) {
+        timer_thread_.join();
     }
     shutdown_token_ = shutdown_token;
     timer_thread_ = std::thread([this]() -> void {
@@ -156,115 +164,96 @@ auto TimerBase::prepare_thread() -> bool
     return true;
 }
 
-auto TimerBase::wait_until_absolute(int64_t deadline_ns) noexcept -> int64_t
+auto TimerBase::wait_until_absolute(MonotonicClock::time_point const deadline) noexcept -> Nanoseconds
 {
     // A signal that cuts the sleep short is not a wake: sleep again to the
     // same deadline. Any other failure returns at once and the caller sees
     // the early wake in the error it is handed.
     int sleep_result = 0;
     do {
-        sleep_result = sleep_until_monotonic_ns(deadline_ns);
+        sleep_result = sleep_until_monotonic(deadline);
     } while (sleep_result == EINTR);
 
-    int64_t const actual_ns = read_monotonic_ns();
-    return actual_ns - deadline_ns;
+    return read_monotonic() - deadline;
 }
 
-auto TimerBase::wait_until_deadline(int64_t mono_deadline_ns) noexcept -> WaitResult
+auto TimerBase::wait_until_raw_deadline(MonotonicRawClock::time_point const raw_deadline) noexcept -> WaitResult
 {
-    int64_t const sleep_deadline_ns = mono_deadline_ns + config_.compensation_ns;
-    if (config_.busy_wait) {
-        (void)wait_until_busy(sleep_deadline_ns, config_.busy_wait_threshold_ns);
-    } else {
-        (void)wait_until_absolute(sleep_deadline_ns);
+    for (;;) {
+        if (auto const result = wait_slice(raw_deadline)) {
+            return *result;
+        }
     }
-
-    return wait_result(read_monotonic_ns() - mono_deadline_ns);
 }
 
-auto TimerBase::wait_result(int64_t error_ns) const noexcept -> WaitResult
+auto TimerBase::wait_slice(MonotonicRawClock::time_point const raw_deadline, Nanoseconds const slice) noexcept
+    -> std::optional<WaitResult>
 {
-    // Guard against period_ns == 0 (CLI-settable via build_timer_arg_specs)
-    // so we never divide by zero in the hot path.
-    int64_t const skipped_counts = (config_.period_ns > 0 && error_ns > config_.period_ns) ? (error_ns / config_.period_ns) : 0;
-    return {.error_ns = error_ns, .skipped_counts = skipped_counts};
+    auto const target_raw = wake_target(raw_deadline);
+    if (!sleep_toward(target_raw, slice)) {
+        return std::nullopt;
+    }
+    return wait_outcome(raw_deadline, spin_until_raw(target_raw));
 }
 
-auto TimerBase::wait_until_raw_deadline(int64_t raw_deadline_ns) noexcept -> WaitResult
+auto TimerBase::sleep_toward(MonotonicRawClock::time_point const target_raw, Nanoseconds const slice) noexcept -> bool
 {
-    int64_t const target_raw_ns = raw_deadline_ns + config_.compensation_ns;
-    track_raw_line(read_monotonic_raw_ns());
-    sleep_early_for_raw(target_raw_ns);
-    return wait_result(spin_until_raw(target_raw_ns) - raw_deadline_ns);
+    track_raw_line(read_monotonic_raw());
+    auto const wake = early_wake(target_raw, read_monotonic_raw());
+    if (!wake) {
+        return true;
+    }
+    auto const slice_end = read_monotonic() + slice;
+    (void)wait_until_absolute(std::min(*wake, slice_end));
+    return *wake <= slice_end;
 }
 
 auto TimerBase::prime_raw_line() noexcept -> void
 {
     // Two samples a millisecond apart give a rate good to ~100 ppm, which
-    // the slew margin in sleep_early_for_raw covers; one sample alone would
+    // the slew margin in early_wake covers; one sample alone would
     // leave the first sleep trusting rate 1.0 against a clock phc2sys may be
     // railing at 10%.
     (void)raw_tracker_.sample();
-    (void)wait_until_absolute(read_monotonic_ns() + 1'000'000);
+    (void)wait_until_absolute(read_monotonic() + Nanoseconds{1'000'000});
     (void)raw_tracker_.sample();
-    raw_line_sampled_ns_ = read_monotonic_raw_ns();
+    raw_line_sampled_ = read_monotonic_raw();
 }
 
-auto TimerBase::track_raw_line(int64_t raw_now_ns) noexcept -> void
+auto TimerBase::track_raw_line(MonotonicRawClock::time_point const raw_now) noexcept -> void
 {
-    if (raw_line_sampled_ns_ == 0) {
+    if (!raw_line_sampled_) {
         prime_raw_line();
         return;
     }
-    int64_t const interval_ns = config_.raw_line_sample_interval_ns;
-    if (interval_ns <= 0 || raw_now_ns - raw_line_sampled_ns_ < interval_ns) {
+    Nanoseconds const interval{config_.raw_line_sample_interval_ns};
+    if (interval <= Nanoseconds::zero() || raw_now - *raw_line_sampled_ < interval) {
         return;
     }
     (void)raw_tracker_.sample();
-    raw_line_sampled_ns_ = raw_now_ns;
+    raw_line_sampled_ = raw_now;
 }
 
-auto TimerBase::sleep_early_for_raw(int64_t target_raw_ns) noexcept -> void
+auto TimerBase::early_wake(MonotonicRawClock::time_point const target_raw, MonotonicRawClock::time_point const raw_now)
+    const noexcept -> std::optional<MonotonicClock::time_point>
 {
-    // The line's rate error after the 1 ms priming baseline, as a fraction;
-    // added to the measured slew so the early wake stays early.
-    constexpr double RATE_MARGIN = 100e-6;
-    auto const line = raw_line_.consume();
-    int64_t const remaining_ns = target_raw_ns - read_monotonic_raw_ns();
-    int64_t const base_guard_ns = config_.busy_wait ? config_.busy_wait_threshold_ns : config_.raw_spin_guard_ns;
-    int64_t const slew_guard_ns =
-        remaining_ns > 0 ? static_cast<int64_t>((std::fabs(line.rate - 1.0) + RATE_MARGIN) * static_cast<double>(remaining_ns)) : 0;
-    if (remaining_ns > base_guard_ns + slew_guard_ns) {
-        (void)wait_until_absolute(raw_line_.to_monotonic_ns(target_raw_ns) - base_guard_ns - slew_guard_ns);
+    Nanoseconds const remaining = target_raw - raw_now;
+    Nanoseconds const guard = Nanoseconds{config_.busy_wait ? config_.busy_wait_threshold_ns : config_.raw_spin_guard_ns} +
+        raw_line_.sleep_margin(target_raw, raw_now);
+    if (remaining <= guard) {
+        return std::nullopt;
     }
+    return raw_line_.to_monotonic(target_raw) - guard;
 }
 
-auto TimerBase::spin_until_raw(int64_t target_raw_ns) noexcept -> int64_t
+auto TimerBase::spin_until_raw(MonotonicRawClock::time_point const target_raw) noexcept -> MonotonicRawClock::time_point
 {
-    int64_t now_ns = read_monotonic_raw_ns();
-    while (now_ns < target_raw_ns) {
+    auto now = read_monotonic_raw();
+    while (now < target_raw) {
         cpu_relax();
-        now_ns = read_monotonic_raw_ns();
+        now = read_monotonic_raw();
     }
-    return now_ns;
-}
-
-auto TimerBase::wait_until_busy(int64_t deadline_ns, int64_t threshold_ns) noexcept -> int64_t
-{
-    int64_t now_ns = read_monotonic_ns();
-    int64_t const remaining_ns = deadline_ns - now_ns;
-
-    // If we have more than threshold time remaining, sleep first
-    if (remaining_ns > threshold_ns) {
-        (void)wait_until_absolute(deadline_ns - threshold_ns);
-    }
-
-    // Busy-wait for remaining time (or all time if period < threshold)
-    while ((now_ns = read_monotonic_ns()) < deadline_ns) {
-        cpu_relax();
-    }
-
-    return now_ns - deadline_ns;
+    return now;
 }
 
 }  // namespace statusbar::realtime

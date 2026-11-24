@@ -50,54 +50,57 @@ TEST(sync_stop_token_wait, wait_times_out_when_not_set)
     EXPECT_TRUE(elapsed >= 10ms);
 }
 
+// The waiters below wait "for an hour": a wake-up that never came would hang
+// the test and the runner's timeout would report it. None of them asserts
+// how long anything took, and none sleeps to let a thread get somewhere.
 TEST(sync_stop_token_wakeup, request_stop_wakes_waiter)
 {
     StopToken t;
+    std::atomic<bool> waiting{false};
     std::atomic<bool> waiter_returned{false};
     std::thread waiter{[&]() noexcept {
-        bool const got = t.wait_for_stop(10s);
+        waiting.store(true);
+        waiting.notify_all();
+        bool const got = t.wait_for_stop(1h);
         waiter_returned.store(got, std::memory_order_relaxed);
     }};
-    std::this_thread::sleep_for(10ms);
-    auto const before = std::chrono::steady_clock::now();
+    waiting.wait(false);
     t.request_stop();
     waiter.join();
-    auto const elapsed = std::chrono::steady_clock::now() - before;
     EXPECT_TRUE(waiter_returned.load(std::memory_order_relaxed));
-    EXPECT_TRUE(elapsed < 500ms);
 }
 
-TEST(sync_stop_token_wakeup, signal_set_does_not_wake_waiter_until_timeout)
+TEST(sync_stop_token_wakeup, a_flag_set_from_a_signal_handler_is_seen_by_the_next_wait)
 {
+    // signal_set() only stores the flag: it is all a signal handler may do,
+    // so it notifies nobody and a waiter already blocked notices at its own
+    // timeout. What can be said without a clock: the flag is set, and a
+    // wait that starts after it returns at once.
     StopToken t;
-    auto const start = std::chrono::steady_clock::now();
-    std::thread setter{[&]() noexcept {
-        std::this_thread::sleep_for(10ms);
-        t.signal_set();
-    }};
-    bool const got = t.wait_for_stop(50ms);
-    auto const elapsed = std::chrono::steady_clock::now() - start;
-    setter.join();
-    EXPECT_TRUE(got);
-    // Without the cv notify, the waiter sleeps the full 50ms timeout
-    // even though the flag was set at ~10ms. Allow some scheduling
-    // slack on either side.
-    EXPECT_TRUE(elapsed >= 40ms);
+    t.signal_set();
+    EXPECT_TRUE(t.stop_requested());
+    EXPECT_TRUE(t.wait_for_stop(1h));
+    EXPECT_TRUE(t.wait_for_stop(0ms));
 }
 
 TEST(sync_stop_token_wakeup, multiple_waiters_all_wake_on_request_stop)
 {
     StopToken t;
+    std::atomic<int> waiting{0};
     std::atomic<int> woken{0};
     auto run_waiter = [&]() noexcept {
-        if (t.wait_for_stop(10s)) {
+        waiting.fetch_add(1);
+        waiting.notify_all();
+        if (t.wait_for_stop(1h)) {
             woken.fetch_add(1, std::memory_order_relaxed);
         }
     };
     std::thread a{run_waiter};
     std::thread b{run_waiter};
     std::thread c{run_waiter};
-    std::this_thread::sleep_for(10ms);
+    for (int seen = waiting.load(); seen < 3; seen = waiting.load()) {
+        waiting.wait(seen);
+    }
     t.request_stop();
     a.join();
     b.join();

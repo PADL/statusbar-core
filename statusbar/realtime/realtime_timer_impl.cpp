@@ -5,7 +5,21 @@
 
 #include "statusbar/realtime/realtime_timer_config.hpp"
 
+#include <algorithm>
+#include <cstdint>
+
 namespace statusbar::realtime {
+
+namespace {
+
+/// A rate in parts per billion as an option gives it, held to what the
+/// configuration can carry.
+[[nodiscard]] auto clamp_ppb(int64_t const value) noexcept -> uint32_t
+{
+    return static_cast<uint32_t>(std::clamp<int64_t>(value, 0, int64_t{UINT32_MAX}));
+}
+
+}  // namespace
 
 auto build_histogram_arg_specs(stats::AtomicHistogramConfig& config) -> args::ArgumentSpecs
 {
@@ -30,12 +44,13 @@ auto build_timer_arg_specs(TimerConfig& config) -> args::ArgumentSpecs
     specs.add<int>("cpu", "CPU number to run timer on", config.cpu, [&](auto v) -> void { config.cpu = v; });
     specs.add<int>("priority", "SCHED_FIFO priority (1-99)", config.priority, [&](auto v) -> void { config.priority = v; });
     specs.add<bool>(
-        "busy_wait", "Use busy-wait mode for ultra-low latency (100% CPU, <5us jitter)", config.busy_wait, [&](auto v) -> void {
-            config.busy_wait = v;
-        });
+        "busy_wait",
+        "Widen the spin before each deadline from raw_spin_guard_ns to busy_wait_threshold_ns",
+        config.busy_wait,
+        [&](auto v) -> void { config.busy_wait = v; });
     specs.add<int64_t>(
         "busy_wait_threshold_ns",
-        "Busy-wait threshold in ns (sleep if remaining time > this, then busy-wait)",
+        "With busy_wait: how early, in ns, to wake on CLOCK_MONOTONIC and start spinning",
         config.busy_wait_threshold_ns,
         [&](auto v) -> void { config.busy_wait_threshold_ns = v; });
     specs.add<bool>(
@@ -60,19 +75,29 @@ auto build_timer_arg_specs(TimerConfig& config) -> args::ArgumentSpecs
         [&](auto v) -> void { config.start_offset_cycles = v; });
     specs.add<int64_t>(
         "resync_interval_cycles",
-        "Wakes between mono-deadline resyncs that correct accumulated slope drift (0 = never)",
+        "Wakes between fresh conversions of the RAW deadline from the adapter's time (0 = never)",
         config.resync_interval_cycles,
         [&](auto v) -> void { config.resync_interval_cycles = v; });
     specs.add<int64_t>(
         "raw_spin_guard_ns",
-        "Raw-reference timers: wake this early on CLOCK_MONOTONIC, then spin on CLOCK_MONOTONIC_RAW to the deadline",
+        "Wake this early on CLOCK_MONOTONIC, then spin on CLOCK_MONOTONIC_RAW to the deadline",
         config.raw_spin_guard_ns,
         [&](auto v) -> void { config.raw_spin_guard_ns = v; });
     specs.add<int64_t>(
         "raw_line_sample_interval_ns",
-        "Raw-reference timers: RAW->MONOTONIC line re-sample interval in ns (0 = once at start)",
+        "RAW->MONOTONIC line re-sample interval in ns (0 = once at start)",
         config.raw_line_sample_interval_ns,
         [&](auto v) -> void { config.raw_line_sample_interval_ns = v; });
+    specs.add<int64_t>(
+        "raw_line_drift_bound_ppb",
+        "How fast CLOCK_MONOTONIC may move against RAW while the line is unsampled, in ppb (the operating system's figure)",
+        int64_t{config.raw_line_drift_bound_ppb},
+        [&](auto v) -> void { config.raw_line_drift_bound_ppb = clamp_ppb(v); });
+    specs.add<int64_t>(
+        "raw_line_sleep_rate_margin_ppb",
+        "Rate error allowed for when the early wake is sized, in ppb",
+        int64_t{config.raw_line_sleep_rate_margin_ppb},
+        [&](auto v) -> void { config.raw_line_sleep_rate_margin_ppb = clamp_ppb(v); });
 
     // Merge histogram specs with prefixes
     specs.merge(build_histogram_arg_specs(config.error_histogram), "error_histogram.");

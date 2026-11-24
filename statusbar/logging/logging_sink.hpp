@@ -48,8 +48,14 @@ class LogSink
 /// telemetry lines).
 [[nodiscard]] inline auto render_line(char const* channel_name, LogEntry const& entry) -> std::string
 {
-    double const seconds = static_cast<double>(entry.timestamp_ns) / 1e9;
-    return std::format("{:.6f} {} [{}] {}\n", seconds, level_char(entry.level), channel_name, entry.message());
+    // In integers: a nanosecond count since some epoch does not go through a double.
+    return std::format(
+        "{}.{:06} {} [{}] {}\n",
+        entry.timestamp_ns / 1'000'000'000,
+        (entry.timestamp_ns % 1'000'000'000) / 1'000,
+        level_char(entry.level),
+        channel_name,
+        entry.message());
 }
 
 /// Writes lines to stderr (unbuffered by default, so journald/terminals see

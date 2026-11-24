@@ -10,7 +10,9 @@
 /// slots, the free list, and the event buffer are all sized at
 /// construction — nothing allocates after startup.
 ///
-/// The pool owns the sockets; the handler works purely in slot indices:
+/// The pool is a ConnectionTransport (net_connection_transport.hpp): the
+/// one made of real sockets. The pool owns the sockets; the handler works
+/// purely in slot indices:
 ///
 ///   on_accept(slot, peer)   a connection landed in `slot`
 ///   on_readable(slot)       call read(slot, buf) until would_block
@@ -53,6 +55,7 @@
 /// symlink. The private directory is gone before listen().
 
 #include "statusbar/net/net_address.hpp"
+#include "statusbar/net/net_connection_transport.hpp"
 #include "statusbar/net/net_fd_multiplexer.hpp"
 #include "statusbar/net/net_message_reactor.hpp"
 #include "statusbar/net/net_socket.hpp"
@@ -63,23 +66,6 @@
 #include <vector>
 
 namespace statusbar::net {
-
-/// Slot-indexed connection events, delivered from the reactor's poll
-/// thread. Handlers may call the pool's read/write/close from inside any
-/// callback.
-class TcpConnectionHandler
-{
-  public:
-    virtual ~TcpConnectionHandler() = default;
-
-    virtual void on_accept(size_t slot, SocketAddress const& peer, int64_t now_ns) = 0;
-    virtual void on_readable(size_t slot, int64_t now_ns) = 0;
-    virtual void on_writable(size_t slot, int64_t now_ns) { (void)slot, (void)now_ns; }
-    virtual void on_closed(size_t slot, int64_t now_ns) = 0;
-
-    /// A connection arrived while every slot was in use and was closed.
-    virtual void on_rejected(SocketAddress const& peer, int64_t now_ns) { (void)peer, (void)now_ns; }
-};
 
 struct TcpServerOptions
 {
@@ -123,7 +109,9 @@ struct LocalSocketFile
     FileDescriptor lock{};
 };
 
-class TcpConnectionPool : public Pollable
+class TcpConnectionPool
+    : public Pollable
+    , public ConnectionTransport
 {
   public:
     TcpConnectionPool(
@@ -150,14 +138,14 @@ class TcpConnectionPool : public Pollable
     /// Reads into @p out (SOCK_SEQPACKET: one message, empty ones skipped). 0 => orderly EOF; would_block =>
     /// no data now; buffer_full => a message longer than @p out, discarded, the connection still usable;
     /// other errors mean the connection is dead.
-    [[nodiscard]] auto read(size_t slot, std::span<uint8_t> out) -> StatusValue<size_t>;
+    [[nodiscard]] auto read(size_t slot, std::span<uint8_t> out) -> StatusValue<size_t> override;
 
     /// Sends what the kernel accepts (possibly 0) and returns the count;
     /// a short write arms write interest for an on_writable() follow-up.
-    [[nodiscard]] auto write(size_t slot, std::span<uint8_t const> data) -> StatusValue<size_t>;
+    [[nodiscard]] auto write(size_t slot, std::span<uint8_t const> data) -> StatusValue<size_t> override;
 
     /// Closes the slot's connection and fires on_closed().
-    void close(size_t slot);
+    void close(size_t slot) override;
 
     /// Whether the slot's unread bytes should raise on_readable(). The
     /// multiplexer is level-triggered: a handler that leaves bytes in the
@@ -166,11 +154,11 @@ class TcpConnectionPool : public Pollable
     /// bytes wait in the socket and TCP flow control holds the peer; on
     /// again, a pending byte raises on_readable() at the next poll. Every
     /// accepted connection starts with reads on.
-    void set_read_interest(size_t slot, bool want_read);
+    void set_read_interest(size_t slot, bool want_read) override;
     [[nodiscard]] auto read_interest(size_t slot) const noexcept -> bool;
 
     [[nodiscard]] auto peer(size_t slot) const -> SocketAddress const&;
-    [[nodiscard]] auto is_open(size_t slot) const noexcept -> bool;
+    [[nodiscard]] auto is_open(size_t slot) const noexcept -> bool override;
     [[nodiscard]] auto active_count() const noexcept -> size_t { return active_; }
     [[nodiscard]] auto capacity() const noexcept -> size_t { return slots_.size(); }
 

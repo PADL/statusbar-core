@@ -150,15 +150,6 @@ TEST(net_rss, plan_keeps_a_table_whose_size_is_not_a_power_of_two)
 
 // Against the kernel
 
-TEST(net_rss, loopback_has_no_indirection_table)
-{
-    auto const steered = set_rss_indirection_all("lo", 0);
-    EXPECT_FALSE(steered.has_value());
-    if (!steered) {
-        EXPECT_TRUE(steered.error() == std::errc::operation_not_supported);
-    }
-}
-
 TEST(net_rss, an_unknown_interface_is_not_operation_not_supported)
 {
 #if !defined(__linux__)
@@ -187,13 +178,6 @@ TEST(net_rss, an_oversize_interface_name_is_refused)
 
     auto const empty = set_rss_indirection_all("", 0);
     EXPECT_FALSE(empty.has_value());
-}
-
-TEST(net_rss, writing_to_loopback_fails_rather_than_pretending)
-{
-    std::array<uint32_t, 4> const all_zero{0, 0, 0, 0};
-    auto const written = set_rss_indirection("lo", all_zero);
-    EXPECT_FALSE(written.has_value());
 }
 
 // The guard: who puts the table back
@@ -398,17 +382,6 @@ TEST(net_rss_steering, a_default_guard_owes_nothing)
     EXPECT_FALSE(guard.holds_table());
     EXPECT_TRUE(guard.previous().empty());
     EXPECT_TRUE(guard.interface_name().empty());
-}
-
-// The read, as its own entry point: this is what a startup check uses to ask
-// whether a single-queue table is the previous run's leftover.
-TEST(net_rss, reading_loopbacks_table_reports_no_rss)
-{
-    auto const table = rss_indirection("lo");
-    EXPECT_FALSE(table.has_value());
-    if (!table) {
-        EXPECT_TRUE(table.error() == std::errc::operation_not_supported);
-    }
 }
 
 TEST(net_rss, reading_an_unknown_interface_is_told_apart_from_no_rss)

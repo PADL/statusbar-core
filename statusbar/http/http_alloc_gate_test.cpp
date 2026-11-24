@@ -3,17 +3,20 @@
 
 /// The M5 allocation gate (docs/HTTP_PLAN.md §7): the module's central
 /// promise — no dynamic allocation after startup — enforced, not
-/// asserted. This translation unit replaces the whole replaceable global
-/// operator new family (plain, aligned, nothrow and aligned-nothrow, with
-/// their deletes) with a counting forwarder; the test builds a server, runs one
-/// warm-up pass of every request shape, ARMS the counter, drives a
+/// asserted, on the engine itself: it runs here on a made-up wire, with no
+/// socket and nothing that waits. (The same gate over real sockets is the
+/// functional test beside this one.) This translation unit replaces the whole
+/// replaceable global operator new family (plain, aligned, nothrow and
+/// aligned-nothrow, with their deletes) with a counting forwarder; the test
+/// builds an engine, runs one
+/// warm-up pass of every kind of request, ARMS the counter, drives a
 /// steady-state mixed workload (static GET from both sources, 304, HEAD,
 /// buffered POST echo, streamed PUT, pipelined pairs, WebSocket echo and
 /// ping, timeout ticks), DISARMS, and requires the count be ZERO.
 ///
 /// The armed section of the test itself must also be allocation-free:
 /// request bytes are prebuilt, responses land in fixed buffers, and
-/// verification is memcmp-shaped. EXPECT failures may allocate — that
+/// verification is done with memcmp. EXPECT failures may allocate — that
 /// only happens when the gate has already failed.
 ///
 /// Every replaceable form has to be here, not just the throwing ones. The
@@ -23,12 +26,13 @@
 /// runtime's operator new and hand it to our malloc-based operator delete:
 /// an alloc-dealloc mismatch under ASan.
 
-#include "statusbar/http/http_server.hpp"
+#include "statusbar/http/http_alloc_gate_counting_new.hpp"
+#include "statusbar/http/http_engine.hpp"
 #include "statusbar/http/http_static.hpp"
+#include "statusbar/http/http_test_support.hpp"
 #include "statusbar/http/http_ws.hpp"
 #include "statusbar/test/test.hpp"
 
-#include <poll.h>
 #include <unistd.h>
 
 #include <array>
@@ -41,190 +45,13 @@
 #include <string>
 #include <vector>
 
-#include <sys/socket.h>
-
-// ---- counting operator new family ------------------------------------------
-
-namespace {
-std::atomic<bool> g_alloc_armed{false};
-std::atomic<uint64_t> g_alloc_count{0};
-
-void count_allocation() noexcept
-{
-    if (g_alloc_armed.load(std::memory_order_relaxed)) {
-        g_alloc_count.fetch_add(1, std::memory_order_relaxed);
-    }
-}
-
-/// The nothrow forms' allocators: counted, nullptr on failure. The throwing
-/// forms are these plus a std::bad_alloc.
-auto counted_malloc(size_t size) noexcept -> void*
-{
-    count_allocation();
-    return std::malloc(size == 0 ? 1 : size);
-}
-
-auto counted_aligned_malloc(size_t size, std::align_val_t alignment) noexcept -> void*
-{
-    count_allocation();
-    void* p = nullptr;
-    size_t const align = size_t(alignment) < sizeof(void*) ? sizeof(void*) : size_t(alignment);
-    if (::posix_memalign(&p, align, size == 0 ? 1 : size) != 0) {
-        return nullptr;
-    }
-    return p;
-}
-}  // namespace
-
-// NOLINTBEGIN(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory,readability-inconsistent-declaration-parameter-name)
-auto operator new(size_t size) -> void*
-{
-    void* p = counted_malloc(size);
-    if (p == nullptr) {
-        throw std::bad_alloc{};
-    }
-    return p;
-}
-
-auto operator new[](size_t size) -> void*
-{
-    return ::operator new(size);
-}
-
-auto operator new(size_t size, std::align_val_t alignment) -> void*
-{
-    void* p = counted_aligned_malloc(size, alignment);
-    if (p == nullptr) {
-        throw std::bad_alloc{};
-    }
-    return p;
-}
-
-auto operator new[](size_t size, std::align_val_t alignment) -> void*
-{
-    return ::operator new(size, alignment);
-}
-
-auto operator new(size_t size, std::nothrow_t const&) noexcept -> void*
-{
-    return counted_malloc(size);
-}
-auto operator new[](size_t size, std::nothrow_t const&) noexcept -> void*
-{
-    return counted_malloc(size);
-}
-auto operator new(size_t size, std::align_val_t alignment, std::nothrow_t const&) noexcept -> void*
-{
-    return counted_aligned_malloc(size, alignment);
-}
-auto operator new[](size_t size, std::align_val_t alignment, std::nothrow_t const&) noexcept -> void*
-{
-    return counted_aligned_malloc(size, alignment);
-}
-
-void operator delete(void* p) noexcept
-{
-    std::free(p);
-}
-void operator delete[](void* p) noexcept
-{
-    std::free(p);
-}
-void operator delete(void* p, size_t) noexcept
-{
-    std::free(p);
-}
-void operator delete[](void* p, size_t) noexcept
-{
-    std::free(p);
-}
-void operator delete(void* p, std::align_val_t) noexcept
-{
-    std::free(p);
-}
-void operator delete[](void* p, std::align_val_t) noexcept
-{
-    std::free(p);
-}
-void operator delete(void* p, size_t, std::align_val_t) noexcept
-{
-    std::free(p);
-}
-void operator delete[](void* p, size_t, std::align_val_t) noexcept
-{
-    std::free(p);
-}
-void operator delete(void* p, std::nothrow_t const&) noexcept
-{
-    std::free(p);
-}
-void operator delete[](void* p, std::nothrow_t const&) noexcept
-{
-    std::free(p);
-}
-void operator delete(void* p, std::align_val_t, std::nothrow_t const&) noexcept
-{
-    std::free(p);
-}
-void operator delete[](void* p, std::align_val_t, std::nothrow_t const&) noexcept
-{
-    std::free(p);
-}
-// NOLINTEND(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory,readability-inconsistent-declaration-parameter-name)
-
 // ---- the workload -----------------------------------------------------------
 
 using namespace statusbar;
 using namespace statusbar::http;
+using namespace statusbar::http::test_support;
 
 namespace {
-
-struct RawClient
-{
-    int fd{-1};
-
-    explicit RawClient(net::SocketAddress const& to)
-    {
-        fd = ::socket(to.family(), SOCK_STREAM, 0);
-        if (fd >= 0 && ::connect(fd, to.sockaddr(), to.length()) < 0) {
-            ::close(fd);
-            fd = -1;
-        }
-    }
-    ~RawClient()
-    {
-        if (fd >= 0) {
-            ::close(fd);
-        }
-    }
-    RawClient(RawClient const&) = delete;
-    auto operator=(RawClient const&) -> RawClient& = delete;
-
-    void send_bytes(uint8_t const* data, size_t len) const
-    {
-        auto const n = ::send(fd, data, len, 0);
-        (void)n;
-    }
-
-    /// Receives until @p expect bytes arrived or the budget lapses; fixed
-    /// buffer, no allocation.
-    auto recv_into(uint8_t* out, size_t cap, size_t expect, int budget_ms) const -> size_t
-    {
-        size_t got = 0;
-        for (int spent = 0; spent < budget_ms && got < expect && got < cap; spent += 5) {
-            struct pollfd pfd{.fd = fd, .events = POLLIN, .revents = 0};
-            if (::poll(&pfd, 1, 5) <= 0) {
-                continue;
-            }
-            auto const n = ::recv(fd, out + got, cap - got, 0);
-            if (n <= 0) {
-                break;
-            }
-            got += size_t(n);
-        }
-        return got;
-    }
-};
 
 /// Buffered echo into per-slot fixed storage; responds via external span.
 class GateEcho : public HttpHandler
@@ -270,42 +97,35 @@ class GateCount : public HttpHandler
 class GateWsEcho : public WsEndpoint
 {
   public:
-    explicit GateWsEcho(HttpServer*& server)
+    explicit GateWsEcho(HttpEngine*& server)
         : server_{server}
     {}
     void on_ws_message(size_t slot, std::span<uint8_t const> payload, bool is_text) override
     {
         (void)server_->ws_send_external(slot, payload, is_text);
     }
-    HttpServer*& server_;
+    HttpEngine*& server_;
 };
 
-void pump(HttpServer& server, int rounds, int64_t now0)
-{
-    for (int i = 0; i < rounds; ++i) {
-        struct pollfd pfd{.fd = server.fd(), .events = POLLIN, .revents = 0};
-        (void)::poll(&pfd, 1, 2);
-        server.on_ready(now0 + i);
-        server.tick(now0 + i);
-    }
-}
-
 /// One request/response over an existing keep-alive connection with
-/// zero allocations: send prebuilt bytes, receive into a fixed buffer,
-/// verify the expected prefix and suffix appear.
+/// zero allocations: put prebuilt bytes on the wire, turn the reactor, and
+/// check what the engine wrote where it lies, prefix and length.
 auto exchange(
-    HttpServer& server,
-    RawClient const& client,
+    ToldSite<>& site,
+    size_t slot,
     std::vector<uint8_t> const& request,
     char const* expect_prefix,
     size_t expect_at_least,
     int64_t now0) -> bool
 {
-    static uint8_t response[16384];
-    client.send_bytes(request.data(), request.size());
-    pump(server, 30, now0);
-    auto const got = client.recv_into(response, sizeof response, expect_at_least, 300);
-    return got >= expect_at_least && std::memcmp(response, expect_prefix, strlen(expect_prefix)) == 0;
+    bool const sent = site.wire.peer_sends(slot, std::span<uint8_t const>{request});
+    (void)site.pump(30, now0);
+    auto const response = site.wire.written(slot);
+    size_t const prefix_len = strlen(expect_prefix);
+    bool const ok = sent && response.size() >= expect_at_least && response.size() >= prefix_len &&
+        std::memcmp(response.data(), expect_prefix, prefix_len) == 0;
+    site.wire.take_written(slot);
+    return ok;
 }
 
 auto req(std::string const& text) -> std::vector<uint8_t>
@@ -350,15 +170,15 @@ TEST(http_alloc_gate, steady_state_allocates_nothing)
 
     HttpLimits limits;
     limits.max_connections = 4;
-    HttpServer server{net::SocketAddress::ipv4_loopback(0), limits, &*manifest};
-    HttpServer* server_ptr = &server;
+    ToldSite<> site{limits, &*manifest};
+    HttpEngine& server = site.engine;
+    HttpEngine* server_ptr = &server;
     GateEcho echo;
     GateCount count;
     GateWsEcho ws_echo{server_ptr};
     EXPECT_TRUE(server.add_route(HttpMethod::post, "/echo", echo));
     EXPECT_TRUE(server.add_route(HttpMethod::put, "/count", count));
     EXPECT_TRUE(server.add_ws_route("/ws", ws_echo));
-    auto const addr = *server.local_addr();
 
     // Prebuilt request bytes (the armed loop only reuses them).
     auto const get_asset = req("GET /asset HTTP/1.1\r\nHost: g\r\n\r\n");
@@ -371,12 +191,10 @@ TEST(http_alloc_gate, steady_state_allocates_nothing)
                                "POST /echo HTTP/1.1\r\nHost: g\r\nContent-Length: 3\r\n\r\nabc");
     auto const conditional = [&] {
         // Learn the ETag during warm-up preparation.
-        RawClient probe{addr};
-        static uint8_t buf[8192];
-        probe.send_bytes(get_asset.data(), get_asset.size());
-        pump(server, 30, 1);
-        auto const got = probe.recv_into(buf, sizeof buf, 200, 300);
-        std::string const response{reinterpret_cast<char const*>(buf), got};  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+        ToldClient const probe{site.wire};
+        probe.send_all(std::span<uint8_t const>{get_asset});
+        (void)site.pump(30, 1);
+        std::string const response = probe.received();
         auto const at = response.find("ETag: ");
         EXPECT_TRUE(at != std::string::npos);
         auto const etag = response.substr(at + 6, response.find('\r', at) - at - 6);
@@ -387,18 +205,21 @@ TEST(http_alloc_gate, steady_state_allocates_nothing)
     auto const ws_text = masked_ws_frame(0x1, "meter update -36.5");
     auto const ws_ping = masked_ws_frame(0x9, "hb");
 
-    // ---- warm-up: every shape once --------------------------------------
-    RawClient http_client{addr};
-    RawClient ws_client{addr};
-    EXPECT_TRUE(exchange(server, http_client, get_asset, "HTTP/1.1 200 OK", 2048, 100));
-    EXPECT_TRUE(exchange(server, http_client, get_streamed, "HTTP/1.1 200 OK", 2048, 200));
-    EXPECT_TRUE(exchange(server, http_client, head_asset, "HTTP/1.1 200 OK", 64, 300));
-    EXPECT_TRUE(exchange(server, http_client, get_404, "HTTP/1.1 404", 32, 400));
-    EXPECT_TRUE(exchange(server, http_client, post_echo, "HTTP/1.1 200 OK", 64, 500));
-    EXPECT_TRUE(exchange(server, http_client, put_count, "HTTP/1.1 200 OK", 32, 600));
-    EXPECT_TRUE(exchange(server, http_client, conditional, "HTTP/1.1 304", 32, 700));
-    EXPECT_TRUE(exchange(server, ws_client, ws_upgrade, "HTTP/1.1 101", 64, 800));
-    EXPECT_TRUE(exchange(server, ws_client, ws_text, "\x81", 4, 900));
+    // ---- warm-up: every kind once ---------------------------------------
+    (void)site.pump(2, 50);  // the probe's connection is gone before the two that stay
+    ToldClient const http_peer{site.wire, 60};
+    ToldClient const ws_peer{site.wire, 60};
+    size_t const http_client = http_peer.slot();
+    size_t const ws_client = ws_peer.slot();
+    EXPECT_TRUE(exchange(site, http_client, get_asset, "HTTP/1.1 200 OK", 2048, 100));
+    EXPECT_TRUE(exchange(site, http_client, get_streamed, "HTTP/1.1 200 OK", 2048, 200));
+    EXPECT_TRUE(exchange(site, http_client, head_asset, "HTTP/1.1 200 OK", 64, 300));
+    EXPECT_TRUE(exchange(site, http_client, get_404, "HTTP/1.1 404", 32, 400));
+    EXPECT_TRUE(exchange(site, http_client, post_echo, "HTTP/1.1 200 OK", 64, 500));
+    EXPECT_TRUE(exchange(site, http_client, put_count, "HTTP/1.1 200 OK", 32, 600));
+    EXPECT_TRUE(exchange(site, http_client, conditional, "HTTP/1.1 304", 32, 700));
+    EXPECT_TRUE(exchange(site, ws_client, ws_upgrade, "HTTP/1.1 101", 64, 800));
+    EXPECT_TRUE(exchange(site, ws_client, ws_text, "\x81", 4, 900));
 
     // ---- the gate --------------------------------------------------------
     g_alloc_count.store(0);
@@ -406,16 +227,16 @@ TEST(http_alloc_gate, steady_state_allocates_nothing)
     bool all_ok = true;
     for (int round = 0; round < 25; ++round) {
         int64_t const now = 10'000 + (int64_t(round) * 1'000);
-        all_ok = all_ok && exchange(server, http_client, get_asset, "HTTP/1.1 200 OK", 2048, now);
-        all_ok = all_ok && exchange(server, http_client, get_streamed, "HTTP/1.1 200 OK", 2048, now + 100);
-        all_ok = all_ok && exchange(server, http_client, head_asset, "HTTP/1.1 200 OK", 64, now + 200);
-        all_ok = all_ok && exchange(server, http_client, get_404, "HTTP/1.1 404", 32, now + 300);
-        all_ok = all_ok && exchange(server, http_client, post_echo, "HTTP/1.1 200 OK", 64, now + 400);
-        all_ok = all_ok && exchange(server, http_client, put_count, "HTTP/1.1 200 OK", 32, now + 500);
-        all_ok = all_ok && exchange(server, http_client, conditional, "HTTP/1.1 304", 32, now + 600);
-        all_ok = all_ok && exchange(server, http_client, pipelined, "HTTP/1.1 200 OK", 2100, now + 700);
-        all_ok = all_ok && exchange(server, ws_client, ws_text, "\x81", 4, now + 800);
-        all_ok = all_ok && exchange(server, ws_client, ws_ping, "\x8a", 4, now + 900);
+        all_ok = all_ok && exchange(site, http_client, get_asset, "HTTP/1.1 200 OK", 2048, now);
+        all_ok = all_ok && exchange(site, http_client, get_streamed, "HTTP/1.1 200 OK", 2048, now + 100);
+        all_ok = all_ok && exchange(site, http_client, head_asset, "HTTP/1.1 200 OK", 64, now + 200);
+        all_ok = all_ok && exchange(site, http_client, get_404, "HTTP/1.1 404", 32, now + 300);
+        all_ok = all_ok && exchange(site, http_client, post_echo, "HTTP/1.1 200 OK", 64, now + 400);
+        all_ok = all_ok && exchange(site, http_client, put_count, "HTTP/1.1 200 OK", 32, now + 500);
+        all_ok = all_ok && exchange(site, http_client, conditional, "HTTP/1.1 304", 32, now + 600);
+        all_ok = all_ok && exchange(site, http_client, pipelined, "HTTP/1.1 200 OK", 2100, now + 700);
+        all_ok = all_ok && exchange(site, ws_client, ws_text, "\x81", 4, now + 800);
+        all_ok = all_ok && exchange(site, ws_client, ws_ping, "\x8a", 4, now + 900);
     }
     g_alloc_armed.store(false);
 
