@@ -325,9 +325,10 @@ time daemon sets at each update. `read_system_clock_error()` returns it
 Linux kernel grows that figure at 500 ppm, which is the largest
 frequency correction it can apply and far looser than a real
 oscillator: one second without the time server costs 500 µs of claimed
-accuracy. (`UtcClockQualityTracker::SYSTEM_GROWTH_PER_SECOND` is that
-Linux figure; it is how the tracker tells the kernel's own growth from
-an update by the time daemon.)
+accuracy. (The tracker tells the kernel's own growth from an update by
+the time daemon by that figure. It is
+`UtcClockQualityTracker::Config::system_growth_per_second`, Linux's by
+default.)
 
 `UtcClockQualityTracker` takes the system's figure at each update as the
 bound at that instant and grows it at the drift the deployment
@@ -351,8 +352,10 @@ the timescale only: whether a local GPS receiver or a distant NTP server
 disciplines the clock is `ClockQuality::time_source`, and how well it is
 known is the bound.
 
-`TAI_MINUS_UTC` is 37 s, in force since 2017. A future leap second
-means changing that constant and building again.
+`TAI_MINUS_UTC` is 37 s, in force since 2017, and is a constant in the
+code. No further leap second is expected: the General Conference on
+Weights and Measures resolved in 2022 to stop inserting them, from 2035
+at the latest.
 
 ### Reaching a RAW deadline
 
@@ -424,6 +427,45 @@ to another timeline and the grid was laid again: `scheduled_time` and
 
 `Timer<>` with no adapter argument schedules on RAW itself.
 
+## What depends on the hardware
+
+No accuracy in this API is a property of the code. Each bound is built
+from figures, and the figures belong to the machine, the operating
+system and the deployment. All of them are set at run time; the defaults
+are cautious and claim nothing about the hardware.
+
+| Figure | Whose it is | Where it is set | Default |
+|---|---|---|---|
+| Drift while coasting | The oscillator and its temperature range | `ClockQuality::drift_bound_ppb`, filled by each source from its configuration: `UtcClockQualityTracker::Config::drift_bound_ppb`, and in statusbar-avb `BridgeSamplingParams::holdover_drift_ppb` and `GptpTimeBridge::holdover_drift_ppb` | 15 ppm |
+| Fixed error | The hardware between the time source and the reading: PHY latency asymmetry, timestamp granularity, a receiver's pulse offset and cable, a path taken as symmetric | `UtcClockQualityTracker::Config::fixed_error`, and in statusbar-avb `BridgeSamplingParams::fixed_error_ns` and `GptpTimeBridge::fixed_error_ns` | 0 |
+| Bound at each sync | Measured on the running machine | Not set: the fit's worst miss plus half the bracket of the paired read, with the fixed error added | |
+| The limit | Each user of the time | `AccuracyLimit` | |
+| Wake margins | The machine's scheduling latency | `TimerConfig::raw_spin_guard_ns`, `busy_wait_threshold_ns`, `raw_line_sample_interval_ns` | 50 µs, 200 µs, 100 ms |
+| How the system treats its clocks | The operating system | `MonotonicRawLineConfig` (`drift_bound_ppb`, `sleep_rate_margin_ppb`, `max_rate_ppm`), reached through `TimerConfig::raw_line_drift_bound_ppb` and `raw_line_sleep_rate_margin_ppb`; `UtcClockQualityTracker::Config` (`system_growth_per_second`, `step_rate_ppb`, `step_margin`) | Linux's |
+| TAI − UTC | Nobody's | A constant, 37 s | |
+
+The fixed error deserves a word. A bound built from measurements
+contains what the measurements scatter by. It cannot contain an error
+that is the same every time: a fit through readings that are all 80 ns
+late is a perfect fit. Such errors come from the hardware, are found on
+a bench or in a data sheet, and are told to the source that suffers
+them. Leaving the figure at zero is a claim that there is none.
+
+```cpp
+UtcClockQualityTracker utc_quality{UtcClockQualityTracker::Config{
+    .drift_bound_ppb = 2'000,              // a temperature-compensated oscillator in a steady room
+    .time_source = TimeSource::gnss,
+    .fixed_error = Nanoseconds{250}}};     // the receiver's pulse offset and its cable
+
+// On an operating system that corrects its clock by no more than 100 ppm:
+MonotonicRawLine line{MonotonicRawLine::Config{.drift_bound_ppb = 100'000}};
+```
+
+The tools in statusbar-avb expose the hardware figures as options
+(`--ptp.holdover_drift_ppb` and `--ptp.fixed_error_ns` for the PHC link,
+the same pair for the gPTP slave and for the system clock), so a
+deployment states them in its configuration file.
+
 ## Rules of use
 
 - Time with `MonotonicRawClock`. Sleep with `MonotonicClock`. Never the
@@ -443,6 +485,8 @@ to another timeline and the grid was laid again: `scheduled_time` and
 - Configure the drift bound from what the deployment knows about its
   oscillator and its temperature range. 15 ppm
   (`DEFAULT_HOLDOVER_DRIFT_PPB`) is the figure when it knows nothing.
+- Tell each source the fixed error of its hardware. A measured bound
+  does not contain it.
 - Durations are shared across domains on purpose. A `Nanoseconds` value
   is not tied to a clock; a `time_point` is.
 
