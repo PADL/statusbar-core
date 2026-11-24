@@ -144,9 +144,11 @@ using UtcClock = Clock<UtcClockTag>;
 /// UTC as a constant (TAI_MINUS_UTC).
 using TaiClock = Clock<TaiClockTag>;
 
-/// TAI - UTC, in force since 2017-01-01. Taken as fixed: a leap second
-/// applied to UTC after that date would need this constant changed and
-/// everything built again.
+/// TAI - UTC, in force since 2017-01-01, and taken as fixed. No further
+/// leap second is expected: the General Conference on Weights and Measures
+/// resolved in 2022 to stop inserting them, from 2035 at the latest. Should
+/// one still be applied before then, this constant changes and everything
+/// is built again.
 inline constexpr Nanoseconds TAI_MINUS_UTC{37'000'000'000LL};
 
 /// The TAI instant of a UTC one (exact: a constant offset)

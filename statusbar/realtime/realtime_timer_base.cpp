@@ -26,6 +26,8 @@ namespace statusbar::realtime {
 TimerBase::TimerBase(TimerConfig config) noexcept
     : config_{config}
     , stats_{config_.error_histogram, config_.duration_histogram}
+    , raw_line_{MonotonicRawLine::Config{
+          .drift_bound_ppb = config_.raw_line_drift_bound_ppb, .sleep_rate_margin_ppb = config_.raw_line_sleep_rate_margin_ppb}}
 {}
 
 TimerBase::~TimerBase() noexcept

@@ -31,6 +31,25 @@ namespace statusbar::realtime {
 class UtcClockQualityTracker
 {
   public:
+    /// What Linux adds to its worst-case error at each whole second of its
+    /// clock between updates (its 500 ppm tolerance). The default of
+    /// Config::system_growth_per_second.
+    static constexpr Nanoseconds SYSTEM_GROWTH_PER_SECOND{500'000};
+
+    /// A change of the system clock against CLOCK_MONOTONIC_RAW faster than
+    /// this, in parts per billion, is a step and not a slew: a slewing
+    /// daemon stays far below a tenth of real time. The default of
+    /// Config::step_rate_ppb.
+    static constexpr uint32_t STEP_RATE_PPB = 100'000'000;
+
+    /// Allowed on top of the rate before a change counts as a step: the
+    /// uncertainty of pairing the two clock reads. The default of
+    /// Config::step_margin.
+    static constexpr Nanoseconds STEP_MARGIN{1'000'000};
+
+    /// What the tracker is told about the machine it runs on. The first
+    /// three figures belong to the hardware and the deployment; the last
+    /// three describe the operating system, and their defaults are Linux's.
     struct Config
     {
         /// How fast the error may grow while the time daemon is not
@@ -40,20 +59,29 @@ class UtcClockQualityTracker
         /// What disciplines the system clock, when the deployment knows.
         /// The tracker cannot tell a GPS receiver from any other server.
         TimeSource time_source{TimeSource::ntp};
+
+        /// An error that no report from the operating system shows, added
+        /// to the bound at every update: what lies between the time source
+        /// and this clock that the time daemon does not measure (a
+        /// receiver's pulse offset and cable, a path the daemon takes as
+        /// symmetric). Zero claims there is none; a negative value is
+        /// taken as zero.
+        Nanoseconds fixed_error{0};
+
+        /// How much the operating system adds to its worst-case error at
+        /// each whole second of its clock between updates by the time
+        /// daemon. The tracker tells the system's own growth from an
+        /// update by this figure, so it must be the system's.
+        Nanoseconds system_growth_per_second{SYSTEM_GROWTH_PER_SECOND};
+
+        /// A change of the system clock against CLOCK_MONOTONIC_RAW faster
+        /// than this, in parts per billion, is a step and not a slew.
+        uint32_t step_rate_ppb{STEP_RATE_PPB};
+
+        /// Allowed on top of step_rate_ppb before a change counts as a
+        /// step: the uncertainty of pairing the two clock reads.
+        Nanoseconds step_margin{STEP_MARGIN};
     };
-
-    /// The system grows its worst-case error by this much at each whole
-    /// second of its clock between updates (its 500 ppm tolerance).
-    static constexpr Nanoseconds SYSTEM_GROWTH_PER_SECOND{500'000};
-
-    /// A change of the system clock against CLOCK_MONOTONIC_RAW faster than
-    /// this, in parts per billion, is a step and not a slew: a slewing
-    /// daemon stays far below a tenth of real time.
-    static constexpr uint32_t STEP_RATE_PPB = 100'000'000;
-
-    /// Allowed on top of the rate before a change counts as a step: the
-    /// uncertainty of pairing the two clock reads.
-    static constexpr Nanoseconds STEP_MARGIN{1'000'000};
 
     UtcClockQualityTracker() noexcept = default;
 
@@ -77,7 +105,7 @@ class UtcClockQualityTracker
         }
         if (reported.synchronized && (stepped || !quality_.is_bounded() || is_update(utc, reported.max_error))) {
             quality_.synced_at = raw;
-            quality_.bound_at_sync = reported.max_error;
+            quality_.bound_at_sync = detail::add_accuracy(reported.max_error, fixed_error());
         }
         remember(raw, utc, reported.max_error);
     }
@@ -107,12 +135,12 @@ class UtcClockQualityTracker
         Nanoseconds const raw_elapsed = raw - last_raw_;
         Nanoseconds const utc_elapsed = utc - last_utc_;
         Nanoseconds const moved = utc_elapsed > raw_elapsed ? utc_elapsed - raw_elapsed : raw_elapsed - utc_elapsed;
-        return moved > accumulated_drift(raw_elapsed, STEP_RATE_PPB) + STEP_MARGIN;
+        return moved > accumulated_drift(raw_elapsed, config_.step_rate_ppb) + config_.step_margin;
     }
 
     /// Whether the time daemon has set the system's worst-case error since
     /// the last observation. Left alone, the system adds exactly
-    /// SYSTEM_GROWTH_PER_SECOND at each whole second of its clock; any
+    /// Config::system_growth_per_second at each whole second of its clock; any
     /// other value was written by the daemon. The clock and the report are
     /// two readings, not one instant: when a second boundary falls between
     /// them the count of seconds is one out, either way, and the report
@@ -124,9 +152,15 @@ class UtcClockQualityTracker
     {
         constexpr int64_t BILLION = 1'000'000'000;
         int64_t const seconds_crossed = (UtcClock::to_ns(utc) / BILLION) - (UtcClock::to_ns(last_utc_) / BILLION);
-        Nanoseconds const beyond_growth = max_error - (last_max_error_ + (SYSTEM_GROWTH_PER_SECOND * seconds_crossed));
-        return beyond_growth != Nanoseconds::zero() && beyond_growth != SYSTEM_GROWTH_PER_SECOND &&
-            beyond_growth != -SYSTEM_GROWTH_PER_SECOND;
+        Nanoseconds const step = config_.system_growth_per_second;
+        Nanoseconds const beyond_growth = max_error - (last_max_error_ + (step * seconds_crossed));
+        return beyond_growth != Nanoseconds::zero() && beyond_growth != step && beyond_growth != -step;
+    }
+
+    /// The configured fixed error, never negative.
+    [[nodiscard]] auto fixed_error() const noexcept -> Nanoseconds
+    {
+        return config_.fixed_error > Nanoseconds::zero() ? config_.fixed_error : Nanoseconds::zero();
     }
 
     auto remember(MonotonicRawClock::time_point raw, UtcClock::time_point utc, Nanoseconds max_error) noexcept -> void

@@ -45,6 +45,29 @@ struct MonotonicRawFixedLine
     int64_t offset_ns{0};
 };
 
+/// The figures the line between the two local clocks is built on. They
+/// describe how the operating system treats CLOCK_MONOTONIC, and their
+/// defaults are Linux's; a deployment on another system, or one that
+/// knows its own better, sets them when it makes the line.
+struct MonotonicRawLineConfig
+{
+    /// How fast CLOCK_MONOTONIC may move against RAW while the line is not
+    /// being sampled, in parts per billion: 500 ppm, the range of Linux's
+    /// frequency correction of the system clock.
+    uint32_t drift_bound_ppb{500'000};
+
+    /// The line's rate error after a 1 ms priming baseline, in parts per
+    /// billion: added to its distance from rate one in sleep_margin, so
+    /// that an early wake stays early.
+    uint32_t sleep_rate_margin_ppb{100'000};
+
+    /// A fit whose rate is further than this from 1.0, in parts per
+    /// million, is rejected and the previous line kept. Wide on purpose:
+    /// phc2sys may rail CLOCK_MONOTONIC at +/-10%, and the line must follow
+    /// it or the early wake is late.
+    double max_rate_ppm{200'000.0};
+};
+
 /// The shared line. Reads take no lock and are consistent (a seqlock: a
 /// reader retries while the writer is mid-update); the
 /// conversions are exact to the nanosecond for any uptime, so a deadline
@@ -59,7 +82,19 @@ class MonotonicRawLine
     /// of parts per 1e9, which carries the sub-ppm steps adjtimex makes.
     static constexpr int64_t SLOPE_DENOMINATOR = 1'000'000'000;
 
+    using Config = MonotonicRawLineConfig;
+
     MonotonicRawLine() noexcept = default;
+
+    /// A line on figures other than the defaults. They are fixed for the
+    /// line's life, so any thread may read them.
+    /// @param config The figures the line and its tracker go by
+    explicit MonotonicRawLine(Config const& config) noexcept
+        : config_{config}
+    {}
+
+    /// The figures this line was made with.
+    [[nodiscard]] auto config() const noexcept -> Config const& { return config_; }
 
     /// Writer side (one thread at a time). A default line is the identity.
     /// The rate is rounded to the integer slope once, here, so that no
@@ -93,16 +128,14 @@ class MonotonicRawLine
         return deviation < 0 ? -deviation : deviation;
     }
 
-    /// The line's rate error after a 1 ms priming baseline, in parts per
-    /// billion: added to its distance from rate one in sleep_margin, so
-    /// that an early wake stays early.
-    static constexpr int64_t SLEEP_RATE_MARGIN_PPB = 100'000;
+    /// The default of Config::sleep_rate_margin_ppb.
+    static constexpr int64_t SLEEP_RATE_MARGIN_PPB = Config{}.sleep_rate_margin_ppb;
 
     /// How much earlier than to_monotonic(@p target_raw) a sleeper has to
     /// aim to be sure of waking before the target: the line's misfit when
     /// it was last sampled (its fit residual and half the read bracket),
     /// plus the slew it could have accrued from that sample to the target,
-    /// at the line's distance from rate one and SLEEP_RATE_MARGIN_PPB. The
+    /// at the line's distance from rate one and its sleep_rate_margin_ppb. The
     /// longer the line goes unsampled the larger this is, and the more of
     /// a wait is spent spinning. A line never sampled (the identity) has no
     /// sample to count from: the slew is counted from @p raw_now.
@@ -140,6 +173,7 @@ class MonotonicRawLine
     [[nodiscard]] static auto slope_numerator(double rate) noexcept -> int64_t;
 
   private:
+    Config config_{};
     itc::SeqlockValue<FixedLine> line_{FixedLine{}};
     itc::SeqlockValue<ClockQuality> quality_{ClockQuality{}};
 };
@@ -159,18 +193,16 @@ class MonotonicRawTracker
 
     static constexpr size_t DEFAULT_WINDOW = 64;
 
-    /// A fit whose rate is further than this from 1.0 is rejected and the
-    /// previous line kept. Wide on purpose: phc2sys may rail CLOCK_MONOTONIC
-    /// at +/-10%, and the line must follow it or the early wake is late.
-    static constexpr double MAX_RATE_PPM = 200'000.0;
+    /// The default of MonotonicRawLineConfig::max_rate_ppm. The tracker
+    /// goes by the figure of the line it writes.
+    static constexpr double MAX_RATE_PPM = MonotonicRawLineConfig{}.max_rate_ppm;
 
-    /// How fast CLOCK_MONOTONIC may move against RAW while the line is not
-    /// being sampled: 500 ppm, the range of the system clock's frequency
-    /// correction. A line seen away from rate one may move back by as much
-    /// as it is off, and a rate seen moving within the window may move as
-    /// much again. The three can happen together, so the line's drift
-    /// bound is their sum.
-    static constexpr uint32_t DEFAULT_DRIFT_BOUND_PPB = 500'000;
+    /// The default of MonotonicRawLineConfig::drift_bound_ppb. A line seen
+    /// away from rate one may move back by as much as it is off, and a rate
+    /// seen moving within the window may move as much again. The three can
+    /// happen together, so the drift bound the tracker publishes is the
+    /// line's configured figure plus those two.
+    static constexpr uint32_t DEFAULT_DRIFT_BOUND_PPB = MonotonicRawLineConfig{}.drift_bound_ppb;
 
     explicit MonotonicRawTracker(MonotonicRawLine& line, size_t window = DEFAULT_WINDOW) noexcept
         : line_{&line}

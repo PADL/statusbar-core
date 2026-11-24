@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "statusbar/args/args.hpp"
+#include "statusbar/realtime/realtime_monotonic_raw_line.hpp"
 #include "statusbar/stats/stats.hpp"
 
 #include <cstddef>
@@ -40,6 +41,13 @@ struct TimerConfig
     /// How often, in ns of RAW time, the timer
     /// thread re-samples its RAW->MONOTONIC line (0 = only once, at the start).
     int64_t raw_line_sample_interval_ns{100'000'000};
+    /// How fast CLOCK_MONOTONIC may move against RAW while the timer's line
+    /// is not being sampled, in parts per billion: an operating-system
+    /// figure, Linux's by default (MonotonicRawLineConfig::drift_bound_ppb).
+    uint32_t raw_line_drift_bound_ppb{MonotonicRawLineConfig{}.drift_bound_ppb};
+    /// The rate error allowed for when the early wake is sized, in parts
+    /// per billion (MonotonicRawLineConfig::sleep_rate_margin_ppb).
+    uint32_t raw_line_sleep_rate_margin_ppb{MonotonicRawLineConfig{}.sleep_rate_margin_ppb};
 
     /// Histogram configuration for wake error distribution
     stats::AtomicHistogramConfig error_histogram{

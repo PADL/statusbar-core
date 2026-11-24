@@ -209,6 +209,63 @@ TEST(utc_clock_quality, the_deployment_says_how_it_drifts_and_what_disciplines_i
     EXPECT_EQ(quality.uncertainty(at(3'610 * BILLION).raw).count(), int64_t{1'470'000 + 7'200'000});
 }
 
+TEST(utc_clock_quality, an_error_the_system_cannot_see_is_added_at_every_update)
+{
+    // A receiver whose pulse is known to no better than a quarter of a millisecond.
+    UtcClockQualityTracker tracker{{.fixed_error = std::chrono::microseconds{250}}};
+    observe(tracker, at(10 * BILLION), reported(true, 1'470));
+    EXPECT_EQ(tracker.quality().bound_at_sync.count(), int64_t{1'470'000 + 250'000});
+
+    // The daemon writes a better figure: the fixed error is on top of that one too.
+    observe(tracker, at(11 * BILLION), reported(true, 900));
+    EXPECT_EQ(tracker.quality().bound_at_sync.count(), int64_t{900'000 + 250'000});
+    EXPECT_EQ(MonotonicRawClock::to_ns(tracker.quality().synced_at), 11 * BILLION);
+}
+
+TEST(utc_clock_quality, a_negative_fixed_error_adds_nothing)
+{
+    UtcClockQualityTracker tracker{{.fixed_error = Nanoseconds{-5}}};
+    observe(tracker, at(10 * BILLION), reported(true, 1'470));
+    EXPECT_EQ(tracker.quality().bound_at_sync.count(), int64_t{1'470'000});
+}
+
+TEST(utc_clock_quality, how_the_system_grows_its_figure_is_the_deployments_to_state)
+{
+    // A system that adds 100 us at each second, where Linux adds 500.
+    UtcClockQualityTracker tracker{{.system_growth_per_second = std::chrono::microseconds{100}}};
+    observe(tracker, at(10 * BILLION), reported(true, 1'000));
+    observe(tracker, at(11 * BILLION), reported(true, 1'100));  // its own growth
+    EXPECT_EQ(MonotonicRawClock::to_ns(tracker.quality().synced_at), 10 * BILLION);
+
+    // Linux's step, on that system, is a figure the daemon wrote.
+    observe(tracker, at(12 * BILLION), reported(true, 1'700));
+    EXPECT_EQ(MonotonicRawClock::to_ns(tracker.quality().synced_at), 12 * BILLION);
+    EXPECT_EQ(tracker.quality().bound_at_sync.count(), int64_t{1'700'000});
+}
+
+TEST(utc_clock_quality, what_counts_as_a_step_is_the_deployments_to_state)
+{
+    // The clock moves 200 ms against RAW within a second. By the defaults
+    // (a tenth of real time, and a millisecond) that is a step.
+    UtcClockQualityTracker strict;
+    observe(strict, at(10 * BILLION), reported(true, 1'470));
+    observe(strict, at(11 * BILLION, 200'000'000), reported(true, 1'470));
+    EXPECT_EQ(strict.quality().epoch, uint64_t{1});
+
+    // A deployment whose daemon slews at up to half of real time calls it a slew.
+    UtcClockQualityTracker lenient{{.step_rate_ppb = 500'000'000}};
+    observe(lenient, at(10 * BILLION), reported(true, 1'470));
+    observe(lenient, at(11 * BILLION, 200'000'000), reported(true, 1'470));
+    EXPECT_EQ(lenient.quality().epoch, uint64_t{0});
+
+    // And one that allows no margin for the pairing of its reads calls a
+    // movement just past the rate a step.
+    UtcClockQualityTracker exact{{.step_rate_ppb = 0, .step_margin = Nanoseconds{0}}};
+    observe(exact, at(10 * BILLION), reported(true, 1'470));
+    observe(exact, at(11 * BILLION, 1), reported(true, 1'470));
+    EXPECT_EQ(exact.quality().epoch, uint64_t{1});
+}
+
 // The one test on the real clocks. Whether this machine is synchronized, and
 // what its clock does between two reads, are not this test's business: it
 // only checks that what the tracker says agrees with itself.

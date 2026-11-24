@@ -295,4 +295,43 @@ TEST(monotonic_raw_tracker, a_negative_bracket_takes_nothing_off_the_bound)
     EXPECT_TRUE(told_wrong.quality().bound_at_sync == told_none.quality().bound_at_sync);
 }
 
+TEST(monotonic_raw_line, the_figures_a_line_goes_by_are_given_when_it_is_made)
+{
+    MonotonicRawLine defaults;
+    EXPECT_EQ(defaults.config().drift_bound_ppb, MonotonicRawTracker::DEFAULT_DRIFT_BOUND_PPB);
+    EXPECT_EQ(int64_t{defaults.config().sleep_rate_margin_ppb}, MonotonicRawLine::SLEEP_RATE_MARGIN_PPB);
+    EXPECT_TRUE(defaults.config().max_rate_ppm == MonotonicRawTracker::MAX_RATE_PPM);
+
+    // A system that corrects its clock by no more than 50 ppm, and a
+    // sleeper that allows 20 ppm for the line's own rate error.
+    MonotonicRawLine line{{.drift_bound_ppb = 50'000, .sleep_rate_margin_ppb = 20'000}};
+    auto const now = MonotonicRawClock::from_ns(LONG_UPTIME_NS);
+
+    // Never sampled: 20 ppm of 5 ms.
+    EXPECT_EQ(line.sleep_margin(now + Nanoseconds{5'000'000}, now).count(), int64_t{100});
+
+    // The tracker publishes the line's own figure as the drift bound.
+    MonotonicRawTracker tracker{line};
+    EXPECT_TRUE(tracker.push(now, MonotonicClock::from_ns(LONG_UPTIME_NS + 7)));
+    EXPECT_EQ(line.quality().drift_bound_ppb, uint32_t{50'000});
+}
+
+TEST(monotonic_raw_tracker, the_rate_window_is_the_lines_figure)
+{
+    // A line that accepts no more than 100 ppm keeps what it had when a
+    // fit comes out 1000 ppm fast.
+    MonotonicRawLine line{{.max_rate_ppm = 100.0}};
+    MonotonicRawTracker tracker{line};
+    EXPECT_TRUE(tracker.push(MonotonicRawClock::from_ns(LONG_UPTIME_NS), MonotonicClock::from_ns(LONG_UPTIME_NS)));
+    EXPECT_FALSE(tracker.push(
+        MonotonicRawClock::from_ns(LONG_UPTIME_NS + 1'000'000'000), MonotonicClock::from_ns(LONG_UPTIME_NS + 1'001'000'000)));
+
+    // By the default window the same pair is a line to follow.
+    MonotonicRawLine wide;
+    MonotonicRawTracker follower{wide};
+    EXPECT_TRUE(follower.push(MonotonicRawClock::from_ns(LONG_UPTIME_NS), MonotonicClock::from_ns(LONG_UPTIME_NS)));
+    EXPECT_TRUE(follower.push(
+        MonotonicRawClock::from_ns(LONG_UPTIME_NS + 1'000'000'000), MonotonicClock::from_ns(LONG_UPTIME_NS + 1'001'000'000)));
+}
+
 TEST_MAIN(statusbar_realtime, realtime_monotonic_raw_line_test)

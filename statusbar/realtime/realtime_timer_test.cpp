@@ -43,6 +43,19 @@ TEST(realtime_timer_config, default_values)
     EXPECT_EQ(config.resync_interval_cycles, 1000);
 }
 
+TEST(realtime_timer_config, the_lines_figures_reach_the_timers_line)
+{
+    TimerConfig config;
+    EXPECT_EQ(config.raw_line_drift_bound_ppb, MonotonicRawLineConfig{}.drift_bound_ppb);
+    EXPECT_EQ(config.raw_line_sleep_rate_margin_ppb, MonotonicRawLineConfig{}.sleep_rate_margin_ppb);
+
+    config.raw_line_drift_bound_ppb = 50'000;
+    config.raw_line_sleep_rate_margin_ppb = 20'000;
+    Timer<> const timer{config, [](TimerEvent<> const&, statusbar::stats::AtomicWakeStats::Snapshot const&) {}};
+    EXPECT_EQ(timer.raw_line().config().drift_bound_ppb, uint32_t{50'000});
+    EXPECT_EQ(timer.raw_line().config().sleep_rate_margin_ppb, uint32_t{20'000});
+}
+
 TEST(realtime_timer_config, default_error_histogram)
 {
     TimerConfig config;

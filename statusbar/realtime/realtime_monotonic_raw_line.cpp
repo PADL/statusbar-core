@@ -86,9 +86,9 @@ struct Sums
     return solved ? *solved : offset_only(first);
 }
 
-[[nodiscard]] auto rate_in_range(double rate) noexcept -> bool
+[[nodiscard]] auto rate_in_range(double rate, double max_rate_ppm) noexcept -> bool
 {
-    return std::fabs(rate - 1.0) <= MonotonicRawTracker::MAX_RATE_PPM * 1e-6;
+    return std::fabs(rate - 1.0) <= max_rate_ppm * 1e-6;
 }
 
 /// The furthest any sample of the window lies from the line, in whole
@@ -121,13 +121,19 @@ struct Sums
     return spread >= 4e9 ? UINT32_MAX : static_cast<uint32_t>(std::ceil(spread));
 }
 
-/// The line's drift bound: the range of the system clock's frequency
-/// correction, the line's own distance from rate one and the spread seen
-/// in the window, all three together. Saturates.
-[[nodiscard]] auto drift_bound_ppb(uint32_t const spread_ppb, int64_t const deviation_ppb) noexcept -> uint32_t
+/// A sum of rates in parts per billion as a drift bound: saturates.
+[[nodiscard]] auto saturated_ppb(int64_t const sum) noexcept -> uint32_t
 {
-    int64_t const sum = int64_t{MonotonicRawTracker::DEFAULT_DRIFT_BOUND_PPB} + int64_t{spread_ppb} + deviation_ppb;
     return sum >= int64_t{UINT32_MAX} ? UINT32_MAX : static_cast<uint32_t>(sum);
+}
+
+/// The line's drift bound: the range of the system clock's frequency
+/// correction (the line's configured figure), the line's own distance from
+/// rate one and the spread seen in the window, all three together.
+[[nodiscard]] auto drift_bound_ppb(uint32_t const base_ppb, uint32_t const spread_ppb, int64_t const deviation_ppb) noexcept
+    -> uint32_t
+{
+    return saturated_ppb(int64_t{base_ppb} + int64_t{spread_ppb} + deviation_ppb);
 }
 
 }  // namespace
@@ -152,7 +158,7 @@ auto MonotonicRawLine::from_monotonic_ns(int64_t mono_ns) const noexcept -> int6
 auto MonotonicRawLine::sleep_margin(
     MonotonicRawClock::time_point const target_raw, MonotonicRawClock::time_point const raw_now) const noexcept -> Nanoseconds
 {
-    auto const slew_ppb = static_cast<uint32_t>(rate_deviation_ppb() + SLEEP_RATE_MARGIN_PPB);
+    uint32_t const slew_ppb = saturated_ppb(rate_deviation_ppb() + int64_t{config_.sleep_rate_margin_ppb});
     ClockQuality const known = quality();
     if (!known.is_bounded()) {
         return accumulated_drift(target_raw - raw_now, slew_ppb);
@@ -165,7 +171,7 @@ auto MonotonicRawTracker::push(
 {
     window_.push({.raw = raw, .mono = mono});
     auto const fit = fit_window(window_);
-    if (!fit || !rate_in_range(fit->rate)) {
+    if (!fit || !rate_in_range(fit->rate, line_->config().max_rate_ppm)) {
         return false;
     }
     line_->publish(*fit);
@@ -176,7 +182,7 @@ auto MonotonicRawTracker::push(
          .bound_at_sync = worst_residual(window_, *line_) +
              (bracket > Nanoseconds::zero() ? (bracket + Nanoseconds{1}) / 2 : Nanoseconds::zero()),
          .epoch = 0,
-         .drift_bound_ppb = drift_bound_ppb(rate_spread_ppb(window_), line_->rate_deviation_ppb()),
+         .drift_bound_ppb = drift_bound_ppb(line_->config().drift_bound_ppb, rate_spread_ppb(window_), line_->rate_deviation_ppb()),
          .time_source = TimeSource::internal_oscillator});
     return true;
 }
