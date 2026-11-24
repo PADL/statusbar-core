@@ -153,6 +153,7 @@ int main()
 
 ## Further reading
 
+- [REALTIME_CLOCK.md](REALTIME_CLOCK.md) — the clock API in long form: theory of operation and worked examples.
 - [TIME_POLICY.md](TIME_POLICY.md) — the clock domains and the "told the time" rule this module's types exist to serve.
 - [`itc`](ITC_MODULE.md) — `StopToken` and `AtomicTripleBuffer<T>` underpin shutdown and tripwire publication.
 - [`stats`](STATS_MODULE.md) — `AtomicWakeStats` / `AtomicHistogramConfig` used by `Timer` and `TimerConfig`.
