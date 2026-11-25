@@ -39,6 +39,8 @@ static auto stats_through_an_incomplete_type(statusbar::net::XdpSocketStats cons
 #    include <linux/if_packet.h>
 #    include <linux/magic.h>
 #    include <net/if.h>
+#    include <sys/mman.h>
+#    include <sys/resource.h>
 #    include <sys/vfs.h>
 
 using namespace statusbar;
@@ -1591,14 +1593,35 @@ static void destroy_veth_pair(char const* name_a)
     (void)system(cmd);
 }
 
+/// True when the kernel exempts this process's locked memory from RLIMIT_MEMLOCK, which is
+/// CAP_IPC_LOCK in the initial user namespace (a container's root holds it only in its own).
+/// Lowers the soft limit to zero for one mlock() and restores it; not for a threaded test.
+[[nodiscard]] static auto memory_locks_are_exempt() noexcept -> bool
+{
+    rlimit saved{};
+    if (::getrlimit(RLIMIT_MEMLOCK, &saved) != 0) {
+        return false;
+    }
+    rlimit const none{.rlim_cur = 0, .rlim_max = saved.rlim_max};
+    std::array<std::byte, 1> probe{};
+    bool const exempt = ::setrlimit(RLIMIT_MEMLOCK, &none) == 0 && ::mlock(probe.data(), probe.size()) == 0;
+    (void)::munlock(probe.data(), probe.size());
+    (void)::setrlimit(RLIMIT_MEMLOCK, &saved);
+    return exempt;
+}
+
 TEST(UmemRegion, one_mapped_area_is_registered_again_for_a_retried_bind)
 {
-    if (getuid() != 0) {
-        SKIP("needs root");
+    // The old UMEM's pages are uncharged deferred, so a retry briefly charges RLIMIT_MEMLOCK twice
+    if (!memory_locks_are_exempt()) {
+        SKIP("needs CAP_IPC_LOCK");
     }
     detail::RingSet rings{};
     detail::UmemRegion region{};
     auto const first = region.allocate(64, 4096, 0, 64, 64, rings);
+    if (!first && region.create_errno() == EPERM) {
+        SKIP("registering a UMEM needs CAP_NET_RAW");
+    }
     EXPECT_TRUE(first.has_value());
     if (!first) {
         return;
