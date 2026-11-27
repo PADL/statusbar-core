@@ -111,6 +111,64 @@ TEST(rawnet_port, a_handle_that_was_never_handed_out_is_refused)
 
 #endif  // __linux__
 
+// A test port carries frames in process: TX is captured with its launch time,
+// injected RX comes back, groups are joined and left, and no backend is named.
+TEST(any_ethernet_port, a_test_port_captures_tx_and_returns_injected_rx)
+{
+    AnyEthernetPort port;
+    EXPECT_TRUE(port.open_test({.hardware_address = ieee::Eui48{0x02, 0, 0, 0, 0, 1}}).has_value());
+    EXPECT_TRUE(port.valid());
+    EXPECT_FALSE(port.backend().has_value());
+    EXPECT_FALSE(port.tx_rx_independent());
+    EXPECT_TRUE(port.describe().starts_with("test"));
+    auto const slot = port.tx_start(1234);
+    EXPECT_TRUE(slot.has_value());
+    EXPECT_TRUE(slot.has_value() && port.tx_commit(slot->handle, 60).has_value());
+    auto* const test = port.as<TestPortContext>();
+    auto const sent = test->pop_tx();
+    EXPECT_EQ(sent.has_value() ? sent->frame.size() : 0, size_t{60});
+    EXPECT_EQ(sent.has_value() ? sent->launch_time_ns : 0, int64_t{1234});
+
+    std::array<uint8_t, 64> const frame{0xAA};
+    EXPECT_TRUE(test->inject_rx(frame).has_value());
+    auto const received = port.rx_start(RxTimePoint{RxClock::duration{5}});
+    auto const rx = received.value_or(std::nullopt);
+    EXPECT_EQ(rx.has_value() ? rx->buffer[0] : 0, uint8_t{0xAA});
+    EXPECT_EQ(rx.has_value() ? rx->timestamp_ns : 0, int64_t{5});
+    EXPECT_TRUE(rx.has_value() && port.rx_release(rx->handle).has_value());
+
+    ieee::Eui48 const group{0x91, 0xE0, 0xF0, 0, 0, 1};
+    EXPECT_TRUE(port.join_multicast(group).has_value());
+    EXPECT_EQ(test->joined_multicast_groups().size(), size_t{1});
+    EXPECT_TRUE(port.leave_multicast(group).has_value());
+    EXPECT_TRUE(test->joined_multicast_groups().empty());
+}
+
+// A test port counts its flushes and cycles, and a refused commit sends
+// nothing and gives its slot back.
+TEST(any_ethernet_port, a_test_port_counts_flushes_and_cycles_and_can_refuse_commits)
+{
+    AnyEthernetPort port;
+    EXPECT_TRUE(port.open_test({.hardware_address = ieee::Eui48{0x02, 0, 0, 0, 0, 1}, .frame_pool_size = 1}).has_value());
+    auto* const test = port.as<TestPortContext>();
+    port.begin_cycle();
+    EXPECT_TRUE(port.tx_flush().has_value());
+    EXPECT_TRUE(port.end_cycle().has_value());
+    EXPECT_EQ(test->tx_flushes(), size_t{1});
+    EXPECT_EQ(test->cycles_begun(), size_t{1});
+    EXPECT_EQ(test->cycles_ended(), size_t{1});
+
+    test->refuse_commits(true);
+    auto const refused = port.tx_start(0);
+    EXPECT_TRUE(refused.has_value());
+    EXPECT_FALSE(refused.has_value() && port.tx_commit(refused->handle, 60).has_value());
+    EXPECT_EQ(test->tx_pending(), size_t{0});
+    test->refuse_commits(false);
+    auto const accepted = port.tx_start(0);  // the one slot, given back by the refusal
+    EXPECT_TRUE(accepted.has_value() && port.tx_commit(accepted->handle, 60).has_value());
+    EXPECT_EQ(test->tx_pending(), size_t{1});
+}
+
 // The one port config stands for a config per backend, and a caller that
 // opens a backend itself gets the same translation the port applies.
 TEST(any_ethernet_port, the_backend_configs_follow_the_one_port_config)
