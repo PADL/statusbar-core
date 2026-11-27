@@ -9,6 +9,8 @@
 #include "statusbar/ieee/ieee.hpp"
 #include "statusbar/test/test.hpp"
 
+#include <unistd.h>
+
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -16,6 +18,8 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace statusbar::pcap;
@@ -688,6 +692,136 @@ TEST(pcap_file_rw, read_short_frame_handled)
     }
 
     std::remove(filename.c_str());
+}
+
+//
+// Tests: the nanosecond pcap (magic a1b23c4d), in either byte order
+//
+
+static_assert(swap_bytes(PCAP_NSEC_MAGIC_NATIVE) == PCAP_NSEC_MAGIC_SWAPPED, "the nanosecond magics are each other, byte-reversed");
+static_assert(record_timestamp_us(RecordHeader{.ts_sec = 7, .ts_usec = 250, .incl_len = 0, .orig_len = 0}, false) == 7'000'250ULL);
+static_assert(
+    record_timestamp_us(RecordHeader{.ts_sec = 7, .ts_usec = 250'999, .incl_len = 0, .orig_len = 0}, true) == 7'000'250ULL);
+
+namespace {
+
+/// One record of a hand-written capture: when, and how many octets of frame.
+struct RawRecord
+{
+    uint32_t seconds;
+    uint32_t fraction;  ///< microseconds or nanoseconds, as the file's magic says
+    uint8_t octets;
+};
+
+/// A file of this process alone under /tmp: these tests also run inside the
+/// all-tests binary, and the two must not write each other's files.
+auto scratch_pcap(std::string_view name) -> std::string
+{
+    return std::string{"/tmp/statusbar_pcap_test_"} + std::to_string(::getpid()) + "_" + std::string{name};
+}
+
+/// @p v as it lies in a file whose byte order is this host's (@p swapped false) or the other.
+auto in_file_order(uint32_t v, bool swapped) -> uint32_t
+{
+    return swapped ? swap_bytes(v) : v;
+}
+
+/// Write a classic pcap by hand: @p magic as it reads on this host when the
+/// file is in host order, every header field byte-swapped when @p swapped.
+auto write_raw_pcap(std::string const& path, uint32_t magic, bool swapped, std::span<RawRecord const> records) -> bool
+{
+    std::FILE* const f = std::fopen(path.c_str(), "wb");
+    if (f == nullptr) {
+        return false;
+    }
+    FileHeader header{};
+    header.magic_number = in_file_order(magic, swapped);
+    header.snaplen = in_file_order(65535, swapped);
+    header.network = in_file_order(1, swapped);
+    bool ok = std::fwrite(&header, sizeof(header), 1, f) == 1;
+    for (auto const& r : records) {
+        RecordHeader rec{};
+        rec.ts_sec = in_file_order(r.seconds, swapped);
+        rec.ts_usec = in_file_order(r.fraction, swapped);
+        rec.incl_len = static_cast<int32_t>(in_file_order(r.octets, swapped));
+        rec.orig_len = rec.incl_len;
+        std::vector<uint8_t> const frame(r.octets, r.octets);
+        ok = ok && std::fwrite(&rec, sizeof(rec), 1, f) == 1 && std::fwrite(frame.data(), frame.size(), 1, f) == 1;
+    }
+    return std::fclose(f) == 0 && ok;
+}
+
+/// The timestamps and sizes a FileReader gives for @p path; nullopt when it does not open or read through.
+auto read_times_and_sizes(std::string const& path) -> std::optional<std::vector<std::pair<uint64_t, size_t>>>
+{
+    auto reader = FileReader::open(path);
+    if (!reader) {
+        return std::nullopt;
+    }
+    std::vector<std::pair<uint64_t, size_t>> seen;
+    uint64_t timestamp_us = 0;
+    Packet packet;
+    for (auto step = reader->read_packet(&timestamp_us, packet); !step || *step;
+         step = reader->read_packet(&timestamp_us, packet)) {
+        if (!step) {
+            return std::nullopt;
+        }
+        seen.emplace_back(timestamp_us, packet.size());
+    }
+    return seen;
+}
+
+}  // namespace
+
+TEST(pcap_nanosecond, each_magic_names_a_byte_order_and_a_resolution)
+{
+    EXPECT_TRUE(file_layout_of(PCAP_MAGIC_NATIVE) == (FileLayout{.swapped = false, .nanoseconds = false}));
+    EXPECT_TRUE(file_layout_of(PCAP_MAGIC_SWAPPED) == (FileLayout{.swapped = true, .nanoseconds = false}));
+    EXPECT_TRUE(file_layout_of(PCAP_NSEC_MAGIC_NATIVE) == (FileLayout{.swapped = false, .nanoseconds = true}));
+    EXPECT_TRUE(file_layout_of(PCAP_NSEC_MAGIC_SWAPPED) == (FileLayout{.swapped = true, .nanoseconds = true}));
+    EXPECT_FALSE(file_layout_of(0).has_value());
+    EXPECT_FALSE(file_layout_of(0x0a0d0d0a).has_value());  // a pcapng Section Header Block
+}
+
+TEST(pcap_nanosecond, a_record_timestamp_is_microseconds_whatever_the_file_counts)
+{
+    RecordHeader const rec{.ts_sec = 1'795'000'000, .ts_usec = 999'999'999, .incl_len = 60, .orig_len = 60};
+    // Nanoseconds are cut to whole microseconds, never rounded up into the next second.
+    EXPECT_EQ(record_timestamp_us(rec, true), 1'795'000'000'999'999ULL);
+    RecordHeader const micro{.ts_sec = 1'795'000'000, .ts_usec = 999'999, .incl_len = 60, .orig_len = 60};
+    EXPECT_EQ(record_timestamp_us(micro, false), 1'795'000'000'999'999ULL);
+    EXPECT_EQ(record_timestamp_us(micro, true), 1'795'000'000'000'999ULL);
+}
+
+TEST(pcap_nanosecond, a_nanosecond_pcap_reads_like_a_microsecond_one)
+{
+    // Three frames: at 5.000000500 s, 2 ms later and 1.5 s after the first.
+    std::array<RawRecord, 3> const nanos{{{5, 500, 60}, {5, 2'000'500, 64}, {6, 500'000'500, 72}}};
+    std::array<RawRecord, 3> const micros{{{5, 0, 60}, {5, 2'000, 64}, {6, 500'000, 72}}};
+    std::vector<std::pair<uint64_t, size_t>> const expected{{0, 60}, {2'000, 64}, {1'500'000, 72}};
+
+    auto const path = scratch_pcap("nsec.pcap");
+    for (bool const swapped : {false, true}) {
+        EXPECT_TRUE(write_raw_pcap(path, PCAP_NSEC_MAGIC_NATIVE, swapped, nanos));
+        auto const from_nanos = read_times_and_sizes(path);
+        EXPECT_TRUE(from_nanos.has_value());
+        EXPECT_TRUE(from_nanos == expected);
+
+        EXPECT_TRUE(write_raw_pcap(path, PCAP_MAGIC_NATIVE, swapped, micros));
+        EXPECT_TRUE(read_times_and_sizes(path) == expected);
+    }
+    std::remove(path.c_str());
+}
+
+TEST(pcap_nanosecond, a_file_of_another_magic_is_still_refused)
+{
+    auto const path = scratch_pcap("other.pcap");
+    std::array<RawRecord, 1> const one{{{5, 0, 60}}};
+    EXPECT_TRUE(write_raw_pcap(path, 0x0a0d0d0a, false, one));
+    auto const reader = FileReader::open(path);
+    EXPECT_FALSE(reader.has_value());
+    EXPECT_TRUE(reader.error() == make_error_code(PcapError::incompatible_magic));
+    std::remove(path.c_str());
 }
 
 //

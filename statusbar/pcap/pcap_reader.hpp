@@ -23,7 +23,9 @@ namespace statusbar::pcap {
 /// PCAP file reader for Wireshark-compatible capture files.
 ///
 /// Reads Ethernet frames from a PCAP file. Handles both native and
-/// byte-swapped file formats automatically.
+/// byte-swapped file formats automatically, and both resolutions of the
+/// record timestamps: a nanosecond pcap is read like a microsecond one, its
+/// timestamps cut to microseconds.
 ///
 /// Construct via the static `open()` factory; the ctor is private so callers
 /// always see the `StatusValue<FileReader>` failure surface.
@@ -77,9 +79,21 @@ class FileReader
   private:
     FileReader() = default;
 
+    /// Read the file header and take the layout its magic number names.
+    [[nodiscard]] auto read_file_header() -> Status;
+    /// Read the next record header into @p rec, in this host's byte order, and
+    /// refuse lengths no record can have. success(false) on a clean EOF.
+    [[nodiscard]] auto read_record_header(RecordHeader& rec) -> StatusValue<bool>;
+    /// Read the next record: its header into @p rec and its captured bytes
+    /// into @p packet. success(false) on a clean EOF.
+    [[nodiscard]] auto read_record(RecordHeader& rec, Packet& packet) -> StatusValue<bool>;
+    /// @p timestamp_us relative to the first record's, which this call makes
+    /// it when there has been none.
+    [[nodiscard]] auto relative_timestamp_us(uint64_t timestamp_us) noexcept -> uint64_t;
+
     FilePtr file_{nullptr, [](FILE*) -> void {}};
     std::string filename_;
-    bool swap_{false};
+    FileLayout layout_{};
     bool seen_first_timestamp_{false};
     uint64_t first_timestamp_us_{0};
 };

@@ -39,7 +39,7 @@ deterministically without wall-clock drift.
 
 - `Packet` — alias for `std::vector<uint8_t>` holding an Ethernet frame.
 - `FileHeader`, `RecordHeader` — 24-byte and 16-byte on-disk pcap structures.
-- `FileReader`, `FileWriter` — legacy pcap I/O; auto-detect byte order on read, append on write.
+- `FileReader`, `FileWriter` — legacy pcap I/O; on read the byte order and the timestamp resolution (microsecond `a1b2c3d4` or nanosecond `a1b23c4d`) are taken from the magic number, and timestamps come out in microseconds either way; append on write, in microseconds.
 - `PcapngBlockType`, `LinkType` — pcapng block-type codes and link-layer types (Ethernet, PPP, Raw, IEEE 802.11, Linux SLL, …).
 - `PcapngBlockHeader`, `PcapngSectionHeaderBody`, `PcapngInterfaceDescBody`, `PcapngEnhancedPacketBody`, `PcapngSimplePacketBody` — on-disk pcapng block layouts.
 - `InterfaceInfo` — per-IDB record: `link_type`, `snap_length`, `ts_resol`.
@@ -93,7 +93,7 @@ int main()
 ## Headers
 
 - `statusbar/pcap/pcap.hpp` — module header; pulls in everything below.
-- `statusbar/pcap/pcap_base.hpp` — `Packet`, `FileHeader`, `RecordHeader`, magic numbers, `swap_bytes`, `FilePtr`, `make_file`, `get_current_time_in_microseconds`.
+- `statusbar/pcap/pcap_base.hpp` — `Packet`, `FileHeader`, `RecordHeader`, magic numbers, `FileLayout` / `file_layout_of`, `record_timestamp_us`, `swap_bytes`, `FilePtr`, `make_file`, `get_current_time_in_microseconds`.
 - `statusbar/pcap/pcap_reader.hpp` / `pcap_writer.hpp` — `FileReader` / `FileWriter` plus the `FileReader` overload of `for_each_packet`.
 - `statusbar/pcap/pcapng_base.hpp` — pcapng enums, block-body structs, `swap_bytes16` / `swap_bytes32` / `swap_bytes64`, `align_to_4`.
 - `statusbar/pcap/pcapng_reader.hpp` / `pcapng_writer.hpp` — `PcapngReader`, `InterfaceInfo`, `PcapngFileWriter`.
