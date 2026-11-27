@@ -195,6 +195,13 @@ class TestPortContext
         int64_t timestamp_ns;
     };
 
+    /// close(): what was received, sent and joined is forgotten.
+    void forget_traffic() noexcept;
+    /// close(): the counts and refuse_commits() are as in a new port.
+    void reset_test_controls() noexcept;
+    /// tx_commit(): the first @p len octets of slot @p handle, with its launch time, kept for pop_tx().
+    void capture_tx(uint64_t handle, size_t len);
+
     bool valid_{false};
     bool refuse_commits_{false};
     size_t tx_flushes_{0};

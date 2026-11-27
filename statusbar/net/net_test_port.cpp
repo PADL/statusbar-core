@@ -8,14 +8,24 @@
 namespace statusbar::net {
 
 void TestPortContext::close() noexcept
-{  // NOLINT(statusbar-block-statements): a many-field reset
+{
     valid_ = false;
     pool_.clear();
     free_list_.clear();
     launch_times_.clear();
+    forget_traffic();
+}
+
+void TestPortContext::forget_traffic() noexcept
+{
     rx_queue_.clear();
     tx_captures_.clear();
     joined_multicast_.clear();
+    reset_test_controls();
+}
+
+void TestPortContext::reset_test_controls() noexcept
+{
     refuse_commits_ = false;
     tx_flushes_ = 0;
     cycles_begun_ = 0;
@@ -51,7 +61,7 @@ auto TestPortContext::open(TestPortConfig const& config, std::pmr::memory_resour
 }
 
 auto TestPortContext::tx_commit(uint64_t handle, size_t len) -> Status
-{  // NOLINT(statusbar-block-statements): one frame captured whole, or refused
+{
     if (handle >= pool_.size()) {
         return failure(NetError::invalid_handle);
     }
@@ -59,7 +69,13 @@ auto TestPortContext::tx_commit(uint64_t handle, size_t len) -> Status
         free_list_.push_back(handle);
         return failure(NetError::send_failed);
     }
+    capture_tx(handle, len);
+    free_list_.push_back(handle);
+    return success();
+}
 
+void TestPortContext::capture_tx(uint64_t handle, size_t len)
+{
     size_t const actual_len = (len > ETHERNET_PORT_MIN_FRAME_BUFFER) ? ETHERNET_PORT_MIN_FRAME_BUFFER : len;
 
     auto const& buf = pool_[static_cast<size_t>(handle)];
@@ -67,9 +83,6 @@ auto TestPortContext::tx_commit(uint64_t handle, size_t len) -> Status
     capture.frame.assign(buf.data(), actual_len);
     capture.launch_time_ns = launch_times_[static_cast<size_t>(handle)];
     tx_captures_.push_back(capture);
-
-    free_list_.push_back(handle);
-    return success();
 }
 
 auto TestPortContext::tx_start(int64_t launch_time_ns) -> StatusValue<EthernetTxSlot>
