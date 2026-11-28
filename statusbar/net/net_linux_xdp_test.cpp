@@ -38,7 +38,9 @@ static auto stats_through_an_incomplete_type(statusbar::net::XdpSocketStats cons
 #    include <vector>
 
 #    include <linux/if_packet.h>
+#    include <linux/magic.h>
 #    include <net/if.h>
+#    include <sys/vfs.h>
 
 using namespace statusbar;
 using namespace statusbar::net;
@@ -1310,6 +1312,18 @@ TEST(xdp_owner, a_path_that_could_not_hold_a_pin_is_refused)
     }
 }
 
+namespace {
+
+/// Whether a bpf filesystem is mounted at /sys/fs/bpf. Root in a container
+/// often has none: the directory is there and nothing can be pinned in it.
+auto bpffs_is_mounted() -> bool
+{
+    struct statfs fs{};
+    return ::statfs("/sys/fs/bpf", &fs) == 0 && static_cast<unsigned long>(fs.f_type) == static_cast<unsigned long>(BPF_FS_MAGIC);
+}
+
+}  // namespace
+
 TEST(xdp_owner, an_empty_pin_directory_is_claimed_by_nobody)
 {
     // Nothing of ours has ever been pinned for this made-up interface, so
@@ -1318,11 +1332,12 @@ TEST(xdp_owner, an_empty_pin_directory_is_claimed_by_nobody)
     // Unprivileged, /sys/fs/bpf cannot be opened at all, and then the call
     // reports that errno rather than answering "nobody" - which is the
     // distinction that matters, since "I cannot tell" must never be acted
-    // on as "unclaimed".
+    // on as "unclaimed". The same holds for root where no bpf filesystem is
+    // mounted, as in a container: being root is not enough to be told.
     auto const path = XdpProgram::pin_path_for("statusbar-none");
     EXPECT_FALSE(path.empty());
     auto const owner = XdpProgram::owner(path);
-    if (getuid() == 0) {
+    if (getuid() == 0 && bpffs_is_mounted()) {
         EXPECT_TRUE(owner.has_value());
         if (owner) {
             EXPECT_TRUE(*owner == XdpPinOwner::none);
